@@ -349,6 +349,23 @@ func (p *Placer) save(ctx context.Context, wf *placementWorkflow, message string
 	return nil
 }
 
+// saveTx is save inside a transaction, for a status change that must land
+// with the work it describes or not at all.
+func (p *Placer) saveTx(ctx context.Context, tx pgx.Tx, wf *placementWorkflow, message string) error {
+	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message}
+	tag, err := tx.Exec(ctx,
+		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
+		wf.id, wf.state, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
+	if err != nil {
+		return err
+	}
+	if wf.owner != "" && tag.RowsAffected() == 0 {
+		return errNotOwner
+	}
+	return nil
+}
+
 func (p *Placer) finish(ctx context.Context, wf *placementWorkflow, state, message string) error {
 	wf.state = state
 	return p.save(ctx, wf, message)
@@ -452,25 +469,33 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 		// The shards refuse writes from here until publish: the drain is
 		// done, and from the first rename onwards a router still holding
 		// the old view would otherwise write the live name on a shard that
-		// has already swapped. Once the swap is published there is nothing
-		// left to protect, and re-arming on a retry of a later step would
-		// shut the table to every client over one unreachable shard.
+		// has already swapped.
+		//
+		// Once publish has committed, the placement is LIVE and the only
+		// work left is giving back what the swap armed. Everything above
+		// releaseShardFence dials every shard, so re-running any of it
+		// meant one unreachable shard kept the fence armed on the healthy
+		// ones -- the table refused everywhere, over a shard that is not
+		// even serving it any anymore, for as long as that shard was down.
+		// publish records SwappedAt in the same transaction that makes the
+		// placement effective, so this is decided by what committed and
+		// not by what a previous pass happened to hold in memory.
 		if wf.st.SwappedAt == nil {
 			if err := p.fenceShards(ctx, wf); err != nil {
 				return false, err
 			}
-		}
-		if _, _, err := p.catchUp(ctx, wf, true); err != nil {
-			return false, err
-		}
-		if err := p.verifyPlacement(ctx, wf); err != nil {
-			return false, err
-		}
-		if err := p.swapAll(ctx, wf); err != nil {
-			return false, err
-		}
-		if err := p.publish(ctx, wf); err != nil {
-			return false, err
+			if _, _, err := p.catchUp(ctx, wf, true); err != nil {
+				return false, err
+			}
+			if err := p.verifyPlacement(ctx, wf); err != nil {
+				return false, err
+			}
+			if err := p.swapAll(ctx, wf); err != nil {
+				return false, err
+			}
+			if err := p.publish(ctx, wf); err != nil {
+				return false, err
+			}
 		}
 		// publish clears the catalog flag itself; the shards' own fence has
 		// to come off too or every write to the table keeps being refused.

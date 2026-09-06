@@ -2422,14 +2422,28 @@ func (p *Placer) publish(ctx context.Context, wf *placementWorkflow) error {
 	if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_map_generation SET generation = generation + 1, updated_at = now()`); err != nil {
 		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
+	// SwappedAt records that the placement is live, and the swapping stage
+	// reads it to decide there is nothing left to do but release the fence.
+	// It is written in THIS transaction: set in memory after the commit, a
+	// pass that then failed on an unreachable shard left the catalog saying
+	// the placement was live and the workflow saying it was not, and the
+	// next pass re-armed the fence and re-ran the swap -- which needs every
+	// shard, so the table stayed refused on the healthy ones.
+	before := wf.st
 	now := p.now()
 	wf.st.SwappedAt = &now
 	if wf.st.FencedAt != nil {
 		wf.st.PauseMS = now.Sub(*wf.st.FencedAt).Milliseconds()
 	}
+	if err := p.saveTx(ctx, tx, wf, "new placement published"); err != nil {
+		wf.st = before
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		wf.st = before
+		return err
+	}
+	wf.fence = wf.state
 	return nil
 }
 
