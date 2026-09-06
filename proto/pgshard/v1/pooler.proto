@@ -453,6 +453,11 @@ message AckRequest {
 // AckResponse reports the outcome.
 message AckResponse {
   Error error = 1;
+  // LSN the pooler actually confirmed to PostgreSQL, which is the ack
+  // clamped to what this reader has delivered. A caller that records the
+  // LSN it asked for rather than this one believes a slot advanced when it
+  // did not, and never asks again.
+  uint64 confirmed_lsn = 2;
 }
 
 // CopyTablesRequest starts or resumes the initial copy of a shard.

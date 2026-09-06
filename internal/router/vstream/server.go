@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -50,6 +51,72 @@ type Server struct {
 	// resume from its last position; the gauges are how that is seen
 	// coming rather than read about afterwards.
 	Meter Meter
+
+	// live holds the emitted position of each open stream, so a unary Ack
+	// can be clamped to what a consumer was actually sent. The pooler
+	// allows one reader per slot, so one stream name has at most one.
+	mu   sync.Mutex
+	live map[string]*emitted
+}
+
+// emitted is what one open stream has delivered, per shard. The merger
+// writes it as it emits; the unary Ack path reads it from another
+// goroutine, which is why it is atomics and not the merger's own map.
+type emitted struct {
+	pos map[router.Shard]*atomic.Uint64
+}
+
+func newEmitted(shards []router.Shard, start map[router.Shard]uint64) *emitted {
+	e := &emitted{pos: make(map[router.Shard]*atomic.Uint64, len(shards))}
+	for _, sh := range shards {
+		v := &atomic.Uint64{}
+		v.Store(start[sh])
+		e.pos[sh] = v
+	}
+	return e
+}
+
+func (e *emitted) advance(sh router.Shard, lsn uint64) {
+	if v := e.pos[sh]; v != nil {
+		for {
+			cur := v.Load()
+			if lsn <= cur || v.CompareAndSwap(cur, lsn) {
+				return
+			}
+		}
+	}
+}
+
+func (e *emitted) at(sh router.Shard) (uint64, bool) {
+	v, ok := e.pos[sh]
+	if !ok {
+		return 0, false
+	}
+	return v.Load(), true
+}
+
+// registerLive publishes an open stream's emitted position and returns the
+// function that withdraws it.
+func (s *Server) registerLive(name string, e *emitted) func() {
+	s.mu.Lock()
+	if s.live == nil {
+		s.live = map[string]*emitted{}
+	}
+	s.live[name] = e
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		if s.live[name] == e {
+			delete(s.live, name)
+		}
+		s.mu.Unlock()
+	}
+}
+
+func (s *Server) liveStream(name string) *emitted {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.live[name]
 }
 
 func (s *Server) logger() *slog.Logger {
@@ -109,32 +176,63 @@ func (s *Server) List(ctx context.Context, _ *pgshardv1.ListVStreamsRequest) (*p
 }
 
 // Ack implements VStream.Ack: every shard in the position is acked on its
-// pooler, which requires an open Stream reader on that pooler.
+// pooler, clamped to what this router has actually emitted for the stream.
+//
+// The clamp is the whole point. An ack moves a slot's confirmed_flush_lsn,
+// and PostgreSQL will not resend anything below it -- so an ack above what
+// the consumer was sent discards transactions that are still sitting in this
+// router's buffers, and they are gone for good if the router then dies. The
+// in-stream ack has always been clamped this way by the merger; this one was
+// not, and a consumer computing a position out of band (pg_current_wal_lsn()
+// on a shard, or another consumer's VGtid) could ask for anything.
+//
+// It therefore requires the stream to be open on THIS router. A router that
+// is not serving the stream does not know what the consumer has seen, so it
+// has nothing to clamp against; acking in the stream is the path that always
+// works.
 func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pgshardv1.VStreamAckResponse, error) {
 	if !catalog.ValidStreamName(req.GetStream()) {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid stream name %q", req.GetStream())
 	}
+	live := s.liveStream(req.GetStream())
+	if live == nil {
+		return &pgshardv1.VStreamAckResponse{Error: &pgshardv1.Error{Sqlstate: "55000",
+			Message: fmt.Sprintf("stream %q is not open on this router, so an ack cannot be checked against what was delivered; ack inside the stream, or on the router serving it", req.GetStream())}}, nil
+	}
 	for sh, lsn := range positionFrom(req.GetPosition()) {
-		if err := s.ackShard(ctx, req.GetStream(), sh, lsn); err != nil {
+		delivered, ok := live.at(sh)
+		if !ok {
+			continue
+		}
+		if lsn > delivered {
+			lsn = delivered
+		}
+		if lsn == 0 {
+			continue
+		}
+		if _, err := s.ackShard(ctx, req.GetStream(), sh, lsn); err != nil {
 			return &pgshardv1.VStreamAckResponse{Error: &pgshardv1.Error{Message: fmt.Sprintf("shard %s/%d: %v", sh.Set, sh.ID, err)}}, nil
 		}
 	}
 	return &pgshardv1.VStreamAckResponse{}, nil
 }
 
-func (s *Server) ackShard(ctx context.Context, stream string, sh router.Shard, lsn uint64) error {
+// ackShard returns the LSN the pooler confirmed, which is the ack clamped to
+// what that pooler's reader has delivered. It is not always what was asked
+// for, and the caller must not record it as if it were.
+func (s *Server) ackShard(ctx context.Context, stream string, sh router.Shard, lsn uint64) (uint64, error) {
 	client, err := s.Topology.Client(sh)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	r, err := client.Ack(ctx, &pgshardv1.AckRequest{Stream: stream, Lsn: lsn})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if r.GetError() != nil {
-		return errors.New(r.GetError().GetMessage())
+		return 0, errors.New(r.GetError().GetMessage())
 	}
-	return nil
+	return r.GetConfirmedLsn(), nil
 }
 
 // Stream implements VStream.Stream.
@@ -218,7 +316,7 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 			r.run(ctx)
 		}()
 	}
-	ackers := newAckers(ctx, &wg, func(sh router.Shard, lsn uint64) error { return s.ackShard(ctx, def.Name, sh, lsn) }, s.logger())
+	ackers := newAckers(ctx, &wg, func(sh router.Shard, lsn uint64) (uint64, error) { return s.ackShard(ctx, def.Name, sh, lsn) }, s.logger())
 	acks := make(chan *pgshardv1.VPosition, 16)
 	go func() {
 		for {
@@ -238,8 +336,10 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 			}
 		}
 	}()
+	live := newEmitted(shards, startPos)
+	defer s.registerLive(def.Name, live)()
 	m := &merger{shards: shards, inputs: inputs, ready: ready, acks: acks, acker: ackers.request, send: send,
-		topo: s.Topology, generation: gen, opts: opts, position: startPos, copying: copying}
+		topo: s.Topology, generation: gen, opts: opts, position: startPos, copying: copying, emitted: live}
 	err = m.run(ctx)
 	cancel()
 	wg.Wait()
@@ -258,16 +358,18 @@ func lockedSender(send func(*pgshardv1.VEvent) error) func(*pgshardv1.VEvent) er
 // ackers forwards acks per shard from one goroutine each, coalescing to
 // the newest requested LSN so a slow pooler never queues stale acks.
 type ackers struct {
-	ctx    context.Context
-	wg     *sync.WaitGroup
-	ack    func(router.Shard, uint64) error
+	ctx context.Context
+	wg  *sync.WaitGroup
+	// ack returns the LSN the pooler confirmed, which can be less than the
+	// one asked for.
+	ack    func(router.Shard, uint64) (uint64, error)
 	logger *slog.Logger
 	mu     sync.Mutex
 	want   map[router.Shard]uint64
 	wake   map[router.Shard]chan struct{}
 }
 
-func newAckers(ctx context.Context, wg *sync.WaitGroup, ack func(router.Shard, uint64) error, logger *slog.Logger) *ackers {
+func newAckers(ctx context.Context, wg *sync.WaitGroup, ack func(router.Shard, uint64) (uint64, error), logger *slog.Logger) *ackers {
 	return &ackers{ctx: ctx, wg: wg, ack: ack, logger: logger, want: map[router.Shard]uint64{}, wake: map[router.Shard]chan struct{}{}}
 }
 
@@ -308,14 +410,24 @@ func (a *ackers) loop(sh router.Shard, wake chan struct{}) {
 			if lsn <= done {
 				break
 			}
-			if err := a.ack(sh, lsn); err != nil {
+			confirmed, err := a.ack(sh, lsn)
+			if err != nil {
 				if a.ctx.Err() != nil {
 					return
 				}
 				a.logger.Warn("vstream: ack failed", "shard", fmt.Sprintf("%s/%d", sh.Set, sh.ID), "lsn", lsn, "err", err)
 				break
 			}
-			done = lsn
+			// Only what the pooler confirmed. Recording the LSN that was
+			// asked for makes every later request for it a no-op -- the
+			// slot stays where it is and nothing ever asks again -- which
+			// is how a consumer that acked correctly ended up holding WAL.
+			done = confirmed
+			if confirmed < lsn {
+				a.logger.Warn("vstream: pooler confirmed less than the ack asked for; the slot advances on the next ack",
+					"shard", fmt.Sprintf("%s/%d", sh.Set, sh.ID), "asked", lsn, "confirmed", confirmed)
+				break
+			}
 		}
 	}
 }

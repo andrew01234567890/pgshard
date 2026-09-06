@@ -54,6 +54,9 @@ type merger struct {
 	now        func() time.Time
 
 	position map[router.Shard]uint64
+	// emitted mirrors position for the unary Ack path, which runs on
+	// another goroutine and must not read the map above.
+	emitted *emitted
 	// copying holds the copy state of every shard still in its copy phase.
 	copying    map[router.Shard]*pgshardv1.VCopyState
 	sentRel    map[string]string
@@ -347,6 +350,9 @@ func (m *merger) emit(u *unit) error {
 	}
 	if u.position && u.endLSN > m.position[u.shard] {
 		m.position[u.shard] = u.endLSN
+		if m.emitted != nil {
+			m.emitted.advance(u.shard, u.endLSN)
+		}
 	}
 	if u.copy != nil {
 		m.copying[u.shard] = u.copy
