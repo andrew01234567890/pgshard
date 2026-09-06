@@ -182,7 +182,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		// running: the shards first, then the fence. A restored cluster
 		// comes back holding a fence that must stay up until two-phase
 		// reconciliation finishes; Barrier.Recover leaves that one alone
-		// because it names a certified restore point.
+		// because it came out of the backup and predates this postmaster.
 		go barrier.RunRecovery(ctx, *resolveEvery, leader)
 		subTemplate := *subscriptionTemplate
 		if subTemplate == "" {

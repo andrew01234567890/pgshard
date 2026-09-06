@@ -378,30 +378,38 @@ func ClearWriteFenceAfterRestore(ctx context.Context, q Execer) error {
 }
 
 // ClearStaleBarrierFence clears the fence of a barrier run that never
-// finished, and reports whether it cleared one.
+// finished on THIS server, and reports whether it cleared one.
 //
 // The distinction it has to make is against a RESTORE. A cluster restored to
 // a barrier comes back holding that barrier's fence -- owner, reason and all,
 // because the restore point was taken while the fence was up -- and that one
-// must stay up until two-phase reconciliation finishes. Reason and owner
-// cannot separate the two: both say "barrier <name>".
+// must stay up until two-phase reconciliation finishes.
 //
-// The restore point can. A run reserves its row uncertified before it raises
-// the fence and certifies it just before releasing, so a fence naming an
-// UNCERTIFIED row belongs to a run that died between those two points. A
-// restored catalog's fence names a CERTIFIED one -- a cluster is restored to
-// a barrier that completed.
+// It is made by WHEN the fence was written, not by what it names. A restore
+// recovers to recovery_target_name = pgshard-<barrier>, which is the WAL
+// restore point the barrier created at its third step; everything the barrier
+// wrote after that, certification included, is past the recovery target and
+// not in the restored catalog. So a restored fence is data that came out of a
+// backup: it predates this postmaster. A fence an interrupted run left was
+// written by a live process while this postmaster has been up.
 //
-// The narrow window this does not cover is a run that certified and died
-// before releasing: that fence names a certified row and is left for the
-// next barrier or an operator, as before.
+// An earlier version of this keyed on the restore point being uncertified,
+// on the reasoning that a cluster is restored to a barrier that completed.
+// That is exactly backwards: the restored catalog is rewound to BEFORE the
+// certifying write, so its row is uncertified too, and the predicate cleared
+// the one fence it was written to protect. The ordering is in Barrier.run --
+// Reserve, Fence, CreateRestorePoint, awaitArchived, verify, Record.
+//
+// A catalog primary that restarted after a barrier died also puts the fence
+// before the postmaster, and is then not cleared. That is the safe direction:
+// it leaves the fence for the next barrier or an operator, which is where it
+// was before any of this.
 func ClearStaleBarrierFence(ctx context.Context, q Execer) (bool, error) {
-	tag, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation g
+	tag, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
 		SET write_fence = false, write_fence_reason = '', write_fence_owner = '',
 		    write_fenced_at = NULL, updated_at = now()
-		WHERE g.write_fence AND g.write_fence_owner <> ''
-		  AND EXISTS (SELECT 1 FROM pgshard.restore_points rp
-		               WHERE 'barrier ' || rp.name = g.write_fence_reason AND NOT rp.certified)`)
+		WHERE write_fence AND write_fence_owner <> ''
+		  AND write_fenced_at > pg_postmaster_start_time()`)
 	if err != nil {
 		return false, err
 	}
