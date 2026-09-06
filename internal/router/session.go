@@ -222,6 +222,10 @@ type Executor struct {
 	txnOnBackend bool
 	txnPreFence  bool
 
+	// stmtSnap is the snapshot the statement in flight was planned
+	// against; nil between statements.
+	stmtSnap *snapshot.Snapshot
+
 	// parked holds the streams of the other shards an open transaction has
 	// touched; wroteHere says whether the current shard was written to.
 	// startupSearchPath is the search_path the client asked for at startup
@@ -391,12 +395,14 @@ func (e *Executor) Shard() Shard { return e.shard }
 // planSession describes this session to the planner. Sessions on the
 // catalog shard set see no table placement and plan everything onto their
 // home shard.
-func (e *Executor) planSession() plan.Session {
-	sess := plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, User: e.info.User, SearchPath: e.searchPath()}
-	if !e.catalogSession() {
-		sess.Snapshot = e.r.cfg.Snapshot()
-	}
-	return sess
+func (e *Executor) planSession() plan.Session { return e.planSessionAt(e.currentSnapshot()) }
+
+// planSessionAt is planSession against a snapshot the caller has already
+// taken, so planning and the generation stamped on what the plan sends come
+// from the same one.
+func (e *Executor) planSessionAt(snap *snapshot.Snapshot) plan.Session {
+	return plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, User: e.info.User,
+		SearchPath: e.searchPath(), Snapshot: snap}
 }
 
 // plan plans sql for this session. Sessions on the catalog shard set run
@@ -431,7 +437,14 @@ func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, e
 		e.r.metrics.Refusals.WithLabelValues(codeStaleGeneration).Inc()
 		return plan.Plan{}, err
 	}
-	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
+	// One snapshot for the statement: it is planned against this and
+	// everything it sends is stamped from it. The watcher swaps the pointer
+	// on every reload, so reading the live one again at send time could
+	// stamp a generation the plan was never made under -- and a pooler
+	// already at that generation admits it, which is the case the fence
+	// exists to refuse.
+	e.stmtSnap = e.currentSnapshot()
+	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSessionAt(e.stmtSnap), sql)
 	if err == nil && pl.Kind == plan.MigrationKind && e.home.Set != DefaultShardSet {
 		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
 	}
@@ -1631,7 +1644,19 @@ func (e *Executor) resolveShardMetrics() {
 	e.errors = e.r.metrics.ShardErrors.WithLabelValues(label)
 }
 
-func (e *Executor) generation() *pgshardv1.Generation { return e.r.cfg.Poolers.Generation(e.shard) }
+// generation stamps a request with the shard map generation and primary
+// epoch of the snapshot the statement in flight was planned against, or the
+// live one when nothing is in flight (an out-of-band Sync or Close, and a
+// catalog session, whose plans do not depend on a snapshot).
+func (e *Executor) generation() *pgshardv1.Generation {
+	if e.stmtSnap == nil {
+		return e.r.cfg.Poolers.Generation(e.shard)
+	}
+	return &pgshardv1.Generation{
+		ShardMapGeneration: uint64(e.stmtSnap.ShardMapGeneration),
+		PrimaryEpoch:       uint64(e.stmtSnap.Serving[snapshot.ShardKey{ShardSet: e.shard.Set, ShardID: e.shard.ID}].Epoch),
+	}
+}
 
 func (e *Executor) client() (pgshardv1.PoolerClient, error) { return e.r.cfg.Poolers.Client(e.shard) }
 
@@ -1938,6 +1963,9 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 		case *pgshardv1.ExecuteResponse_ReadyForQuery:
 			prev := e.tx
 			e.tx = txStatus(m.ReadyForQuery.TxnStatus)
+			// The statement is over; anything sent after it is stamped from
+			// the live snapshot again.
+			e.stmtSnap = nil
 			if prev == pgwire.TxIdle && e.tx != pgwire.TxIdle && !e.txnOnBackend {
 				e.txnOnBackend, e.txnPreFence = true, !e.r.writeFenced(nil)
 			}
