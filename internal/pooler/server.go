@@ -578,6 +578,9 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	r.packed = r.packed || req.PackedRows
 	r.batched = r.batched || req.BatchedRows
 	view := r.srv.cfg.Source.View()
+	if e := serving(view); e != nil {
+		return r.refuse(e)
+	}
 	if e := fence(view, req.Generation); e != nil {
 		return r.refuse(e)
 	}
@@ -822,7 +825,11 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 	if s.draining.Load() {
 		return nil, errUnavailable
 	}
-	if e := fence(s.cfg.Source.View(), req.Generation); e != nil {
+	view := s.cfg.Source.View()
+	if e := serving(view); e != nil {
+		return &pgshardv1.ReserveResponse{Error: e}, nil
+	}
+	if e := fence(view, req.Generation); e != nil {
 		return &pgshardv1.ReserveResponse{Error: e}, nil
 	}
 	if req.SessionId == "" {

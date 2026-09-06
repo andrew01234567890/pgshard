@@ -45,8 +45,15 @@ func NewStaticSource(v View) *StaticSource {
 	return s
 }
 
-// Set replaces the view.
-func (s *StaticSource) Set(v View) { s.v.Store(&v) }
+// Set replaces the view. A static view is always serving: it is configured
+// rather than refreshed, so there is nothing about it that can go stale.
+// Serving is what a SnapshotSource clears when its catalog view stops being
+// refreshed, and leaving the zero value of the field to mean "refuse
+// everything" would make every View literal a trap.
+func (s *StaticSource) Set(v View) {
+	v.Serving = true
+	s.v.Store(&v)
+}
 
 // View implements Source.
 func (s *StaticSource) View() View { return *s.v.Load() }
@@ -122,6 +129,22 @@ func isPrepareTransaction(sql string) bool {
 
 // SQLSTATE 55000 (object_not_in_prerequisite_state) marks fencing refusals.
 const fenceSQLState = "55000"
+
+// serving refuses everything while the pooler's own view of the catalog has
+// stopped being refreshed. The generation and epoch in a stale view are the
+// last ones it read, and enforcing a fence from those is enforcing the wrong
+// thing -- a router that has moved on is admitted, and one that has not is
+// refused with a message blaming the router. View() already stops serving in
+// that case; nothing read it.
+func serving(v View) *pgshardv1.Error {
+	if v.Serving {
+		return nil
+	}
+	return &pgshardv1.Error{Sqlstate: fenceSQLState,
+		Message: "this pooler's catalog view is stale, so it cannot say which shard map or epoch it serves",
+		Hint:    "the pooler cannot reach the catalog; the request is not wrong and can be retried",
+		Reason:  pgshardv1.Reason_REASON_STALE_GENERATION}
+}
 
 // fence checks a request's generation against the view; nil means admitted.
 func fence(v View, g *pgshardv1.Generation) *pgshardv1.Error {
