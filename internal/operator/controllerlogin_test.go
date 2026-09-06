@@ -51,6 +51,11 @@ func TestTheControllerReachesTheCatalogAsItsOwnRole(t *testing.T) {
 	if strings.Contains(catalogDSN, "user="+superuserName) {
 		t.Errorf("the catalog DSN still names the superuser: %q", catalogDSN)
 	}
+	// Role and DCL work on the catalog group stays the superuser's, the
+	// same as on every shard, and takes its password from PGPASSWORD.
+	if got := argOf(dep.Spec.Template.Spec.Containers[0].Args, "--catalog-role-dsn="); got != CatalogDSN(c) {
+		t.Errorf("catalog role DSN %q, want %q", got, CatalogDSN(c))
+	}
 	if !strings.Contains(joined, "--catalog-password-file="+controllerLoginDir) {
 		t.Errorf("the catalog password does not come from a file: %v", args)
 	}

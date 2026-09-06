@@ -72,15 +72,21 @@ write happen.
 
 The controller reaches the catalog as `pgshard_controller`: `pgshard_system`
 membership for the schema it drives, plus `pg_read_all_stats` and the
-`pg_create_restore_point`, `pg_control_checkpoint`, `pg_reload_conf` and
-`ALTER SYSTEM ON PARAMETER default_transaction_read_only` grants the barrier
-needs on the catalog group. Its password is generated per cluster into
+`pg_create_restore_point`, `pg_switch_wal`, `pg_control_checkpoint`,
+`pg_reload_conf` and `ALTER SYSTEM ON PARAMETER
+default_transaction_read_only` grants the barrier needs on the catalog
+group. Its password is generated per cluster into
 `<cluster>-controller-login` and mounted at `/etc/pgshard/controller`, read
 through `--catalog-password-file` rather than passed in argv, where
-`/proc/<pid>/cmdline` would expose it. `PGPASSWORD` in that container is
-still the superuser's, because the shard and subscription DSNs are: DDL,
-replication and finishing another session's prepared transaction are
-superuser work on a shard, which is tracked separately.
+`/proc/<pid>/cmdline` would expose it.
+
+`PGPASSWORD` in that container is still the superuser's, and two paths use
+it. The shard and subscription DSNs: DDL, replication and finishing another
+session's prepared transaction are superuser work on a shard. And
+`--catalog-role-dsn`, which is role and DCL work on the *catalog group* —
+`CREATE ROLE` needs `CREATEROLE`, a membership grant needs `ADMIN` on the
+role, and comparing a SCRAM verifier means reading `pg_authid`, none of
+which a least-privilege login has. Both are tracked separately from this.
 
 The agent's own gRPC port (9090) requires a per-cluster token on every RPC,
 so reaching the port is not enough to drive failovers. The token is

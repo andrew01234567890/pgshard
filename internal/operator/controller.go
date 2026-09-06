@@ -54,6 +54,11 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 	args := []string{"run",
 		"--catalog-dsn=" + ControllerCatalogDSN(c),
 		"--catalog-password-file=" + controllerLoginDir + "/" + secretKey,
+		// Role and DCL work on the catalog group is superuser work, as it
+		// is on every shard: CREATE ROLE needs CREATEROLE, a membership
+		// grant needs ADMIN on the role, and comparing a verifier means
+		// reading pg_authid. This one takes its password from PGPASSWORD.
+		"--catalog-role-dsn=" + CatalogDSN(c),
 		fmt.Sprintf("--listen=:%d", controllerPort),
 		fmt.Sprintf("--metrics-listen=:%d", controllerHTTPPort),
 		// Without the shard template the resolver does not run at all, so a

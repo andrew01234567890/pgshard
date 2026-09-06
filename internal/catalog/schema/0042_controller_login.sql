@@ -18,6 +18,10 @@
 --                                certifies a restore point while writers are
 --                                still running.
 --   pg_create_restore_point      the restore point itself.
+--   pg_switch_wal                the segment it lands in, archived so the
+--                                restore can reach it. Taken in the same
+--                                step, and superuser-only for the same
+--                                reason pg_create_restore_point is.
 --   pg_control_checkpoint        the timeline recorded with it.
 --   pg_reload_conf               makes the write pause take effect.
 --   ALTER SYSTEM ON PARAMETER    the write pause itself. PostgreSQL 15 added
@@ -39,6 +43,7 @@ $$;
 GRANT pgshard_system TO pgshard_controller;
 GRANT pg_read_all_stats TO pgshard_controller;
 GRANT EXECUTE ON FUNCTION pg_create_restore_point(text) TO pgshard_controller;
+GRANT EXECUTE ON FUNCTION pg_switch_wal() TO pgshard_controller;
 GRANT EXECUTE ON FUNCTION pg_control_checkpoint() TO pgshard_controller;
 GRANT EXECUTE ON FUNCTION pg_reload_conf() TO pgshard_controller;
 GRANT ALTER SYSTEM ON PARAMETER default_transaction_read_only TO pgshard_controller;

@@ -47,6 +47,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fs.SetOutput(stderr)
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN with pgshard_system privileges (required)")
 	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn; the environment's PGPASSWORD is left for the shard DSNs")
+	catalogRoleDSN := fs.String("catalog-role-dsn", "", "superuser DSN for role and DCL work on the catalog group (defaults to --catalog-dsn)")
 	listen := fs.String("listen", "127.0.0.1:15500", "gRPC address for the Controller service (empty disables)")
 	metricsListen := fs.String("metrics-listen", "", "HTTP address for /metrics (empty disables)")
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
@@ -181,11 +182,20 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		go resolver.Run(ctx, *resolveEvery, leader)
 		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},
 			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
-		roles := &controller.RoleVerifier{Store: &controller.PGRoleStore{Pool: pool}, Shards: dialer, Catalog: controller.CatalogDialer(pool), Logger: logger}
+		// Role and DCL work on the catalog group needs the same superuser
+		// the shards get it from: CREATE ROLE needs CREATEROLE, a
+		// membership grant needs ADMIN on the role, and comparing a
+		// verifier means reading pg_authid. The pool's least-privilege
+		// login can do none of those.
+		catalogRoles := controller.CatalogDialer(pool)
+		if *catalogRoleDSN != "" {
+			catalogRoles = controller.DSNDialer(*catalogRoleDSN)
+		}
+		roles := &controller.RoleVerifier{Store: &controller.PGRoleStore{Pool: pool}, Shards: dialer, Catalog: catalogRoles, Logger: logger}
 		go roles.Run(ctx, *verifyRolesEvery, leader)
 		keyCheck := &controller.ShardKeyCheck{Pool: pool, Shards: dialer, Logger: logger}
 		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer, DDLRole: *ddlRole,
-			Catalog: controller.CatalogDialer(pool), Roles: roles, KeyCheck: keyCheck, Term: term.Load}
+			Catalog: catalogRoles, Roles: roles, KeyCheck: keyCheck, Term: term.Load}
 		go applier.Run(ctx, *applyEvery, leader)
 		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery, leader)
 		// A barrier whose controller died leaves the cluster fenced and its
