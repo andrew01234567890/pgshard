@@ -168,7 +168,11 @@ the rest with `0A000`. See *Routing* below.
   it can fail, and a backend can be wedged somewhere PostgreSQL will not
   interrupt it — and past the grace the stream is aborted rather than
   waited on, since no answer is coming and an unbounded wait holds the
-  session, its pooler session and the router's drain open.
+  session, its pooler session and the router's drain open. A scatter is
+  bounded the same way and by the same 5s: each participant's read ends
+  when the statement's context does, and the wait for the participants to
+  finish is bounded once, for the set -- a shard that never answers costs
+  the statement that grace, not the session.
 - **Cancel.** A `CancelRequest` is verified against the session's key and
   forwarded as the pooler `Cancel` RPC; a query context that ends while a
   batch is in flight (drain) does the same. The batch is always drained to
@@ -271,7 +275,8 @@ first shard and every other shard's must match it (name, type, typmod,
 format), else `XX000` "shards … disagree on the result shape". The first
 shard error cancels the other participants (pooler `Cancel`) and is
 reported once every stream has drained; a client cancel cancels every
-participant (each reports `57014`). Supported shapes:
+participant (each reports `57014`) and, past the cancel grace, aborts the
+streams of any that have not answered rather than holding their slots. Supported shapes:
 
 | Shape | Shard statement | Router |
 |---|---|---|
