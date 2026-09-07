@@ -580,26 +580,16 @@ func (a *Applier) targets(ctx context.Context, m catalog.DDLMigration, set strin
 // and connection failures with backoff.
 func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, key string, id int32, s catalog.ShardMigration) catalog.ShardMigration {
 	if m.Strategy != "multistep" {
-		resumed := s.State == catalog.ShardRunning || s.State == catalog.ShardRetrying
-		// Whether an EARLIER PROCESS may have committed this statement,
-		// which is not the same question as whether this pass has attempted
-		// it before. running is saved immediately before the statement is
-		// sent, so a process that died holding it may have got as far as
-		// COMMIT. retrying is saved after a transient failure -- a lock
-		// timeout or a refused dial -- which did not.
-		//
-		// It is captured once and never moves, unlike resumed, which is set
-		// after every attempt including the ones that never reached the
-		// server.
-		priorRun := s.State == catalog.ShardRunning
+		// Whether an attempt on this shard may have reached the server and
+		// committed -- not whether one has been made. running is saved
+		// immediately before the statement is sent, so a process that died
+		// holding it may have got as far as COMMIT. retrying is saved after
+		// any transient failure, including a refused dial that never opened
+		// a connection, so it carries its own answer on the row.
+		resumed := s.State == catalog.ShardRunning || (s.State == catalog.ShardRetrying && s.Ran)
 		return a.retrying(ctx, logger, m, key, id, s, func() (string, error) {
-			out, err := a.step(ctx, m, key, id, resumed, priorRun)
-			// Only an attempt that could have reached the server makes the
-			// next one a resume. Setting this unconditionally meant one
-			// refused dial put every shard of the pass behind the resume
-			// guard, and a CREATE TABLE whose table existed out of band was
-			// then reported applied on shards that had never run anything.
-			if mayHaveRun(err) {
+			out, err := a.step(ctx, m, key, id, resumed)
+			if mayHaveRun(m, err) {
 				resumed = true
 			}
 			return out, err
@@ -682,6 +672,10 @@ func (a *Applier) retrying(ctx context.Context, logger *slog.Logger, m *catalog.
 			return s
 		}
 		s.Error, s.SQLState = err.Error(), sqlState(err)
+		// Sticky, and recorded on the row: the next PASS has only this to
+		// tell an attempt that was interrupted mid-statement from one that
+		// never reached the server.
+		s.Ran = s.Ran || mayHaveRun(m, err)
 		var skip *skippedError
 		if errors.As(err, &skip) {
 			s.State, s.Error = catalog.ShardSkipped, skip.err.Error()
@@ -787,7 +781,7 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 // checks whether the object already matches (the previous attempt may have
 // committed before its progress was saved); an index left invalid by an
 // interrupted CREATE INDEX CONCURRENTLY is dropped and built again.
-func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string, id int32, resumed, priorRun bool) (string, error) {
+func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string, id int32, resumed bool) (string, error) {
 	db := m.Database
 	if m.Meta.Object.Kind == "role" || m.Meta.Object.Kind == "database" || strings.HasSuffix(m.Kind, "ROLE") {
 		db = ""
@@ -855,11 +849,11 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 		// without this the replay's 42704 fails a migration whose every
 		// shard is correct.
 		//
-		// priorRun, not resumed: resumed is true after any attempt at all,
-		// including a refused dial and a lock timeout, neither of which can
-		// have committed anything. Forgiving those reported a migration
-		// complete when nothing had been dropped anywhere.
-		if priorRun && missingObject(err) && strings.HasPrefix(m.Kind, "DROP ") {
+		// resumed means an attempt may have committed, which is exactly the
+		// question here: a refused dial and a lock timeout do not set it,
+		// and forgiving those reported a migration complete when nothing
+		// had been dropped anywhere.
+		if resumed && missingObject(err) && strings.HasPrefix(m.Kind, "DROP ") {
 			return catalog.ShardApplied, nil
 		}
 		return "", err
@@ -1282,7 +1276,7 @@ func transient(err error) bool {
 // transaction they were in. Everything else -- a connection lost
 // mid-statement above all -- is indeterminate, and a guard that asks this
 // question has to assume the statement did run.
-func mayHaveRun(err error) bool {
+func mayHaveRun(m *catalog.DDLMigration, err error) bool {
 	if err == nil {
 		return true
 	}
@@ -1293,6 +1287,14 @@ func mayHaveRun(err error) bool {
 	var sf *saveFailed
 	if errors.As(err, &sf) {
 		return false
+	}
+	// A statement that does not run in one transaction can leave work
+	// behind whatever it answers: CREATE INDEX CONCURRENTLY interrupted by
+	// a lock timeout leaves an INVALID index, and the next attempt has to
+	// know to drop it -- a plain retry of "IF NOT EXISTS" over one of those
+	// succeeds and reports a valid index that is not.
+	if m.Strategy == "concurrent" || m.Meta.Repack || outsideTransaction(m.Kind) {
+		return true
 	}
 	switch sqlState(err) {
 	case "55P03", "40P01", "40001", "57P03":

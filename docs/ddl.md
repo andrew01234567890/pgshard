@@ -174,7 +174,9 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    * Any other error is a hard failure of that shard.
 
 6. **Record.** `per_shard` holds one entry per target,
-   `{"<shard>": {"state": pending|running|retrying|applied|skipped|failed, "attempts": n, "error": "...", "sqlstate": "..."}}`.
+   `{"<shard>": {"state": pending|running|retrying|applied|skipped|failed, "attempts": n, "error": "...", "sqlstate": "...", "ran": true}}`.
+  `ran` marks a shard where an attempt reached the server and may have
+  committed; it is absent where every attempt failed before that.
    The migration is `complete` when every shard is `applied` (or `skipped`
    under scope `existing`, with at least one applied) and `failed` as soon as
    one shard fails hard or exhausts its retries; `error` names the first

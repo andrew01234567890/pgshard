@@ -174,6 +174,13 @@ type ShardMigration struct {
 	Step     int    `json:"step,omitempty"`
 	Error    string `json:"error,omitempty"`
 	SQLState string `json:"sqlstate,omitempty"`
+	// Ran records that an attempt on this shard reached the server and may
+	// have committed. A refused dial and a lock timeout leave it false, so
+	// a later pass can tell a shard that was interrupted mid-statement from
+	// one that never got to send it -- which is the difference between
+	// checking whether the work is already done and reporting it done
+	// without ever asking.
+	Ran bool `json:"ran,omitempty"`
 }
 
 // DDLMigration is a row of pgshard.migrations.
