@@ -54,6 +54,10 @@ func TestDroppingAnObjectOnATableFollowsTheTable(t *testing.T) {
 		// anything attached to it.
 		{"drop trigger t on settings", ScopeHome},
 		{"drop policy p on settings", ScopeHome},
+		// Schema-qualified, so an off-by-one in the name indexing looks up
+		// the wrong relation and gets the wrong scope.
+		{"drop trigger t on public.orders", ScopeAll},
+		{"drop policy p on public.settings", ScopeHome},
 	} {
 		p, err := New().Plan(context.Background(), session(snap), c.sql)
 		if err != nil {
@@ -66,6 +70,61 @@ func TestDroppingAnObjectOnATableFollowsTheTable(t *testing.T) {
 		}
 		if got := p.Migration.Scope; got != c.want {
 			t.Errorf("%s: scope %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
+// Renaming has the same two rules as dropping, and had the same defect: an
+// object attached to a table follows the table, and an object pgshard did
+// not create is refused rather than renamed on one shard. ALTER TABLE ...
+// RENAME CONSTRAINT is the one that matters -- a statement any migration
+// tool emits, which renamed a sharded table's constraint on shard 0 and
+// left every other shard holding the old name.
+func TestRenamingFollowsTheSameRulesAsDropping(t *testing.T) {
+	snap := fixture(t)
+	for _, c := range []struct{ sql, want string }{
+		{"alter trigger t on orders rename to u", ScopeAll},
+		{"alter policy p on orders rename to q", ScopeAll},
+		{"alter rule r on orders rename to q", ScopeAll},
+		{"alter table orders rename constraint a to b", ScopeAll},
+		{"alter table settings rename constraint a to b", ScopeHome},
+	} {
+		p, err := New().Plan(context.Background(), session(snap), c.sql)
+		if err != nil {
+			t.Errorf("%s: %v", c.sql, err)
+			continue
+		}
+		if p.Migration == nil {
+			t.Errorf("%s: planned as %v with no migration, so it reaches one shard", c.sql, p.Kind)
+			continue
+		}
+		if got := p.Migration.Scope; got != c.want {
+			t.Errorf("%s: scope %q, want %q", c.sql, got, c.want)
+		}
+	}
+	// And the objects that exist in every group, which pgshard never
+	// created and cannot fan out.
+	for _, sql := range []string{
+		"alter function f(int) rename to g",
+		"alter aggregate agg(int) rename to agg2",
+		"alter collation c rename to d",
+		"alter statistics st rename to st2",
+		"alter function f(int) owner to bob",
+		"alter function f(int) set schema s",
+		"alter domain d owner to bob",
+	} {
+		p, err := New().Plan(context.Background(), session(snap), sql)
+		if err == nil {
+			t.Errorf("%s: planned as %v over %v; the other shards keep the old name", sql, p.Kind, p.Shards)
+			continue
+		}
+		if !strings.Contains(err.Error(), "not available through the router") {
+			t.Errorf("%s: refused as %v", sql, err)
+		}
+		// The refusal must name what the user typed, not the table case
+		// the shared helper is written for.
+		if strings.Contains(err.Error(), "ALTER TABLE") {
+			t.Errorf("%s: refused as %v, which names a table", sql, err)
 		}
 	}
 }
