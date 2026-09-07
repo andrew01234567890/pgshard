@@ -364,6 +364,9 @@ func (s *session) endMessage() {
 
 func (s *session) queryContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
+	if d := s.server.cfg.MaxQueryDuration; d > 0 {
+		ctx, cancel = context.WithTimeout(parent, d)
+	}
 	s.mu.Lock()
 	s.queryCancel, s.queryCtx = cancel, ctx
 	revoked := s.revoked
@@ -817,7 +820,31 @@ func (s *session) reportError(err error) {
 	if errors.Is(err, context.Canceled) {
 		err = Errorf(CodeQueryCanceled, "canceling statement due to user request")
 	}
+	err = s.asQueryTimeout(err)
 	s.be.Send(toErrorResponse(err))
+}
+
+// asQueryTimeout renames the failure of a statement this session stopped
+// itself.
+//
+// The statement's own error says whatever the transport or the shard said
+// when the context went away, which describes how it ended and not why. A
+// client is owed the reason, and PostgreSQL's own words for it: this is a
+// statement timeout, whether the clock that ran out belongs to the backend
+// or to the router in front of it.
+func (s *session) asQueryTimeout(err error) error {
+	if err == nil || s.server.cfg.MaxQueryDuration <= 0 {
+		return err
+	}
+	s.mu.Lock()
+	qctx := s.queryCtx
+	s.mu.Unlock()
+	if qctx == nil || !errors.Is(qctx.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	e := Errorf(CodeQueryCanceled, "canceling statement due to statement timeout")
+	e.Detail = fmt.Sprintf("The router stops a statement after %s.", s.server.cfg.MaxQueryDuration)
+	return e
 }
 
 // dispatch handles one frontend message; it returns cont=false when the

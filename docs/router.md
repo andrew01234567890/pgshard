@@ -204,6 +204,14 @@ the rest with `0A000`. See *Routing* below.
   batch is in flight (drain) does the same. The batch is always drained to
   `ReadyForQuery` so the stream stays in sync. Keys no local session owns
   are forwarded to peer routers (see *Operations*).
+- **Query duration.** `--max-query-duration` bounds how long one statement
+  may run before the router cancels it as if the client had asked; the
+  client gets `57014` with PostgreSQL's own wording and a detail naming the
+  router. It defaults to `0`, unbounded, as PostgreSQL's `statement_timeout`
+  does. It is what makes the cancel path reachable without a client: a
+  statement nothing interrupts holds a router goroutine, a pooler backend
+  and a share of the drain, and a client that has gone away asks for
+  nothing.
 - **COPY.** `COPY ... FROM STDIN` relays client chunks to the pooler until
   `CopyDone`/`CopyFail`; `COPY ... TO STDOUT` streams back.
 - **`ParameterStatus`.** A GUC_REPORT setting a backend reports as changed
