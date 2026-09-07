@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -2177,15 +2176,14 @@ func without(list []string, drop string) []string {
 	return out
 }
 
+// allShards is every shard of the session's set, ascending. The snapshot
+// computed it once when it was loaded; it is the same answer for every
+// statement planned against that snapshot, and nothing here changes it.
 func (w *walker) allShards() []int32 {
-	var out []int32
-	if w.sess.Snapshot != nil {
-		for _, r := range w.sess.Snapshot.ShardSets[w.sess.shardSet()] {
-			out = appendUnique(out, r.ShardID)
-		}
+	if w.sess.Snapshot == nil {
+		return nil
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
+	return w.sess.Snapshot.ShardIDs(w.sess.shardSet())
 }
 
 func (w *walker) insert(s *pgquerypb.InsertStmt) error {
