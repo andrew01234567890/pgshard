@@ -406,7 +406,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			// A lowered connection limit is a revocation too: it is checked
 			// when a session connects, so without this the sessions already
 			// open keep whatever the old allowance let the role take.
-			if n := srv.TerminateExcess(roles.ConnectionLimit); n > 0 {
+			if n := srv.TerminateExcess(rt.ConnectionLimit); n > 0 {
 				logger.Info("terminated sessions a role held beyond its connection limit", "sessions", n)
 			}
 		}

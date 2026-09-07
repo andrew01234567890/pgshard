@@ -271,12 +271,22 @@ func (s *session) latchRevoked() bool {
 	return s.serving
 }
 
+// role is the session's role and whether it has finished authenticating as
+// it. A session publishes the role it claims before it proves it, so that a
+// revocation reaches a client mid-exchange; anything counting a role's
+// sessions wants only the ones that got that far.
+func (s *session) role() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.info.User, s.serving
+}
+
 // endRevoked tells the client why and closes the socket. It closes the
 // connection only: the executor belongs to the session's own goroutine and
 // is not safe to touch from here, and closing the socket unblocks that
 // goroutine, whose deferred close releases it.
-func (s *session) endRevoked() {
-	er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection because the role may no longer log in"))
+func (s *session) endRevoked(reason string) {
+	er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection because %s", reason))
 	er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
 	if buf, err := er.Encode(nil); err == nil {
 		// Bounded: the session goroutine may be blocked flushing to a
@@ -779,8 +789,11 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Unlock()
 	if late {
 		// Revoked during the last moments of startup: the latch was set
-		// while it could not be acted on, so act on it now.
-		s.endRevoked()
+		// while it could not be acted on, so act on it now. Only the login
+		// sweep can latch a session this early -- the limit sweep counts
+		// only sessions that are already serving -- so the reason is that
+		// one.
+		s.endRevoked("the role may no longer log in")
 	}
 	return nil
 }

@@ -372,7 +372,7 @@ func (s *Server) TerminateWhere(revoked func(user string) bool) int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sess.endRevoked()
+			sess.endRevoked("the role may no longer log in")
 		}()
 	}
 	wg.Wait()
@@ -396,13 +396,23 @@ func (s *Server) TerminateWhere(revoked func(user string) bool) int {
 // caused the overage.
 func (s *Server) TerminateExcess(limit func(user string) (int32, bool)) int {
 	s.mu.Lock()
-	byUser := map[string][]*session{}
+	sessions := make([]*session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		if u := sess.user(); u != "" {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	byUser := map[string][]*session{}
+	for _, sess := range sessions {
+		// Only the ones that finished authenticating. A session publishes
+		// the role it claims before it proves it, so that a revocation
+		// reaches a client mid-exchange -- but counting those here would
+		// let anyone who can reach the port claim a role, stall at the
+		// password prompt, and have that role's real sessions shed as the
+		// newest over the limit. The connect path counts the same set.
+		if u, serving := sess.role(); serving && u != "" {
 			byUser[u] = append(byUser[u], sess)
 		}
 	}
-	s.mu.Unlock()
 
 	var ending []*session
 	n := 0
@@ -425,7 +435,7 @@ func (s *Server) TerminateExcess(limit func(user string) (int32, bool)) int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sess.endRevoked()
+			sess.endRevoked("the role holds more connections than its limit now allows")
 		}()
 	}
 	wg.Wait()

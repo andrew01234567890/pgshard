@@ -1025,8 +1025,14 @@ LIMIT` looks like it promises. Making it cluster-wide needs shared
 accounting and is not built (PGS-309).
 
 Lowering a limit reaches the sessions already open: the role-refresh sweep
-ends the newest sessions above the new allowance, since those are the ones
-it would no longer admit, and leaves the older ones a pool has settled on.
+ends the newest sessions above the allowance the role has now -- its own
+`connection_limit`, or `--max-sessions-per-role` when it carries none, the
+same question the connect path asks -- since those are the ones it would no
+longer admit, and leaves the older ones a pool has settled on. Only sessions
+that finished authenticating are counted: a session publishes the role it
+claims before it proves it, so that a revocation can reach a client
+mid-exchange, and counting those would let anyone who can reach the port
+claim a role and have its real sessions shed in their place.
 Revoking a role's login, deleting it and letting its password expire end
 its live sessions the same way, on the same sweep -- a limit is checked when
 a session connects, so without this a role kept whatever the old allowance

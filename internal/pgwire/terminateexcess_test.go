@@ -1,6 +1,8 @@
 package pgwire
 
 import (
+	"errors"
+	"net"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -72,11 +74,19 @@ func TestARoleExactlyAtItsLimitKeepsEverySession(t *testing.T) {
 	}
 }
 
+// endsWithFatal reports whether the session ended. A read that merely times
+// out is not an ending: the client sets a deadline, so treating any error
+// as "ended" would report every session that was left alone as terminated,
+// ten seconds later.
 func endsWithFatal(t *testing.T, c *rawClient) bool {
 	t.Helper()
 	for range 20 {
 		msg, err := c.fe.Receive()
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return false
+			}
 			return true
 		}
 		if e, ok := msg.(*pgproto3.ErrorResponse); ok && e.Severity == "FATAL" {
@@ -99,4 +109,42 @@ func stillOpen(t *testing.T, c *rawClient) bool {
 		}
 	}
 	return false
+}
+
+// A session publishes the role it claims before it proves it, so a
+// revocation can reach a client mid-exchange. Counting those toward the
+// role's limit let anyone who could reach the port claim a role, stall at
+// the password prompt, and have that role's real sessions shed as the
+// newest over the limit -- no password required.
+func TestUnauthenticatedClaimantsDoNotEvictARolesSessions(t *testing.T) {
+	ts := startServer(t, Config{
+		Authenticator: CleartextAuthenticator{Lookup: lookup(map[string]string{"busy": "s3cret"})},
+	})
+	// Two peers that claim the role and never answer the password prompt.
+	for range 2 {
+		c := dialRaw(t, ts.addr)
+		c.rawStartup(ProtocolVersion30, map[string]string{"user": "busy", "database": "db"})
+		if _, ok := c.recv().(*pgproto3.AuthenticationCleartextPassword); !ok {
+			t.Fatal("want a password request")
+		}
+	}
+	// And one that is really the role.
+	genuine := dialRaw(t, ts.addr)
+	genuine.rawStartup(ProtocolVersion30, map[string]string{"user": "busy", "database": "db"})
+	if _, ok := genuine.recv().(*pgproto3.AuthenticationCleartextPassword); !ok {
+		t.Fatal("want a password request")
+	}
+	genuine.send(&pgproto3.PasswordMessage{Password: "s3cret"})
+	for {
+		if _, ok := genuine.recv().(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+
+	if n := ts.TerminateExcess(func(string) (int32, bool) { return 2, true }); n != 0 {
+		t.Fatalf("terminated %d sessions; the role holds one, and two strangers claiming its name are not its own", n)
+	}
+	if !stillOpen(t, genuine) {
+		t.Fatal("the role's own session was shed to make room for peers that never authenticated")
+	}
 }
