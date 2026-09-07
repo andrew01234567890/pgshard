@@ -174,7 +174,9 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    * Any other error is a hard failure of that shard.
 
 6. **Record.** `per_shard` holds one entry per target,
-   `{"<shard>": {"state": pending|running|retrying|applied|skipped|failed, "attempts": n, "error": "...", "sqlstate": "..."}}`.
+   `{"<shard>": {"state": pending|running|retrying|applied|skipped|failed, "attempts": n, "error": "...", "sqlstate": "...", "ran": true}}`.
+  `ran` marks a shard where an attempt reached the server and may have
+  committed; it is absent where every attempt failed before that.
    The migration is `complete` when every shard is `applied` (or `skipped`
    under scope `existing`, with at least one applied) and `failed` as soon as
    one shard fails hard or exhausts its retries; `error` names the first
@@ -198,7 +200,11 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
   role, database) and marked applied without re-running the statement when
   the object already matches. Statements without such an object (`ALTER
   TABLE`, `GRANT`) are re-executed; a `pending` shard is never guarded, so an
-  object created out of band is a hard failure, not a silent success.
+  object created out of band is a hard failure, not a silent success. Only
+  an attempt that could have reached the server makes the next one a
+  resume: a refused dial, a lock timeout, a deadlock and a serialization
+  failure each leave the shard exactly where it was, so a retry after one
+  of those is still a first attempt as far as the guard is concerned.
   A `DROP` is the exception the other way: a trigger, policy, rule, type or
   sequence carries no `meta.object`, so it re-runs and PostgreSQL answers
   `42704`. That is the state the migration asked for — an earlier process
