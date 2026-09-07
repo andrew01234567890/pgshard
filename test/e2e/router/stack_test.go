@@ -176,6 +176,18 @@ func releasePort(port int) {
 	}
 }
 
+// bindingPort runs fn -- a docker run publishing a reserved port, or
+// anything else that binds one this harness chose -- with the reservation
+// released and the start lock held. Docker binds the port itself while
+// `docker run` is running, so it needs the same window every child process
+// gets: released at the last moment, and nobody else inside it.
+func bindingPort(port int, fn func() ([]byte, error)) ([]byte, error) {
+	startingProcess.Lock()
+	defer startingProcess.Unlock()
+	releasePort(port)
+	return fn()
+}
+
 // listenFlags name an argument whose value is an address THIS process will
 // bind. A peer's address is in the arguments too and belongs to another
 // process's reservation, which is why the flag rather than the shape of the

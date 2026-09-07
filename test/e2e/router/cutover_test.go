@@ -144,8 +144,10 @@ func startNetPostgres(tb testing.TB, network, name string, opts ...string) (addr
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical ` + strings.Join(opts, " ")
-	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", name, "--network", network, "-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
-		"--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
+	out, err := bindingPort(port, func() ([]byte, error) {
+		return exec.Command("docker", "run", "-d", "--rm", "--name", name, "--network", network, "-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
+			"--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
+	})
 	if err != nil {
 		tb.Fatalf("docker run: %v: %s", err, out)
 	}

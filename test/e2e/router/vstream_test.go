@@ -402,7 +402,10 @@ func startStandby(tb testing.TB, primaryContainer, primaryAdminDSN string, opts 
 		   -c sync_replication_slots=on -c primary_slot_name=standby1 \
 		   -c "primary_conninfo=host=` + primaryIP + ` port=5432 user=postgres dbname=` + appDatabase + `" ` + strings.Join(opts, " ")
 	cname := fmt.Sprintf("pgshard-router-e2e-standby-%d", port)
-	out, err = exec.Command("docker", "run", "-d", "--rm", "--name", cname, "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
+	out, err = bindingPort(port, func() ([]byte, error) {
+		return exec.Command("docker", "run", "-d", "--rm", "--name", cname, "-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
+			"--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
+	})
 	if err != nil {
 		tb.Fatalf("docker run: %v: %s", err, out)
 	}
