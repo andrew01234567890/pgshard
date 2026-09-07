@@ -314,11 +314,14 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 			c.TLS = TLSFiles{CertFile: "/certs/tls.crt", KeyFile: "/certs/tls.key", CAFile: "/certs/ca.crt"}
 		}
 		// The control plane's own roles, and nothing else. The superuser is
-		// how the operator, a replica and the controller's SHARD work reach
-		// a member; the router's and the controller's catalog roles are how
-		// each reaches the catalog, and they exist only where the catalog
-		// schema does, so on a shard those lines match no role at all.
-		controlPlane := map[string]bool{"postgres": true, catalog.RouterRole: true, catalog.ControllerRole: true}
+		// how the operator and the controller's SHARD work reach a member;
+		// the router's and the controller's catalog roles are how each
+		// reaches the catalog, and they exist only where the catalog schema
+		// does, so on a shard those lines match no role at all; the
+		// replication role is how a standby streams and how pg_rewind
+		// reaches its source, and it exists on every group.
+		controlPlane := map[string]bool{"postgres": true, catalog.RouterRole: true,
+			catalog.ControllerRole: true, catalog.ReplicationRole: true}
 		var host, superuser, reject int
 		for _, line := range strings.Split(RenderPgHBAConf(c), "\n") {
 			f := strings.Fields(line)

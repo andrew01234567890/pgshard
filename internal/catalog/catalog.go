@@ -41,6 +41,15 @@ const (
 // which the agent control-plane token is also derived.
 const RouterRole = "pgshard_router"
 
+// ReplicationRole is the login role a standby streams as, and the one
+// pg_basebackup and pg_rewind contact the source with. Unlike the roles
+// above it is not created by a migration: it exists on EVERY group,
+// including the shards, which have no pgshard schema at all -- the operator
+// creates it on each group's primary and physical replication carries it to
+// that group's standbys. The name lives here so the operator and the agent
+// cannot disagree about it.
+const ReplicationRole = "pgshard_replication"
+
 // ControllerRole is the login role the controller uses to reach the catalog.
 // It is a member of pgshard_system -- it drives every workflow, so it writes
 // the whole schema -- plus the handful of server capabilities the barrier

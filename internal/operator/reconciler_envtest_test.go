@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agent"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
@@ -104,7 +106,11 @@ type fakeProber struct {
 	// journal records fence writes and promotions in order.
 	journal *[]string
 	// routerPasswords records every ALTER ROLE the reconcile asked for.
-	routerPasswords []string
+	routerPasswords  []string
+	replicationRoles []string
+	// replicationRoleErr is what a paused primary answers: CREATE ROLE,
+	// ALTER ROLE and GRANT are all writes.
+	replicationRoleErr error
 	// bootstrapRoles records every verifier the reconcile published so a
 	// generated credential can reach the router.
 	bootstrapRoles   []string
@@ -604,6 +610,13 @@ func (f *fakeProber) SetLoginPassword(_ context.Context, dsn, role, password str
 	defer f.mu.Unlock()
 	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"/"+role+"="+password)
 	return nil
+}
+
+func (f *fakeProber) EnsureReplicationRole(_ context.Context, dsn, password string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replicationRoles = append(f.replicationRoles, hostOf(dsn)+"="+password)
+	return f.replicationRoleErr
 }
 
 func (f *fakeProber) SeedBootstrapRole(_ context.Context, dsn, rolname, password string) error {
@@ -1349,6 +1362,29 @@ func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
 		t.Errorf("ALTER ROLE calls %v, want %q", applied, want)
 	}
 
+	// Every group's primary is told the replication password on every pass,
+	// for the same reason: a group restored or rebuilt from elsewhere comes
+	// back with whatever password it was cloned with, and its standbys
+	// cannot stream until it is back in step with the Secret.
+	var rep corev1.Secret
+	get(t, ReplicationSecretName(c.Name), &rep)
+	ownedBy(t, &rep, c)
+	repPw := string(rep.Data["password"])
+	if repPw == pw || repPw == string(su.Data["password"]) {
+		t.Error("the replication password must be its own")
+	}
+	if string(rep.Data["username"]) != catalog.ReplicationRole {
+		t.Errorf("username %q, want %q", rep.Data["username"], catalog.ReplicationRole)
+	}
+	fp.mu.Lock()
+	repApplied := append([]string(nil), fp.replicationRoles...)
+	fp.mu.Unlock()
+	for _, g := range Groups(c) {
+		if want := g.ServiceRW() + ".default.svc=" + repPw; !slices.Contains(repApplied, want) {
+			t.Errorf("group %s was never given the replication role: %v", g.Name(), repApplied)
+		}
+	}
+
 	// The controller has its own login on the same catalog, and the same
 	// reason for the password to be applied on every pass.
 	var ctl corev1.Secret
@@ -1516,5 +1552,130 @@ func TestFencedAndServingWritesFollowTheWriteFence(t *testing.T) {
 	}
 	if cond := condition(t, "fence", pgshardv1alpha1.ConditionServingWrites); cond.Status != metav1.ConditionFalse {
 		t.Fatalf("a fenced cluster is not serving writes: %+v", cond)
+	}
+}
+
+// TestTheConninfoFollowsThePrimarysOwnPod: on an upgrade the primary is the
+// LAST member to roll, so for most of the roll it is still running a pod
+// whose pg_hba does not list the replication role. Every standby's
+// primary_conninfo has to keep naming the superuser until then -- a standby
+// pointed at an identity its primary rejects stops streaming, which drops
+// the sync set and holds the roll before it ever reaches the primary.
+//
+// The question is asked of EVERY member pod, not just the primary's: a
+// failover mid-roll, or a demoted former primary still on the old pod,
+// would otherwise flip it while an old-shape pod is still there, and that
+// pod would then be told to read a Secret it does not mount the moment its
+// container restarted.
+func TestTheConninfoFollowsThePrimarysOwnPod(t *testing.T) {
+	r, fp, c := setup(t, "stg")
+	bringUp(t, r, fp, c)
+	g := Groups(c)[0]
+
+	conninfo := func() string {
+		t.Helper()
+		var cm corev1.ConfigMap
+		get(t, g.ConfigMapName(), &cm)
+		var cfg agent.Config
+		if err := json.Unmarshal([]byte(cm.Data[agentConfigKey(g.MemberName(1))]), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg.PrimaryConninfo
+	}
+	if !strings.Contains(conninfo(), "user="+catalog.ReplicationRole) {
+		t.Fatalf("a cluster whose pods all admit the role does not use it: %q", conninfo())
+	}
+
+	setAnnotation := func(member string, on bool) {
+		t.Helper()
+		var pod corev1.Pod
+		get(t, member, &pod)
+		if on {
+			pod.Annotations[AnnotationReplicationLogin] = "true"
+		} else {
+			delete(pod.Annotations, AnnotationReplicationLogin)
+		}
+		if err := k8sClient.Update(context.Background(), &pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// An older pod anywhere in the group is enough, whether it is the
+	// primary or a standby the roll has not reached yet.
+	for _, member := range []string{g.MemberName(0), g.MemberName(1)} {
+		setAnnotation(member, false)
+		reconcile(t, r, c)
+		if got := conninfo(); !strings.Contains(got, "user="+superuserName) {
+			t.Errorf("with %s on an older pod the conninfo is %q, want the superuser", member, got)
+		}
+		if got := replicationFileOf(t, g); got != "" {
+			t.Errorf("with %s on an older pod the members are told to read %q, a Secret they may not mount", member, got)
+		}
+		setAnnotation(member, true)
+		reconcile(t, r, c)
+		if got := conninfo(); !strings.Contains(got, "user="+catalog.ReplicationRole) {
+			t.Errorf("with every pod on the new shape the conninfo is %q, want the role", got)
+		}
+	}
+}
+
+// replicationFileOf is the replicationPasswordFile a member is told to read.
+func replicationFileOf(t *testing.T, g Group) string {
+	t.Helper()
+	var cm corev1.ConfigMap
+	get(t, g.ConfigMapName(), &cm)
+	var cfg agent.Config
+	if err := json.Unmarshal([]byte(cm.Data[agentConfigKey(g.MemberName(1))]), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	return cfg.ReplicationPasswordFile
+}
+
+// TestAPausedPrimaryDoesNotTakeThePassDownWithIt: CREATE ROLE, ALTER ROLE
+// and GRANT are writes, and a primary under the write pause a barrier or a
+// cutover raises refuses them with 25006. Maintaining the replication role
+// there must therefore be skipped rather than attempted, and must never be
+// fatal to the pass -- failing it took the slots, synchronous_standby_names
+// and the whole rollout down for as long as the pause lasted, which is
+// exactly when the cluster can least afford it.
+func TestAPausedPrimaryDoesNotTakeThePassDownWithIt(t *testing.T) {
+	r, fp, c := setup(t, "pau")
+	bringUp(t, r, fp, c)
+	g := Groups(c)[0]
+	var su corev1.Secret
+	get(t, SecretName(c.Name), &su)
+	dsn := DSN(g.ServiceRW(), c.Namespace, string(su.Data[secretKey]))
+
+	fp.mu.Lock()
+	fp.pausedDSN = map[string]bool{dsn: true}
+	fp.replicationRoleErr = errors.New("cannot execute ALTER ROLE in a read-only transaction (SQLSTATE 25006)")
+	fp.replicationRoles = nil
+	fp.slots = nil
+	fp.mu.Unlock()
+
+	reconcile(t, r, c)
+
+	fp.mu.Lock()
+	roles := append([]string(nil), fp.replicationRoles...)
+	slots := append([]string(nil), fp.slots...)
+	fp.mu.Unlock()
+	for _, got := range roles {
+		if strings.HasPrefix(got, g.ServiceRW()+".default.svc=") {
+			t.Errorf("the role was maintained on a paused primary (%s); it can only fail there", got)
+		}
+	}
+	// The groups that are NOT paused still get it, so this is a skip and
+	// not a switch that turned the whole thing off.
+	if len(roles) == 0 {
+		t.Error("no group was given the replication role at all")
+	}
+	var sawGroup bool
+	for _, s := range slots {
+		if strings.HasPrefix(s, g.ServiceRW()+".default.svc:") {
+			sawGroup = true
+		}
+	}
+	if !sawGroup {
+		t.Errorf("the pass stopped before the slots of the paused group: %v", slots)
 	}
 }

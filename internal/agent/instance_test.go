@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -220,5 +221,130 @@ func TestACloneDoesNotEmptyPGDATABeforeItHasReachedTheSource(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("PGDATA was emptied before the source was reached: %v", err)
+	}
+}
+
+// The password a standby streams with lands in the pgpass file, because
+// pg_basebackup and pg_rewind take it from there: a --dbname carrying a
+// password would put it in argv, which /proc exposes to anything on the
+// node. The superuser's entry stays -- pgbackrest and the schema copy still
+// reach the local server as postgres.
+func TestPgpassCarriesTheReplicationPasswordToo(t *testing.T) {
+	in := newTestInstance(t)
+	pwFile := filepath.Join(t.TempDir(), "replication")
+	// A colon and a backslash: .pgpass ends its fields on the first and
+	// escapes with the second, so an unescaped password reads as the wrong
+	// field and silently authenticates nothing.
+	if err := os.WriteFile(pwFile, []byte(`a:b\c`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in.cfg.ReplicationPasswordFile = pwFile
+	if err := in.writePgpass(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(in.pgpassPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "*:*:*:postgres:secret\n" + `*:*:*:pgshard_replication:a\:b\\c` + "\n"
+	if string(got) != want {
+		t.Fatalf("pgpass = %q, want %q", got, want)
+	}
+
+	// An unreadable or empty file is a startup failure, not a member that
+	// silently streams as nobody.
+	in.cfg.ReplicationPasswordFile = filepath.Join(t.TempDir(), "absent")
+	if err := in.writePgpass(); err == nil {
+		t.Error("a missing replication password file was accepted")
+	}
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in.cfg.ReplicationPasswordFile = empty
+	if err := in.writePgpass(); err == nil {
+		t.Error("an empty replication password file was accepted")
+	}
+}
+
+// The credential sent to the source must belong to the role the conninfo
+// names, and it must never be part of the connection STRING: pgx puts that
+// whole string into a parse error, and its redaction of password='...'
+// stops at the first quote inside the value. A member reaches its primary with primary_conninfo for three
+// different things -- waiting for it to come up, creating this member's
+// slot on it, and cloning -- and each builds its own connection string.
+// Splicing the superuser's password onto a conninfo that says
+// user=pgshard_replication authenticates nothing, and it fails at the
+// moment a member is trying to rejoin, which is the worst moment to find
+// out.
+func TestTheSourcePasswordBelongsToTheRoleTheConninfoNames(t *testing.T) {
+	in := newTestInstance(t)
+	pwFile := filepath.Join(t.TempDir(), "replication")
+	if err := os.WriteFile(pwFile, []byte("streamer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in.cfg.ReplicationPasswordFile = pwFile
+
+	for _, c := range []struct{ source, want string }{
+		{"host=src port=5432 user=" + replicationRole, "streamer"},
+		{"host=src port=5432 user=" + superuserRole, "secret"},
+		// No user is the libpq default, which in a member's environment is
+		// the superuser.
+		{"host=src port=5432", "secret"},
+	} {
+		cfg, err := in.sourceConfig(c.source)
+		if err != nil {
+			t.Fatalf("%s: %v", c.source, err)
+		}
+		if cfg.Password != c.want {
+			t.Errorf("%s: password %q, want %q", c.source, cfg.Password, c.want)
+		}
+		if strings.Contains(cfg.ConnString(), c.want) {
+			t.Errorf("%s: the password is in the connection string %q, which pgx puts into a parse error",
+				c.source, cfg.ConnString())
+		}
+	}
+
+	// A member whose operator predates the replication Secret still has
+	// only the superuser's password, and must keep working.
+	in.cfg.ReplicationPasswordFile = ""
+	cfg, err := in.sourceConfig("host=src user=" + replicationRole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Password != "secret" {
+		t.Errorf("without a replication Secret the password is %q, want the superuser's", cfg.Password)
+	}
+}
+
+// A conninfo with no dbname does not mean "the default database": libpq and
+// pgx leave it to the server, and the server uses THE USER NAME. So the
+// moment primary_conninfo stopped saying user=postgres, every ordinary
+// connection to a source started asking for a database called
+// pgshard_replication, which does not exist -- a clone that never
+// bootstraps, a rejoin that never rewinds, a slot that is never created.
+// It cost nothing for as long as the two names happened to coincide.
+func TestASourceConnectionNamesADatabaseThatExists(t *testing.T) {
+	in := newTestInstance(t)
+	for _, c := range []struct{ source, want string }{
+		{"host=src user=" + replicationRole, "postgres"},
+		{"host=src user=" + superuserRole, "postgres"},
+		{"host=src user=" + replicationRole + " dbname=app", "app"},
+	} {
+		cfg, err := in.sourceConfig(c.source)
+		if err != nil {
+			t.Fatalf("%s: %v", c.source, err)
+		}
+		if cfg.Database != c.want {
+			t.Errorf("%s: database %q, want %q", c.source, cfg.Database, c.want)
+		}
+	}
+	// pg_rewind takes a string rather than a config and libpq defaults it
+	// the same way, so that path needs the same treatment.
+	if got := withDatabase("host=src user=" + replicationRole); !strings.Contains(got, "dbname=postgres") {
+		t.Errorf("pg_rewind source = %q, want a dbname", got)
+	}
+	if got := withDatabase("host=src dbname=app"); strings.Contains(got, "dbname=postgres") {
+		t.Errorf("an explicit dbname was overridden: %q", got)
 	}
 }

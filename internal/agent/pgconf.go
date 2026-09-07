@@ -177,8 +177,9 @@ const superuserRole = "postgres"
 // does not otherwise know the catalog schema, so the names are repeated
 // rather than imported; a test keeps them equal.
 const (
-	routerRole     = "pgshard_router"
-	controllerRole = "pgshard_controller"
+	routerRole      = "pgshard_router"
+	controllerRole  = "pgshard_controller"
+	replicationRole = "pgshard_replication"
 )
 
 // RenderPgHBAConf renders pg_hba.conf.
@@ -211,19 +212,24 @@ func RenderPgHBAConf(c *Config) string {
 	// shard-key routing, the write fences a cutover raises, and the
 	// coordination that makes a multi-shard write atomic. SCRAM proved who
 	// it was; nothing checked it had come the right way.
-	fmt.Fprintf(&b, "%-8s all             %-18s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
-	fmt.Fprintf(&b, "%-8s replication     %-18s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	fmt.Fprintf(&b, "%-8s all             %-19s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	fmt.Fprintf(&b, "%-8s replication     %-19s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
 	// The router and the controller reach the catalog as their own
 	// least-privilege roles rather than as the superuser, and they do so
 	// over TCP like the rest of the control plane. The roles exist only
 	// where the catalog schema does, so on a shard these lines match
 	// nothing -- the controller's shard connections are still the
 	// superuser's, and matched by the line above.
-	fmt.Fprintf(&b, "%-8s all             %-18s %-23s scram-sha-256\n", hostKeyword(host), routerRole, cidr)
-	fmt.Fprintf(&b, "%-8s all             %-18s %-23s scram-sha-256\n", hostKeyword(host), controllerRole, cidr)
-	fmt.Fprintf(&b, "%-8s all             all                %-23s reject\n", hostKeyword(host), cidr)
+	fmt.Fprintf(&b, "%-8s all             %-19s %-23s scram-sha-256\n", hostKeyword(host), routerRole, cidr)
+	fmt.Fprintf(&b, "%-8s all             %-19s %-23s scram-sha-256\n", hostKeyword(host), controllerRole, cidr)
+	// A standby streams as its own role rather than as the superuser, and
+	// pg_rewind reaches the source as the same role over an ordinary
+	// connection -- so it needs both lines, not just the replication one.
+	fmt.Fprintf(&b, "%-8s replication     %-19s %-23s scram-sha-256\n", hostKeyword(host), replicationRole, cidr)
+	fmt.Fprintf(&b, "%-8s all             %-19s %-23s scram-sha-256\n", hostKeyword(host), replicationRole, cidr)
+	fmt.Fprintf(&b, "%-8s all             all                 %-23s reject\n", hostKeyword(host), cidr)
 	if host == "hostssl" {
-		fmt.Fprintf(&b, "%-8s all             all                %-23s reject\n", "hostnossl", cidr)
+		fmt.Fprintf(&b, "%-8s all             all                 %-23s reject\n", "hostnossl", cidr)
 	}
 	return b.String()
 }

@@ -237,6 +237,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if _, err := r.ensureControllerSecret(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("controller secret: %w", err)
 	}
+	if _, err := r.ensureReplicationSecret(ctx, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("replication secret: %w", err)
+	}
 	if _, err := r.ensureRouterSecret(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("router secret: %w", err)
 	}
@@ -430,38 +433,7 @@ func (r *ClusterReconciler) ensureSecret(ctx context.Context, c *pgshardv1alpha1
 // router terminates untrusted client connections, and the superuser password
 // is direct write access to every shard.
 func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
-	key := types.NamespacedName{Namespace: c.Namespace, Name: RouterSecretName(c.Name)}
-	var sec corev1.Secret
-	err := r.Get(ctx, key, &sec)
-	if err == nil {
-		if pw := sec.Data[secretKey]; len(pw) > 0 {
-			return string(pw), nil
-		}
-		return "", fmt.Errorf("secret %s has no %q key", key.Name, secretKey)
-	}
-	if !apierrors.IsNotFound(err) {
-		return "", err
-	}
-	buf := make([]byte, 24)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	pw := hex.EncodeToString(buf)
-	sec = corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
-		Type:       corev1.SecretTypeBasicAuth,
-		StringData: map[string]string{"username": catalog.RouterRole, secretKey: pw},
-	}
-	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
-		return "", err
-	}
-	if err := r.Create(ctx, &sec); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return r.ensureRouterSecret(ctx, c)
-		}
-		return "", err
-	}
-	return pw, nil
+	return r.ensureLoginSecret(ctx, c, RouterSecretName(c.Name), catalog.RouterRole)
 }
 
 // ensureControllerSecret generates the controller's catalog password. The
@@ -470,7 +442,36 @@ func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1
 // anything that could read its environment direct write access to every
 // shard and the catalog, bypassing the router entirely.
 func (r *ClusterReconciler) ensureControllerSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
-	key := types.NamespacedName{Namespace: c.Namespace, Name: ControllerSecretName(c.Name)}
+	return r.ensureLoginSecret(ctx, c, ControllerSecretName(c.Name), catalog.ControllerRole)
+}
+
+// ensureReplicationSecret generates the password a standby streams with.
+// It is not the superuser's: primary_conninfo is written into every
+// standby's postgresql.auto.conf and travels in every clone, so the
+// credential that reaches the most places should be the one that can do the
+// least -- stream, and read the files pg_rewind compares.
+func (r *ClusterReconciler) ensureReplicationSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	return r.ensureLoginSecret(ctx, c, ReplicationSecretName(c.Name), catalog.ReplicationRole)
+}
+
+// ensureReplicationRole gives one group's primary the role its standbys
+// stream as. It runs on every pass for the same reason the catalog logins'
+// passwords are reapplied on every pass: a group restored or rebuilt from
+// elsewhere comes back with whatever password it was cloned with.
+func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string) error {
+	pw, err := r.ensureReplicationSecret(ctx, c)
+	if err != nil {
+		return err
+	}
+	return r.Prober.EnsureReplicationRole(ctx, dsn, pw)
+}
+
+// ensureLoginSecret returns the cluster's generated password for one login
+// role, creating it on first sight. The password is never regenerated: a
+// role whose password changed under a running cluster is a cluster that
+// locked out whatever holds the old one.
+func (r *ClusterReconciler) ensureLoginSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, name, role string) (string, error) {
+	key := types.NamespacedName{Namespace: c.Namespace, Name: name}
 	var sec corev1.Secret
 	err := r.Get(ctx, key, &sec)
 	if err == nil {
@@ -490,14 +491,14 @@ func (r *ClusterReconciler) ensureControllerSecret(ctx context.Context, c *pgsha
 	sec = corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
 		Type:       corev1.SecretTypeBasicAuth,
-		StringData: map[string]string{"username": catalog.ControllerRole, secretKey: pw},
+		StringData: map[string]string{"username": role, secretKey: pw},
 	}
 	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
 		return "", err
 	}
 	if err := r.Create(ctx, &sec); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			return r.ensureControllerSecret(ctx, c)
+			return r.ensureLoginSecret(ctx, c, name, role)
 		}
 		return "", err
 	}
@@ -917,14 +918,47 @@ func dataClaim(pod *corev1.Pod) string {
 	return ""
 }
 
-func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) error {
-	desired := r.Renderer.ConfigMap(c, g, primary, tuning, pol, repoReady)
+func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady, replication bool) error {
+	desired := r.Renderer.ConfigMap(c, g, primary, tuning, pol, repoReady, replication)
 	cm := &corev1.ConfigMap{ObjectMeta: desired.ObjectMeta}
 	return r.ensureOwned(ctx, c, cm, func() error {
 		cm.Labels = desired.Labels
 		cm.Data = desired.Data
 		return nil
 	})
+}
+
+// groupAdmitsReplicationRole reports whether EVERY member pod of this group
+// that exists renders a pg_hba listing the replication role. A standby
+// pointed at a primary that does not is a standby that cannot stream, and
+// the rollout holds before it reaches the primary that would fix it.
+//
+// Every pod, not just the primary's: a failover mid-roll, or a demoted
+// former primary still on the old pod, would otherwise flip this true while
+// an old-shape pod is still there -- and that pod would then read a config
+// naming a Secret it does not mount the moment its container restarted.
+// Asking about all of them also makes the answer stop flapping, which
+// matters because the answer is part of the template hash and every flip
+// is another roll.
+//
+// A group with no pods at all is a group whose pods are all about to be
+// created from the current template, so it starts with the role rather than
+// taking an extra roll to get there.
+func (r *ClusterReconciler) groupAdmitsReplicationRole(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) (bool, error) {
+	for _, name := range g.MemberNames() {
+		var pod corev1.Pod
+		err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &pod)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if pod.Annotations[AnnotationReplicationLogin] != "true" {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, password string, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) (groupObservation, error) {
@@ -942,6 +976,11 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	} else if sum != "" {
 		obs.template.InternalTLS += ":" + sum
 	}
+	admits, err := r.groupAdmitsReplicationRole(ctx, c, g)
+	if err != nil {
+		return obs, err
+	}
+	obs.template.Replication = admits
 	if err := r.ensureSettings(ctx, c, g, &obs, password); err != nil {
 		return obs, err
 	}
@@ -1043,7 +1082,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 			if err != nil {
 				return obs, err
 			}
-			if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy, obs.repoReady); err != nil {
+			if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy, obs.repoReady, obs.template.Replication); err != nil {
 				return obs, err
 			}
 		}
@@ -1069,6 +1108,18 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	}
 	obs.primaryOK = true
 	obs.writesPaused = pstate.WritesPaused
+	// CREATE ROLE, ALTER ROLE and GRANT are all writes, and a paused
+	// primary refuses them with 25006 -- so while a barrier or a cutover
+	// holds the pause this is skipped rather than attempted, and it is
+	// never fatal to the pass either way. Failing here used to take the
+	// slots, synchronous_standby_names and the rollout down with it for as
+	// long as the pause lasted.
+	if !pstate.WritesPaused {
+		if err := r.ensureReplicationRole(ctx, c, dsn); err != nil {
+			logf.FromContext(ctx).Info("could not maintain the replication role; continuing",
+				"group", g.Name(), "err", err)
+		}
+	}
 	// Reported, never fatal to the pass: the fence lives in the catalog
 	// group, which is itself rebuilt member by member on a storage-class
 	// change, and a group that stopped rolling out because it could not
@@ -1140,7 +1191,7 @@ func (r *ClusterReconciler) ensureSettings(ctx context.Context, c *pgshardv1alph
 			return err
 		}
 	}
-	return r.ensureConfigMap(ctx, c, g, obs.state.primary, obs.tuning, obs.policy, obs.repoReady)
+	return r.ensureConfigMap(ctx, c, g, obs.state.primary, obs.tuning, obs.policy, obs.repoReady, obs.template.Replication)
 }
 
 func ordinalOf(g Group, member string) int {
@@ -1275,7 +1326,7 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 		}
 		return obs, err
 	}
-	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy, obs.repoReady); err != nil {
+	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy, obs.repoReady, obs.template.Replication); err != nil {
 		return obs, err
 	}
 	obs = r.finishGroup(ctx, c, g, obs, members)

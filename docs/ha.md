@@ -15,13 +15,14 @@ JSON config per member into the group ConfigMap (`<member>.json`) and runs
 | Field | Value |
 |---|---|
 | `role` | `primary` for the designated primary, `standby` otherwise |
-| `primaryConninfo` | `host=<cluster>-<group>-rw.<ns>.svc port=5432 user=postgres` (clone, rewind and streaming source) |
+| `primaryConninfo` | `host=<cluster>-<group>-rw.<ns>.svc port=5432 user=pgshard_replication dbname=postgres` (clone, rewind and streaming source); `user=postgres` until every member pod of the group admits the role, see [operator.md](operator.md). The `dbname` is not decoration: an ordinary connection that omits it asks for a database named after the *user*. |
 | `peerFailsafeURLs` | every other member's `http://<member>.<group>-peers.<ns>.svc:8080/failsafe` |
 | `lease` | `{enabled: true, namespace: <ns>}`; the Lease is `<cluster>-<group>-primary` |
 | `postgres.synchronousStandbyNames` | initial value; the operator maintains it afterwards |
 | `postgres.parameters` | `spec.postgresql.parameters`; agent-owned settings win |
 | `shutdownTimeout` | `5s` (smart shutdown bound before fast) |
 | `passwordFile` | `/etc/pgshard-secret/password` from the superuser Secret |
+| `replicationPasswordFile` | `/etc/pgshard/replication/password` from the `<cluster>-replication` Secret; the agent writes it into its `.pgpass` and sends it with any conninfo naming the replication role |
 
 Probes: startup `/startz`, readiness `/readyz`, liveness `/livez` on the agent
 HTTP port 8080. A primary's `/livez` fails only when the kube API and every
