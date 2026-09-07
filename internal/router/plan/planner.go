@@ -1114,9 +1114,25 @@ func (w *walker) outerFeatures(s *pgquerypb.SelectStmt) {
 	if len(s.GetWindowClause()) > 0 {
 		w.blocker("window functions")
 	}
-	for _, t := range s.GetTargetList() {
+	// The ORDER BY expressions as well as the target list. A window
+	// function there was never examined at all: each shard ranked its own
+	// rows from 1, and the merge then ordered by those per-shard ranks --
+	// an order that is not the one asked for, with no error to say so.
+	for _, t := range targetsAndSorts(s) {
 		if hasWindow(t) {
 			w.blocker("window functions")
+			break
+		}
+	}
+	// A subquery in ORDER BY is not walked -- its relations are never
+	// routed and nothing assesses whether every shard computes the same
+	// value for it. One over a sharded table does not: each shard orders by
+	// its own answer, and the merge sorts by a column that means something
+	// different on each. Refused for the same reason a subquery anywhere
+	// else in a scatter is.
+	for _, o := range s.GetSortClause() {
+		if hasSubLink(o.GetSortBy().GetNode()) {
+			w.blocker("subqueries")
 			break
 		}
 	}
@@ -1245,6 +1261,18 @@ func (w *walker) scalarFunctions() declared {
 	return func(name string) bool {
 		return snap.ScalarFunctions[snapshot.FunctionKey{Database: w.sess.Database, Name: name}]
 	}
+}
+
+// hasSubLink reports whether node contains a subquery expression.
+func hasSubLink(node *pgquerypb.Node) bool {
+	found := false
+	visit(node, func(n *pgquerypb.Node) bool {
+		if n.GetSubLink() != nil {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 // hasStar reports whether the expression expands to an unknown number of

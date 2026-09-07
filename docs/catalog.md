@@ -83,8 +83,9 @@ reason.
 It is edited with normal SQL because the router cannot learn it any other
 way today: `CREATE FUNCTION`, `CREATE AGGREGATE` and `CREATE EXTENSION` are
 all refused through the router, so there is no DDL path for it to record
-from. `WHERE`-clause functions were never affected; only the target list of
-a multi-shard read.
+from. `WHERE`-clause functions are not affected; the classification covers the
+target list and the `ORDER BY` expressions, which become hidden target
+columns and are the same question about the same value.
 
 ### `pgshard.shard_ranges`
 
