@@ -827,6 +827,20 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 		if m.Scope == "existing" && missingObject(err) {
 			return "", &skippedError{err}
 		}
+		// A resumed DROP whose object is already gone is the state the
+		// migration asked for: this shard committed the drop and the crash
+		// came before the catalog was told. Only the drops the planner can
+		// mark with an object are covered by the resume check above -- a
+		// trigger, a policy, a rule, a type, a sequence and a DROP TABLE
+		// naming several tables carry none -- so without this the replay's
+		// 42704 fails a migration whose every shard is correct.
+		//
+		// Resumed only. A shard that never started is a shard where nothing
+		// dropped anything, and a missing object there is a real
+		// disagreement the migration has to report.
+		if resumed && missingObject(err) && strings.HasPrefix(m.Kind, "DROP ") {
+			return catalog.ShardApplied, nil
+		}
 		return "", err
 	}
 	return catalog.ShardApplied, nil
