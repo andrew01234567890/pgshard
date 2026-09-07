@@ -199,8 +199,7 @@ func (s *Server) StreamChanges(req *pgshardv1.StreamRequest, srv pgshardv1.Poole
 // text, so a caller can still tell a stale generation -- re-read the
 // topology and this same ack can succeed -- from a failure that says
 // nothing about whether a retry helps.
-func ackErr(e *pgshardv1.Error) error {
-	code := codes.Internal
+func ackErr(code codes.Code, e *pgshardv1.Error) error {
 	if e.GetReason() == pgshardv1.Reason_REASON_STALE_GENERATION {
 		code = codes.FailedPrecondition
 	}
@@ -222,7 +221,7 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	// member the shard has moved off discards WAL the new primary's slot
 	// still needs.
 	if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
-		return nil, ackErr(e)
+		return nil, ackErr(codes.FailedPrecondition, e)
 	}
 	slot, err := s.slotOf(req.GetSlot(), req.GetStream())
 	if err != nil {
@@ -232,7 +231,10 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	r := s.readers[slot]
 	s.mu.Unlock()
 	if r == nil {
-		return nil, ackErr(&pgshardv1.Error{Sqlstate: "55000", Message: "slot " + slot + " has no active reader"})
+		// Unavailable, not Internal: the reader attaches when the stream
+		// opens, so an ack that arrives before it is early rather than
+		// wrong, and the same ack sent again works.
+		return nil, ackErr(codes.Unavailable, &pgshardv1.Error{Sqlstate: "55000", Message: "slot " + slot + " has no active reader"})
 	}
 	lsn := min(req.GetLsn(), r.delivered.Load())
 	for {
@@ -251,7 +253,10 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 			return nil, ctx.Err()
 		}
 		if time.Now().After(deadline) {
-			return nil, ackErr(&pgshardv1.Error{Sqlstate: "57014", Message: "ack not confirmed in time"})
+			// DeadlineExceeded, not Internal: the flush may well land a
+			// moment later, and the position is not lost -- the next ack
+			// asks for it again.
+			return nil, ackErr(codes.DeadlineExceeded, &pgshardv1.Error{Sqlstate: "57014", Message: "ack not confirmed in time"})
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

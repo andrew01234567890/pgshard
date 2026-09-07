@@ -16,6 +16,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -214,13 +215,40 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pg
 			continue
 		}
 		if _, err := s.ackShard(ctx, req.GetStream(), sh, lsn); err != nil {
-			// The shard's own status is kept: a stale generation there is
-			// a stale generation here, and flattening it into a message
-			// would leave the consumer with text to parse.
-			return nil, status.Errorf(status.Code(err), "shard %s/%d: %v", sh.Set, sh.ID, err)
+			return nil, shardAckErr(sh, err)
 		}
 	}
 	return &pgshardv1.VStreamAckResponse{}, nil
+}
+
+// shardAckErr names the shard on a failure the pooler reported, keeping the
+// status whole.
+//
+// Rebuilding it from the code and the message alone -- which is what
+// status.Errorf(status.Code(err), ...) does -- drops the details, and the
+// details are where the pooler says whether the refusal was a stale
+// generation. A consumer would then be left with FailedPrecondition, which
+// this RPC also returns for a stream that is open on another router, and no
+// way to tell the two apart.
+func shardAckErr(sh router.Shard, err error) error {
+	st := status.Convert(err)
+	out := status.New(st.Code(), fmt.Sprintf("shard %s/%d: %s", sh.Set, sh.ID, st.Message()))
+	if d, derr := out.WithDetails(detailsOf(st)...); derr == nil {
+		out = d
+	}
+	return out.Err()
+}
+
+// detailsOf is the status's details as messages, dropping any that will not
+// unmarshal -- a detail nobody here can read is not worth failing over.
+func detailsOf(st *status.Status) []protoadapt.MessageV1 {
+	var out []protoadapt.MessageV1
+	for _, d := range st.Details() {
+		if m, ok := d.(protoadapt.MessageV1); ok {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // ackShard returns the LSN the pooler confirmed, which is the ack clamped to

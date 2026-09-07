@@ -35,7 +35,9 @@ func (h *pgHarness) testStream(t *testing.T) {
 	if _, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Generation: gen(3, 1)}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("ack without slot: %v", err)
 	}
-	if _, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 1, Generation: gen(3, 1)}); status.Code(err) != codes.Internal {
+	// Unavailable: the reader attaches when the stream opens, so an ack
+	// that arrives first is early rather than wrong.
+	if _, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 1, Generation: gen(3, 1)}); status.Code(err) != codes.Unavailable {
 		t.Fatalf("ack without reader: %v", err)
 	}
 	if s, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "nope", Generation: gen(3, 1)}); err == nil {
