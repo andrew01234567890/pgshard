@@ -204,7 +204,7 @@ func TestAckClampsToDelivered(t *testing.T) {
 	s := NewServer(Config{Source: NewStaticSource(View{})})
 	r := &streamReader{wake: make(chan struct{}, 1)}
 	r.delivered.Store(100)
-	r.flushed.Store(100)
+	r.noteFlushed(100)
 	s.mu.Lock()
 	s.readers = map[string]*streamReader{"b": r}
 	s.mu.Unlock()
@@ -216,7 +216,7 @@ func TestAckClampsToDelivered(t *testing.T) {
 		t.Fatalf("acked %d, want clamped to delivered 100", got)
 	}
 	r.delivered.Store(300)
-	r.flushed.Store(300)
+	r.noteFlushed(300)
 	if _, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Slot: "b", Lsn: 250, Generation: gen(0, 0)}); err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestAnAckAtTheStartPositionIsNotClampedToNothing(t *testing.T) {
 	// once it has sent its standby status.
 	go func() {
 		<-r.wake
-		r.flushed.Store(r.acked.Load())
+		r.noteFlushed(r.acked.Load())
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -344,7 +344,7 @@ func TestAnAckBeyondWhatWasDeliveredSaysWhatItConfirmed(t *testing.T) {
 	}
 	go func() {
 		<-r.wake
-		r.flushed.Store(r.acked.Load())
+		r.noteFlushed(r.acked.Load())
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
