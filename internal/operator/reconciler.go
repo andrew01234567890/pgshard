@@ -1707,7 +1707,7 @@ func sqlSurfaceMessage(serving int) string {
 		return fmt.Sprintf("routers parse PostgreSQL %d while the shards run %d; syntax the shards would refuse is refused here first", grammar.Major, serving)
 	}
 	return fmt.Sprintf("the shards run PostgreSQL %d but the routers parse %d: %d-only syntax is refused and server_version reports %d. The upgrade moved the data; the SQL surface follows a router build that parses %d",
-		serving, grammar.Major, serving, grammar.Major, serving)
+		serving, grammar.Major, serving, grammar.Major, grammar.Major)
 }
 
 // setRolloutStatus summarises the groups' rolling steps into status.rollout

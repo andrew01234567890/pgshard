@@ -75,6 +75,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	s := &Snapshot{
 		LoadedAt:        time.Now(),
 		ShardSets:       map[string][]Range{},
+		PGMajors:        map[string]int{},
 		Serving:         map[ShardKey]Serving{},
 		Databases:       map[string]catalog.Database{},
 		Tables:          map[TableKey]Placement{},
@@ -93,6 +94,26 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	}
 	for _, r := range ranges {
 		s.ShardSets[r.ShardSet] = append(s.ShardSets[r.ShardSet], rangeFromCatalog(r))
+	}
+	sets, err := catalog.ListShardSets(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: shard sets: %w", err)
+	}
+	for _, set := range sets {
+		// A retired set still has rows for as long as its groups are kept.
+		// Counting its major would hold the cluster's SQL surface down to
+		// the version it was upgraded away from.
+		//
+		// A set that is only proposed or provisioning does count, and that
+		// is safe rather than lucky: a reshard stamps the pending set with
+		// the serving set's own major, and an upgrade only starts when the
+		// spec asks for a higher one, so nothing writes a pending major
+		// below what already serves. A downgrade path would break that, and
+		// would have to narrow this to the serving set.
+		if set.State == catalog.ShardSetRetired || set.PGMajor == nil {
+			continue
+		}
+		s.PGMajors[set.Name] = *set.PGMajor
 	}
 	statuses, err := catalog.ListAllShardStatus(ctx, tx)
 	if err != nil {

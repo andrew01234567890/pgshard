@@ -89,14 +89,11 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	rolesTTL := fs.Duration("roles-ttl", 5*time.Second, "how long catalog role verifiers are cached")
 	snapshotWait := fs.Duration("snapshot-wait", 30*time.Second, "time to wait for the first catalog snapshot")
 	startupTimeout := fs.Duration("startup-timeout", 10*time.Second, "time a connection may spend before authentication completes")
-	// Compiled in, this was wrong for every PostgreSQL minor after the one
-	// it was written against, and wrong by a whole major on a cluster
-	// serving 19 -- which reports itself to clients as 18.6. Deriving it
-	// from what the shards actually run needs the router to learn their
-	// version, and during a rolling major upgrade to decide which of two
-	// answers is the cluster's; that is PGS-471. Until then it is at least
-	// correctable without a rebuild.
-	serverVersion := fs.String("server-version", "18.6 (pgshard)", "value reported as the server_version parameter to clients")
+	// Empty means derive it from the majors the live shard sets run and the
+	// grammar this router is built against, which is what the SQL surface
+	// actually is; see router.ServerVersion. A value here pins it instead,
+	// for a client that has to be told something else.
+	serverVersion := fs.String("server-version", "", "value reported as the server_version parameter to clients (empty derives it from the majors the shard sets run)")
 	maxStartupConns := fs.Int("max-startup-conns", 100, "concurrent connections allowed in the pre-authentication phase (refused with 53300 past the cap)")
 	maxSessions := fs.Int("max-sessions", router.DefaultMaxSessions, "authenticated sessions this router holds at once, whatever role they belong to (refused with 53300 past the cap; negative means no cap)")
 	maxMessageBody := fs.Int("max-message-body", pgwire.DefaultMaxMessageBodyLen, "largest frontend message body accepted, in bytes; the buffer is allocated from the message header before the body arrives, so this times --max-sessions is the heap a router must survive")
@@ -222,10 +219,15 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	var srv *pgwire.Server
 	srvCfg := pgwire.Config{
-		Authenticator:     pgwire.SCRAMAuthenticator{Lookup: roles.Lookup, MockSecret: mockNonce},
-		TLSConfig:         tlsCfg,
-		AllowPlaintext:    *allowPlaintext,
-		ServerVersion:     *serverVersion,
+		Authenticator:  pgwire.SCRAMAuthenticator{Lookup: roles.Lookup, MockSecret: mockNonce},
+		TLSConfig:      tlsCfg,
+		AllowPlaintext: *allowPlaintext,
+		ServerVersion: func() string {
+			if *serverVersion != "" {
+				return *serverVersion
+			}
+			return router.ServerVersion(w.Current())
+		},
 		InstanceID:        uint32(*instanceID),
 		StartupTimeout:    *startupTimeout,
 		MaxStartupConns:   *maxStartupConns,

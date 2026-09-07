@@ -206,7 +206,7 @@ func (c *rawClient) startupAs(version uint32, user string) startupResult {
 }
 
 func TestSimpleQueryProtocol30(t *testing.T) {
-	ts := startServer(t, Config{ServerVersion: "18.6 (pgshard)"})
+	ts := startServer(t, Config{ServerVersion: func() string { return "18.6 (pgshard)" }})
 	c := dialRaw(t, ts.addr)
 	res := c.startup(ProtocolVersion30)
 	if res.negotiate != nil {
