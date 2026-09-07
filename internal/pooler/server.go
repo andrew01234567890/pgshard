@@ -373,6 +373,12 @@ type relay struct {
 	// the Close messages the pooler injects, which the backend answers
 	// like any other.
 	awaiting int
+	// unwatch stops the deadline watcher armed for the message in flight.
+	// It has to run before the backend goes back to the pool, not only when
+	// the message returns: a watcher still armed over a backend somebody
+	// else now holds would set a deadline on their connection, and its own
+	// stop would clear one they had just set.
+	unwatch func()
 	// copyBytes counts CopyData buffered for the backend since the last
 	// write to it. COPY IN produces no reply until it ends, so nothing
 	// else would move the upload out of memory before CopyDone.
@@ -626,7 +632,8 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	// deadline, a stream it aborted -- reached this handler as a cancelled
 	// ctx and nothing else, so it went on waiting for PostgreSQL and held
 	// the backend and the session entry with it. This is where that ends.
-	defer b.watch(ctx)()
+	r.unwatch = sync.OnceFunc(b.watch(ctx))
+	defer r.stopWatch()
 	if _, isFlush := req.Message.(*pgshardv1.ExecuteRequest_Flush); isFlush {
 		// Flush itself is answered by nothing, so it is not counted.
 		b.send(fm)
@@ -653,6 +660,15 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		return r.backendLost(b, err)
 	}
 	return r.pump(b)
+}
+
+// stopWatch ends the deadline watcher for the message in flight, if one is
+// armed. Running it twice is how it is meant to be used: once wherever the
+// backend leaves this relay, and once on the way out of handle.
+func (r *relay) stopWatch() {
+	if r.unwatch != nil {
+		r.unwatch()
+	}
 }
 
 // forward buffers fm on b, keeping the backend's prepared-statement set in
@@ -810,6 +826,9 @@ func (r *relay) pump(b *Backend) error {
 		case *pgproto3.ReadyForQuery:
 			r.endBatch(b)
 			if !r.reserved() && b.idle() {
+				// Before it stops being ours: recycle resets the backend on
+				// the same socket and then hands it to the pool.
+				r.stopWatch()
 				r.setBackend(nil)
 				r.srv.recycle(b)
 			}

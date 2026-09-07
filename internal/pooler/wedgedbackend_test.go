@@ -78,3 +78,46 @@ func attachedSession(h *harness) bool {
 	se := h.srv.sessions["wedged"]
 	return se != nil && se.attached
 }
+
+// The deadline watcher belongs to the message being relayed, not to the
+// backend. A statement that ends hands its backend back to the pool from
+// inside the same call the watcher was armed for, so a router giving up a
+// moment later would otherwise reach a connection this session no longer
+// owns: cutting short the reset in flight on it, and clearing a deadline
+// its next owner had just set.
+func TestGivingUpDoesNotReachABackendAlreadyBackInThePool(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reached := make(chan struct{})
+	h.pg.holdDiscard.Store(&reached)
+
+	stream, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, stream, queryReq("done", "select 1", gen(7, 3), identity("alice")))
+
+	// The statement is answered and the backend is on its way back to the
+	// pool, still resetting.
+	<-reached
+	cancel()
+	// Long enough for a watcher still armed to have acted on it. Without
+	// this the reset finishes first and the assertion below holds whether
+	// the watcher was scoped correctly or not.
+	time.Sleep(100 * time.Millisecond)
+	close(h.pg.releaseDiscard)
+
+	// The backend finished its reset and was pooled, so the next session
+	// gets it rather than dialling a new one.
+	before := h.pg.dials.Load()
+	fresh, err := h.client.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, fresh, queryReq("next", "select 1", gen(7, 3), identity("alice")))
+	if got := h.pg.dials.Load(); got != before {
+		t.Fatalf("dials went %d -> %d; giving up cut short a reset on a backend the session had already released", before, got)
+	}
+}

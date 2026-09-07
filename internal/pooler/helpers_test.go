@@ -29,12 +29,19 @@ type fakePG struct {
 	seen    []string
 	dialed  []string
 	block   chan struct{}
-	copied  atomic.Int64
+	// holdDiscard, when set, is closed as the reset reaches the fake and
+	// the reset then waits for releaseDiscard: it is how a test gets to act
+	// while a backend is mid-reset on its way back to the pool.
+	holdDiscard    atomic.Pointer[chan struct{}]
+	releaseDiscard chan struct{}
+	copied         atomic.Int64
 	// lastCK/lastSK alias the key slices handed to the most recent dial.
 	lastCK, lastSK []byte
 }
 
-func newFakePG() *fakePG { return &fakePG{block: make(chan struct{})} }
+func newFakePG() *fakePG {
+	return &fakePG{block: make(chan struct{}), releaseDiscard: make(chan struct{})}
+}
 
 func (f *fakePG) dial(_ context.Context, database, role string, ck, sk []byte) (*Backend, error) {
 	f.dials.Add(1)
@@ -103,6 +110,13 @@ func (f *fakePG) serve(conn net.Conn) {
 			q := strings.ToUpper(strings.TrimSpace(m.String))
 			switch {
 			case q == "DISCARD ALL":
+				// A test that needs the reset to still be in flight while
+				// something else happens closes discarding when it is done.
+				if ch := f.holdDiscard.Load(); ch != nil {
+					close(*ch)
+					f.holdDiscard.Store(nil)
+					<-f.releaseDiscard
+				}
 				clear(prepared)
 			case q == "BEGIN":
 				tx = 'T'
