@@ -6,10 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 func newTestInstance(t *testing.T) *Instance {
@@ -269,7 +268,9 @@ func TestPgpassCarriesTheReplicationPasswordToo(t *testing.T) {
 }
 
 // The credential sent to the source must belong to the role the conninfo
-// names. A member reaches its primary with primary_conninfo for three
+// names, and it must never be part of the connection STRING: pgx puts that
+// whole string into a parse error, and its redaction of password='...'
+// stops at the first quote inside the value. A member reaches its primary with primary_conninfo for three
 // different things -- waiting for it to come up, creating this member's
 // slot on it, and cloning -- and each builds its own connection string.
 // Splicing the superuser's password onto a conninfo that says
@@ -291,27 +292,23 @@ func TestTheSourcePasswordBelongsToTheRoleTheConninfoNames(t *testing.T) {
 		// the superuser.
 		{"host=src port=5432", "secret"},
 	} {
-		got, err := in.sourceDSN(c.source)
-		if err != nil {
-			t.Fatalf("%s: %v", c.source, err)
-		}
-		cfg, err := pgx.ParseConfig(got)
+		cfg, err := in.sourceConfig(c.source)
 		if err != nil {
 			t.Fatalf("%s: %v", c.source, err)
 		}
 		if cfg.Password != c.want {
 			t.Errorf("%s: password %q, want %q", c.source, cfg.Password, c.want)
 		}
+		if strings.Contains(cfg.ConnString(), c.want) {
+			t.Errorf("%s: the password is in the connection string %q, which pgx puts into a parse error",
+				c.source, cfg.ConnString())
+		}
 	}
 
 	// A member whose operator predates the replication Secret still has
 	// only the superuser's password, and must keep working.
 	in.cfg.ReplicationPasswordFile = ""
-	got, err := in.sourceDSN("host=src user=" + replicationRole)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := pgx.ParseConfig(got)
+	cfg, err := in.sourceConfig("host=src user=" + replicationRole)
 	if err != nil {
 		t.Fatal(err)
 	}

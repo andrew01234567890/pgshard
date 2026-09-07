@@ -242,16 +242,28 @@ func pgpassEscape(v string) string {
 	return strings.NewReplacer(`\`, `\\`, `:`, `\:`).Replace(v)
 }
 
-// sourceDSN adds the password for the role source NAMES, so a conninfo and
-// the credential sent with it cannot disagree. Splicing the superuser's
-// password onto a conninfo naming the replication role authenticates
-// nothing, and every rejoin, clone and slot creation goes through here.
-func (in *Instance) sourceDSN(source string) (string, error) {
+// sourceConfig is the connection to a source primary, carrying the password
+// of the role source NAMES: a conninfo and the credential sent with it
+// cannot disagree, and splicing the superuser's password onto one naming the
+// replication role authenticates nothing. Every rejoin, clone and slot
+// creation goes through here.
+//
+// The password is set on the config rather than appended to the string.
+// pgx puts the whole connection string into a parse error, and its
+// redaction of password='...' stops at the first quote inside the value --
+// so a password with a quote in it would reach the log this returns to.
+func (in *Instance) sourceConfig(source string) (*pgx.ConnConfig, error) {
+	cfg, err := pgx.ParseConfig(source)
+	if err != nil {
+		return nil, err
+	}
 	pw, err := in.passwordFor(dsnUser(source))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return source + " password='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(pw) + "' connect_timeout=5", nil
+	cfg.Password = pw
+	cfg.ConnectTimeout = 5 * time.Second
+	return cfg, nil
 }
 
 // dsnUser reads the user out of a keyword/value conninfo. Empty means the
@@ -532,12 +544,12 @@ func (in *Instance) rebuild(ctx context.Context) error {
 // rejoin can pg_rewind instead of falling back to a full reclone while the
 // -rw Service still has no endpoint.
 func (in *Instance) waitSource(ctx context.Context, source string) error {
-	dsn, err := in.sourceDSN(source)
+	cfg, err := in.sourceConfig(source)
 	if err != nil {
 		return err
 	}
 	for {
-		conn, err := pgx.Connect(ctx, dsn)
+		conn, err := pgx.ConnectConfig(ctx, cfg)
 		if err == nil {
 			_ = conn.Close(ctx)
 			return nil
@@ -554,11 +566,11 @@ func (in *Instance) waitSource(ctx context.Context, source string) error {
 // ensureSlotOnSource creates this member's physical slot on the source
 // primary when it is missing, so streaming can start after a rewind.
 func (in *Instance) ensureSlotOnSource(ctx context.Context, source string) error {
-	dsn, err := in.sourceDSN(source)
+	cfg, err := in.sourceConfig(source)
 	if err != nil {
 		return err
 	}
-	conn, err := pgx.Connect(ctx, dsn)
+	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("connect to source: %w", err)
 	}
