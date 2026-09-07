@@ -182,8 +182,16 @@ func (b *mergeBuilder) run() error {
 	// are rejected by the shard itself (a bare column in the target list is
 	// 42803), which is why it survived: the ones that are not rejected are
 	// the ones that project no column at all.
+	//
+	// It is refused here rather than left to aggregates(), which would
+	// describe the target list -- and the target list is not where the
+	// aggregate is.
 	for _, o := range s.GetSortClause() {
 		if hasAggregate(o.GetSortBy().GetNode()) {
+			if !shardLocal {
+				return notYet("multi-shard ORDER BY an aggregate is not available yet: the whole statement then returns one row, and each shard would answer with its own",
+					"group by the shard key \""+b.shardKey+"\" so that every group lives on one shard, or filter on one key value")
+			}
 			aggregated = true
 			break
 		}

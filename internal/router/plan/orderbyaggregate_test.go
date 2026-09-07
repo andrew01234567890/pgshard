@@ -25,6 +25,10 @@ func TestAnAggregateInOrderByIsNotAPlainScatter(t *testing.T) {
 		"select 1 from orders order by max(amount)",
 		"select 'x' from orders order by count(*)",
 		"select 1 from orders order by sum(amount) desc",
+		// An empty select list is the same shape with nothing at all to
+		// concatenate: one zero-width row per shard where the server
+		// answers with one.
+		"select from orders order by max(amount)",
 	} {
 		if p, err := New().Plan(context.Background(), session(snap), sql); err == nil {
 			t.Errorf("%s: planned as %v over %d shards; the server returns one row and this returns one per shard",
@@ -44,6 +48,43 @@ func TestOrderingOnAnAggregateIsFineWhenEveryGroupIsShardLocal(t *testing.T) {
 	// And an ordinary column in ORDER BY is untouched.
 	if _, err := New().Plan(context.Background(), session(snap), "select id from orders order by amount"); err != nil {
 		t.Fatalf("ordering on a column stopped being planned: %v", err)
+	}
+}
+
+// A window function in ORDER BY was never examined at all: each shard
+// ranked its own rows from 1, and the merge then ordered by those per-shard
+// ranks -- an order that is not the one asked for, with nothing to say so.
+// It is a window function wherever it appears, so it gets the blocker that
+// name has rather than something about aggregates.
+func TestAWindowFunctionInOrderByIsRefusedAsOne(t *testing.T) {
+	snap := fixture(t)
+	_, err := New().Plan(context.Background(), session(snap), "select id from orders order by rank() over (order by amount)")
+	if err == nil {
+		t.Fatal("a window function in ORDER BY was planned; the merge would order by per-shard ranks")
+	}
+	if !strings.Contains(err.Error(), "window functions") {
+		t.Errorf("refused as %v, want the window-function blocker", err)
+	}
+}
+
+// A subquery in ORDER BY is not walked, so its relations are never routed
+// and nothing checks that every shard computes the same value for it. One
+// over a sharded table does not: each shard orders by its own answer and the
+// merge sorts by a column that means something different on each.
+func TestASubqueryInOrderByIsRefusedAsOne(t *testing.T) {
+	snap := fixture(t)
+	for _, sql := range []string{
+		"select id from orders order by (select max(amount) from orders)",
+		"select id from orders order by (select max(amount) from regions)",
+	} {
+		_, err := New().Plan(context.Background(), session(snap), sql)
+		if err == nil {
+			t.Errorf("%s: planned, and nothing routed the subquery or compared what each shard answers", sql)
+			continue
+		}
+		if !strings.Contains(err.Error(), "subqueries") {
+			t.Errorf("%s: refused as %v, want the subquery blocker", sql, err)
+		}
 	}
 }
 

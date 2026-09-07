@@ -348,6 +348,9 @@ compute `sum(x)` and `count(x)`), `JSON_ARRAYAGG`/`JSON_OBJECTAGG`,
 an aggregate in `ORDER BY` without a shard-key `GROUP BY` (an aggregate
 anywhere in a `SELECT` makes the whole statement return one row, so
 concatenating the shards returns one row per shard),
+a window function or a subquery in `ORDER BY` — the first would order by
+each shard's own ranking, the second is never routed and nothing checks
+that every shard computes the same value for it,
 any function in the target list **or `ORDER BY`** that is not a PostgreSQL
 built-in and has not been declared in `pgshard.functions` ("multi-shard
 first() is not available yet: it is not a PostgreSQL built-in") — the router classifies a function by name, from the
