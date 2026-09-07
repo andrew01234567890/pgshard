@@ -247,6 +247,14 @@ func TestThePoolerRoleCanStreamAndCopyAndWriteNothing(t *testing.T) {
 	for _, sql := range []string{
 		`CREATE TABLE t (id int primary key, v text)`,
 		`INSERT INTO t VALUES (1, 'a')`,
+		// A table under row-level security, which the copy must still read
+		// in full: logical decoding applies no policy, so a copy that did
+		// would hand a consumer a subset and then start sending it
+		// everything, with nothing raised anywhere.
+		`CREATE TABLE secret (id int primary key, owner text)`,
+		`INSERT INTO secret VALUES (1, 'alice'), (2, 'bob')`,
+		`ALTER TABLE secret ENABLE ROW LEVEL SECURITY`,
+		`CREATE POLICY own ON secret USING (owner = current_user)`,
 		`CREATE PUBLICATION pgshard_all FOR ALL TABLES`,
 	} {
 		if _, err := admin.Exec(ctx, sql); err != nil {
@@ -286,11 +294,21 @@ func TestThePoolerRoleCanStreamAndCopyAndWriteNothing(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = copyConn.Close(context.Background()) })
 	if err := copyConn.Exec(ctx,
-		"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '"+snapshot+"'").Close(); err != nil {
+		"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '"+snapshot+
+			"'; SET LOCAL row_security = off").Close(); err != nil {
 		t.Fatalf("import the exported snapshot: %v", err)
 	}
 	if _, err := copyConn.Exec(ctx, "SELECT count(*) FROM t").ReadAll(); err != nil {
 		t.Errorf("the pooler role cannot read the tables a stream copies: %v", err)
+	}
+	// Every row, not the ones a policy would leave. pg_read_all_data grants
+	// SELECT and does not bypass a policy; the superuser this replaced did,
+	// silently, which is why nothing noticed the difference.
+	rows2, err := copyConn.Exec(ctx, "SELECT count(*) FROM secret").ReadAll()
+	if err != nil {
+		t.Errorf("reading a table under row-level security: %v", err)
+	} else if got := string(rows2[0].Rows[0][0]); got != "2" {
+		t.Errorf("the copy sees %s of 2 rows under a row-level policy; the stream would then send all of them", got)
 	}
 	if _, err := copyConn.Exec(ctx, "SELECT * FROM pg_publication_tables").ReadAll(); err != nil {
 		t.Errorf("pg_publication_tables: %v", err)

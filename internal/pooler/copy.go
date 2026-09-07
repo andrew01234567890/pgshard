@@ -137,7 +137,14 @@ func (s *Server) runCopy(ctx context.Context, req *pgshardv1.CopyTablesRequest, 
 	if publication == "" {
 		publication = "pgshard_all"
 	}
-	if err := conn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT "+quoteLiteral(info.SnapshotName)).Close(); err != nil {
+	// row_security off makes a policy an ERROR rather than a filter. The
+	// copy has to deliver the same rows the stream then will, and logical
+	// decoding applies no row-level security -- so a copy quietly reduced by
+	// one is a consumer that is wrong and never told. The role has
+	// BYPASSRLS, so this changes nothing today; it is what turns losing that
+	// attribute into a failure instead of a subset.
+	if err := conn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT "+
+		quoteLiteral(info.SnapshotName)+"; SET LOCAL row_security = off").Close(); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "import snapshot: %v", err)
 	}
 	tables, err := publicationTables(ctx, conn, publication)

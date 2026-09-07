@@ -73,7 +73,9 @@ the write fences and the coordination of a multi-shard write happen.
 The pooler opens its change-stream connections as `pgshard_pooler`, also on
 every group: `REPLICATION` for the logical decoding connection and the slot
 a stream exports its snapshot from, `pg_read_all_data` for the tables that
-snapshot is then copied out of, and nothing that writes. Its password is
+snapshot is then copied out of, `BYPASSRLS` because logical decoding applies
+no row-level security and the initial copy has to deliver the same rows the
+stream then will, and nothing that writes. Its password is
 generated into `<cluster>-pooler` and mounted at `/etc/pgshard/pooler`. With
 that and the router role for the catalog, the pooler container carries
 **no** `PGPASSWORD` and no superuser Secret at all — libpq applies that

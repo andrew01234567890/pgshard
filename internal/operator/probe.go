@@ -802,11 +802,19 @@ func ReplicationLogin(password string) GroupLogin {
 // REPLICATION for the logical decoding connection and the slot it exports a
 // snapshot from; pg_read_all_data for the tables that snapshot is then
 // copied out of. It can write nothing.
+//
+// BYPASSRLS because a stream's initial copy has to deliver the same rows the
+// stream itself will: logical decoding applies no row-level security, so a
+// copier that DID would hand a consumer a subset and then start sending it
+// everything, with no error anywhere. pg_read_all_data grants SELECT and
+// does not bypass a policy -- as the superuser this connection used to did,
+// silently, which is why nothing noticed. The role still cannot write, so
+// bypassing a read policy is the whole of what this adds.
 func PoolerLogin(password string) GroupLogin {
 	return GroupLogin{
 		Role:       catalog.PoolerRole,
 		Password:   password,
-		Attributes: "LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS",
+		Attributes: "LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS",
 		Grants:     []string{"pg_read_all_data"},
 	}
 }

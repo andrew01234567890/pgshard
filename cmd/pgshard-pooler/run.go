@@ -29,6 +29,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pki"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/pprofserve"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -55,7 +56,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN; when set, generation and epoch come from the catalog")
-	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn; the environment's PGPASSWORD is left for the local server")
+	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn")
 	shardSet := fs.String("shard-set", "", "shard set of this shard (with --catalog-dsn)")
 	shardID := fs.Int("shard-id", 0, "shard id of this shard (with --catalog-dsn)")
 	generation := fs.Uint64("generation", 0, "static shard-map generation (without --catalog-dsn)")
@@ -118,6 +119,15 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cli.ExitUsage
 	}
 	*streamDSN = streamWithPassword
+	// Parsed here rather than on the first Stream call: a malformed DSN is
+	// a startup mistake, and answering every change-stream request with an
+	// Internal error is a poor way to report one.
+	if *streamDSN != "" {
+		if _, err := pgconn.ParseConfig(*streamDSN); err != nil {
+			fmt.Fprintf(stderr, "pgshard-pooler run: --stream-dsn: %v\n", err)
+			return cli.ExitUsage
+		}
+	}
 
 	dialer := pooler.Dialer{Address: addr, Timeout: 5 * time.Second, TLS: backendTLS}
 	base := pooler.View{Generation: *generation, Epoch: *epoch, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true}
