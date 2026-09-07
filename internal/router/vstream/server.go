@@ -196,8 +196,11 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pg
 	}
 	live := s.liveStream(req.GetStream())
 	if live == nil {
-		return &pgshardv1.VStreamAckResponse{Error: &pgshardv1.Error{Sqlstate: "55000",
-			Message: fmt.Sprintf("stream %q is not open on this router, so an ack cannot be checked against what was delivered; ack inside the stream, or on the router serving it", req.GetStream())}}, nil
+		// FailedPrecondition, not Internal: another router is serving the
+		// stream and the same ack sent there succeeds, which is something
+		// a consumer can act on.
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"stream %q is not open on this router, so an ack cannot be checked against what was delivered; ack inside the stream, or on the router serving it", req.GetStream())
 	}
 	for sh, lsn := range positionFrom(req.GetPosition()) {
 		delivered, ok := live.at(sh)
@@ -211,7 +214,10 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pg
 			continue
 		}
 		if _, err := s.ackShard(ctx, req.GetStream(), sh, lsn); err != nil {
-			return &pgshardv1.VStreamAckResponse{Error: &pgshardv1.Error{Message: fmt.Sprintf("shard %s/%d: %v", sh.Set, sh.ID, err)}}, nil
+			// The shard's own status is kept: a stale generation there is
+			// a stale generation here, and flattening it into a message
+			// would leave the consumer with text to parse.
+			return nil, status.Errorf(status.Code(err), "shard %s/%d: %v", sh.Set, sh.ID, err)
 		}
 	}
 	return &pgshardv1.VStreamAckResponse{}, nil
@@ -228,10 +234,11 @@ func (s *Server) ackShard(ctx context.Context, stream string, sh router.Shard, l
 	r, err := client.Ack(ctx, &pgshardv1.AckRequest{Stream: stream, Lsn: lsn,
 		Generation: &pgshardv1.Generation{ShardMapGeneration: s.Topology.Generation(), PrimaryEpoch: s.Topology.Epoch(sh)}})
 	if err != nil {
+		// The failure is the status now, detail and all: an ack that
+		// confirmed nothing used to arrive as a successful RPC carrying an
+		// error in its body, and reading it here turned a classified
+		// refusal into a bare message.
 		return 0, err
-	}
-	if r.GetError() != nil {
-		return 0, errors.New(r.GetError().GetMessage())
 	}
 	return r.GetConfirmedLsn(), nil
 }

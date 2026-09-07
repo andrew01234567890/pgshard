@@ -35,8 +35,8 @@ func (h *pgHarness) testStream(t *testing.T) {
 	if _, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Generation: gen(3, 1)}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("ack without slot: %v", err)
 	}
-	if r, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 1, Generation: gen(3, 1)}); err != nil || r.GetError() == nil {
-		t.Fatalf("ack without reader: %v %v", r, err)
+	if _, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 1, Generation: gen(3, 1)}); status.Code(err) != codes.Internal {
+		t.Fatalf("ack without reader: %v", err)
 	}
 	if s, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "nope", Generation: gen(3, 1)}); err == nil {
 		if _, err := s.Recv(); status.Code(err) != codes.FailedPrecondition {

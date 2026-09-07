@@ -185,6 +185,32 @@ func (s *Server) StreamChanges(req *pgshardv1.StreamRequest, srv pgshardv1.Poole
 	}, true)
 }
 
+// ackErr is how an ack that did not advance the slot fails its RPC.
+//
+// An ack is one operation with no partial answer, so its failure belongs in
+// the status like every other whole-RPC failure -- the same rule the agent
+// and the controller already follow. Embedding it meant an ack that
+// confirmed nothing arrived as a successful RPC, so every interceptor,
+// retry policy and metric that reads only the status counted it as OK, and
+// the one caller that did read the body threw the classification away and
+// kept the message.
+//
+// The Error travels as a status detail rather than being flattened into
+// text, so a caller can still tell a stale generation -- re-read the
+// topology and this same ack can succeed -- from a failure that says
+// nothing about whether a retry helps.
+func ackErr(e *pgshardv1.Error) error {
+	code := codes.Internal
+	if e.GetReason() == pgshardv1.Reason_REASON_STALE_GENERATION {
+		code = codes.FailedPrecondition
+	}
+	st := status.New(code, e.GetMessage())
+	if d, err := st.WithDetails(e); err == nil {
+		st = d
+	}
+	return st.Err()
+}
+
 // Ack implements Pooler.Ack: it hands the position to the slot's reader and
 // waits until the reader has reported it to the server. Positions beyond the
 // last delivered batch end are clamped so confirmed_flush never overtakes
@@ -196,7 +222,7 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	// member the shard has moved off discards WAL the new primary's slot
 	// still needs.
 	if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
-		return &pgshardv1.AckResponse{Error: e}, nil
+		return nil, ackErr(e)
 	}
 	slot, err := s.slotOf(req.GetSlot(), req.GetStream())
 	if err != nil {
@@ -206,7 +232,7 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	r := s.readers[slot]
 	s.mu.Unlock()
 	if r == nil {
-		return &pgshardv1.AckResponse{Error: &pgshardv1.Error{Sqlstate: "55000", Message: "slot " + slot + " has no active reader"}}, nil
+		return nil, ackErr(&pgshardv1.Error{Sqlstate: "55000", Message: "slot " + slot + " has no active reader"})
 	}
 	lsn := min(req.GetLsn(), r.delivered.Load())
 	for {
@@ -225,7 +251,7 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 			return nil, ctx.Err()
 		}
 		if time.Now().After(deadline) {
-			return &pgshardv1.AckResponse{Error: &pgshardv1.Error{Sqlstate: "57014", Message: "ack not confirmed in time"}}, nil
+			return nil, ackErr(&pgshardv1.Error{Sqlstate: "57014", Message: "ack not confirmed in time"})
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
