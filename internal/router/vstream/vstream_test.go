@@ -574,9 +574,12 @@ func TestStreamRequestValidation(t *testing.T) {
 	// A unary ack for a stream this router is not serving is refused: it
 	// has nothing to check the position against, and an ack above what the
 	// consumer was sent discards transactions for good.
-	ack, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 5}}}})
-	if err != nil || ack.GetError() == nil || ack.GetError().GetSqlstate() != "55000" {
-		t.Fatalf("unary ack without an open stream: %v %v", ack, err)
+	// It fails the RPC: an ack that advanced nothing used to come back as
+	// a successful call carrying an error in its body, which every retry
+	// policy and metric that reads the status counted as OK.
+	_, err = h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 5}}}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unary ack without an open stream: %v", err)
 	}
 	if n := len(h.pool[0].ackedLSNs()); n != 0 {
 		t.Fatalf("a refused ack still reached the pooler: %v", h.pool[0].ackedLSNs())

@@ -197,9 +197,11 @@ func (s *Server) DropStream(ctx context.Context, req *pgshardv1.DropStreamReques
 	if s.Streams == nil {
 		return nil, status.Error(codes.Unimplemented, "the controller has no shard access configured for streams")
 	}
-	resp := &pgshardv1.DropStreamResponse{}
+	// A drop either happened or did not; there is no partial answer beside
+	// the error, so the failure is the status. Embedded, a stream that was
+	// not dropped came back as a successful RPC.
 	if err := s.Streams.Drop(ctx, req.GetStream()); err != nil {
-		resp.Error = &pgshardv1.Error{Message: err.Error()}
+		return nil, status.Error(codes.Internal, err.Error())
 	}
-	return resp, nil
+	return &pgshardv1.DropStreamResponse{}, nil
 }

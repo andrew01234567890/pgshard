@@ -40,12 +40,18 @@ func TestTheStreamRPCsAreFenced(t *testing.T) {
 			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), c.want) {
 				t.Errorf("CopyTables: %v, want FailedPrecondition %q", err, c.want)
 			}
-			resp, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Stream: "orders", Lsn: 1, Generation: c.gen})
-			if err != nil {
-				t.Fatal(err)
+			// Ack fails its RPC like the two above it. It used to answer
+			// OK with the refusal in the body, so a fenced ack was a
+			// successful call to everything that reads only the status.
+			_, err = s.Ack(context.Background(), &pgshardv1.AckRequest{Stream: "orders", Lsn: 1, Generation: c.gen})
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("Ack: %v, want FailedPrecondition %q", err, c.want)
 			}
-			if resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), c.want) {
-				t.Errorf("Ack: %v, want %q", resp.GetError(), c.want)
+			// And the refusal keeps its classification: a caller can tell
+			// "your view is stale, re-read it" from a failure that says
+			// nothing about whether a retry helps.
+			if got := ackReason(err); got != pgshardv1.Reason_REASON_STALE_GENERATION {
+				t.Errorf("Ack reason = %v, want STALE_GENERATION", got)
 			}
 		})
 	}
@@ -86,4 +92,14 @@ func TestAStaleViewRefusesStreams(t *testing.T) {
 	if !strings.Contains(err.Error(), "catalog view is stale") {
 		t.Fatalf("Stream on a stale pooler: %v", err)
 	}
+}
+
+// ackReason reads the Error the pooler attaches to a refused ack.
+func ackReason(err error) pgshardv1.Reason {
+	for _, d := range status.Convert(err).Details() {
+		if e, ok := d.(*pgshardv1.Error); ok {
+			return e.GetReason()
+		}
+	}
+	return pgshardv1.Reason_REASON_UNSPECIFIED
 }

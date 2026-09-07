@@ -16,6 +16,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -196,8 +197,11 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pg
 	}
 	live := s.liveStream(req.GetStream())
 	if live == nil {
-		return &pgshardv1.VStreamAckResponse{Error: &pgshardv1.Error{Sqlstate: "55000",
-			Message: fmt.Sprintf("stream %q is not open on this router, so an ack cannot be checked against what was delivered; ack inside the stream, or on the router serving it", req.GetStream())}}, nil
+		// FailedPrecondition, not Internal: another router is serving the
+		// stream and the same ack sent there succeeds, which is something
+		// a consumer can act on.
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"stream %q is not open on this router, so an ack cannot be checked against what was delivered; ack inside the stream, or on the router serving it", req.GetStream())
 	}
 	for sh, lsn := range positionFrom(req.GetPosition()) {
 		delivered, ok := live.at(sh)
@@ -211,10 +215,40 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pg
 			continue
 		}
 		if _, err := s.ackShard(ctx, req.GetStream(), sh, lsn); err != nil {
-			return &pgshardv1.VStreamAckResponse{Error: &pgshardv1.Error{Message: fmt.Sprintf("shard %s/%d: %v", sh.Set, sh.ID, err)}}, nil
+			return nil, shardAckErr(sh, err)
 		}
 	}
 	return &pgshardv1.VStreamAckResponse{}, nil
+}
+
+// shardAckErr names the shard on a failure the pooler reported, keeping the
+// status whole.
+//
+// Rebuilding it from the code and the message alone -- which is what
+// status.Errorf(status.Code(err), ...) does -- drops the details, and the
+// details are where the pooler says whether the refusal was a stale
+// generation. A consumer would then be left with FailedPrecondition, which
+// this RPC also returns for a stream that is open on another router, and no
+// way to tell the two apart.
+func shardAckErr(sh router.Shard, err error) error {
+	st := status.Convert(err)
+	out := status.New(st.Code(), fmt.Sprintf("shard %s/%d: %s", sh.Set, sh.ID, st.Message()))
+	if d, derr := out.WithDetails(detailsOf(st)...); derr == nil {
+		out = d
+	}
+	return out.Err()
+}
+
+// detailsOf is the status's details as messages, dropping any that will not
+// unmarshal -- a detail nobody here can read is not worth failing over.
+func detailsOf(st *status.Status) []protoadapt.MessageV1 {
+	var out []protoadapt.MessageV1
+	for _, d := range st.Details() {
+		if m, ok := d.(protoadapt.MessageV1); ok {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // ackShard returns the LSN the pooler confirmed, which is the ack clamped to
@@ -228,10 +262,11 @@ func (s *Server) ackShard(ctx context.Context, stream string, sh router.Shard, l
 	r, err := client.Ack(ctx, &pgshardv1.AckRequest{Stream: stream, Lsn: lsn,
 		Generation: &pgshardv1.Generation{ShardMapGeneration: s.Topology.Generation(), PrimaryEpoch: s.Topology.Epoch(sh)}})
 	if err != nil {
+		// The failure is the status now, detail and all: an ack that
+		// confirmed nothing used to arrive as a successful RPC carrying an
+		// error in its body, and reading it here turned a classified
+		// refusal into a bare message.
 		return 0, err
-	}
-	if r.GetError() != nil {
-		return 0, errors.New(r.GetError().GetMessage())
 	}
 	return r.GetConfirmedLsn(), nil
 }
