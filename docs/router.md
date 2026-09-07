@@ -1018,6 +1018,20 @@ wants its one application role to have the whole router; set it wherever more
 than one tenant shares a router, so one of them cannot take it from the
 others. A role that carries its own `connection_limit` keeps it.
 
+Both limits are per router, so a role's cluster-wide allowance is its limit
+times the number of routers behind the Service -- the same shape as
+PostgreSQL's own per-instance limit, and not what `ALTER ROLE ... CONNECTION
+LIMIT` looks like it promises. Making it cluster-wide needs shared
+accounting and is not built (PGS-309).
+
+Lowering a limit reaches the sessions already open: the role-refresh sweep
+ends the newest sessions above the new allowance, since those are the ones
+it would no longer admit, and leaves the older ones a pool has settled on.
+Revoking a role's login, deleting it and letting its password expire end
+its live sessions the same way, on the same sweep -- a limit is checked when
+a session connects, so without this a role kept whatever the old allowance
+had let it take.
+
 For a local stack, `pgshard-router dev-bootstrap` migrates the catalog and
 registers a database, a role (password from `PGSHARD_DEV_PASSWORD`) and one
 shard's pooler endpoint (`--shard-id`, default 0), and creates the same role

@@ -403,6 +403,12 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			if n := srv.TerminateWhere(func(user string) bool { return !roles.MayLogIn(user) }); n > 0 {
 				logger.Info("terminated sessions of roles that may no longer log in", "sessions", n)
 			}
+			// A lowered connection limit is a revocation too: it is checked
+			// when a session connects, so without this the sessions already
+			// open keep whatever the old allowance let the role take.
+			if n := srv.TerminateExcess(roles.ConnectionLimit); n > 0 {
+				logger.Info("terminated sessions a role held beyond its connection limit", "sessions", n)
+			}
 		}
 	}()
 	go func() { errc <- srv.Serve(l) }()
