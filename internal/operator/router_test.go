@@ -140,7 +140,8 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 	// operator-deployed cluster. The database comes from the request, so
 	// the DSN only has to reach the local server.
 	for _, want := range []string{"pgshard-pooler run", "--listen :9091", "--pg-socket-dir /tmp", "--catalog-dsn ", "--shard-set catalog", "--shard-id 0",
-		"--stream-dsn host=/tmp user=postgres dbname=postgres", "--insecure-dev"} {
+		"--stream-dsn host=/tmp user=" + catalog.PoolerRole + " dbname=postgres",
+		"--stream-password-file /etc/pgshard/pooler/password", "--insecure-dev"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("command %q lacks %q", got, want)
 		}
@@ -152,16 +153,21 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 		pooler.ReadinessProbe.HTTPGet.Path != "/healthz" || pooler.ReadinessProbe.HTTPGet.Port.IntValue() != 9127 {
 		t.Errorf("readiness %+v", pooler.ReadinessProbe)
 	}
-	// Two credentials, from two Secrets. PGPASSWORD is the superuser's and
-	// libpq applies it to every connection, so it is the local socket's --
-	// the one that creates and reads replication slots. The catalog
-	// connection reads the shard map as the router's login role, with its
-	// password mounted from that role's own Secret, so a compromised pooler
-	// no longer holds the credential that is direct write access to every
-	// shard.
-	if len(pooler.Env) != 1 || pooler.Env[0].Name != "PGPASSWORD" || pooler.Env[0].ValueFrom == nil ||
-		pooler.Env[0].ValueFrom.SecretKeyRef.Name != SecretName(c.Name) {
-		t.Errorf("PGPASSWORD must be the superuser Secret, for the local socket: %+v", pooler.Env)
+	// Two credentials, from two Secrets, and NO PGPASSWORD: libpq applies
+	// that variable to every connection that lacks a password of its own,
+	// so one variable here would hand both connections the same identity --
+	// and the identity it used to hand them was the superuser's, which is
+	// direct write access to every shard. This container terminates the
+	// data plane; neither credential it now holds can write anything.
+	for _, e := range pooler.Env {
+		if e.Name == "PGPASSWORD" {
+			t.Errorf("the pooler still carries PGPASSWORD: %+v", e)
+		}
+	}
+	for _, m := range pooler.VolumeMounts {
+		if m.Name == "secret" {
+			t.Errorf("the pooler still mounts the superuser Secret at %s", m.MountPath)
+		}
 	}
 	if !strings.Contains(got, "--catalog-dsn "+RouterCatalogDSN(c)) {
 		t.Errorf("the catalog connection must be the router role: %q", got)

@@ -29,6 +29,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pki"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/pprofserve"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -55,7 +56,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN; when set, generation and epoch come from the catalog")
-	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn; the environment's PGPASSWORD is left for the local server")
+	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn")
 	shardSet := fs.String("shard-set", "", "shard set of this shard (with --catalog-dsn)")
 	shardID := fs.Int("shard-id", 0, "shard id of this shard (with --catalog-dsn)")
 	generation := fs.Uint64("generation", 0, "static shard-map generation (without --catalog-dsn)")
@@ -66,7 +67,8 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	maxIdle := fs.Duration("backend-max-idle", 10*time.Minute, "close backends idle longer than this")
 	reserveTimeout := fs.Duration("reserve-timeout", 5*time.Minute, "release a reserved session whose Execute stream has been gone this long")
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to let in-flight transactions finish on shutdown")
-	streamDSN := fs.String("stream-dsn", "", "superuser DSN for change-stream replication connections (enables Stream)")
+	streamDSN := fs.String("stream-dsn", "", "DSN for change-stream replication connections (enables Stream)")
+	streamPasswordFile := fs.String("stream-password-file", "", "file holding the password for --stream-dsn")
 	streamShard := fs.String("stream-shard", "", "group name used in stream slot names (default derived from --shard-set/--shard-id)")
 	metricsListen := fs.String("metrics-listen", "", "HTTP address for /metrics (empty disables)")
 	pprofListen := fs.String("pprof-listen", "", "HTTP address for /debug/pprof (empty disables; profiling runs only)")
@@ -109,17 +111,36 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
 		return cli.ExitUsage
 	}
+	// Both users of the stream DSN -- the recovery probe below and the
+	// change-stream RPCs -- get it with its password already in it.
+	streamWithPassword, err := withPasswordFile(*streamDSN, *streamPasswordFile, "stream")
+	if err != nil {
+		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
+		return cli.ExitUsage
+	}
+	*streamDSN = streamWithPassword
+	// Parsed here rather than on the first Stream call: a malformed DSN is
+	// a startup mistake, and answering every change-stream request with an
+	// Internal error is a poor way to report one.
+	if *streamDSN != "" {
+		if _, err := pgconn.ParseConfig(*streamDSN); err != nil {
+			fmt.Fprintf(stderr, "pgshard-pooler run: --stream-dsn: %v\n", err)
+			return cli.ExitUsage
+		}
+	}
+
 	dialer := pooler.Dialer{Address: addr, Timeout: 5 * time.Second, TLS: backendTLS}
 	base := pooler.View{Generation: *generation, Epoch: *epoch, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true}
 	var source pooler.Source = pooler.NewStaticSource(base)
 	snapshotAge := func() float64 { return -1 }
 	if *catalogDSN != "" {
-		// The catalog login is its own credential. PGPASSWORD is the
-		// superuser's, for the local socket that reads replication slots,
-		// and libpq would apply it to both connections -- so this one
-		// carries its password in the DSN, read from a file rather than
-		// written into a pod spec.
-		dsn, err := withPasswordFile(*catalogDSN, *catalogPasswordFile)
+		// Each connection carries its own credential in its own DSN, read
+		// from a file rather than written into a pod spec or argv. There is
+		// no PGPASSWORD to fall back on, and there deliberately is not:
+		// libpq applies it to every connection that lacks a password of its
+		// own, so one variable would hand both connections the same
+		// identity.
+		dsn, err := withPasswordFile(*catalogDSN, *catalogPasswordFile, "catalog")
 		if err != nil {
 			fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
 			return cli.ExitUsage
@@ -270,19 +291,19 @@ func backendTLSConfig(mode, rootCert, host string) (*tls.Config, error) {
 }
 
 // withPasswordFile adds the password in path to a libpq keyword/value DSN.
-// An empty path leaves the DSN alone, so a caller that has PGPASSWORD for
-// this connection keeps working.
-func withPasswordFile(dsn, path string) (string, error) {
+// An empty path leaves the DSN alone, so a pooler run by hand against a DSN
+// that already carries its credential still works.
+func withPasswordFile(dsn, path, what string) (string, error) {
 	if path == "" {
 		return dsn, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("catalog password file: %w", err)
+		return "", fmt.Errorf("%s password file: %w", what, err)
 	}
 	pw := strings.TrimRight(string(b), "\r\n")
 	if pw == "" {
-		return "", fmt.Errorf("catalog password file %s is empty", path)
+		return "", fmt.Errorf("the %s password file is empty", what)
 	}
 	// libpq quoting: single quotes around the value, backslash before a
 	// quote or a backslash inside it.

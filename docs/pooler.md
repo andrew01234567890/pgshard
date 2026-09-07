@@ -169,6 +169,18 @@ pgshard-pooler run --listen 0.0.0.0:15432 --pg-socket-dir /var/run/postgresql \
 `--pg-host/--pg-port` replace `--pg-socket-dir` for TCP. `--help` and
 `--version` behave as for every pgshard command.
 
+Each of the pooler's own connections carries its own credential, read from a
+file rather than taken from the environment: `--catalog-password-file` for
+`--catalog-dsn`, which reaches the catalog as `pgshard_router`, and
+`--stream-password-file` for `--stream-dsn`, which reaches the local server
+as `pgshard_pooler`. Neither can write anything. There is deliberately no
+`PGPASSWORD` fallback in an operator-deployed pooler: libpq applies that
+variable to every connection lacking a password of its own, so one variable
+would hand both connections the same identity — and the identity it used to
+hand them was the superuser's, which is direct write access to every shard.
+Client sessions are unaffected; they reach PostgreSQL as the real user with
+the SCRAM keys the router forwards.
+
 ## Testing
 
 `go test ./internal/pooler/` runs unit tests against an in-process fake

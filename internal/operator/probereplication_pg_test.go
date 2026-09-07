@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -32,12 +33,12 @@ func TestTheReplicationRoleCanStreamRewindAndNothingElse(t *testing.T) {
 	}
 	ctx := context.Background()
 	dsn := startProbePostgres(t)
-	if err := (PgxProber{}).EnsureReplicationRole(ctx, dsn, "s3cr3t"); err != nil {
+	if err := (PgxProber{}).EnsureGroupLogins(ctx, dsn, []GroupLogin{ReplicationLogin("s3cr3t"), PoolerLogin("p00l")}); err != nil {
 		t.Fatal(err)
 	}
 	// Twice: it runs on every pass, and a group rebuilt from elsewhere comes
 	// back with whatever password it was cloned with.
-	if err := (PgxProber{}).EnsureReplicationRole(ctx, dsn, "rotated"); err != nil {
+	if err := (PgxProber{}).EnsureGroupLogins(ctx, dsn, []GroupLogin{ReplicationLogin("rotated"), PoolerLogin("p00l")}); err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
 
@@ -132,7 +133,7 @@ func TestTheRenderedConninfoConnectsAsTheRoleItNames(t *testing.T) {
 	}
 	ctx := context.Background()
 	dsn := startProbePostgres(t)
-	if err := (PgxProber{}).EnsureReplicationRole(ctx, dsn, "s3cr3t"); err != nil {
+	if err := (PgxProber{}).EnsureGroupLogins(ctx, dsn, []GroupLogin{ReplicationLogin("s3cr3t"), PoolerLogin("p00l")}); err != nil {
 		t.Fatal(err)
 	}
 	at, err := pgx.ParseConfig(dsn)
@@ -205,24 +206,142 @@ func TestTheReplicationPasswordIsOnlyWrittenWhenItChanges(t *testing.T) {
 		return *v
 	}
 
-	if err := (PgxProber{}).EnsureReplicationRole(ctx, dsn, "first"); err != nil {
+	if err := (PgxProber{}).EnsureGroupLogins(ctx, dsn, []GroupLogin{ReplicationLogin("first")}); err != nil {
 		t.Fatal(err)
 	}
 	first := stored()
 	if first == "" {
 		t.Fatal("no verifier was written at all")
 	}
-	if err := (PgxProber{}).EnsureReplicationRole(ctx, dsn, "first"); err != nil {
+	if err := (PgxProber{}).EnsureGroupLogins(ctx, dsn, []GroupLogin{ReplicationLogin("first")}); err != nil {
 		t.Fatal(err)
 	}
 	if stored() != first {
 		t.Error("the same password rewrote the verifier; every pass would churn pg_authid and its WAL")
 	}
 	// A rotated Secret, or a group restored with an older one, still lands.
-	if err := (PgxProber{}).EnsureReplicationRole(ctx, dsn, "second"); err != nil {
+	if err := (PgxProber{}).EnsureGroupLogins(ctx, dsn, []GroupLogin{ReplicationLogin("second")}); err != nil {
 		t.Fatal(err)
 	}
 	if stored() == first {
 		t.Error("a changed password did not reach the role, so a restored group stays locked out")
+	}
+}
+
+// The pooler opens change-stream connections as its own role, not as the
+// superuser: it terminates the data plane, and everything it does on this
+// connection is a read. Each capability below is granted separately by
+// PostgreSQL, and a missing one shows up only when a stream is started --
+// so they are exercised against a real server rather than asserted.
+func TestThePoolerRoleCanStreamAndCopyAndWriteNothing(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgresLogical(t)
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close(context.Background()) })
+	for _, sql := range []string{
+		`CREATE TABLE t (id int primary key, v text)`,
+		`INSERT INTO t VALUES (1, 'a')`,
+		// A table under row-level security, which the copy must still read
+		// in full: logical decoding applies no policy, so a copy that did
+		// would hand a consumer a subset and then start sending it
+		// everything, with nothing raised anywhere.
+		`CREATE TABLE secret (id int primary key, owner text)`,
+		`INSERT INTO secret VALUES (1, 'alice'), (2, 'bob')`,
+		`ALTER TABLE secret ENABLE ROW LEVEL SECURITY`,
+		`CREATE POLICY own ON secret USING (owner = current_user)`,
+		`CREATE PUBLICATION pgshard_all FOR ALL TABLES`,
+	} {
+		if _, err := admin.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := (PgxProber{}).EnsureGroupLogins(ctx, dsn, []GroupLogin{PoolerLogin("p00l")}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.User = catalog.PoolerRole
+
+	// The logical decoding connection, and the slot a stream exports its
+	// snapshot from.
+	rc := cfg.Copy()
+	rc.RuntimeParams["replication"] = "database"
+	repl, err := pgconn.ConnectConfig(ctx, rc)
+	if err != nil {
+		t.Fatalf("the pooler role cannot open a logical replication connection: %v", err)
+	}
+	t.Cleanup(func() { _ = repl.Close(context.Background()) })
+	rows, err := repl.Exec(ctx, "CREATE_REPLICATION_SLOT probe TEMPORARY LOGICAL pgoutput EXPORT_SNAPSHOT").ReadAll()
+	if err != nil {
+		t.Fatalf("CREATE_REPLICATION_SLOT: %v", err)
+	}
+	snapshot := string(rows[0].Rows[0][2])
+
+	// The copy that snapshot is read through: user tables it has no grant
+	// of its own on, which is what pg_read_all_data is for.
+	copyConn, err := pgconn.ConnectConfig(ctx, cfg.Copy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = copyConn.Close(context.Background()) })
+	if err := copyConn.Exec(ctx,
+		"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '"+snapshot+
+			"'; SET LOCAL row_security = off").Close(); err != nil {
+		t.Fatalf("import the exported snapshot: %v", err)
+	}
+	if _, err := copyConn.Exec(ctx, "SELECT count(*) FROM t").ReadAll(); err != nil {
+		t.Errorf("the pooler role cannot read the tables a stream copies: %v", err)
+	}
+	// Every row, not the ones a policy would leave. pg_read_all_data grants
+	// SELECT and does not bypass a policy; the superuser this replaced did,
+	// silently, which is why nothing noticed the difference.
+	rows2, err := copyConn.Exec(ctx, "SELECT count(*) FROM secret").ReadAll()
+	if err != nil {
+		t.Errorf("reading a table under row-level security: %v", err)
+	} else if got := string(rows2[0].Rows[0][0]); got != "2" {
+		t.Errorf("the copy sees %s of 2 rows under a row-level policy; the stream would then send all of them", got)
+	}
+	if _, err := copyConn.Exec(ctx, "SELECT * FROM pg_publication_tables").ReadAll(); err != nil {
+		t.Errorf("pg_publication_tables: %v", err)
+	}
+	_ = copyConn.Exec(ctx, "COMMIT").Close()
+
+	// START_REPLICATION holds the connection open when it is accepted, so
+	// the only answer that means anything here is a refusal.
+	sctx, scancel := context.WithTimeout(ctx, 4*time.Second)
+	_, err = repl.Exec(sctx, "START_REPLICATION SLOT probe LOGICAL 0/0 (proto_version '4', publication_names 'pgshard_all')").ReadAll()
+	scancel()
+	if refused(err) || (err != nil && strings.Contains(err.Error(), "must be")) {
+		t.Errorf("START_REPLICATION was refused: %v", err)
+	}
+
+	// And it writes nothing at all.
+	pcfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pcfg.User = catalog.PoolerRole
+	plain, err := pgx.ConnectConfig(ctx, pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plain.Close(context.Background()) })
+	for _, sql := range []string{
+		`INSERT INTO t VALUES (2, 'b')`,
+		`ALTER SYSTEM SET default_transaction_read_only = on`,
+		`CREATE ROLE probe_role LOGIN`,
+	} {
+		if _, err := plain.Exec(ctx, sql); !refused(err) {
+			t.Errorf("the pooler role can run %s (%v)", sql, err)
+		}
 	}
 }

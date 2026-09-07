@@ -240,6 +240,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if _, err := r.ensureReplicationSecret(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("replication secret: %w", err)
 	}
+	if _, err := r.ensurePoolerSecret(ctx, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("pooler secret: %w", err)
+	}
 	if _, err := r.ensureRouterSecret(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("router secret: %w", err)
 	}
@@ -454,16 +457,32 @@ func (r *ClusterReconciler) ensureReplicationSecret(ctx context.Context, c *pgsh
 	return r.ensureLoginSecret(ctx, c, ReplicationSecretName(c.Name), catalog.ReplicationRole)
 }
 
-// ensureReplicationRole gives one group's primary the role its standbys
-// stream as. It runs on every pass for the same reason the catalog logins'
-// passwords are reapplied on every pass: a group restored or rebuilt from
-// elsewhere comes back with whatever password it was cloned with.
-func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string) error {
-	pw, err := r.ensureReplicationSecret(ctx, c)
+// ensureGroupLogins gives one group's primary the login roles every group
+// carries: the one its standbys stream as, and the one its poolers open
+// change streams with. Both run on every pass for the same reason the
+// catalog logins' passwords are reapplied on every pass -- a group restored
+// or rebuilt from elsewhere comes back with whatever passwords it was
+// cloned with. Physical replication carries the roles to the standbys, so
+// only the primary is told.
+func (r *ClusterReconciler) ensureGroupLogins(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string) error {
+	replication, err := r.ensureReplicationSecret(ctx, c)
 	if err != nil {
 		return err
 	}
-	return r.Prober.EnsureReplicationRole(ctx, dsn, pw)
+	pooler, err := r.ensurePoolerSecret(ctx, c)
+	if err != nil {
+		return err
+	}
+	return r.Prober.EnsureGroupLogins(ctx, dsn, []GroupLogin{
+		ReplicationLogin(replication), PoolerLogin(pooler),
+	})
+}
+
+// ensurePoolerSecret generates the password the pooler's change-stream
+// connections use. Not the superuser's: the pooler terminates the data
+// plane, and this credential can read but not write.
+func (r *ClusterReconciler) ensurePoolerSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	return r.ensureLoginSecret(ctx, c, PoolerSecretName(c.Name), catalog.PoolerRole)
 }
 
 // ensureLoginSecret returns the cluster's generated password for one login
@@ -1115,8 +1134,8 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	// slots, synchronous_standby_names and the rollout down with it for as
 	// long as the pause lasted.
 	if !pstate.WritesPaused {
-		if err := r.ensureReplicationRole(ctx, c, dsn); err != nil {
-			logf.FromContext(ctx).Info("could not maintain the replication role; continuing",
+		if err := r.ensureGroupLogins(ctx, c, dsn); err != nil {
+			logf.FromContext(ctx).Info("could not maintain the group's login roles; continuing",
 				"group", g.Name(), "err", err)
 		}
 	}

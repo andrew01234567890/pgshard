@@ -613,6 +613,10 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 				// same reason.
 				{Name: replicationVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 					SecretName: ReplicationSecretName(c.Name)}}},
+				// And the pooler's own, which is the credential that
+				// replaced the superuser in that container.
+				{Name: poolerLoginVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName: PoolerSecretName(c.Name)}}},
 				{Name: "pg-socket", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 			},
 		},
@@ -655,14 +659,6 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		// The catalog, as the router's login role rather than the
 		// superuser: this connection only reads the shard map's generation
 		// and epoch, so it does not need more.
-		//
-		// The superuser password stays in PGPASSWORD for the local socket
-		// below, which creates and reads replication slots and genuinely
-		// needs it. So the container holds two credentials and one of them
-		// is still the superuser's. That no longer reaches the agent
-		// control plane -- the token hashed from this password was
-		// withdrawn in PGS-572 -- but the shard access it grants is its
-		// own problem, which is PGS-591.
 		"--catalog-dsn", RouterCatalogDSN(c),
 		"--catalog-password-file", poolerCatalogPasswordDir + "/" + secretKey,
 		"--shard-set", shardSet,
@@ -670,13 +666,20 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		// Without a DSN the pooler refuses every Stream and CopyTables
 		// call, so a change stream fails on the first request. The
 		// database is taken from the request, so this one only has to
-		// reach the local server; PGPASSWORD is already in the env.
-		"--stream-dsn", fmt.Sprintf("host=%s user=%s dbname=postgres", pgSocketDir, superuserName),
+		// reach the local server.
+		//
+		// As its own role, and no longer as the superuser: this container
+		// terminates the data plane, and what it needs here is to read --
+		// logical decoding, the snapshot a stream starts from, and the
+		// tables that snapshot is copied out of. It holds two credentials
+		// and neither can write anything.
+		"--stream-dsn", fmt.Sprintf("host=%s user=%s dbname=postgres", pgSocketDir, catalog.PoolerRole),
+		"--stream-password-file", poolerLoginDir + "/" + secretKey,
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: "pg-socket", MountPath: pgSocketDir},
-		{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
 		{Name: poolerCatalogSecretVolume, MountPath: poolerCatalogPasswordDir, ReadOnly: true},
+		{Name: poolerLoginVolume, MountPath: poolerLoginDir, ReadOnly: true},
 	}
 	if internalTLSEnabled(c) {
 		dir, vol := internalTLSMountPath, internalTLSVolume
@@ -699,8 +702,10 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		Image:   Image(c),
 		Command: []string{"pgshard-pooler"},
 		Args:    args,
-		Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: SecretName(c.Name)}, Key: secretKey}}}},
+		// No PGPASSWORD and no superuser Secret: both of this container's
+		// connections carry their own credential from their own file.
+		// libpq applies PGPASSWORD to any connection without one, which is
+		// exactly why it cannot stay here.
 		Ports: []corev1.ContainerPort{
 			{Name: "pooler-grpc", ContainerPort: poolerGRPCPort},
 			{Name: "pooler-metrics", ContainerPort: poolerMetricsPort},

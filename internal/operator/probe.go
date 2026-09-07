@@ -60,9 +60,9 @@ type Prober interface {
 	WriteFenced(ctx context.Context, dsn string) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
 	SetLoginPassword(ctx context.Context, dsn, role, password string) error
-	// EnsureReplicationRole creates or updates the role a standby streams
-	// as on the group's primary, given a superuser DSN for it.
-	EnsureReplicationRole(ctx context.Context, dsn, password string) error
+	// EnsureGroupLogins creates or updates the login roles every group
+	// carries, given a superuser DSN for its primary.
+	EnsureGroupLogins(ctx context.Context, dsn string, logins []GroupLogin) error
 	// SeedBootstrapRole publishes a SCRAM verifier for rolname in
 	// pgshard.roles, so the generated credential can reach the cluster
 	// through the router and create the first role of its own.
@@ -764,51 +764,111 @@ func (PgxProber) SetLoginPassword(ctx context.Context, dsn, role, password strin
 	return err
 }
 
-// EnsureReplicationRole creates the role a standby streams as, and gives it
+// GroupLogin is one login role every group carries, with the attributes it
+// is created with and the grants it needs. Neither is derivable from the
+// role name, and both are what the operator has to reapply on a group
+// restored or rebuilt from elsewhere.
+type GroupLogin struct {
+	Role     string
+	Password string
+	// Attributes follows CREATE ROLE / ALTER ROLE, e.g. "LOGIN REPLICATION
+	// NOSUPERUSER". It is a constant of the program, never user input.
+	Attributes string
+	// Grants are GRANT <this> TO <role> -- predefined roles, or a function
+	// signature for EXECUTE.
+	Grants    []string
+	Functions []string
+}
+
+// ReplicationLogin is the role a standby streams as. Its function grants are
+// what pg_rewind needs from a source it is not superuser on (see its Notes);
+// without them the rejoin after a failover falls through to a full re-clone,
+// which is the same outcome with hours of copying.
+func ReplicationLogin(password string) GroupLogin {
+	return GroupLogin{
+		Role:       catalog.ReplicationRole,
+		Password:   password,
+		Attributes: "LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS",
+		Functions: []string{
+			"pg_catalog.pg_ls_dir(text, boolean, boolean)",
+			"pg_catalog.pg_stat_file(text, boolean)",
+			"pg_catalog.pg_read_binary_file(text)",
+			"pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean)",
+		},
+	}
+}
+
+// PoolerLogin is the role the pooler opens change-stream connections with.
+// REPLICATION for the logical decoding connection and the slot it exports a
+// snapshot from; pg_read_all_data for the tables that snapshot is then
+// copied out of. It can write nothing.
+//
+// BYPASSRLS because a stream's initial copy has to deliver the same rows the
+// stream itself will: logical decoding applies no row-level security, so a
+// copier that DID would hand a consumer a subset and then start sending it
+// everything, with no error anywhere. pg_read_all_data grants SELECT and
+// does not bypass a policy -- as the superuser this connection used to did,
+// silently, which is why nothing noticed. The role still cannot write, so
+// bypassing a read policy is the whole of what this adds.
+func PoolerLogin(password string) GroupLogin {
+	return GroupLogin{
+		Role:       catalog.PoolerRole,
+		Password:   password,
+		Attributes: "LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS",
+		Grants:     []string{"pg_read_all_data"},
+	}
+}
+
+// EnsureGroupLogins creates the login roles a group carries and gives each
 // the password the operator generated for this cluster. It runs on every
 // pass for the same reason SetLoginPassword does: a group restored or
-// rebuilt from elsewhere comes back with whatever password it was cloned
-// with, and this is what puts it back in step with the Secret.
-//
-// The grants are what pg_rewind needs from a source it is not superuser on
-// (see its Notes). Without them the rejoin after a failover falls through to
-// a full re-clone, which is the same outcome with hours of copying.
-func (PgxProber) EnsureReplicationRole(ctx context.Context, dsn, password string) error {
+// rebuilt from elsewhere comes back with whatever passwords it was cloned
+// with, and this is what puts it back in step with the Secrets.
+func (PgxProber) EnsureGroupLogins(ctx context.Context, dsn string, logins []GroupLogin) error {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	role := pgx.Identifier{catalog.ReplicationRole}.Sanitize()
+	for _, l := range logins {
+		if err := ensureGroupLogin(ctx, conn, l); err != nil {
+			return fmt.Errorf("%s: %w", l.Role, err)
+		}
+	}
+	return nil
+}
+
+func ensureGroupLogin(ctx context.Context, conn *pgx.Conn, l GroupLogin) error {
+	role := pgx.Identifier{l.Role}.Sanitize()
 	if _, err := conn.Exec(ctx, `DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '`+catalog.ReplicationRole+`') THEN
-			CREATE ROLE `+role+` LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '`+l.Role+`') THEN
+			CREATE ROLE `+role+` `+l.Attributes+`;
 		END IF;
 	END $$`); err != nil {
 		return err
 	}
-	// Only when it does not already hold this password. ALTER ROLE draws a
+	// The password only when it is not already this one. ALTER ROLE draws a
 	// fresh SCRAM salt every time, so running it on every pass would write
 	// pg_authid and its WAL on every pass for every group -- and under
 	// log_statement=ddl it would put the password in each primary's log
 	// that often too.
 	var current *string
 	if err := conn.QueryRow(ctx,
-		`SELECT rolpassword FROM pg_authid WHERE rolname = $1`, catalog.ReplicationRole).Scan(&current); err != nil {
+		`SELECT rolpassword FROM pg_authid WHERE rolname = $1`, l.Role).Scan(&current); err != nil {
 		return err
 	}
-	if !scramMatches(current, password) {
-		if _, err := conn.Exec(ctx, `ALTER ROLE `+role+
-			` WITH LOGIN REPLICATION NOSUPERUSER PASSWORD `+quoteLiteral(password)); err != nil {
+	if !scramMatches(current, l.Password) {
+		if _, err := conn.Exec(ctx, `ALTER ROLE `+role+` WITH `+l.Attributes+
+			` PASSWORD `+quoteLiteral(l.Password)); err != nil {
 			return err
 		}
 	}
-	for _, fn := range []string{
-		"pg_catalog.pg_ls_dir(text, boolean, boolean)",
-		"pg_catalog.pg_stat_file(text, boolean)",
-		"pg_catalog.pg_read_binary_file(text)",
-		"pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean)",
-	} {
+	for _, g := range l.Grants {
+		if _, err := conn.Exec(ctx, `GRANT `+pgx.Identifier{g}.Sanitize()+` TO `+role); err != nil {
+			return err
+		}
+	}
+	for _, fn := range l.Functions {
 		if _, err := conn.Exec(ctx, `GRANT EXECUTE ON FUNCTION `+fn+` TO `+role); err != nil {
 			return err
 		}
@@ -978,10 +1038,10 @@ func (b boundedProber) SetLoginPassword(ctx context.Context, dsn, role, password
 	return b.Inner.SetLoginPassword(ctx, dsn, role, password)
 }
 
-func (b boundedProber) EnsureReplicationRole(ctx context.Context, dsn, password string) error {
+func (b boundedProber) EnsureGroupLogins(ctx context.Context, dsn string, logins []GroupLogin) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.EnsureReplicationRole(ctx, dsn, password)
+	return b.Inner.EnsureGroupLogins(ctx, dsn, logins)
 }
 
 // BootstrapVerifier implements Prober.

@@ -77,18 +77,33 @@ func mustProbeExec(t *testing.T, conn *pgx.Conn, sql string) {
 // helper rather than a shared fixture.
 func startProbePostgres(t *testing.T) string {
 	t.Helper()
+	return startProbePostgresWith(t)
+}
+
+// startProbePostgresLogical is the same server with logical decoding
+// available, which a change-stream test needs and nothing else does.
+func startProbePostgresLogical(t *testing.T) string {
+	t.Helper()
+	return startProbePostgresWith(t, "-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8")
+}
+
+func startProbePostgresWith(t *testing.T, opts ...string) string {
+	t.Helper()
 	const image = "ghcr.io/andrew01234567890/pgshard-postgres:18"
 	if exec.Command("docker", "image", "inspect", image).Run() != nil {
 		if out, err := exec.Command("docker", "pull", image).CombinedOutput(); err != nil {
 			dockertest.Unavailable(t, "image %s unavailable: %v: %s", image, err, out)
 		}
 	}
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1::5432",
+	// The server options arrive as positional arguments after the script's
+	// own $0, which is why "sh" is there.
+	args := append([]string{"run", "-d", "--rm", "-p", "127.0.0.1::5432",
 		"--entrypoint", "sh", image, "-ec",
 		`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
 		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
 		 echo "host replication all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
+		 exec postgres -D /tmp/pgdata -c listen_addresses='*' "$@"`, "sh"}, opts...)
+	out, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)
 	}

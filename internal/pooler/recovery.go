@@ -25,7 +25,8 @@ const DefaultRecoveryInterval = 2 * time.Second
 // standing in front of a member that is no longer the primary. Recovery
 // state is the one fact about this member that the catalog cannot supply.
 type RecoveryProbe struct {
-	// DSN reaches the local server; a superuser DSN on the pod's socket.
+	// DSN reaches the local server over the pod's socket. pg_is_in_recovery
+	// needs no privilege, so this is the change stream's own login.
 	DSN string
 	// Interval defaults to DefaultRecoveryInterval.
 	Interval time.Duration

@@ -612,10 +612,12 @@ func (f *fakeProber) SetLoginPassword(_ context.Context, dsn, role, password str
 	return nil
 }
 
-func (f *fakeProber) EnsureReplicationRole(_ context.Context, dsn, password string) error {
+func (f *fakeProber) EnsureGroupLogins(_ context.Context, dsn string, logins []GroupLogin) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.replicationRoles = append(f.replicationRoles, hostOf(dsn)+"="+password)
+	for _, l := range logins {
+		f.replicationRoles = append(f.replicationRoles, hostOf(dsn)+"/"+l.Role+"="+l.Password)
+	}
 	return f.replicationRoleErr
 }
 
@@ -1379,9 +1381,26 @@ func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
 	fp.mu.Lock()
 	repApplied := append([]string(nil), fp.replicationRoles...)
 	fp.mu.Unlock()
+	// And the pooler's own, which is what replaced the superuser in that
+	// container. Both roles live on every group, so both are applied there.
+	var poolerSec corev1.Secret
+	get(t, PoolerSecretName(c.Name), &poolerSec)
+	ownedBy(t, &poolerSec, c)
+	poolerPw := string(poolerSec.Data["password"])
+	if poolerPw == repPw || poolerPw == pw || poolerPw == string(su.Data["password"]) {
+		t.Error("the pooler's password must be its own")
+	}
+	if string(poolerSec.Data["username"]) != catalog.PoolerRole {
+		t.Errorf("username %q, want %q", poolerSec.Data["username"], catalog.PoolerRole)
+	}
 	for _, g := range Groups(c) {
-		if want := g.ServiceRW() + ".default.svc=" + repPw; !slices.Contains(repApplied, want) {
-			t.Errorf("group %s was never given the replication role: %v", g.Name(), repApplied)
+		for _, want := range []string{
+			g.ServiceRW() + ".default.svc/" + catalog.ReplicationRole + "=" + repPw,
+			g.ServiceRW() + ".default.svc/" + catalog.PoolerRole + "=" + poolerPw,
+		} {
+			if !slices.Contains(repApplied, want) {
+				t.Errorf("group %s was never given %q: %v", g.Name(), want, repApplied)
+			}
 		}
 	}
 
