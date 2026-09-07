@@ -92,3 +92,40 @@ func FuzzDecodeStartupPacket(f *testing.F) {
 		}
 	})
 }
+
+// Counting was enough while a batch was refused. Running one means the text
+// handed to each statement has to be the statement and nothing else -- a
+// semicolon inside a dollar-quoted body is not a boundary, and a comment
+// between two statements belongs to neither.
+func TestSplitStatementsGivesEachStatementItsOwnText(t *testing.T) {
+	for _, c := range []struct {
+		sql  string
+		want []string
+	}{
+		{"", nil},
+		{"; ;", nil},
+		{"select 1", []string{"select 1"}},
+		{"select 1;", []string{"select 1"}},
+		{" select 1 ; select 2 ", []string{"select 1 ", "select 2 "}},
+		{"select 1;\n-- between\nselect 2", []string{"select 1", "select 2"}},
+		{"insert into t values (';'); select 2", []string{"insert into t values (';')", "select 2"}},
+		{"do $body$ begin perform 1; end $body$; select 2", []string{"do $body$ begin perform 1; end $body$", "select 2"}},
+		{"select 1 /* ; */; select 2", []string{"select 1 /* ; */", "select 2"}},
+		{"select 1;\n-- trailing", []string{"select 1"}},
+	} {
+		got, err := splitStatements(c.sql)
+		if err != nil {
+			t.Errorf("splitStatements(%q) err = %v", c.sql, err)
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("splitStatements(%q) = %q, want %q", c.sql, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("splitStatements(%q)[%d] = %q, want %q", c.sql, i, got[i], c.want[i])
+			}
+		}
+	}
+}

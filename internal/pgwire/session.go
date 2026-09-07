@@ -915,28 +915,117 @@ func (s *session) extendedError(err error) error {
 }
 
 func (s *session) simpleQuery(ctx context.Context, sql string, w *resultWriter) error {
-	n, err := countStatements(sql)
+	stmts, err := splitStatements(sql)
 	switch {
 	case err != nil:
 		s.reportError(Errorf(CodeSyntaxError, "%v", err))
 		return s.readyForQuery()
-	case n > 1:
-		s.reportError(Errorf(CodeFeatureNotSupported, "multi-statement simple queries are not supported"))
-		return s.readyForQuery()
-	case n == 0:
+	case len(stmts) == 0:
 		s.be.Send(&pgproto3.EmptyQueryResponse{})
 		return s.readyForQuery()
+	case len(stmts) > 1:
+		return s.simpleQueryBatch(ctx, stmts, w)
 	}
-	qctx, cancel := s.queryContext(ctx)
-	err = s.exec.SimpleQuery(qctx, sql, w)
-	cancel()
-	// Any CopyData still in flight after an aborted COPY is ignored by dispatch.
-	s.setCopyIn(nil)
-	if err != nil {
+	// The whole text, not the statement the splitter cut out of it: a
+	// leading comment is part of what the client sent, and a shard reads
+	// some of them -- a planner hint is a comment by design, and a query
+	// tag is one on purpose.
+	if err := s.runStatement(ctx, sql, w); err != nil {
 		if w.ioErr != nil {
 			return w.ioErr
 		}
 		s.reportError(err)
 	}
 	return s.readyForQuery()
+}
+
+// runStatement executes one statement of a simple query and leaves the
+// ReadyForQuery to the caller: a batch sends exactly one, at the end,
+// however many statements it ran.
+func (s *session) runStatement(ctx context.Context, sql string, w ResultWriter) error {
+	qctx, cancel := s.queryContext(ctx)
+	err := s.exec.SimpleQuery(qctx, sql, w)
+	cancel()
+	// Any CopyData still in flight after an aborted COPY is ignored by dispatch.
+	s.setCopyIn(nil)
+	return err
+}
+
+// simpleQueryBatch runs the statements of a multi-statement simple query.
+//
+// PostgreSQL wraps a batch the client did not open a transaction for in one
+// of its own, so the statements either all take effect or none do, and it
+// stops at the first error rather than running on. Both matter to the
+// scripts that send batches: a migration that fails halfway through a
+// semicolon-separated file must not leave half of itself applied.
+//
+// A batch sent inside a transaction the client opened is already atomic,
+// and its own COMMIT or ROLLBACK is the client's to send.
+func (s *session) simpleQueryBatch(ctx context.Context, stmts []string, w *resultWriter) error {
+	implicit := s.exec.TransactionStatus() == TxIdle
+	if implicit {
+		qctx, cancel := s.queryContext(ctx)
+		err := s.exec.BeginImplicit(qctx)
+		cancel()
+		if err != nil {
+			if w.ioErr != nil {
+				return w.ioErr
+			}
+			s.reportError(err)
+			return s.readyForQuery()
+		}
+	}
+	for i, stmt := range stmts {
+		// The last statement's completion is held back until the commit
+		// has succeeded. PostgreSQL ends the implicit transaction before
+		// it reports that statement (postgres.c, exec_simple_query) for
+		// the reason its own comment gives: a client expects either a
+		// command completion or an error, and telling it the batch
+		// finished and then that the commit failed is both.
+		out, held := ResultWriter(w), (*heldCompletion)(nil)
+		if implicit && i == len(stmts)-1 {
+			held = &heldCompletion{ResultWriter: w}
+			out = held
+		}
+		if err := s.runStatement(ctx, stmt, out); err != nil {
+			if w.ioErr != nil {
+				return w.ioErr
+			}
+			if implicit {
+				// The rollback's own failure says nothing the statement's
+				// error does not, and the client is owed that one.
+				_ = s.endImplicit(ctx, false)
+			}
+			s.reportError(err)
+			return s.readyForQuery()
+		}
+		// Still in it, unless a statement ended it: an executor that lets
+		// a batch commit its own transaction leaves nothing to close, and
+		// committing again would be a COMMIT against no transaction.
+		if held != nil && s.exec.TransactionStatus() != TxIdle {
+			if err := s.endImplicit(ctx, true); err != nil {
+				if w.ioErr != nil {
+					return w.ioErr
+				}
+				s.reportError(err)
+				return s.readyForQuery()
+			}
+		}
+		if held != nil {
+			if err := held.release(); err != nil {
+				return w.ioErr
+			}
+		}
+	}
+	return s.readyForQuery()
+}
+
+// endImplicit ends the batch's transaction under the session's query
+// context, so a CancelRequest reaches a commit that is slow -- a two-phase
+// commit across shards is the slow one -- rather than only the statements
+// before it.
+func (s *session) endImplicit(ctx context.Context, commit bool) error {
+	qctx, cancel := s.queryContext(ctx)
+	defer cancel()
+	return s.exec.EndImplicit(qctx, commit)
 }

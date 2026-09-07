@@ -145,6 +145,13 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 	if e.tx != pgwire.TxIdle {
 		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s inside a transaction block is not available through the router: DDL fans out to every shard and cannot be rolled back with the transaction", m.Kind)
 		err.Hint = "run DDL outside BEGIN/COMMIT; each shard applies it in its own transaction"
+		if e.implicitTx {
+			// The client sent no BEGIN, so a hint about its own is a hint
+			// about something it did not do. What it sent is a batch, and
+			// the transaction is the one this router opened around it.
+			err = pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s is not available inside a multi-statement simple query: it fans out to every shard and cannot be rolled back with the transaction the batch runs in", m.Kind)
+			err.Hint = "send the DDL as its own query, not as one statement of a semicolon-separated batch"
+		}
 		return err
 	}
 	if e.r.cfg.Migrations == nil {

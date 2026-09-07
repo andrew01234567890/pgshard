@@ -15,15 +15,32 @@ var errUnterminated = errors.New("unterminated quoted string or comment")
 // digit, "--" line comments and nested /* */ block comments. Identifiers may
 // contain '$', so "a$b$" is an identifier, not a dollar quote.
 func countStatements(sql string) (int, error) {
-	n := 0
+	stmts, err := splitStatements(sql)
+	return len(stmts), err
+}
+
+// splitStatements returns the text of each non-empty top-level statement,
+// without its terminating semicolon. A statement keeps whatever whitespace
+// and comments sit inside it; what precedes its first token is dropped,
+// which is where a leading comment on the batch goes.
+func splitStatements(sql string) ([]string, error) {
+	var stmts []string
+	start := 0
 	seen := false
+	// note marks the first byte of a statement: everything before it is the
+	// whitespace and comments that separate it from the one before.
+	note := func(i int) {
+		if !seen {
+			start, seen = i, true
+		}
+	}
 	i := 0
 	for i < len(sql) {
 		c := sql[i]
 		switch {
 		case c == ';':
 			if seen {
-				n++
+				stmts = append(stmts, sql[start:i])
 				seen = false
 			}
 			i++
@@ -36,54 +53,54 @@ func countStatements(sql string) (int, error) {
 		case c == '/' && i+1 < len(sql) && sql[i+1] == '*':
 			end, ok := skipBlockComment(sql, i)
 			if !ok {
-				return 0, errUnterminated
+				return nil, errUnterminated
 			}
 			i = end
 		case c == '\'':
-			seen = true
+			note(i)
 			end, ok := skipStandardString(sql, i)
 			if !ok {
-				return 0, errUnterminated
+				return nil, errUnterminated
 			}
 			i = end
 		case c == '"':
-			seen = true
+			note(i)
 			end, ok := skipQuoted(sql, i, '"')
 			if !ok {
-				return 0, errUnterminated
+				return nil, errUnterminated
 			}
 			i = end
 		case (c == 'e' || c == 'E') && i+1 < len(sql) && sql[i+1] == '\'':
-			seen = true
+			note(i)
 			end, ok := skipEscapeString(sql, i+1)
 			if !ok {
-				return 0, errUnterminated
+				return nil, errUnterminated
 			}
 			i = end
 		case c == '$':
-			seen = true
+			note(i)
 			if end, ok, isDollar := skipDollarQuote(sql, i); isDollar {
 				if !ok {
-					return 0, errUnterminated
+					return nil, errUnterminated
 				}
 				i = end
 			} else {
 				i++
 			}
 		case isIdentStart(c):
-			seen = true
+			note(i)
 			for i < len(sql) && isIdentCont(sql[i]) {
 				i++
 			}
 		default:
-			seen = true
+			note(i)
 			i++
 		}
 	}
 	if seen {
-		n++
+		stmts = append(stmts, sql[start:])
 	}
-	return n, nil
+	return stmts, nil
 }
 
 func isIdentStart(c byte) bool {

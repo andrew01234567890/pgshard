@@ -591,16 +591,10 @@ func TestExtendedProtocolAndErrorRecovery(t *testing.T) {
 	}
 }
 
-func TestMultiStatementRefusal(t *testing.T) {
+func TestSemicolonsThatAreNotStatementBoundaries(t *testing.T) {
 	ts := startServer(t, Config{})
 	c := dialRaw(t, ts.addr)
 	c.startup(ProtocolVersion30)
-	c.send(&pgproto3.Query{String: "select 1; select 1"})
-	er, ok := c.recv().(*pgproto3.ErrorResponse)
-	if !ok || er.Code != CodeFeatureNotSupported || er.Message != "multi-statement simple queries are not supported" {
-		t.Fatalf("got %+v", er)
-	}
-	c.recv()
 	c.send(&pgproto3.Query{String: "select 'unterminated; select 1"})
 	if er, ok := c.recv().(*pgproto3.ErrorResponse); !ok || er.Code != CodeSyntaxError {
 		t.Fatalf("got %+v", er)
