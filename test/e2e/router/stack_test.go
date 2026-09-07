@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -137,19 +138,74 @@ func dockerHostPort(tb testing.TB, container string) string {
 	return ""
 }
 
-// freePort is still how the pgshard binaries under test are given a listen
-// address: they take one on the command line and do not report a port they
-// chose themselves, so there is nothing to read back. The window is real but
-// small, and closing it means teaching each binary to accept :0 and say
-// where it landed.
+// freePort is how the pgshard binaries under test are given a listen
+// address: they take one on the command line, so the harness has to choose
+// it before the process exists.
+//
+// The listener is HELD rather than closed here. Closing it immediately left
+// the port unowned between the choice and the child's bind, and anything
+// else on the machine could take it -- which on a loaded CI runner it did,
+// and the test then failed with "bind: address already in use" on a diff
+// that had nothing to do with it. startProcess releases the reservation at
+// the last possible moment, so nothing but the child can win the race.
 func freePort(tb testing.TB) int {
 	tb.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		tb.Fatal(err)
 	}
-	defer func() { _ = l.Close() }()
-	return l.Addr().(*net.TCPAddr).Port
+	port := l.Addr().(*net.TCPAddr).Port
+	reservedPorts.Store(port, l)
+	tb.Cleanup(func() { releasePort(port) })
+	return port
+}
+
+// reservedPorts holds a listener per port this process has handed out and
+// whose child has not yet taken it.
+var reservedPorts sync.Map
+
+// startingProcess serialises the moment between releasing a reservation and
+// the child binding it. Without it two tests starting at once can be inside
+// that window together, and the kernel is free to hand the second the port
+// the first has just let go of.
+var startingProcess sync.Mutex
+
+func releasePort(port int) {
+	if l, ok := reservedPorts.LoadAndDelete(port); ok {
+		_ = l.(net.Listener).Close()
+	}
+}
+
+// listenFlags name an argument whose value is an address THIS process will
+// bind. A peer's address is in the arguments too and belongs to another
+// process's reservation, which is why the flag rather than the shape of the
+// value decides.
+var listenFlags = map[string]bool{
+	"--listen": true, "--peer-cancel-listen": true, "--health-listen": true,
+	"--metrics-listen": true, "--vstream-listen": true,
+}
+
+// releaseOwnPorts closes the reservations for the addresses args tells this
+// process to bind.
+func releaseOwnPorts(args []string) {
+	for i, a := range args {
+		flag, value, inline := strings.Cut(a, "=")
+		if !inline {
+			flag = a
+			if i+1 >= len(args) {
+				continue
+			}
+			value = args[i+1]
+		}
+		if !listenFlags[flag] {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(value); err == nil {
+			if n, err := strconv.Atoi(port); err == nil {
+				releasePort(n)
+			}
+		}
+	}
 }
 
 // containers maps a server's host address to the docker container running
@@ -294,9 +350,16 @@ func startProcessEnv(tb testing.TB, log *logBuffer, ready string, env []string, 
 	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout, cmd.Stderr = log, log
+	// Held until the child has reported itself listening: from the moment
+	// its ports stop being reserved to the moment it owns them, nothing
+	// else in this process may be in the same window.
+	startingProcess.Lock()
+	releaseOwnPorts(args)
 	if err := cmd.Start(); err != nil {
+		startingProcess.Unlock()
 		tb.Fatal(err)
 	}
+	defer startingProcess.Unlock()
 	waited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(waited) }()
 	tb.Cleanup(func() {
