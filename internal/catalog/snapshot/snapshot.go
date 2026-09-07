@@ -170,6 +170,16 @@ type Snapshot struct {
 	// WriteFence is set while the cluster pauses writes for a certified
 	// restore point; routers hold new writes until it clears.
 	WriteFence bool
+	// resharding and shardIDs cache what Resharding and ShardIDs would
+	// otherwise recompute per statement. Both are derived from fields that
+	// do not change after Load, so a snapshot answers them once.
+	//
+	// The slices in shardIDs are shared with every plan that asks for
+	// them. Nothing may append to or reorder what ShardIDs returns: a plan
+	// holds it for as long as it is cached, and a second plan would see
+	// the first one's edit.
+	resharding *bool
+	shardIDs   map[string][]int32
 	// migrating caches Migrating for a loaded snapshot, which the router
 	// consults on every write. nil means it was not computed -- a snapshot
 	// built directly rather than through Load -- and the scan still runs, so
@@ -214,6 +224,12 @@ func SamePlanning(a, b *Snapshot) bool {
 func (s *Snapshot) index() {
 	m := s.scanMigrating()
 	s.migrating = &m
+	r := s.scanResharding()
+	s.resharding = &r
+	s.shardIDs = make(map[string][]int32, len(s.ShardSets))
+	for set := range s.ShardSets {
+		s.shardIDs[set] = s.scanShardIDs(set)
+	}
 	s.rev = s.fingerprint()
 }
 
@@ -353,12 +369,49 @@ func (s *Snapshot) scanMigrating() bool {
 // or copied into: statements logical replication cannot carry (TRUNCATE)
 // are refused meanwhile.
 func (s *Snapshot) Resharding() bool {
+	if s.resharding != nil {
+		return *s.resharding
+	}
+	return s.scanResharding()
+}
+
+func (s *Snapshot) scanResharding() bool {
 	for _, sv := range s.Serving {
 		if sv.State == "provisioning" {
 			return true
 		}
 	}
 	return false
+}
+
+// ShardIDs is the shard ids of one shard set, ascending and without
+// repeats. A plan over every shard -- a scatter, a reference write -- is
+// this list, and it does not change for the life of a snapshot.
+//
+// The returned slice is shared. A caller that needs to change it must copy
+// it first; see the note on shardIDs.
+func (s *Snapshot) ShardIDs(set string) []int32 {
+	if ids, ok := s.shardIDs[set]; ok {
+		return ids
+	}
+	return s.scanShardIDs(set)
+}
+
+func (s *Snapshot) scanShardIDs(set string) []int32 {
+	ranges := s.ShardSets[set]
+	if len(ranges) == 0 {
+		return nil
+	}
+	out := make([]int32, 0, len(ranges))
+	for _, r := range ranges {
+		out = append(out, r.ShardID)
+	}
+	// Sort then collapse, rather than a membership test per range: the
+	// ranges of one set are one per shard today, but this runs for every
+	// set on every catalog reload and a quadratic scan is a poor thing to
+	// leave in the path of a cluster that grows.
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // ServingShardSet is ServingSet, or the default set when the snapshot was
