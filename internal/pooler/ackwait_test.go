@@ -1,6 +1,8 @@
 package pooler
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -75,28 +77,88 @@ func TestEveryWaiterHearsTheFlush(t *testing.T) {
 	}
 }
 
-// The reader parks in a receive for a quarter of a second at a time. An ack
-// that lands while it is parked waits out the rest of that before its
-// status goes out, which is most of the latency an ack pays -- so while one
-// is outstanding the wait is short.
-func TestTheReaderWaitsLessWhileAnAckIsOutstanding(t *testing.T) {
-	const normal = 250 * time.Millisecond
-	r := &streamReader{wake: make(chan struct{}, 1)}
+// The wait is woken by the flush, not by a clock. A poll would return up to
+// its own interval late, so what this measures is the delay between the
+// flush happening and the wait returning -- which a ten-millisecond poll
+// cannot keep under a millisecond, and a signal does not notice.
+//
+// Worst of several attempts, because a poll that happens to tick just after
+// the flush looks like a signal once.
+func TestTheWaitIsWokenByTheFlushRatherThanAClock(t *testing.T) {
+	var worst time.Duration
+	for i := range 9 {
+		r := &streamReader{wake: make(chan struct{}, 1)}
+		// Spread across a ten-millisecond cycle, starting just past its
+		// first tick. A poll that has just looked has to wait most of an
+		// interval before it looks again; sampling only inside the first
+		// interval would let one look like a signal.
+		delay := 11*time.Millisecond + time.Duration(i)*time.Millisecond
+		flushed := make(chan time.Time, 1)
+		go func() {
+			time.Sleep(delay)
+			flushed <- time.Now()
+			r.noteFlushed(100)
+		}()
+		if err := r.awaitFlush(context.Background(), 100, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if late := time.Since(<-flushed); late > worst {
+			worst = late
+		}
+	}
+	if worst > 5*time.Millisecond {
+		t.Fatalf("the wait returned %v after the flush at worst; a signal returns at once and a 10ms poll does not", worst)
+	}
+}
 
-	if got := receiveWait(normal, r); got != normal {
-		t.Fatalf("idle wait = %v, want the full %v", got, normal)
-	}
-	r.acked.Store(100)
-	if got := receiveWait(normal, r); got >= normal {
-		t.Fatalf("wait with an ack outstanding = %v, want less than %v", got, normal)
-	}
+// A wait that is already satisfied returns without waiting at all.
+func TestAWaitThatIsAlreadySatisfiedReturnsAtOnce(t *testing.T) {
+	r := &streamReader{wake: make(chan struct{}, 1)}
 	r.noteFlushed(100)
-	if got := receiveWait(normal, r); got != normal {
-		t.Fatalf("wait after the flush = %v, want the full %v again", got, normal)
+	start := time.Now()
+	if err := r.awaitFlush(context.Background(), 100, time.Millisecond); err != nil {
+		t.Fatalf("awaitFlush: %v", err)
 	}
-	// A deployment that configured a wait shorter than the ack-pending one
-	// keeps its own.
-	if got := receiveWait(time.Millisecond, r); got != time.Millisecond {
-		t.Fatalf("configured wait = %v, want it kept", got)
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Fatalf("took %v for a position already flushed", took)
+	}
+}
+
+// The value and the channel have to come from one lock. Reading the value
+// first and then registering leaves a window: a flush that lands in it
+// closes a channel nobody holds yet, and the waiter then waits for the next
+// one -- for a position that is already durable.
+//
+// Contention rather than a single attempt, because the window is only a few
+// instructions wide: many waiters register while flushes land underneath
+// them, and every waiter must either see a value that covers it or be woken.
+func TestRegisteringForTheNextFlushCannotMissThisOne(t *testing.T) {
+	const rounds, waiters = 300, 8
+	for round := range rounds {
+		r := &streamReader{wake: make(chan struct{}, 1)}
+		target := uint64(round + 1)
+		var wg sync.WaitGroup
+		stranded := make(chan uint64, waiters)
+		for range waiters {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				flushed, advanced := r.flushedAt()
+				if flushed >= target {
+					return
+				}
+				select {
+				case <-advanced:
+				case <-time.After(2 * time.Second):
+					stranded <- flushed
+				}
+			}()
+		}
+		go r.noteFlushed(target)
+		wg.Wait()
+		close(stranded)
+		if saw, ok := <-stranded; ok {
+			t.Fatalf("round %d: a waiter saw flushed=%d and then waited for an advance that had already happened", round, saw)
+		}
 	}
 }

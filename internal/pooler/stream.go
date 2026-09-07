@@ -98,26 +98,6 @@ type StreamConfig struct {
 // the position it advanced to.
 const ackConfirmTimeout = 10 * time.Second
 
-// ackPendingReceiveTimeout is how long the reader waits for server data
-// while an ack is still waiting for its status to go out.
-const ackPendingReceiveTimeout = 5 * time.Millisecond
-
-// receiveWait is how long the reader waits for server data before looking
-// at anything else.
-//
-// Shorter while an ack is outstanding. The standby status goes out at the
-// top of the read loop, so an ack that arrives while the receive is parked
-// waits out the whole of it before the consumer hears that its position is
-// durable -- which is most of the latency an ack pays. Nothing is lost by
-// asking sooner: a receive that times out with nothing to report is the
-// ordinary idle case, and this path already runs it several times a second.
-func receiveWait(normal time.Duration, r *streamReader) time.Duration {
-	if r.flushed.Load() < r.acked.Load() {
-		return min(normal, ackPendingReceiveTimeout)
-	}
-	return normal
-}
-
 // streamReader is the one admitted reader of a slot.
 type streamReader struct {
 	acked     atomic.Uint64
@@ -144,6 +124,32 @@ func (r *streamReader) flushedAt() (uint64, <-chan struct{}) {
 		r.progress = make(chan struct{})
 	}
 	return r.flushed.Load(), r.progress
+}
+
+// awaitFlush waits until the server has confirmed lsn.
+//
+// It waits on the flush rather than asking again on a timer: polling put
+// its own interval between the slot moving and the caller hearing so, on
+// the one path whose purpose is to tell a consumer its position is durable.
+func (r *streamReader) awaitFlush(ctx context.Context, lsn uint64, within time.Duration) error {
+	timeout := time.NewTimer(within)
+	defer timeout.Stop()
+	for {
+		flushed, advanced := r.flushedAt()
+		if flushed >= lsn {
+			return nil
+		}
+		select {
+		case <-advanced:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			// DeadlineExceeded, not Internal: the flush may well land a
+			// moment later, and the position is not lost -- the next ack
+			// asks for it again.
+			return ackErr(codes.DeadlineExceeded, &pgshardv1.Error{Sqlstate: "57014", Message: "ack not confirmed in time"})
+		}
+	}
 }
 
 // noteFlushed records how far the server has confirmed and wakes whoever is
@@ -305,23 +311,8 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	case r.wake <- struct{}{}:
 	default:
 	}
-	timeout := time.NewTimer(ackConfirmTimeout)
-	defer timeout.Stop()
-	for {
-		flushed, advanced := r.flushedAt()
-		if flushed >= lsn {
-			break
-		}
-		select {
-		case <-advanced:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timeout.C:
-			// DeadlineExceeded, not Internal: the flush may well land a
-			// moment later, and the position is not lost -- the next ack
-			// asks for it again.
-			return nil, ackErr(codes.DeadlineExceeded, &pgshardv1.Error{Sqlstate: "57014", Message: "ack not confirmed in time"})
-		}
+	if err := r.awaitFlush(ctx, lsn, ackConfirmTimeout); err != nil {
+		return nil, err
 	}
 	return &pgshardv1.AckResponse{ConfirmedLsn: lsn}, nil
 }
@@ -455,7 +446,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 			}
 		default:
 		}
-		rctx, cancel := context.WithTimeout(ctx, receiveWait(cfg.ReceiveTimeout, reader))
+		rctx, cancel := context.WithTimeout(ctx, cfg.ReceiveTimeout)
 		msg, err := conn.Receive(rctx)
 		cancel()
 		switch {
