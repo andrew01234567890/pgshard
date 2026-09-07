@@ -363,7 +363,18 @@ func (s *session) endMessage() {
 }
 
 func (s *session) queryContext(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
+	// Built once, either way. Creating the cancellable one and then
+	// replacing it would leave the first on the connection's child list
+	// until the connection ended, one per statement.
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if d := s.server.cfg.MaxQueryDuration; d > 0 {
+		ctx, cancel = context.WithTimeout(parent, d)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
 	s.mu.Lock()
 	s.queryCancel, s.queryCtx = cancel, ctx
 	revoked := s.revoked
@@ -415,10 +426,32 @@ func (s *session) cancelQuery(secret []byte) bool {
 func (s *session) setCopyIn(c *copyInStream) {
 	s.mu.Lock()
 	s.copyIn = c
-	cancelled := c != nil && s.queryCtx != nil && s.queryCtx.Err() != nil
+	var (
+		cancelled bool
+		deadline  time.Time
+	)
+	if c != nil && s.queryCtx != nil {
+		cancelled = s.queryCtx.Err() != nil
+		deadline, _ = s.queryCtx.Deadline()
+	}
 	s.mu.Unlock()
-	if cancelled {
+	switch {
+	case c == nil:
+		// Whatever the COPY put on the socket comes off with it. A
+		// deadline left behind would be the next read's, and the next read
+		// is the client's idle wait for a statement to send.
+		_ = s.conn.SetReadDeadline(time.Time{})
+	case cancelled:
 		_ = s.conn.SetReadDeadline(time.Now())
+	case !deadline.IsZero():
+		// The statement's own limit has to reach this read too. Nothing
+		// else does: the transfer is a loop of socket reads that never
+		// consults the context, so without the deadline on the socket a
+		// client that stops sending holds the COPY, its backend and its
+		// share of the drain for as long as it likes -- and one that keeps
+		// sending is stopped only once it says it has finished, having
+		// already sent everything.
+		_ = s.conn.SetReadDeadline(deadline)
 	}
 }
 
@@ -820,6 +853,42 @@ func (s *session) reportError(err error) {
 	s.be.Send(toErrorResponse(err))
 }
 
+// asQueryTimeout renames the failure of a statement this session stopped
+// itself.
+//
+// The statement's own error says whatever the transport or the shard said
+// when the context went away, which describes how it ended and not why. A
+// client is owed the reason, and PostgreSQL's own words for it: this is a
+// statement timeout, whether the clock that ran out belongs to the backend
+// or to the router in front of it.
+func (s *session) asQueryTimeout(qctx context.Context, err error) error {
+	if err == nil || s.server.cfg.MaxQueryDuration <= 0 {
+		return err
+	}
+	if qctx == nil || !errors.Is(qctx.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	e := Errorf(CodeQueryCanceled, "canceling statement due to statement timeout")
+	e.Detail = fmt.Sprintf("The router stops a statement after %s.", s.server.cfg.MaxQueryDuration)
+	return e
+}
+
+// runQuery runs one cancellable step under a context of its own and names
+// the failure of a step this session stopped itself.
+//
+// The verdict has to be taken here, while that context is still the one the
+// step ran under. Reading the session's current context later gets whatever
+// ran since -- the rollback that follows a failed batch statement, say --
+// and then a statement that timed out is reported by whatever the transport
+// said instead, and a statement that failed for its own reasons is reported
+// as a timeout because the rollback ran out of time after it.
+func (s *session) runQuery(ctx context.Context, step func(context.Context) error) error {
+	qctx, cancel := s.queryContext(ctx)
+	err := step(qctx)
+	cancel()
+	return s.asQueryTimeout(qctx, err)
+}
+
 // dispatch handles one frontend message; it returns cont=false when the
 // session should end normally and a non-nil error on I/O failure.
 func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (bool, error) {
@@ -840,32 +909,26 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		s.reportError(Errorf(CodeFeatureNotSupported, "the function call sub-protocol is not supported"))
 		return true, s.readyForQuery()
 	case *pgproto3.Parse:
-		qctx, cancel := s.queryContext(ctx)
-		err := s.exec.Parse(qctx, m.Name, m.Query, m.ParameterOIDs)
-		cancel()
+		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Parse(qctx, m.Name, m.Query, m.ParameterOIDs) })
 		if err != nil {
 			return true, s.extendedError(err)
 		}
 		s.be.Send(&pgproto3.ParseComplete{})
 	case *pgproto3.Bind:
-		qctx, cancel := s.queryContext(ctx)
-		err := s.exec.Bind(qctx, m.DestinationPortal, m.PreparedStatement, m.ParameterFormatCodes, m.Parameters, m.ResultFormatCodes)
-		cancel()
+		err := s.runQuery(ctx, func(qctx context.Context) error {
+			return s.exec.Bind(qctx, m.DestinationPortal, m.PreparedStatement, m.ParameterFormatCodes, m.Parameters, m.ResultFormatCodes)
+		})
 		if err != nil {
 			return true, s.extendedError(err)
 		}
 		s.be.Send(&pgproto3.BindComplete{})
 	case *pgproto3.Describe:
-		qctx, cancel := s.queryContext(ctx)
-		err := s.exec.Describe(qctx, DescribeKind(m.ObjectType), m.Name, w)
-		cancel()
+		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Describe(qctx, DescribeKind(m.ObjectType), m.Name, w) })
 		if err != nil {
 			return true, s.extendedError(err)
 		}
 	case *pgproto3.Execute:
-		qctx, cancel := s.queryContext(ctx)
-		err := s.exec.Execute(qctx, m.Portal, int32(m.MaxRows), w)
-		cancel()
+		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Execute(qctx, m.Portal, int32(m.MaxRows), w) })
 		if err != nil {
 			return true, s.extendedError(err)
 		}
@@ -878,9 +941,7 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		// Flush must produce the answers to what has been staged, not only
 		// push bytes already written: a pipelined client sends Execute
 		// then Flush and waits, so buffering until Sync hangs it.
-		qctx, cancel := s.queryContext(ctx)
-		err := s.exec.Flush(qctx, w)
-		cancel()
+		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Flush(qctx, w) })
 		if err != nil {
 			s.reportError(err)
 			s.skipToSync = true
@@ -892,9 +953,7 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		// needs the cancellable context the other steps use; otherwise a
 		// cancel or a revocation waits for the statement rather than
 		// stopping it.
-		qctx, cancel := s.queryContext(ctx)
-		err := s.exec.Sync(qctx)
-		cancel()
+		err := s.runQuery(ctx, s.exec.Sync)
 		if err != nil {
 			s.reportError(err)
 		}
@@ -943,9 +1002,7 @@ func (s *session) simpleQuery(ctx context.Context, sql string, w *resultWriter) 
 // ReadyForQuery to the caller: a batch sends exactly one, at the end,
 // however many statements it ran.
 func (s *session) runStatement(ctx context.Context, sql string, w ResultWriter) error {
-	qctx, cancel := s.queryContext(ctx)
-	err := s.exec.SimpleQuery(qctx, sql, w)
-	cancel()
+	err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.SimpleQuery(qctx, sql, w) })
 	// Any CopyData still in flight after an aborted COPY is ignored by dispatch.
 	s.setCopyIn(nil)
 	return err
@@ -964,9 +1021,7 @@ func (s *session) runStatement(ctx context.Context, sql string, w ResultWriter) 
 func (s *session) simpleQueryBatch(ctx context.Context, stmts []string, w *resultWriter) error {
 	implicit := s.exec.TransactionStatus() == TxIdle
 	if implicit {
-		qctx, cancel := s.queryContext(ctx)
-		err := s.exec.BeginImplicit(qctx)
-		cancel()
+		err := s.runQuery(ctx, s.exec.BeginImplicit)
 		if err != nil {
 			if w.ioErr != nil {
 				return w.ioErr
@@ -1025,7 +1080,5 @@ func (s *session) simpleQueryBatch(ctx context.Context, stmts []string, w *resul
 // commit across shards is the slow one -- rather than only the statements
 // before it.
 func (s *session) endImplicit(ctx context.Context, commit bool) error {
-	qctx, cancel := s.queryContext(ctx)
-	defer cancel()
-	return s.exec.EndImplicit(qctx, commit)
+	return s.runQuery(ctx, func(qctx context.Context) error { return s.exec.EndImplicit(qctx, commit) })
 }

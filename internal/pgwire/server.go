@@ -69,6 +69,15 @@ type Config struct {
 	// past the cap are refused with 53300. Zero means 100, negative
 	// disables the cap.
 	MaxStartupConns int
+	// MaxQueryDuration bounds how long one statement may run before the
+	// session cancels it. Zero leaves it unbounded, which is what
+	// PostgreSQL's own statement_timeout defaults to.
+	//
+	// It is what makes the cancel path reachable without a client: a
+	// backend nothing interrupts holds a router goroutine, a pooler
+	// backend and a share of the drain, and until a deadline exists the
+	// only thing that ends that is the client asking.
+	MaxQueryDuration time.Duration
 	// MaxMessageBodyLen bounds one frontend message body. The length is
 	// taken from a five-byte header and the buffer for it is allocated
 	// before any of the body arrives, so an unbounded ceiling lets a valid
