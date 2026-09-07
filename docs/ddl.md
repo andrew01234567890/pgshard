@@ -199,13 +199,16 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
   the object already matches. Statements without such an object (`ALTER
   TABLE`, `GRANT`) are re-executed; a `pending` shard is never guarded, so an
   object created out of band is a hard failure, not a silent success.
-  A resumed `DROP` is the exception the other way: a trigger, policy, rule,
-  type or sequence carries no `meta.object`, so it re-runs and PostgreSQL
-  answers `42704`. That is the state the migration asked for — this shard
-  committed the drop and the crash came before the catalog was told — so a
-  resumed `DROP` whose object is already gone is applied, not failed. Only
-  drops, and only on a resumed shard: a `pending` shard dropped nothing, and
-  a resumed `ALTER` that cannot find its table has found a real problem.
+  A `DROP` is the exception the other way: a trigger, policy, rule, type or
+  sequence carries no `meta.object`, so it re-runs and PostgreSQL answers
+  `42704`. That is the state the migration asked for — an earlier process
+  committed the drop and died before the catalog was told — so a `DROP`
+  whose object is already gone is applied, not failed, on a shard that
+  process had left `running`. Only drops, only that state, and only a
+  missing object: a shard that never started dropped nothing, a `retrying`
+  shard's last attempt was a lock timeout or a refused dial and cannot have
+  committed, an `ALTER` that cannot find its table has found a real problem,
+  and a drop refused for a dependent object or a permission is a refusal.
 * **Same verifier everywhere.** `CREATE ROLE … PASSWORD 'plain'` is hashed
   in the router; every shard and the catalog store the same SCRAM verifier.
 * **Ordering.** Migrations are applied in submission order across the whole
