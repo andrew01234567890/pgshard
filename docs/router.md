@@ -245,7 +245,15 @@ every session-level `SET search_path` / `RESET search_path` / `RESET ALL` in
 order
 (staged ones included, so a `SET` inside a transaction takes effect for the
 next statement and is dropped on rollback). `pg_catalog`, `information_schema`
-and `pg_temp` are always home-shard. `SET LOCAL search_path` and `SET
+and `pg_temp` are always home-shard, so introspection answers for one
+physical PostgreSQL rather than for the cluster: a divergence between shards
+mid-migration is invisible, and a reference table looks like a sharded one.
+The one case the router does correct is its own: a reference to
+`information_schema.columns` or `pg_catalog.pg_attribute`, wherever it sits
+in the statement, is read through a subquery that drops names beginning
+`_pgshard_`. Those are the working columns of an in-flight rewrite, which
+the router already hides from `SELECT *` and refuses by name; listing them
+here let a schema diff propose a column the router would then refuse. `SET LOCAL search_path` and `SET
 search_path FROM CURRENT` are refused, as is a shard-key literal in the ON
 clause of an outer join (it filters one side only and does not pin the
 statement).

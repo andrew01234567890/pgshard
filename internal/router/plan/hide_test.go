@@ -333,7 +333,7 @@ func TestUndeclaredReferenceWriteWaitsForItsInspection(t *testing.T) {
 //
 // When PGS-590 is fixed this test should fail. Invert it then: it exists so
 // the fix has something to flip rather than something to remember.
-func TestIntrospectionStillSeesAHiddenRewriteColumn(t *testing.T) {
+func TestIntrospectionNoLongerListsAHiddenRewriteColumn(t *testing.T) {
 	p := New()
 	snap := rewriteFixture(t, "tenant_id", "id", "amount")
 	ctx := context.Background()
@@ -347,23 +347,36 @@ func TestIntrospectionStillSeesAHiddenRewriteColumn(t *testing.T) {
 		t.Fatalf("the user-table path must hide the working column, got %q", pl.Rewritten)
 	}
 
-	// The same router, asked what columns the table has, does nothing at
-	// all: no rewrite, and no filter on the rows the home shard will
-	// return -- which include the working column, because it is a real
-	// column on the real table.
-	for _, sql := range []string{
-		"select column_name from information_schema.columns where table_name = 'orders'",
-		"select attname from pg_catalog.pg_attribute where attrelid = 'orders'::regclass",
+	// And the same router asked what columns the table has: the catalog it
+	// reads is filtered, so the working column is not in the answer
+	// either. It still answers from the home shard's own catalog -- that
+	// half of PGS-590 is untouched.
+	for _, c := range []struct{ sql, want string }{
+		{"select column_name from information_schema.columns where table_name = 'orders'", "column_name"},
+		{"select attname from pg_catalog.pg_attribute where attrelid = 'orders'::regclass", "attname"},
+		{"select attname from pg_attribute a join pg_class c on c.oid = a.attrelid", "attname"},
+		// Not in the statement's own FROM: this is the shape a driver
+		// actually sends, and the shape the first version of the filter
+		// walked straight past.
+		{"select exists (select 1 from information_schema.columns where table_name = 'orders')", "column_name"},
+		{"with c as (select * from pg_catalog.pg_attribute) select attname from c", "attname"},
 	} {
-		pl, err := p.Plan(ctx, session(snap), sql)
+		pl, err := p.Plan(ctx, session(snap), c.sql)
 		if err != nil {
-			t.Fatalf("%s: %v", sql, err)
+			t.Fatalf("%s: %v", c.sql, err)
 		}
-		if pl.Rewritten != "" {
-			t.Fatalf("introspection is rewritten after all -- PGS-590 may be fixed; invert this test: %q", pl.Rewritten)
+		if !strings.Contains(pl.Rewritten, c.want+" NOT LIKE") {
+			t.Fatalf("%s: rewritten to %q, want the reserved prefix filtered out of %s", c.sql, pl.Rewritten, c.want)
 		}
 		if pl.Kind != Unsharded {
-			t.Fatalf("%s: kind = %v, want Unsharded (the home shard's own catalog)", sql, pl.Kind)
+			t.Fatalf("%s: kind = %v, want Unsharded (the home shard's own catalog)", c.sql, pl.Kind)
 		}
+	}
+
+	// A relation that merely shares the name is not the catalog: a user
+	// table called columns is the client's own.
+	pl, err = p.Plan(ctx, session(snap), "select * from myapp.columns")
+	if err == nil && strings.Contains(pl.Rewritten, "NOT LIKE") {
+		t.Fatalf("a user relation named columns was filtered as though it were the catalog: %q", pl.Rewritten)
 	}
 }
