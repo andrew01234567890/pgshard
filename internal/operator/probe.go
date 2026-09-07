@@ -59,6 +59,9 @@ type Prober interface {
 	WriteFenced(ctx context.Context, dsn string) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
 	SetLoginPassword(ctx context.Context, dsn, role, password string) error
+	// EnsureReplicationRole creates or updates the role a standby streams
+	// as on the group's primary, given a superuser DSN for it.
+	EnsureReplicationRole(ctx context.Context, dsn, password string) error
 	// SeedBootstrapRole publishes a SCRAM verifier for rolname in
 	// pgshard.roles, so the generated credential can reach the cluster
 	// through the router and create the first role of its own.
@@ -760,6 +763,46 @@ func (PgxProber) SetLoginPassword(ctx context.Context, dsn, role, password strin
 	return err
 }
 
+// EnsureReplicationRole creates the role a standby streams as, and gives it
+// the password the operator generated for this cluster. It runs on every
+// pass for the same reason SetLoginPassword does: a group restored or
+// rebuilt from elsewhere comes back with whatever password it was cloned
+// with, and this is what puts it back in step with the Secret.
+//
+// The grants are what pg_rewind needs from a source it is not superuser on
+// (see its Notes). Without them the rejoin after a failover falls through to
+// a full re-clone, which is the same outcome with hours of copying.
+func (PgxProber) EnsureReplicationRole(ctx context.Context, dsn, password string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	role := pgx.Identifier{catalog.ReplicationRole}.Sanitize()
+	if _, err := conn.Exec(ctx, `DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '`+catalog.ReplicationRole+`') THEN
+			CREATE ROLE `+role+` LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $$`); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, `ALTER ROLE `+role+
+		` WITH LOGIN REPLICATION NOSUPERUSER PASSWORD `+quoteLiteral(password)); err != nil {
+		return err
+	}
+	for _, fn := range []string{
+		"pg_catalog.pg_ls_dir(text, boolean, boolean)",
+		"pg_catalog.pg_stat_file(text, boolean)",
+		"pg_catalog.pg_read_binary_file(text)",
+		"pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean)",
+	} {
+		if _, err := conn.Exec(ctx, `GRANT EXECUTE ON FUNCTION `+fn+` TO `+role); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SeedBootstrapRole implements Prober. Nothing else writes pgshard.roles
 // until somebody logs in, and nobody can log in until something writes
 // pgshard.roles: the router authenticates against that table alone, and
@@ -901,6 +944,12 @@ func (b boundedProber) SetLoginPassword(ctx context.Context, dsn, role, password
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.SetLoginPassword(ctx, dsn, role, password)
+}
+
+func (b boundedProber) EnsureReplicationRole(ctx context.Context, dsn, password string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.EnsureReplicationRole(ctx, dsn, password)
 }
 
 // BootstrapVerifier implements Prober.

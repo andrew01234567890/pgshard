@@ -36,6 +36,11 @@ type Config struct {
 	BinDir  string `json:"binDir"`
 	// PasswordFile holds the postgres superuser password (initdb --pwfile).
 	PasswordFile string `json:"passwordFile"`
+	// ReplicationPasswordFile holds the password for the role
+	// PrimaryConninfo names. Empty leaves the pgpass file with only the
+	// superuser's entry, which is what a cluster whose members predate the
+	// replication role still has.
+	ReplicationPasswordFile string `json:"replicationPasswordFile,omitempty"`
 	// PrimaryConninfo is the source used for cloning and rewinding.
 	PrimaryConninfo string `json:"primaryConninfo"`
 	// PodCIDR is the network allowed to authenticate with scram over TCP.

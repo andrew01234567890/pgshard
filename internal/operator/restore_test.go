@@ -122,7 +122,7 @@ func TestRestoreSourceRoundTripAndAgentConfig(t *testing.T) {
 	if noRepo := agentConfig(c, g, g.MemberName(0), g.MemberName(0), Template(c, Group{}, nil, newPolicy()), false, false); noRepo.RecloneFromRepo {
 		t.Fatal("recloneFromRepo set without a completed backup")
 	}
-	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, newPolicy(), true)
+	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, newPolicy(), true, true)
 	if !strings.Contains(cm.Data[agentConfigKey(g.MemberName(1))], `"recloneFromRepo": true`) || !strings.Contains(cm.Data[agentConfigKey(g.MemberName(1))], `"stanza": "old-shard-0-pg18"`) {
 		t.Fatalf("configmap lacks restore settings:\n%s", cm.Data[agentConfigKey(g.MemberName(1))])
 	}

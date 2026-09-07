@@ -37,3 +37,39 @@ func TestControlPlaneLoginRolesMatchTheCatalog(t *testing.T) {
 		t.Error("the reject line went missing")
 	}
 }
+
+// TestPgHBAAdmitsWhoeverPrimaryConninfoNames: a standby streams as the user
+// in primary_conninfo, and pg_rewind reaches the same source as the same
+// user over an ordinary connection. pg_hba rejects every identity it does
+// not list by name, so the two files have to agree -- and they are rendered
+// by different functions from different fields, which is how they could
+// stop agreeing without anything failing to compile.
+//
+// Both connection types, because they match different pg_hba lines: a
+// replication line does not admit pg_rewind and an "all" line does not admit
+// a walsender.
+func TestPgHBAAdmitsWhoeverPrimaryConninfoNames(t *testing.T) {
+	c := &Config{PodCIDR: "10.0.0.0/8", PrimaryConninfo: "host=src port=5432 user=" + replicationRole}
+	var user string
+	for _, kv := range strings.Fields(PrimaryConninfo(c)) {
+		if v, ok := strings.CutPrefix(kv, "user="); ok {
+			user = v
+		}
+	}
+	if user == "" {
+		t.Fatal("primary_conninfo names no user")
+	}
+	admitted := map[string]bool{}
+	for _, line := range strings.Split(RenderPgHBAConf(c), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 5 && strings.HasPrefix(f[0], "host") && f[2] == user && f[4] == "scram-sha-256" {
+			admitted[f[1]] = true
+		}
+	}
+	for _, db := range []string{"replication", "all"} {
+		if !admitted[db] {
+			t.Errorf("pg_hba does not admit %q for %s, so a standby cannot stream or rewind:\n%s",
+				user, db, RenderPgHBAConf(c))
+		}
+	}
+}

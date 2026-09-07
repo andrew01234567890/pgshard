@@ -222,7 +222,72 @@ func (in *Instance) writePgpass() error {
 	if err != nil {
 		return err
 	}
-	return writeFileSync(in.pgpassPath(), []byte("*:*:*:postgres:"+pw+"\n"))
+	lines := "*:*:*:" + superuserRole + ":" + pgpassEscape(pw) + "\n"
+	// pg_basebackup and pg_rewind reach the source as the replication role,
+	// and both take their password from here rather than from a command
+	// line that /proc exposes.
+	if in.cfg.ReplicationPasswordFile != "" {
+		rpw, err := in.replicationPassword()
+		if err != nil {
+			return err
+		}
+		lines += "*:*:*:" + replicationRole + ":" + pgpassEscape(rpw) + "\n"
+	}
+	return writeFileSync(in.pgpassPath(), []byte(lines))
+}
+
+// pgpassEscape quotes the field separator and the escape character itself,
+// which is all a .pgpass line escapes.
+func pgpassEscape(v string) string {
+	return strings.NewReplacer(`\`, `\\`, `:`, `\:`).Replace(v)
+}
+
+// sourceDSN adds the password for the role source NAMES, so a conninfo and
+// the credential sent with it cannot disagree. Splicing the superuser's
+// password onto a conninfo naming the replication role authenticates
+// nothing, and every rejoin, clone and slot creation goes through here.
+func (in *Instance) sourceDSN(source string) (string, error) {
+	pw, err := in.passwordFor(dsnUser(source))
+	if err != nil {
+		return "", err
+	}
+	return source + " password='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(pw) + "' connect_timeout=5", nil
+}
+
+// dsnUser reads the user out of a keyword/value conninfo. Empty means the
+// libpq default, which in a pgshard member's environment is the superuser.
+func dsnUser(dsn string) string {
+	for _, kv := range strings.Fields(dsn) {
+		if v, ok := strings.CutPrefix(kv, "user="); ok {
+			return v
+		}
+	}
+	return superuserRole
+}
+
+func (in *Instance) passwordFor(role string) (string, error) {
+	if role != replicationRole {
+		return in.password()
+	}
+	return in.replicationPassword()
+}
+
+// replicationPassword is the password of the role a standby streams as. A
+// member configured without one falls back to the superuser's, which is what
+// a cluster whose operator predates the replication role still renders.
+func (in *Instance) replicationPassword() (string, error) {
+	if in.cfg.ReplicationPasswordFile == "" {
+		return in.password()
+	}
+	b, err := os.ReadFile(in.cfg.ReplicationPasswordFile)
+	if err != nil {
+		return "", fmt.Errorf("replication password: %w", err)
+	}
+	pw := strings.TrimRight(string(b), "\r\n")
+	if pw == "" {
+		return "", fmt.Errorf("replication password: %s is empty", in.cfg.ReplicationPasswordFile)
+	}
+	return pw, nil
 }
 
 func (in *Instance) password() (string, error) {
@@ -467,12 +532,12 @@ func (in *Instance) rebuild(ctx context.Context) error {
 // rejoin can pg_rewind instead of falling back to a full reclone while the
 // -rw Service still has no endpoint.
 func (in *Instance) waitSource(ctx context.Context, source string) error {
-	pw, err := in.password()
+	dsn, err := in.sourceDSN(source)
 	if err != nil {
 		return err
 	}
 	for {
-		conn, err := pgx.Connect(ctx, source+" password="+pw+" connect_timeout=5")
+		conn, err := pgx.Connect(ctx, dsn)
 		if err == nil {
 			_ = conn.Close(ctx)
 			return nil
@@ -489,11 +554,11 @@ func (in *Instance) waitSource(ctx context.Context, source string) error {
 // ensureSlotOnSource creates this member's physical slot on the source
 // primary when it is missing, so streaming can start after a rewind.
 func (in *Instance) ensureSlotOnSource(ctx context.Context, source string) error {
-	pw, err := in.password()
+	dsn, err := in.sourceDSN(source)
 	if err != nil {
 		return err
 	}
-	conn, err := pgx.Connect(ctx, source+" password="+pw+" connect_timeout=5")
+	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("connect to source: %w", err)
 	}

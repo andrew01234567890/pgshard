@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func newTestInstance(t *testing.T) *Instance {
@@ -220,5 +222,100 @@ func TestACloneDoesNotEmptyPGDATABeforeItHasReachedTheSource(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("PGDATA was emptied before the source was reached: %v", err)
+	}
+}
+
+// The password a standby streams with lands in the pgpass file, because
+// pg_basebackup and pg_rewind take it from there: a --dbname carrying a
+// password would put it in argv, which /proc exposes to anything on the
+// node. The superuser's entry stays -- pgbackrest and the schema copy still
+// reach the local server as postgres.
+func TestPgpassCarriesTheReplicationPasswordToo(t *testing.T) {
+	in := newTestInstance(t)
+	pwFile := filepath.Join(t.TempDir(), "replication")
+	// A colon and a backslash: .pgpass ends its fields on the first and
+	// escapes with the second, so an unescaped password reads as the wrong
+	// field and silently authenticates nothing.
+	if err := os.WriteFile(pwFile, []byte(`a:b\c`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in.cfg.ReplicationPasswordFile = pwFile
+	if err := in.writePgpass(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(in.pgpassPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "*:*:*:postgres:secret\n" + `*:*:*:pgshard_replication:a\:b\\c` + "\n"
+	if string(got) != want {
+		t.Fatalf("pgpass = %q, want %q", got, want)
+	}
+
+	// An unreadable or empty file is a startup failure, not a member that
+	// silently streams as nobody.
+	in.cfg.ReplicationPasswordFile = filepath.Join(t.TempDir(), "absent")
+	if err := in.writePgpass(); err == nil {
+		t.Error("a missing replication password file was accepted")
+	}
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in.cfg.ReplicationPasswordFile = empty
+	if err := in.writePgpass(); err == nil {
+		t.Error("an empty replication password file was accepted")
+	}
+}
+
+// The credential sent to the source must belong to the role the conninfo
+// names. A member reaches its primary with primary_conninfo for three
+// different things -- waiting for it to come up, creating this member's
+// slot on it, and cloning -- and each builds its own connection string.
+// Splicing the superuser's password onto a conninfo that says
+// user=pgshard_replication authenticates nothing, and it fails at the
+// moment a member is trying to rejoin, which is the worst moment to find
+// out.
+func TestTheSourcePasswordBelongsToTheRoleTheConninfoNames(t *testing.T) {
+	in := newTestInstance(t)
+	pwFile := filepath.Join(t.TempDir(), "replication")
+	if err := os.WriteFile(pwFile, []byte("streamer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in.cfg.ReplicationPasswordFile = pwFile
+
+	for _, c := range []struct{ source, want string }{
+		{"host=src port=5432 user=" + replicationRole, "streamer"},
+		{"host=src port=5432 user=" + superuserRole, "secret"},
+		// No user is the libpq default, which in a member's environment is
+		// the superuser.
+		{"host=src port=5432", "secret"},
+	} {
+		got, err := in.sourceDSN(c.source)
+		if err != nil {
+			t.Fatalf("%s: %v", c.source, err)
+		}
+		cfg, err := pgx.ParseConfig(got)
+		if err != nil {
+			t.Fatalf("%s: %v", c.source, err)
+		}
+		if cfg.Password != c.want {
+			t.Errorf("%s: password %q, want %q", c.source, cfg.Password, c.want)
+		}
+	}
+
+	// A member whose operator predates the replication Secret still has
+	// only the superuser's password, and must keep working.
+	in.cfg.ReplicationPasswordFile = ""
+	got, err := in.sourceDSN("host=src user=" + replicationRole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgx.ParseConfig(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Password != "secret" {
+		t.Errorf("without a replication Secret the password is %q, want the superuser's", cfg.Password)
 	}
 }

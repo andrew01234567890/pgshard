@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agent"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
@@ -104,7 +106,8 @@ type fakeProber struct {
 	// journal records fence writes and promotions in order.
 	journal *[]string
 	// routerPasswords records every ALTER ROLE the reconcile asked for.
-	routerPasswords []string
+	routerPasswords  []string
+	replicationRoles []string
 	// bootstrapRoles records every verifier the reconcile published so a
 	// generated credential can reach the router.
 	bootstrapRoles   []string
@@ -603,6 +606,13 @@ func (f *fakeProber) SetLoginPassword(_ context.Context, dsn, role, password str
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"/"+role+"="+password)
+	return nil
+}
+
+func (f *fakeProber) EnsureReplicationRole(_ context.Context, dsn, password string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replicationRoles = append(f.replicationRoles, hostOf(dsn)+"="+password)
 	return nil
 }
 
@@ -1349,6 +1359,29 @@ func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
 		t.Errorf("ALTER ROLE calls %v, want %q", applied, want)
 	}
 
+	// Every group's primary is told the replication password on every pass,
+	// for the same reason: a group restored or rebuilt from elsewhere comes
+	// back with whatever password it was cloned with, and its standbys
+	// cannot stream until it is back in step with the Secret.
+	var rep corev1.Secret
+	get(t, ReplicationSecretName(c.Name), &rep)
+	ownedBy(t, &rep, c)
+	repPw := string(rep.Data["password"])
+	if repPw == pw || repPw == string(su.Data["password"]) {
+		t.Error("the replication password must be its own")
+	}
+	if string(rep.Data["username"]) != catalog.ReplicationRole {
+		t.Errorf("username %q, want %q", rep.Data["username"], catalog.ReplicationRole)
+	}
+	fp.mu.Lock()
+	repApplied := append([]string(nil), fp.replicationRoles...)
+	fp.mu.Unlock()
+	for _, g := range Groups(c) {
+		if want := g.ServiceRW() + ".default.svc=" + repPw; !slices.Contains(repApplied, want) {
+			t.Errorf("group %s was never given the replication role: %v", g.Name(), repApplied)
+		}
+	}
+
 	// The controller has its own login on the same catalog, and the same
 	// reason for the password to be applied on every pass.
 	var ctl corev1.Secret
@@ -1516,5 +1549,55 @@ func TestFencedAndServingWritesFollowTheWriteFence(t *testing.T) {
 	}
 	if cond := condition(t, "fence", pgshardv1alpha1.ConditionServingWrites); cond.Status != metav1.ConditionFalse {
 		t.Fatalf("a fenced cluster is not serving writes: %+v", cond)
+	}
+}
+
+// TestTheConninfoFollowsThePrimarysOwnPod: on an upgrade the primary is the
+// LAST member to roll, so for most of the roll it is still running a pod
+// whose pg_hba does not list the replication role. Every standby's
+// primary_conninfo has to keep naming the superuser until the primary's own
+// pod says otherwise -- a standby pointed at an identity its primary rejects
+// stops streaming, which drops the sync set and holds the roll before it
+// ever reaches the primary.
+func TestTheConninfoFollowsThePrimarysOwnPod(t *testing.T) {
+	r, fp, c := setup(t, "stg")
+	bringUp(t, r, fp, c)
+	g := Groups(c)[0]
+
+	conninfo := func() string {
+		t.Helper()
+		var cm corev1.ConfigMap
+		get(t, g.ConfigMapName(), &cm)
+		var cfg agent.Config
+		if err := json.Unmarshal([]byte(cm.Data[agentConfigKey(g.MemberName(1))]), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg.PrimaryConninfo
+	}
+	if !strings.Contains(conninfo(), "user="+catalog.ReplicationRole) {
+		t.Fatalf("a cluster whose pods all admit the role does not use it: %q", conninfo())
+	}
+
+	// The primary as an older pod: mounted no Secret, rendered no pg_hba
+	// line for the role.
+	var pod corev1.Pod
+	get(t, g.MemberName(0), &pod)
+	delete(pod.Annotations, AnnotationReplicationLogin)
+	if err := k8sClient.Update(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if got := conninfo(); !strings.Contains(got, "user="+superuserName) {
+		t.Errorf("with a primary that does not admit the role the conninfo is %q, want the superuser", got)
+	}
+
+	get(t, g.MemberName(0), &pod)
+	pod.Annotations[AnnotationReplicationLogin] = "true"
+	if err := k8sClient.Update(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if got := conninfo(); !strings.Contains(got, "user="+catalog.ReplicationRole) {
+		t.Errorf("once the primary admits the role the conninfo is %q, want it to use it", got)
 	}
 }

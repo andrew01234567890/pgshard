@@ -46,6 +46,17 @@ const (
 	// is running, not what the spec now asks for: during a rollout those
 	// differ, and a caller has to dial each member by the first.
 	AnnotationAgentMTLS = "pgshard.io/agent-mtls"
+	// AnnotationReplicationLogin on a member pod records that this pod
+	// renders a pg_hba admitting the replication role and mounts its
+	// Secret. A standby may only be pointed at its primary as that role
+	// once the PRIMARY carries this: pg_hba rejects an identity it does not
+	// list, and members roll one at a time with the primary last, so
+	// switching every standby's primary_conninfo in the same pass that
+	// introduces the role leaves each restarted standby unable to stream
+	// until the primary follows -- which the rollout gate will not let it
+	// do, because it holds when the sync set is too small. Mounting the
+	// material and using it are two rolls, in that order.
+	AnnotationReplicationLogin = "pgshard.io/replication-login"
 	// AnnotationPrimaryEpoch and AnnotationPrimary on the group Lease publish
 	// the fence for readers that cannot reach the catalog.
 	AnnotationPrimaryEpoch = "pgshard.io/primary-epoch"
@@ -102,6 +113,8 @@ const (
 	poolerCatalogPasswordDir  = "/etc/pgshard/catalog"
 	controllerLoginVolume     = "controller-login"
 	controllerLoginDir        = "/etc/pgshard/controller"
+	replicationVolume         = "replication-login"
+	replicationDir            = "/etc/pgshard/replication"
 	// LabelShardSet on a shard group's objects names the catalog shard set
 	// it belongs to.
 	LabelShardSet = "pgshard.io/shard-set"
@@ -364,6 +377,10 @@ func SecretName(cluster string) string { return cluster + "-superuser" }
 
 // RouterSecretName holds the router's catalog login password.
 func RouterSecretName(cluster string) string { return cluster + "-router" }
+
+// ReplicationSecretName holds the password a standby streams with, and the
+// one pg_basebackup and pg_rewind reach the source as.
+func ReplicationSecretName(cluster string) string { return cluster + "-replication" }
 
 // ControllerSecretName holds the controller's catalog login password. Its
 // own Secret, so rotating it and rotating the superuser's are separate acts.

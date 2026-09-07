@@ -19,6 +19,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agent"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
 	"github.com/andrew01234567890/pgshard/internal/pki"
 )
@@ -101,6 +102,12 @@ type MemberTemplate struct {
 	// on, a checksum of the referenced Secret's content; enabling TLS or
 	// rotating the certificate must roll the immutable member pods.
 	InternalTLS string `json:"internalTLS,omitempty"`
+	// Replication is whether this group's members may stream as the
+	// replication role rather than as the superuser. It is set from the
+	// PRIMARY's running pod, not from the spec, so the identity a standby
+	// presents is one the primary it dials already admits; see
+	// AnnotationReplicationLogin.
+	Replication bool `json:"replication,omitempty"`
 }
 
 // Template computes the desired member template of a group. tuning is the
@@ -127,7 +134,7 @@ func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings
 // immutable, so without it a cluster keeps the shape it was created with
 // until something else rolls it, and a shape the rest of the release
 // depends on is silently absent.
-const podShape = "2:pooler-probe-on-metrics-port"
+const podShape = "3:replication-login"
 
 // Hash is the pod-shaped part of the template (image, resources, restart
 // token) as stamped on pods; a difference always means a pod restart.
@@ -165,19 +172,24 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 		}
 	}
 	cfg := agent.Config{
-		Cluster:          c.Name,
-		Shard:            g.Name(),
-		Member:           member,
-		Role:             role,
-		PGData:           pgdataPath,
-		PasswordFile:     secretMountPath + "/" + secretKey,
-		AuthTokenFile:    agentTokenDir + "/" + agentTokenKey,
-		PrimaryConninfo:  fmt.Sprintf("host=%s.%s.svc port=%d user=%s", g.ServiceRW(), c.Namespace, postgresPort, superuserName),
-		PodCIDR:          "all",
-		PeerFailsafeURLs: peers,
-		Port:             postgresPort,
-		HTTPAddr:         fmt.Sprintf(":%d", agentHTTPPort),
-		GRPCAddr:         fmt.Sprintf(":%d", agentGRPCPort),
+		Cluster:       c.Name,
+		Shard:         g.Name(),
+		Member:        member,
+		Role:          role,
+		PGData:        pgdataPath,
+		PasswordFile:  secretMountPath + "/" + secretKey,
+		AuthTokenFile: agentTokenDir + "/" + agentTokenKey,
+		// A standby streams as its own role, not as the superuser. This
+		// string is written into every standby's postgresql.auto.conf and
+		// travels in every clone, so the credential behind it should be the
+		// one that can do the least.
+		ReplicationPasswordFile: replicationDir + "/" + secretKey,
+		PrimaryConninfo:         fmt.Sprintf("host=%s.%s.svc port=%d user=%s", g.ServiceRW(), c.Namespace, postgresPort, replicationUser(tpl)),
+		PodCIDR:                 "all",
+		PeerFailsafeURLs:        peers,
+		Port:                    postgresPort,
+		HTTPAddr:                fmt.Sprintf(":%d", agentHTTPPort),
+		GRPCAddr:                fmt.Sprintf(":%d", agentGRPCPort),
 		Postgres: agent.PostgresSettings{
 			// Every member except this one. The value is only read where
 			// the member is the primary, and a member that is promoted
@@ -210,12 +222,22 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 	return &cfg
 }
 
+// replicationUser is the identity a member dials its primary with: its own
+// role once the primary admits it, and the superuser until then.
+func replicationUser(tpl MemberTemplate) string {
+	if tpl.Replication {
+		return catalog.ReplicationRole
+	}
+	return superuserName
+}
+
 func agentConfigKey(member string) string { return member + ".json" }
 
 // ConfigMap renders the per-member agent configs and the derived override;
 // primary decides which member bootstraps with initdb and which ones clone.
-func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) *corev1.ConfigMap {
+func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady, replication bool) *corev1.ConfigMap {
 	tpl := Template(c, g, tuning, pol)
+	tpl.Replication = replication
 	data := map[string]string{}
 	override := OverrideConf(tuning)
 	if override != "" {
@@ -526,6 +548,7 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 	if agentGRPCTLS(c) != (agent.TLSFiles{}) {
 		meta.Annotations[AnnotationAgentMTLS] = "true"
 	}
+	meta.Annotations[AnnotationReplicationLogin] = "true"
 	pod := &corev1.Pod{
 		ObjectMeta: meta,
 		Spec: corev1.PodSpec{
@@ -569,6 +592,10 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 				// Secret above so the two can be rotated independently.
 				{Name: poolerCatalogSecretVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 					SecretName: RouterSecretName(c.Name)}}},
+				// The password a standby streams with, kept apart for the
+				// same reason.
+				{Name: replicationVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName: ReplicationSecretName(c.Name)}}},
 				{Name: "pg-socket", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 			},
 		},
@@ -751,6 +778,7 @@ func agentMounts(c *pgshardv1alpha1.PgShardCluster) []corev1.VolumeMount {
 		{Name: "config", MountPath: configMountPath, ReadOnly: true},
 		{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
 		{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true},
+		{Name: replicationVolume, MountPath: replicationDir, ReadOnly: true},
 		{Name: "pg-socket", MountPath: pgSocketDir},
 	}
 	if internalTLSEnabled(c) {

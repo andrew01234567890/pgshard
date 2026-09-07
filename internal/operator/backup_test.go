@@ -125,7 +125,7 @@ func TestTemplateAndPodCarryBackupPolicy(t *testing.T) {
 			t.Errorf("pod without policy mounts %s", v.Name)
 		}
 	}
-	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, pol, false)
+	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, pol, false, true)
 	var cfg agent.Config
 	if err := json.Unmarshal([]byte(cm.Data[agentConfigKey(g.MemberName(1))]), &cfg); err != nil {
 		t.Fatal(err)
@@ -136,7 +136,7 @@ func TestTemplateAndPodCarryBackupPolicy(t *testing.T) {
 	if got, err := backup.Render(cfg.Backup.WithDefaults(), "/pgdata", 5432); err == nil || !strings.Contains(err.Error(), backupEncryptionMountPath+"/passphrase") {
 		t.Errorf("rendering must look for the mounted credentials: %q %v", got, err)
 	}
-	plainCM := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, nil, false)
+	plainCM := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, nil, false, true)
 	if strings.Contains(plainCM.Data[agentConfigKey(g.MemberName(1))], `"backup"`) {
 		t.Error("no policy must render no backup section")
 	}

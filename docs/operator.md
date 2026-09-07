@@ -62,13 +62,33 @@ is enabled (see [Network policy](#network-policy)) and
 [backup.md](backup.md#encryption)). Each rejects on write rather than
 changing what a running cluster does, and each has an explicit opt-out for
 the case where the plain thing is what was wanted.
-`pg_hba.conf` admits only the control plane over TCP: the superuser, and
+`pg_hba.conf` admits only the control plane over TCP: the superuser,
 `pgshard_router` and `pgshard_controller` for the router's and the
-controller's catalog connections, both of which exist only where the catalog
-schema does. Everything else is rejected, so an application role reaches a
-shard through the pooler's unix socket and the router, which is where
-shard-key routing, the write fences and the coordination of a multi-shard
-write happen.
+controller's catalog connections (both of which exist only where the catalog
+schema does), and `pgshard_replication`, which exists on every group.
+Everything else is rejected, so an application role reaches a shard through
+the pooler's unix socket and the router, which is where shard-key routing,
+the write fences and the coordination of a multi-shard write happen.
+
+A standby streams as `pgshard_replication`, not as the superuser:
+`primary_conninfo` is written into every standby's `postgresql.auto.conf`
+and travels in every clone, so the credential that reaches the most places
+is the one that can do the least. It may stream, create its own physical
+slot, and execute the four functions `pg_rewind` calls on a source it is not
+superuser on -- and nothing else. The operator creates it on each group's
+primary and physical replication carries it to that group's standbys; the
+password is generated per cluster into `<cluster>-replication` and mounted
+at `/etc/pgshard/replication`, from which the agent writes a `.pgpass` entry
+rather than putting it on a `pg_basebackup` command line.
+
+The switch is staged over two rolls, and has to be. `pg_hba` rejects an
+identity it does not list, members roll one at a time with the primary
+**last**, and the rollout holds as soon as the sync set is too small: a pass
+that pointed every standby at the new role while the primary still ran the
+old pod would restart a standby that cannot stream, drop the sync set, and
+hold the roll before reaching the primary that would have admitted it. So a
+member's `primary_conninfo` names the role only once the primary's own pod
+carries `pgshard.io/replication-login`, and names the superuser until then.
 
 The controller reaches the catalog as `pgshard_controller`: `pgshard_system`
 membership for the schema it drives, plus `pg_read_all_stats` and the
