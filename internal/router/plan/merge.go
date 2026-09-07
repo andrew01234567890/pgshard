@@ -98,8 +98,11 @@ type mergeBuilder struct {
 	// one of them.
 	sharded     map[string]bool
 	onlySharded bool
-	spec        Merge
-	changed     bool
+	// scalar answers whether a non-built-in name has been declared a scalar
+	// function for this session's database.
+	scalar  declared
+	spec    Merge
+	changed bool
 	// clone is the mutable copy of the tree, made on first change.
 	clone  *pgquerypb.SelectStmt
 	cloneT *pgquerypb.ParseResult
@@ -108,13 +111,13 @@ type mergeBuilder struct {
 // buildMerge computes the Merge for sel; err is the refusal when the shape
 // cannot be merged.
 func buildMerge(tree proto.Message, sel *pgquerypb.SelectStmt, shardKey string, blockers []string,
-	sharded map[string]bool, onlySharded bool) (*Merge, error) {
+	sharded map[string]bool, onlySharded bool, scalar declared) (*Merge, error) {
 	if len(blockers) > 0 {
 		return nil, notYet("multi-shard SELECT with "+strings.Join(blockers, ", ")+" is not available yet",
 			"filter on one shard key value")
 	}
 	b := &mergeBuilder{tree: tree, sel: sel, shardKey: shardKey, sharded: sharded, onlySharded: onlySharded,
-		spec: Merge{Limit: -1, Offset: -1}}
+		scalar: scalar, spec: Merge{Limit: -1, Offset: -1}}
 	if err := b.run(); err != nil {
 		return nil, err
 	}
@@ -183,9 +186,9 @@ func (b *mergeBuilder) run() error {
 		// this router cannot classify instead. Grouping on the shard key
 		// makes every group shard-local, which is why shardLocal is exempt.
 		for _, t := range s.GetTargetList() {
-			if name := unknownFunction(t); name != "" {
+			if name := unknownFunction(t, b.scalar); name != "" {
 				return notYet("multi-shard "+name+"() is not available yet: it is not a PostgreSQL built-in, and a user-defined aggregate cannot be told from a scalar function by name",
-					"filter on one shard key value, or group by the shard key \""+b.shardKey+"\" so that every group lives on one shard")
+					"declare it in pgshard.functions, filter on one shard key value, or group by the shard key \""+b.shardKey+"\" so that every group lives on one shard")
 			}
 		}
 	}

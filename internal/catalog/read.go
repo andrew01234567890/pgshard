@@ -254,6 +254,30 @@ func ListSequenceNames(ctx context.Context, q Querier) ([]string, error) {
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
+// DeclaredFunction is a row of pgshard.functions: a non-built-in function an
+// operator has classified, so the router knows whether concatenating its
+// shards is an answer or a partial one.
+type DeclaredFunction struct {
+	Database string
+	Schema   string
+	Name     string
+	Kind     string
+}
+
+// Aggregate reports whether f is one, which is the kind a scatter must
+// refuse.
+func (f DeclaredFunction) Aggregate() bool { return f.Kind == "aggregate" }
+
+// ListDeclaredFunctions returns every row of pgshard.functions.
+func ListDeclaredFunctions(ctx context.Context, q Querier) ([]DeclaredFunction, error) {
+	rows, err := q.Query(ctx,
+		`SELECT database, schema, name, kind FROM pgshard.functions ORDER BY database, schema, name`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[DeclaredFunction])
+}
+
 // ListAllShardRanges returns the ranges of every shard set ordered by set and key space.
 func ListAllShardRanges(ctx context.Context, q Querier) ([]ShardRange, error) {
 	rows, err := q.Query(ctx, `

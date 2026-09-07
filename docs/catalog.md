@@ -54,6 +54,38 @@ statement a trigger sends `NOTIFY pgshard_desired` with payload
 | `hash_version` | References `pgshard.hash_versions`. |
 | `sequence_columns` | Columns of a sharded table the router fills from `pgshard.sequences` on `INSERT` (migration `0005`); `NULL` for none. See *Sequences* in `docs/router.md`. |
 
+### `pgshard.functions`
+
+Since migration `0043`. Which non-built-in functions a scatter may project.
+
+| Column | Meaning |
+|--------|---------|
+| `database`, `schema`, `name` | Primary key; `database` references `pgshard.databases` and the rows go with it. |
+| `kind` | `scalar` or `aggregate`. |
+| `desired_generation`, `updated_at` | Stamped and notified like every other desired-state table. |
+
+A scatter that concatenates its shards is right for a scalar function and
+wrong for an aggregate — an aggregate answers with one partial row per shard
+and no error — and a parse tree cannot tell them apart, because a
+user-defined aggregate is a plain function call with no aggregate flags. So
+the router refuses every function it cannot name as a PostgreSQL built-in,
+which takes `ST_AsText`, `uuid_generate_v4`, `similarity` and every other
+extension scalar with it. This table is how an operator says yes.
+
+The router treats a name as safe when the database has a `scalar` row for it
+and **no** `aggregate` row. The `schema` is recorded for the operator, not
+matched: the router does not resolve `search_path`, so a name that is a
+scalar in one schema and an aggregate in another stays refused — and listing
+the aggregate is how an operator makes that so deliberately. A
+schema-qualified call is looked up by its last name element for the same
+reason.
+
+It is edited with normal SQL because the router cannot learn it any other
+way today: `CREATE FUNCTION`, `CREATE AGGREGATE` and `CREATE EXTENSION` are
+all refused through the router, so there is no DDL path for it to record
+from. `WHERE`-clause functions were never affected; only the target list of
+a multi-shard read.
+
 ### `pgshard.shard_ranges`
 
 | Column | Meaning |

@@ -155,6 +155,12 @@ type Snapshot struct {
 	// Sequences names the rows of pgshard.sequences, the global sequences
 	// the router answers nextval() for.
 	Sequences map[string]bool
+	// ScalarFunctions names the non-built-in functions a scatter may
+	// project, per database. A name is in it when pgshard.functions has a
+	// scalar row for it and no aggregate row: an aggregate concatenated
+	// across shards answers with one partial row per shard and no error,
+	// and nothing in a parse tree tells the two apart.
+	ScalarFunctions map[FunctionKey]bool
 	// WriteFence is set while the cluster pauses writes for a certified
 	// restore point; routers hold new writes until it clears.
 	WriteFence bool
@@ -168,6 +174,15 @@ type Snapshot struct {
 	// means it was not computed, which SamePlanning reads as "assume they
 	// differ".
 	rev uint64
+}
+
+// FunctionKey names a function within one database. The schema is not part
+// of it: resolving an unqualified call against search_path is not something
+// the router does, so a name that is a scalar in one schema and an aggregate
+// in another is refused rather than guessed at.
+type FunctionKey struct {
+	Database string
+	Name     string
 }
 
 // SamePlanning reports whether b says the same thing about the catalog as
@@ -275,6 +290,17 @@ func (s *Snapshot) fingerprint() uint64 {
 		str(name)
 		flag(s.Sequences[name])
 	}
+	// A declaration changes what a scatter may project, so a prepared
+	// statement planned before it has to be replanned. Withdrawing one is
+	// the case that matters: an operator who mis-declared an aggregate as a
+	// scalar corrects it by adding the aggregate row, and every session
+	// that had already prepared the scatter would otherwise go on
+	// concatenating one partial answer per shard.
+	for _, k := range slices.SortedFunc(maps.Keys(s.ScalarFunctions), compareFunctionKeys) {
+		str(k.Database)
+		str(k.Name)
+		flag(s.ScalarFunctions[k])
+	}
 	return h.Sum64()
 }
 
@@ -283,6 +309,13 @@ func compareShardKeys(a, b ShardKey) int {
 		return c
 	}
 	return cmp.Compare(a.ShardID, b.ShardID)
+}
+
+func compareFunctionKeys(a, b FunctionKey) int {
+	if c := cmp.Compare(a.Database, b.Database); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Name, b.Name)
 }
 
 func compareTableKeys(a, b TableKey) int {

@@ -177,7 +177,8 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 			Tables: map[TableKey]Placement{
 				{Database: "app", SchemaName: "public", TableName: "orders"}: {Placement: "sharded", ShardKey: "tenant_id", ShardKeyChecked: true, Generation: 3},
 			},
-			Sequences: map[string]bool{"app.public.orders_id_seq": true},
+			Sequences:       map[string]bool{"app.public.orders_id_seq": true},
+			ScalarFunctions: map[FunctionKey]bool{{Database: "app", Name: "declared"}: true},
 		}
 		s.index()
 		return s
@@ -238,7 +239,18 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 		},
 		"a database default": func(s *Snapshot) { s.Databases["app"] = catalog.Database{Name: "app", DefaultPlacement: "sharded"} },
 		"a global sequence":  func(s *Snapshot) { s.Sequences["app.public.new_id_seq"] = true },
-		"the write fence":    func(s *Snapshot) { s.WriteFence = true },
+		// Withdrawing one is the case that matters: an operator who
+		// mis-declared an aggregate as a scalar corrects it by adding the
+		// aggregate row, and a session that had already prepared the
+		// scatter would otherwise go on concatenating one partial answer
+		// per shard.
+		"a declared function": func(s *Snapshot) {
+			s.ScalarFunctions[FunctionKey{Database: "app", Name: "st_astext"}] = true
+		},
+		"a withdrawn declaration": func(s *Snapshot) {
+			delete(s.ScalarFunctions, FunctionKey{Database: "app", Name: "declared"})
+		},
+		"the write fence": func(s *Snapshot) { s.WriteFence = true },
 	} {
 		changed := build()
 		change(changed)
