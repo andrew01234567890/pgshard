@@ -98,6 +98,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	maxSessions := fs.Int("max-sessions", router.DefaultMaxSessions, "authenticated sessions this router holds at once, whatever role they belong to (refused with 53300 past the cap; negative means no cap)")
 	maxMessageBody := fs.Int("max-message-body", pgwire.DefaultMaxMessageBodyLen, "largest frontend message body accepted, in bytes; the buffer is allocated from the message header before the body arrives, so this times --max-sessions is the heap a router must survive")
 	maxSessionsPerRole := fs.Int("max-sessions-per-role", 0, "sessions one role may hold when the role carries no connection_limit of its own (0 leaves it unlimited); bounds what one credential can commit of the memory above")
+	maxBodyBudget := fs.Int64("max-message-body-budget", 0, "bytes every session together may have committed to message bodies declared but not yet arrived (0 leaves it unbounded, and the bound is then --max-message-body times --max-sessions); a body below 1 MiB is never charged, so an idle session costs nothing")
 	maxQueryDuration := fs.Duration("max-query-duration", 0, "time one simple query, or one extended-protocol batch at its Sync, may run before the router cancels it (0 leaves it unbounded, as PostgreSQL's own statement_timeout does); the cancel reaches the shard and the stream is torn down after its grace")
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to wait for open transactions and active queries on shutdown")
 	drainDelay := fs.Duration("drain-delay", 5*time.Second, "time between readiness turning false and closing the listener")
@@ -229,12 +230,13 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			}
 			return router.ServerVersion(w.Current())
 		},
-		InstanceID:        uint32(*instanceID),
-		StartupTimeout:    *startupTimeout,
-		MaxQueryDuration:  *maxQueryDuration,
-		MaxStartupConns:   *maxStartupConns,
-		MaxMessageBodyLen: *maxMessageBody,
-		Logger:            logger,
+		InstanceID:           uint32(*instanceID),
+		StartupTimeout:       *startupTimeout,
+		MaxQueryDuration:     *maxQueryDuration,
+		MaxStartupConns:      *maxStartupConns,
+		MaxMessageBodyLen:    *maxMessageBody,
+		MaxMessageBodyBudget: *maxBodyBudget,
+		Logger:               logger,
 	}
 	var forwarder *cancelpeer.Forwarder
 	if *peerListen != "" {

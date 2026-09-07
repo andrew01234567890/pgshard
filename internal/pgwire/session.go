@@ -53,6 +53,10 @@ type session struct {
 	id     uint64
 	conn   net.Conn
 	reader *bufio.Reader
+	// framed reads the client's byte stream one protocol message at a
+	// time, so a body is charged to the server's budget before pgproto3
+	// allocates it.
+	framed *framedReader
 	be     *pgproto3.Backend
 
 	// rows holds DataRow frames encoded for this session, and beDirty says
@@ -111,7 +115,8 @@ func newSession(s *Server, conn net.Conn, id uint64) *session {
 func (s *session) resetIO(conn net.Conn) {
 	s.conn = conn
 	s.reader = bufio.NewReader(conn)
-	s.be = pgproto3.NewBackend(s.reader, conn)
+	s.framed = newFramedReader(s.reader, conn, s.server.bodyBudget, s.server.shutdownCh)
+	s.be = pgproto3.NewBackend(s.framed, conn)
 	s.be.SetMaxBodyLen(min(preAuthMaxMessageBodyLen, s.maxBodyLen()))
 }
 
@@ -470,6 +475,10 @@ const refusalWriteTimeout = 5 * time.Second
 
 func (s *session) run() {
 	log := s.server.logger.With("session", s.id, "remote", s.conn.RemoteAddr().String())
+	// Whatever budget a half-read body still holds goes back when the
+	// session ends, however it ends: a client that dropped mid-body is the
+	// ordinary case, not an exceptional one.
+	defer func() { s.framed.close() }()
 	ctx := context.Background()
 	if !s.beginMessage() {
 		return
@@ -736,8 +745,12 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Unlock()
 	s.be.Send(&pgproto3.AuthenticationOk{})
 	_ = s.be.SetAuthType(pgproto3.AuthTypeOk)
-	// Authenticated: this session may now declare the full body length.
+	// Authenticated: this session may now declare the full body length, and
+	// the large ones start costing the server's shared budget. The framing
+	// itself has been on since the first byte; only the charge waits for a
+	// client that has proved who it is.
 	s.be.SetMaxBodyLen(s.maxBodyLen())
+	s.framed.startCharging()
 	for _, kv := range s.parameterStatus() {
 		s.be.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 	}

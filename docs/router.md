@@ -981,6 +981,28 @@ clients that send headers and then stall. The defaults are 16 MiB and 5000. A
 deployment that sends larger single messages raises the first knowing what it
 multiplies by; one that expects fewer sessions should lower the second.
 
+`--max-message-body-budget` removes the multiplication. The router reads the
+header itself and charges a declared body of 1 MiB or more against a budget
+the whole server shares before pgproto3 is allowed to allocate it, so an
+idle session costs nothing -- its header has not arrived -- and the sum of
+bodies in flight is bounded whatever the session count is. Below 1 MiB
+nothing is charged, which is every ordinary message: a `Query`, a `Bind`
+carrying a large value, and libpq's own 64 KiB COPY chunks. The budget is
+never set below `--max-message-body`, since a budget that could not admit
+one legal message would refuse it for ever. It is off by default, and with
+it set the ceiling can be raised for the messages that need it without
+multiplying by the session count.
+
+A session holding budget for a body that has stopped arriving loses its
+connection after 30 seconds, and one that waits that long to be granted
+budget is failed rather than parked: the memory is committed on that
+client's say-so, so that client is what gives way, not the rest of the
+router. It is idleness that is bounded and not the transfer, so a large
+message arriving steadily over a slow link keeps its budget for as long as
+it keeps coming. A body larger than the whole budget is refused by the
+per-message ceiling as soon as its header is read, rather than waiting for
+a grant that could never come.
+
 `--max-sessions-per-role` bounds what a *single credential* can take of that,
 for the roles whose `pgshard.roles.connection_limit` is unset (the catalog
 default is unlimited). It is off by default, because a single-tenant cluster
