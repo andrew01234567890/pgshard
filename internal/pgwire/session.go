@@ -363,9 +363,17 @@ func (s *session) endMessage() {
 }
 
 func (s *session) queryContext(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
+	// Built once, either way. Creating the cancellable one and then
+	// replacing it would leave the first on the connection's child list
+	// until the connection ended, one per statement.
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
 	if d := s.server.cfg.MaxQueryDuration; d > 0 {
 		ctx, cancel = context.WithTimeout(parent, d)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
 	}
 	s.mu.Lock()
 	s.queryCancel, s.queryCtx = cancel, ctx
