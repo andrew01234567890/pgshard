@@ -54,3 +54,22 @@ func TestTransactionControlOutsideABatchStillWorks(t *testing.T) {
 		}
 	}
 }
+
+// The transaction a batch runs in is the router's, so a client that sent no
+// BEGIN must not be told to run its DDL outside one. What it sent is a
+// batch, and that is what the refusal has to name.
+func TestDDLInsideABatchIsRefusedInTermsOfTheBatch(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	_, err := conn.Exec(ctx, "select 1; create table t (a int)", pgx.QueryExecModeSimpleProtocol)
+	if sqlstate(err) != "0A000" {
+		t.Fatalf("err = %v, want 0A000", err)
+	}
+	if !strings.Contains(err.Error(), "multi-statement simple query") {
+		t.Fatalf("err = %v, want the batch named", err)
+	}
+	if strings.Contains(err.Error(), "BEGIN/COMMIT") {
+		t.Fatalf("err = %v, blames a transaction block the client never opened", err)
+	}
+}

@@ -124,3 +124,80 @@ func (r *recordingExecutor) EndImplicit(ctx context.Context, commit bool) error 
 	}
 	return r.Executor.EndImplicit(ctx, commit)
 }
+
+// PostgreSQL ends the implicit transaction before it reports the last
+// statement, and says why in its own source: a client expects either a
+// command completion or an error, not one and then the other. A commit can
+// still fail -- a serialization failure, a deferred constraint, a prepare
+// that no shard accepted -- and a client walking results one at a time would
+// otherwise have been told the batch finished before hearing it did not.
+func TestACommitThatFailsReplacesTheLastStatementsCompletion(t *testing.T) {
+	ts := startServer(t, Config{})
+	ts.newExec = func(SessionInfo) (Executor, error) {
+		return &failingCommitExecutor{Executor: NewFakeExecutor()}, nil
+	}
+	c := dialRaw(t, ts.addr)
+	c.startup(ProtocolVersion30)
+	c.send(&pgproto3.Query{String: "select 1; select 1"})
+
+	// The first statement is finished and cannot be taken back.
+	if _, ok := c.recv().(*pgproto3.RowDescription); !ok {
+		t.Fatal("first statement: row description")
+	}
+	c.recv()
+	if _, ok := c.recv().(*pgproto3.CommandComplete); !ok {
+		t.Fatal("first statement: command complete")
+	}
+	// The last statement's rows are already out; only its completion waits.
+	if _, ok := c.recv().(*pgproto3.RowDescription); !ok {
+		t.Fatal("last statement: row description")
+	}
+	c.recv()
+	switch m := c.recv().(type) {
+	case *pgproto3.ErrorResponse:
+		if !strings.Contains(m.Message, "commit refused") {
+			t.Fatalf("want the commit's own error, got %+v", m)
+		}
+	case *pgproto3.CommandComplete:
+		t.Fatal("the last statement was reported complete before the commit that failed")
+	default:
+		t.Fatalf("got %T", m)
+	}
+	if _, ok := c.recv().(*pgproto3.ReadyForQuery); !ok {
+		t.Fatal("want ReadyForQuery after the failed commit")
+	}
+}
+
+type failingCommitExecutor struct {
+	Executor
+}
+
+func (f *failingCommitExecutor) EndImplicit(ctx context.Context, commit bool) error {
+	if commit {
+		return Errorf("40001", "commit refused")
+	}
+	return f.Executor.EndImplicit(ctx, commit)
+}
+
+// A leading comment is part of what the client sent, and a shard reads some
+// of them: a planner hint is a comment by design. Splitting a single
+// statement out of its own text used to drop everything before its first
+// token.
+func TestASingleStatementKeepsWhatPrecedesIt(t *testing.T) {
+	ts := startServer(t, Config{})
+	var seen []string
+	ts.newExec = func(SessionInfo) (Executor, error) {
+		return &recordingExecutor{Executor: NewFakeExecutor(), seen: &seen}, nil
+	}
+	c := dialRaw(t, ts.addr)
+	c.startup(ProtocolVersion30)
+	c.send(&pgproto3.Query{String: "/*+ SeqScan(t) */ select 1"})
+	for {
+		if _, ok := c.recv().(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if len(seen) != 1 || seen[0] != "/*+ SeqScan(t) */ select 1" {
+		t.Fatalf("executor saw %q, want the text the client sent", seen)
+	}
+}

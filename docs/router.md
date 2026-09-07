@@ -140,8 +140,14 @@ the rest with `0A000`. See *Routing* below.
   applied. That transaction is the router's, and a transaction control
   statement inside such a batch is refused with `0A000` -- PostgreSQL lets
   a `BEGIN` there adopt the implicit transaction and a `COMMIT` end it, and
-  that handover is not implemented. Inside the client's own transaction the
-  batch opens nothing and its `COMMIT` is the client's to send.
+  that handover is not implemented. DDL is refused there for the same
+  reason it is refused inside `BEGIN`: it fans out to every shard and
+  cannot be rolled back with the transaction, so a migration file whose
+  statements include DDL still has to send them one query at a time.
+  Inside the client's own transaction the batch opens nothing and its
+  `COMMIT` is the client's to send. The last statement's completion is
+  withheld until the commit succeeds, so a commit that fails replaces it
+  rather than following it.
 - **Transactions.** `BEGIN` … `COMMIT`/`ROLLBACK` are forwarded; the pooler
   keeps the backend while its `ReadyForQuery` status is not idle. The
   router's own status indicator is the pooler's. A transaction that touches

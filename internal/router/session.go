@@ -676,7 +676,10 @@ func (e *Executor) refuseTxnControlInBatch(class StmtClass) error {
 	}
 	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
 		"a transaction control statement is not available inside a multi-statement simple query")
-	err.Hint = "send the batch inside your own BEGIN and COMMIT, or send its statements one at a time"
+	// Not "put it inside BEGIN and COMMIT": the batch that trips this
+	// usually is "begin; ...; commit", and the answer is that the BEGIN
+	// has to arrive as its own query, before the batch.
+	err.Hint = "send BEGIN as its own query before the batch, and COMMIT as its own query after it"
 	return err
 }
 

@@ -926,7 +926,11 @@ func (s *session) simpleQuery(ctx context.Context, sql string, w *resultWriter) 
 	case len(stmts) > 1:
 		return s.simpleQueryBatch(ctx, stmts, w)
 	}
-	if err := s.runStatement(ctx, stmts[0], w); err != nil {
+	// The whole text, not the statement the splitter cut out of it: a
+	// leading comment is part of what the client sent, and a shard reads
+	// some of them -- a planner hint is a comment by design, and a query
+	// tag is one on purpose.
+	if err := s.runStatement(ctx, sql, w); err != nil {
 		if w.ioErr != nil {
 			return w.ioErr
 		}
@@ -938,7 +942,7 @@ func (s *session) simpleQuery(ctx context.Context, sql string, w *resultWriter) 
 // runStatement executes one statement of a simple query and leaves the
 // ReadyForQuery to the caller: a batch sends exactly one, at the end,
 // however many statements it ran.
-func (s *session) runStatement(ctx context.Context, sql string, w *resultWriter) error {
+func (s *session) runStatement(ctx context.Context, sql string, w ResultWriter) error {
 	qctx, cancel := s.queryContext(ctx)
 	err := s.exec.SimpleQuery(qctx, sql, w)
 	cancel()
@@ -971,30 +975,57 @@ func (s *session) simpleQueryBatch(ctx context.Context, stmts []string, w *resul
 			return s.readyForQuery()
 		}
 	}
-	for _, stmt := range stmts {
-		if err := s.runStatement(ctx, stmt, w); err != nil {
+	for i, stmt := range stmts {
+		// The last statement's completion is held back until the commit
+		// has succeeded. PostgreSQL ends the implicit transaction before
+		// it reports that statement (postgres.c, exec_simple_query) for
+		// the reason its own comment gives: a client expects either a
+		// command completion or an error, and telling it the batch
+		// finished and then that the commit failed is both.
+		out, held := ResultWriter(w), (*heldCompletion)(nil)
+		if implicit && i == len(stmts)-1 {
+			held = &heldCompletion{ResultWriter: w}
+			out = held
+		}
+		if err := s.runStatement(ctx, stmt, out); err != nil {
 			if w.ioErr != nil {
 				return w.ioErr
 			}
 			if implicit {
 				// The rollback's own failure says nothing the statement's
 				// error does not, and the client is owed that one.
-				_ = s.exec.EndImplicit(ctx, false)
+				_ = s.endImplicit(ctx, false)
 			}
 			s.reportError(err)
 			return s.readyForQuery()
 		}
-	}
-	// Still in it, unless a statement ended it: an executor that lets a
-	// batch commit its own transaction leaves nothing here to close, and
-	// committing again would be a second COMMIT against no transaction.
-	if implicit && s.exec.TransactionStatus() != TxIdle {
-		if err := s.exec.EndImplicit(ctx, true); err != nil {
-			if w.ioErr != nil {
+		// Still in it, unless a statement ended it: an executor that lets
+		// a batch commit its own transaction leaves nothing to close, and
+		// committing again would be a COMMIT against no transaction.
+		if held != nil && s.exec.TransactionStatus() != TxIdle {
+			if err := s.endImplicit(ctx, true); err != nil {
+				if w.ioErr != nil {
+					return w.ioErr
+				}
+				s.reportError(err)
+				return s.readyForQuery()
+			}
+		}
+		if held != nil {
+			if err := held.release(); err != nil {
 				return w.ioErr
 			}
-			s.reportError(err)
 		}
 	}
 	return s.readyForQuery()
+}
+
+// endImplicit ends the batch's transaction under the session's query
+// context, so a CancelRequest reaches a commit that is slow -- a two-phase
+// commit across shards is the slow one -- rather than only the statements
+// before it.
+func (s *session) endImplicit(ctx context.Context, commit bool) error {
+	qctx, cancel := s.queryContext(ctx)
+	defer cancel()
+	return s.exec.EndImplicit(qctx, commit)
 }
