@@ -632,6 +632,9 @@ func (r *rel) root() *rel {
 type walker struct {
 	sess Session
 	plan *Plan
+	// edit is the clone the statement's rewrites share; see editable. The
+	// parse result itself belongs to the cache and must not be mutated.
+	edit *pgquerypb.ParseResult
 	// hiddenName is the first migration working column the statement names,
 	// found by the single pre-scan rather than by a walk of its own.
 	hiddenName string

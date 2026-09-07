@@ -7,6 +7,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"google.golang.org/protobuf/proto"
 )
 
 // reservedColumnFilters are the catalogs that list a table's columns by
@@ -23,6 +24,23 @@ var likeReservedPrefix = strings.ReplaceAll(catalog.HiddenPrefix, "_", `\_`) + "
 var reservedColumnFilters = map[string]struct{ schema, column string }{
 	"columns":      {"information_schema", "column_name"},
 	"pg_attribute": {"pg_catalog", "attname"},
+}
+
+// editable is the parse tree a rewrite may change: a clone, made once and
+// shared by every pass that rewrites this statement.
+//
+// The parse result itself is the cache's, handed to every session that
+// sends the same SQL, and mutating it means the next execution starts from
+// the last one's output. For this pass that is unbounded: the walk finds
+// the catalog reference inside the subquery it built last time and wraps it
+// again, so the text grows on every execution until it is refused for
+// length. One clone rather than one each also lets the passes compose --
+// two clones would each deparse their own half and the last would win.
+func (w *walker) editable() *pgquerypb.ParseResult {
+	if w.edit == nil {
+		w.edit = proto.Clone(w.tree.(*pgquerypb.ParseResult)).(*pgquerypb.ParseResult)
+	}
+	return w.edit
 }
 
 // hideReservedFromIntrospection filters pgshard's own working columns out
@@ -49,13 +67,26 @@ var reservedColumnFilters = map[string]struct{ schema, column string }{
 // it everywhere else.
 func (w *walker) hideReservedFromIntrospection() error {
 	switch w.plan.Kind {
-	case Refuse, SessionLocal:
+	case Refuse, SessionLocal, MigrationKind:
+		// DDL is applied from the recorded statement, not from the
+		// rewritten text, so a rewrite here would be computed, ignored,
+		// and still cost the re-plan that a non-empty Rewritten forces.
 		return nil
 	}
-	if !w.filterIntrospection(w.root) {
+	if w.referencesCatalogDirectly() {
+		// Two ways a statement can depend on the catalog being a table
+		// rather than a subquery over one: naming it by schema
+		// (information_schema.columns.column_name) and reading a system
+		// column off it. Both are legal SQL that a subquery does not
+		// answer, and neither is what a client reflecting on a schema
+		// sends, so the filter stands aside rather than break them.
 		return nil
 	}
-	sql, err := pgparser.Deparse(w.tree)
+	tree := w.editable()
+	if !w.filterIntrospection(tree.GetStmts()[0].GetStmt()) {
+		return nil
+	}
+	sql, err := pgparser.Deparse(tree)
 	if err != nil {
 		return pgwire.Errorf(pgwire.CodeInternalError, "filtering pgshard's own columns out of introspection: %v", err)
 	}
@@ -81,15 +112,41 @@ func (w *walker) hideReservedFromIntrospection() error {
 func (w *walker) filterIntrospection(root *pgquerypb.Node) bool {
 	var targets []*pgquerypb.Node
 	visit(root, func(n *pgquerypb.Node) bool {
-		if s := n.GetSelectStmt(); s != nil {
-			collectFromItems(s.GetFromClause(), &targets)
+		switch s := n.GetNode().(type) {
+		case *pgquerypb.Node_SelectStmt:
+			collectSelect(s.SelectStmt, &targets)
+		case *pgquerypb.Node_UpdateStmt:
+			collectFromItems(s.UpdateStmt.GetFromClause(), &targets)
+		case *pgquerypb.Node_DeleteStmt:
+			collectFromItems(s.DeleteStmt.GetUsingClause(), &targets)
 		}
 		return true
 	})
+	changed := false
 	for _, item := range targets {
-		item.Node = &pgquerypb.Node_RangeSubselect{RangeSubselect: reservedFilterFor(item.GetRangeVar())}
+		rv := item.GetRangeVar()
+		if rv == nil {
+			// Already replaced: a from item can be reached twice when a
+			// statement nests the same select.
+			continue
+		}
+		item.Node = &pgquerypb.Node_RangeSubselect{RangeSubselect: reservedFilterFor(rv)}
+		changed = true
 	}
-	return len(targets) > 0
+	return changed
+}
+
+// collectSelect gathers from one SELECT and from the arms of any set
+// operation under it. The arms are SelectStmt messages rather than Nodes,
+// so the reflective walk never offers them to the callback: a UNION of two
+// catalog reads went through unfiltered.
+func collectSelect(s *pgquerypb.SelectStmt, out *[]*pgquerypb.Node) {
+	if s == nil {
+		return
+	}
+	collectFromItems(s.GetFromClause(), out)
+	collectSelect(s.GetLarg(), out)
+	collectSelect(s.GetRarg(), out)
 }
 
 // collectFromItems gathers the from-clause range vars that name a filtered
@@ -140,4 +197,30 @@ func reservedFilterFor(rv *pgquerypb.RangeVar) *pgquerypb.RangeSubselect {
 		Subquery: raw.GetStmt(),
 		Alias:    &pgquerypb.Alias{Aliasname: name},
 	}
+}
+
+// referencesCatalogDirectly reports whether the statement reads one of the
+// filtered catalogs in a way that only the table itself answers.
+func (w *walker) referencesCatalogDirectly() bool {
+	found := false
+	visit(w.root, func(n *pgquerypb.Node) bool {
+		cr := n.GetColumnRef()
+		if cr == nil || found {
+			return !found
+		}
+		fields := stringList(cr.GetFields())
+		if len(fields) > 0 && systemColumns[strings.ToLower(fields[len(fields)-1])] {
+			found = true
+			return false
+		}
+		if len(fields) >= 3 {
+			switch strings.ToLower(fields[0]) {
+			case "information_schema", "pg_catalog":
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
 }
