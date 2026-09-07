@@ -3,8 +3,10 @@ package snapshot
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -221,6 +223,31 @@ func TestSnapshotWithPostgres(t *testing.T) {
 		}
 		if roles.MayUseCatalog("outsider") {
 			t.Fatal("a role with no control-plane grant was admitted")
+		}
+	})
+
+	// The router's SQL surface is the lowest major still serving, so the
+	// snapshot has to say which majors those are -- and has to leave out the
+	// two kinds of row that would answer for a group nobody routes to.
+	t.Run("the majors it reports are the ones still serving", func(t *testing.T) {
+		mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state, pg_major) VALUES
+			('g2', 2, 'provisioning', 19),
+			('g0', 3, 'retired', 17),
+			('unstamped', 4, 'serving', NULL)`)
+		mustExec(t, conn, `UPDATE pgshard.shard_sets SET pg_major = 18 WHERE shard_set = 'default'`)
+		t.Cleanup(func() { mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set <> 'default'`) })
+		t.Cleanup(func() { mustExec(t, conn, `UPDATE pgshard.shard_sets SET pg_major = NULL WHERE shard_set = 'default'`) })
+
+		s, err := Load(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int{"default": 18, "g2": 19}
+		if !maps.Equal(s.PGMajors, want) {
+			t.Fatalf("PGMajors = %v, want %v: a retired set is a version the cluster has left, and an unstamped one is not a claim that it runs the default", s.PGMajors, want)
+		}
+		if got := s.ServingMajors(); !slices.Equal(got, []int{18, 19}) {
+			t.Fatalf("ServingMajors = %v, want [18 19]", got)
 		}
 	})
 

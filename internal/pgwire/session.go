@@ -758,7 +758,7 @@ func (s *session) upgradeTLS() error {
 
 func (s *session) parameterStatus() [][2]string {
 	params := map[string]string{
-		"server_version":                s.server.cfg.ServerVersion,
+		"server_version":                s.server.cfg.ServerVersion(),
 		"server_encoding":               "UTF8",
 		"client_encoding":               "UTF8",
 		"DateStyle":                     "ISO, MDY",

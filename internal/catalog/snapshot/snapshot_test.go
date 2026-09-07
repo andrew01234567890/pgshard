@@ -251,6 +251,10 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 			delete(s.ScalarFunctions, FunctionKey{Database: "app", Name: "declared"})
 		},
 		"the write fence": func(s *Snapshot) { s.WriteFence = true },
+		// The major decides which grammar the cluster's SQL surface is, so a
+		// plan cached across a set changing major was made under a rule that
+		// no longer holds.
+		"the major a shard set runs": func(s *Snapshot) { s.PGMajors = map[string]int{"default": 19} },
 	} {
 		changed := build()
 		change(changed)

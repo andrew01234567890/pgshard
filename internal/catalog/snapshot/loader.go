@@ -75,6 +75,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	s := &Snapshot{
 		LoadedAt:        time.Now(),
 		ShardSets:       map[string][]Range{},
+		PGMajors:        map[string]int{},
 		Serving:         map[ShardKey]Serving{},
 		Databases:       map[string]catalog.Database{},
 		Tables:          map[TableKey]Placement{},
@@ -93,6 +94,19 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	}
 	for _, r := range ranges {
 		s.ShardSets[r.ShardSet] = append(s.ShardSets[r.ShardSet], rangeFromCatalog(r))
+	}
+	sets, err := catalog.ListShardSets(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: shard sets: %w", err)
+	}
+	for _, set := range sets {
+		// A retired set still has rows for as long as its groups are kept.
+		// Counting its major would hold the cluster's SQL surface down to
+		// the version it was upgraded away from.
+		if set.State == catalog.ShardSetRetired || set.PGMajor == nil {
+			continue
+		}
+		s.PGMajors[set.Name] = *set.PGMajor
 	}
 	statuses, err := catalog.ListAllShardStatus(ctx, tx)
 	if err != nil {

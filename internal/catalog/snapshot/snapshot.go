@@ -149,9 +149,15 @@ type Snapshot struct {
 	// ServingSet names the shard set routers route user data by.
 	ServingSet string
 	ShardSets  map[string][]Range
-	Serving    map[ShardKey]Serving
-	Databases  map[string]catalog.Database
-	Tables     map[TableKey]Placement
+	// PGMajors is the PostgreSQL major each live shard set runs, from
+	// pgshard.shard_sets.pg_major. Retired sets are left out, and so is a
+	// set whose major was never stamped -- a cluster created before
+	// upgrades existed says nothing here rather than claiming a default.
+	// It is empty on a Partial view, which never reads it.
+	PGMajors  map[string]int
+	Serving   map[ShardKey]Serving
+	Databases map[string]catalog.Database
+	Tables    map[TableKey]Placement
 	// Sequences names the rows of pgshard.sequences, the global sequences
 	// the router answers nextval() for.
 	Sequences map[string]bool
@@ -246,6 +252,12 @@ func (s *Snapshot) fingerprint() uint64 {
 			num(r.Start)
 			num(r.End)
 		}
+	}
+	// The majors decide which grammar the cluster's SQL surface is, so a
+	// plan made before one changed was made under a different rule.
+	for _, set := range slices.Sorted(maps.Keys(s.PGMajors)) {
+		str(set)
+		num(int64(s.PGMajors[set]))
 	}
 	for _, k := range slices.SortedFunc(maps.Keys(s.Serving), compareShardKeys) {
 		str(k.ShardSet)
@@ -356,6 +368,21 @@ func (s *Snapshot) ServingShardSet() string {
 		return catalog.DefaultShardSet
 	}
 	return s.ServingSet
+}
+
+// ServingMajors is the PostgreSQL major of every live shard set, in
+// ascending order. Sets whose major was never stamped contribute nothing:
+// the answer is what the catalog knows, not a guess standing in for it.
+func (s *Snapshot) ServingMajors() []int {
+	if len(s.PGMajors) == 0 {
+		return nil
+	}
+	majors := make([]int, 0, len(s.PGMajors))
+	for _, m := range s.PGMajors {
+		majors = append(majors, m)
+	}
+	slices.Sort(majors)
+	return slices.Compact(majors)
 }
 
 // Migrating reports whether any shard of the serving set is fenced by a

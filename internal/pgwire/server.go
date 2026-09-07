@@ -49,8 +49,11 @@ type Config struct {
 	// simply omits SSLRequest would otherwise send its SCRAM exchange, its
 	// SQL and its results in the clear. Development only.
 	AllowPlaintext bool
-	// ServerVersion is reported as the server_version parameter.
-	ServerVersion string
+	// ServerVersion returns the value reported as the server_version
+	// parameter. It is asked once per connection rather than read once at
+	// startup: the SQL surface a router offers follows the majors its shard
+	// sets run, and those change under it during an upgrade.
+	ServerVersion func() string
 	// Parameters overrides or extends the default ParameterStatus set.
 	Parameters map[string]string
 	// CancelHandler overrides the default local-only cancel dispatch.
@@ -108,8 +111,8 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.NewExecutor == nil {
 		return nil, errors.New("pgwire: Config.NewExecutor is required")
 	}
-	if cfg.ServerVersion == "" {
-		cfg.ServerVersion = "18.0 (pgshard)"
+	if cfg.ServerVersion == nil {
+		cfg.ServerVersion = func() string { return "18.0 (pgshard)" }
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)

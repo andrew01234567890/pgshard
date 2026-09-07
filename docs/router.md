@@ -93,12 +93,16 @@ the rest with `0A000`. See *Routing* below.
 - **Poolers.** Endpoints come from `pgshard.shard_status.primary_endpoint`
   by default; `--pooler [SET/]ID=host:port` pins one statically. Pooler
   connections use mTLS (`--pooler-tls-cert/-key/-ca`) unless `--insecure-dev`.
-- **Reported version.** `server_version` is `--server-version`, default
-  `18.6 (pgshard)`. It is a fixed string, not derived from what the shards
-  run, so a cluster serving PostgreSQL 19 reports 18.6 unless this is set.
-  Deriving it needs the router to learn the shards' version, and during a
-  rolling major upgrade to decide which of two answers is the cluster's
-  (PGS-471); until then it is at least correctable without a rebuild.
+- **Reported version.** `server_version` is derived, per connection, from
+  the majors the live shard sets run (`pgshard.shard_sets.pg_major`) and the
+  major this router's grammar was built against: the lowest of them, as
+  `<major>.0 (pgshard)`. The shards bound it because syntax an older group
+  still serving would refuse must not be advertised, and the grammar bounds
+  it because a router cannot offer syntax it cannot parse -- so a cluster
+  fully on PostgreSQL 19 read by a router built against the 18 grammar
+  reports 18, which is what its SQL surface is. The minor is `0`: nothing
+  here knows the minor the shards run. `--server-version` pins a literal
+  string instead, for a client that has to be told something else.
 - **Fencing.** Every pooler request is stamped with the snapshot's
   `shard_map_generation` and the shard's `primary_epoch`. A pooler refuses a
   stale stamp with `55000` and says so is a fence; the router buffers and

@@ -42,7 +42,7 @@ func TestPsqlConformance(t *testing.T) {
 	// both native Docker and Docker Desktop (where --network host is the VM
 	// and only IPv4 listeners are forwarded).
 	ts := startServerOn(t, Config{
-		ServerVersion: "18.6 (pgshard)",
+		ServerVersion: func() string { return "18.6 (pgshard)" },
 		Authenticator: SCRAMAuthenticator{Lookup: lookup(map[string]string{"alice": scram.String()})},
 	}, "tcp4", "0.0.0.0:0")
 	_, port, err := net.SplitHostPort(ts.addr)
