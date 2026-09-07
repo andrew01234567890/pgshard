@@ -229,6 +229,48 @@ func (b *Backend) flush() error {
 	return nil
 }
 
+// watch makes this backend's blocking reads and writes answer to ctx, and
+// returns the function that stops watching.
+//
+// pgproto3 reads and writes the socket directly, with no context anywhere:
+// a backend PostgreSQL will not interrupt therefore held the handler
+// goroutine, the backend itself and the session entry until PostgreSQL
+// answered, whatever the caller had already given up on. A connection
+// deadline is what those reads do answer to, so the context becomes one --
+// its own if it has a deadline, and one in the past the moment it is done.
+//
+// A read or write cut short this way leaves the protocol state unknown, so
+// the error marks the backend broken and it is discarded rather than
+// returned to the pool. That is the point: the alternative is holding it
+// for a statement nobody is waiting for any more.
+func (b *Backend) watch(ctx context.Context) func() {
+	// Held, not re-read: a backend discarded while this is watching has
+	// its connection closed and the field cleared under us. The closed
+	// connection refuses a deadline harmlessly; the cleared field is a nil
+	// dereference, and reading it from here at all is a race.
+	conn := b.conn
+	if conn == nil || ctx == nil || ctx.Done() == nil {
+		return func() {}
+	}
+	if d, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(d)
+	}
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-stop:
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+		_ = conn.SetDeadline(time.Time{})
+	}
+}
+
 func (b *Backend) receive() (pgproto3.BackendMessage, error) {
 	msg, err := b.fe.Receive()
 	if err != nil {
