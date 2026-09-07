@@ -35,8 +35,18 @@ type AgentStatus struct {
 }
 
 // AgentClient drives member agents over pgshard.v1.Agent. addr is host:port
-// of the agent's gRPC listener. The transport is plaintext for now; mTLS
-// between operator and agents is a later layer.
+// of the agent's gRPC listener.
+//
+// The transport is mutual TLS wherever the member being dialled requires
+// it, and plaintext otherwise -- decided per member from the row that says
+// what that member is running, because turning the requirement on is a roll
+// and half a rolled fleet is in each state. See dial below and
+// spec.internalTLS.agentMTLS.
+//
+// (This said "plaintext for now; mTLS between operator and agents is a
+// later layer" until 2026-09-07, long after that layer landed. It is the
+// first thing a reader meets here, and it described the agent control plane
+// as unauthenticated when it need not be.)
 type AgentClient interface {
 	Status(ctx context.Context, addr string) (AgentStatus, error)
 	Promote(ctx context.Context, addr string, epoch uint64, holder string) error
