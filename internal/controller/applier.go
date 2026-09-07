@@ -593,8 +593,16 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 		// server.
 		priorRun := s.State == catalog.ShardRunning
 		return a.retrying(ctx, logger, m, key, id, s, func() (string, error) {
-			defer func() { resumed = true }()
-			return a.step(ctx, m, key, id, resumed, priorRun)
+			out, err := a.step(ctx, m, key, id, resumed, priorRun)
+			// Only an attempt that could have reached the server makes the
+			// next one a resume. Setting this unconditionally meant one
+			// refused dial put every shard of the pass behind the resume
+			// guard, and a CREATE TABLE whose table existed out of band was
+			// then reported applied on shards that had never run anything.
+			if mayHaveRun(err) {
+				resumed = true
+			}
+			return out, err
 		})
 	}
 	steps := m.Meta.Steps
@@ -1265,6 +1273,32 @@ func transient(err error) bool {
 		return true
 	}
 	return false
+}
+
+// mayHaveRun reports whether an attempt that ended with err could have
+// reached the server and committed. A refused dial never opened a
+// connection; a save failure is a step deliberately not run; a lock
+// timeout, a deadlock and a serialization failure each abort the
+// transaction they were in. Everything else -- a connection lost
+// mid-statement above all -- is indeterminate, and a guard that asks this
+// question has to assume the statement did run.
+func mayHaveRun(err error) bool {
+	if err == nil {
+		return true
+	}
+	var de *dialError
+	if errors.As(err, &de) {
+		return false
+	}
+	var sf *saveFailed
+	if errors.As(err, &sf) {
+		return false
+	}
+	switch sqlState(err) {
+	case "55P03", "40P01", "40001", "57P03":
+		return false
+	}
+	return true
 }
 
 func missingObject(err error) bool {
