@@ -208,8 +208,14 @@ func (ps *poolerStream) took(r recvResult) (*pgshardv1.ExecuteResponse, error) {
 // held the router's drain and its shutdown open with nothing able to end
 // them: forceClose cancels the query context and closes the client socket,
 // and neither is what this waits on. Aborting the gRPC stream is what wakes
-// the reader, so past the grace that is what happens -- at the cost of a
-// session the pooler has to expire on its own, which it does.
+// the reader, so past the grace that is what happens.
+//
+// What it costs is on the pooler: its handler is still inside a blocking
+// backend read, so the session stays attached, a following Release waits out
+// its own timeout instead of recycling, and the reservation sweep skips
+// attached sessions altogether. That backend returns when PostgreSQL finally
+// answers, not on a timer. This bounds the router; bounding the pooler's own
+// backend I/O is separate work.
 func (ps *poolerStream) close() {
 	ps.once.Do(func() { close(ps.gone) })
 	_ = ps.stream.CloseSend()

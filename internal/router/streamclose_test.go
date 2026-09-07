@@ -12,16 +12,19 @@ import (
 // backend PostgreSQL will not interrupt looks like from the router.
 type wedgedStream struct {
 	pgshardv1.Pooler_ExecuteClient
-	ctx  context.Context
-	held chan struct{}
+	ctx    context.Context
+	held   chan struct{}
+	sentAt time.Time
+	seenAt time.Time
 }
 
 func (s *wedgedStream) Recv() (*pgshardv1.ExecuteResponse, error) {
 	<-s.ctx.Done()
+	s.seenAt = time.Now()
 	close(s.held)
 	return nil, s.ctx.Err()
 }
-func (s *wedgedStream) CloseSend() error         { return nil }
+func (s *wedgedStream) CloseSend() error         { s.sentAt = time.Now(); return nil }
 func (s *wedgedStream) Context() context.Context { return s.ctx }
 
 // close waited for the pooler to finish the session, without a bound. A
@@ -51,5 +54,12 @@ func TestClosingAStreamTheePoolerNeverFinishesIsBounded(t *testing.T) {
 	case <-ps.done:
 	case <-time.After(time.Second):
 		t.Fatal("close returned with the reader still running")
+	}
+	// The bound is a last resort, not the mechanism: the pooler gets the
+	// half-close and the whole grace to finish the session on its own before
+	// the stream is torn out from under it. Cancelling straight away is what
+	// abort is for, and a close that did that would pass everything above.
+	if waited := ws.seenAt.Sub(ws.sentAt); waited < cancelGrace/2 {
+		t.Fatalf("stream cancelled %v after the half-close; the pooler gets %v to finish first", waited, cancelGrace)
 	}
 }

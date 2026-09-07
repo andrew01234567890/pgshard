@@ -284,7 +284,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // forceCloseGrace bounds the wait for sessions to end after they have been
 // force-closed. A variable so tests need not spend it.
-var forceCloseGrace = 5 * time.Second
+//
+// Deliberately far longer than one session's teardown: ending a session
+// releases each shard it holds in turn, and every one of those waits its own
+// grace on a pooler stream and then its own release timeout. A grace as short
+// as one of those would report sessions that are ending, not sessions that
+// never will.
+var forceCloseGrace = 30 * time.Second
 
 // TerminateWhere ends every session whose role revoked reports, and returns
 // how many it asked to end. The caller decides from the roles it holds now

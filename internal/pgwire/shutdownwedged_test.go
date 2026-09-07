@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +50,12 @@ func TestShutdownReturnsEvenWhenAForcedSessionDoesNot(t *testing.T) {
 	case err := <-returned:
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("shutdown err = %v, want it to carry the deadline it exceeded", err)
+		}
+		// A plain deadline is what a caller gets when it simply ran out of
+		// time; this one also has to say the sessions outlived being closed,
+		// because that is the part an operator has to act on.
+		if !strings.Contains(err.Error(), "sessions still running") {
+			t.Fatalf("shutdown err = %v, want it to say the sessions outlived the force-close", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("shutdown never returned; a wedged session held it past its own deadline")
