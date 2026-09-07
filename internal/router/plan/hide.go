@@ -1,8 +1,6 @@
 package plan
 
 import (
-	"google.golang.org/protobuf/proto"
-
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
@@ -78,7 +76,7 @@ func (w *walker) hideRewriteColumns() error {
 		e.Hint = "retry the statement, or list the columns explicitly"
 		return e
 	}
-	tree := proto.Clone(w.tree.(*pgquerypb.ParseResult)).(*pgquerypb.ParseResult)
+	tree := w.editable()
 	root := tree.GetStmts()[0].GetStmt()
 	if needStar {
 		expandStars(root, target)

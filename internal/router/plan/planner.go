@@ -100,6 +100,11 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 	if err := w.hideRewriteColumns(); err != nil {
 		return refusalErr(err)
 	}
+	// After it, and deparsing the same tree: both rewrite the statement,
+	// and the text that reaches the shards has to carry both changes.
+	if err := w.hideReservedFromIntrospection(); err != nil {
+		return refusalErr(err)
+	}
 	if pl.Rewritten != "" && !masked {
 		// The masked text names its columns, so the second pass finds
 		// nothing left to mask and cannot recurse again.
@@ -627,6 +632,9 @@ func (r *rel) root() *rel {
 type walker struct {
 	sess Session
 	plan *Plan
+	// edit is the clone the statement's rewrites share; see editable. The
+	// parse result itself belongs to the cache and must not be mutated.
+	edit *pgquerypb.ParseResult
 	// hiddenName is the first migration working column the statement names,
 	// found by the single pre-scan rather than by a walk of its own.
 	hiddenName string
