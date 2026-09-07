@@ -404,12 +404,14 @@ func (s *Snapshot) scanShardIDs(set string) []int32 {
 	}
 	out := make([]int32, 0, len(ranges))
 	for _, r := range ranges {
-		if !slices.Contains(out, r.ShardID) {
-			out = append(out, r.ShardID)
-		}
+		out = append(out, r.ShardID)
 	}
+	// Sort then collapse, rather than a membership test per range: the
+	// ranges of one set are one per shard today, but this runs for every
+	// set on every catalog reload and a quadratic scan is a poor thing to
+	// leave in the path of a cluster that grows.
 	slices.Sort(out)
-	return out
+	return slices.Compact(out)
 }
 
 // ServingShardSet is ServingSet, or the default set when the snapshot was

@@ -101,3 +101,25 @@ func TestShardIDsAreComputedOnce(t *testing.T) {
 		t.Fatalf("unindexed snapshot = %v, want the scan's answer", got)
 	}
 }
+
+// The resharding flag is answered from what the load computed, not from the
+// serving map as it stands. Nothing else proves the cache is consulted:
+// agreeing with the scan is what a snapshot that scans every time also does.
+func TestReshardingIsAnsweredFromTheIndex(t *testing.T) {
+	s := &Snapshot{Serving: map[ShardKey]Serving{{ShardSet: "default", ShardID: 0}: {State: "serving"}}}
+	s.index()
+	if s.Resharding() {
+		t.Fatal("a serving set is not resharding")
+	}
+	// A loaded snapshot is immutable; this reaches past that on purpose, to
+	// show the answer comes from the index rather than from a fresh walk.
+	s.Serving[ShardKey{ShardSet: "default", ShardID: 0}] = Serving{State: "provisioning"}
+	if s.Resharding() {
+		t.Fatal("Resharding walked the serving map; a loaded snapshot must answer from what it indexed")
+	}
+	// And a snapshot built by hand still walks it.
+	byHand := &Snapshot{Serving: map[ShardKey]Serving{{ShardSet: "default", ShardID: 0}: {State: "provisioning"}}}
+	if !byHand.Resharding() {
+		t.Fatal("an unindexed snapshot must scan rather than report the zero value")
+	}
+}
