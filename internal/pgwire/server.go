@@ -11,8 +11,11 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // Cancel-key layouts. Protocol 3.2 keys carry the router instance prefix and
@@ -69,6 +72,14 @@ type Config struct {
 	// past the cap are refused with 53300. Zero means 100, negative
 	// disables the cap.
 	MaxStartupConns int
+	// MaxMessageBodyBudget bounds the memory every session together may
+	// have committed to message bodies that have been declared but not yet
+	// arrived. Zero leaves it unbounded, and the bound is then
+	// MaxMessageBodyLen times the session count, because a body is
+	// allocated in full the moment its five-byte header says how large it
+	// is. With a budget an idle session costs nothing, and the ceiling can
+	// be raised for the messages that need it without multiplying.
+	MaxMessageBodyBudget int64
 	// MaxQueryDuration bounds how long one statement may run before the
 	// session cancels it. Zero leaves it unbounded, which is what
 	// PostgreSQL's own statement_timeout defaults to.
@@ -94,6 +105,9 @@ type Server struct {
 	logger     *slog.Logger
 
 	startupSem chan struct{}
+	// bodyBudget is what every session's declared-but-unarrived message
+	// bodies are charged against. nil when the server does not bound one.
+	bodyBudget *semaphore.Weighted
 	// afterAccept runs between Accept returning and the handler being
 	// registered. Tests set it to hold Serve exactly where Shutdown used to
 	// be able to overtake it; it is nil everywhere else.
@@ -147,6 +161,11 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg.MaxStartupConns = 100
 	}
 	srv := &Server{cfg: cfg, instanceID: id, logger: cfg.Logger, sessions: map[uint64]*session{}, shutdownCh: make(chan struct{})}
+	ceiling := cfg.MaxMessageBodyLen
+	if ceiling <= 0 {
+		ceiling = DefaultMaxMessageBodyLen
+	}
+	srv.bodyBudget = newBodyBudget(cfg.MaxMessageBodyBudget, ceiling)
 	if cfg.MaxStartupConns > 0 {
 		srv.startupSem = make(chan struct{}, cfg.MaxStartupConns)
 	}
