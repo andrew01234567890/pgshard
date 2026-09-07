@@ -115,6 +115,8 @@ const (
 	controllerLoginDir        = "/etc/pgshard/controller"
 	replicationVolume         = "replication-login"
 	replicationDir            = "/etc/pgshard/replication"
+	poolerLoginVolume         = "pooler-login"
+	poolerLoginDir            = "/etc/pgshard/pooler"
 	// LabelShardSet on a shard group's objects names the catalog shard set
 	// it belongs to.
 	LabelShardSet = "pgshard.io/shard-set"
@@ -377,6 +379,10 @@ func SecretName(cluster string) string { return cluster + "-superuser" }
 
 // RouterSecretName holds the router's catalog login password.
 func RouterSecretName(cluster string) string { return cluster + "-router" }
+
+// PoolerSecretName holds the password the pooler's change-stream
+// connections use.
+func PoolerSecretName(cluster string) string { return cluster + "-pooler" }
 
 // ReplicationSecretName holds the password a standby streams with, and the
 // one pg_basebackup and pg_rewind reach the source as.

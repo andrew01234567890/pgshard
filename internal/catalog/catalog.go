@@ -50,6 +50,13 @@ const RouterRole = "pgshard_router"
 // cannot disagree about it.
 const ReplicationRole = "pgshard_replication"
 
+// PoolerRole is the login role the pooler's change-stream connections use.
+// Like ReplicationRole it exists on every group and is not created by a
+// migration. It reads: logical decoding, the exported snapshot a stream
+// starts from, and the tables that snapshot copies -- so it has REPLICATION
+// and pg_read_all_data, and cannot write anything at all.
+const PoolerRole = "pgshard_pooler"
+
 // ControllerRole is the login role the controller uses to reach the catalog.
 // It is a member of pgshard_system -- it drives every workflow, so it writes
 // the whole schema -- plus the handful of server capabilities the barrier

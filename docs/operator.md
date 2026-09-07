@@ -70,6 +70,17 @@ Everything else is rejected, so an application role reaches a shard through
 the pooler's unix socket and the router, which is where shard-key routing,
 the write fences and the coordination of a multi-shard write happen.
 
+The pooler opens its change-stream connections as `pgshard_pooler`, also on
+every group: `REPLICATION` for the logical decoding connection and the slot
+a stream exports its snapshot from, `pg_read_all_data` for the tables that
+snapshot is then copied out of, and nothing that writes. Its password is
+generated into `<cluster>-pooler` and mounted at `/etc/pgshard/pooler`. With
+that and the router role for the catalog, the pooler container carries
+**no** `PGPASSWORD` and no superuser Secret at all — libpq applies that
+variable to every connection lacking a password of its own, so one variable
+there would hand both connections the same identity, and the identity it
+used to hand them was direct write access to every shard.
+
 A standby streams as `pgshard_replication`, not as the superuser:
 `primary_conninfo` is written into every standby's `postgresql.auto.conf`
 and travels in every clone, so the credential that reaches the most places

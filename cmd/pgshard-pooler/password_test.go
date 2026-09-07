@@ -17,7 +17,7 @@ func TestTheCatalogPasswordComesFromAFile(t *testing.T) {
 	dir := t.TempDir()
 	const dsn = "host=c.svc port=5432 user=pgshard_router dbname=postgres"
 
-	if got, err := withPasswordFile(dsn, ""); err != nil || got != dsn {
+	if got, err := withPasswordFile(dsn, "", "catalog"); err != nil || got != dsn {
 		t.Fatalf("no file must leave the DSN alone: %q %v", got, err)
 	}
 
@@ -25,7 +25,7 @@ func TestTheCatalogPasswordComesFromAFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("s3cr3t\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := withPasswordFile(dsn, path)
+	got, err := withPasswordFile(dsn, path, "catalog")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestTheCatalogPasswordComesFromAFile(t *testing.T) {
 	if err := os.WriteFile(awkward, []byte(`a'b\c`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err = withPasswordFile(dsn, awkward)
+	got, err = withPasswordFile(dsn, awkward, "catalog")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,10 +52,10 @@ func TestTheCatalogPasswordComesFromAFile(t *testing.T) {
 	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := withPasswordFile(dsn, empty); err == nil {
+	if _, err := withPasswordFile(dsn, empty, "catalog"); err == nil {
 		t.Fatal("an empty password file must fail rather than connect without one")
 	}
-	if _, err := withPasswordFile(dsn, filepath.Join(dir, "missing")); err == nil {
+	if _, err := withPasswordFile(dsn, filepath.Join(dir, "missing"), "catalog"); err == nil {
 		t.Fatal("a missing password file must fail")
 	}
 }
