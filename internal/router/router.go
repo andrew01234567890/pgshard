@@ -231,7 +231,7 @@ func (r *Router) NewExecutor(info pgwire.SessionInfo) (pgwire.Executor, error) {
 	// Read the limit before taking the lock: RoleCache holds its own mutex
 	// across a catalog reload, and blocking r.mu on that would stall every
 	// session close, cancel and buffer reservation behind catalog latency.
-	limit, limited := r.limitFor(info.User)
+	limit, limited := r.ConnectionLimit(info.User)
 	r.mu.Lock()
 	if limit := r.maxSessions(); limit > 0 && len(r.sessions) >= limit {
 		r.mu.Unlock()
@@ -265,10 +265,16 @@ func (r *Router) maxSessions() int {
 	return r.cfg.MaxSessions
 }
 
-// limitFor is the role's own connection limit, falling back to
+// ConnectionLimit is the role's own connection limit, falling back to
 // MaxSessionsPerRole for a role that carries none. nil RoleLimits leaves
 // only the fallback.
-func (r *Router) limitFor(user string) (int32, bool) {
+//
+// Exported because the sweep that sheds sessions above a lowered limit has
+// to ask the same question the connect path asks. Asking the catalog
+// directly instead would miss the router-wide default, so a role relying on
+// that default would be admitted against one limit and never measured
+// against any.
+func (r *Router) ConnectionLimit(user string) (int32, bool) {
 	if r.cfg.RoleLimits != nil {
 		if limit, ok := r.cfg.RoleLimits.ConnectionLimit(user); ok {
 			return limit, true

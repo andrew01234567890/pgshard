@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 
 	"sync/atomic"
@@ -370,7 +372,70 @@ func (s *Server) TerminateWhere(revoked func(user string) bool) int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sess.endRevoked()
+			sess.endRevoked("the role may no longer log in")
+		}()
+	}
+	wg.Wait()
+	return n
+}
+
+// TerminateExcess ends the sessions a role holds beyond the limit it has
+// now, and returns how many it asked to end. limit reports the role's
+// allowance and whether it has one at all.
+//
+// The limit is checked when a session connects, so lowering it left every
+// session already open in place: a role given a lower allowance kept
+// whatever it had taken under the old one, for as long as those sessions
+// lived. Nothing else brought it back into line, because a role at or over
+// its limit simply stops being admitted -- which is not the same as being
+// reduced to it.
+//
+// The newest go. They are the ones that would not have been admitted under
+// the limit the role has now, and ending the oldest instead would take the
+// long-lived connections a pool has settled on and leave the newcomers that
+// caused the overage.
+func (s *Server) TerminateExcess(limit func(user string) (int32, bool)) int {
+	s.mu.Lock()
+	sessions := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	byUser := map[string][]*session{}
+	for _, sess := range sessions {
+		// Only the ones that finished authenticating. A session publishes
+		// the role it claims before it proves it, so that a revocation
+		// reaches a client mid-exchange -- but counting those here would
+		// let anyone who can reach the port claim a role, stall at the
+		// password prompt, and have that role's real sessions shed as the
+		// newest over the limit. The connect path counts the same set.
+		if u, serving := sess.role(); serving && u != "" {
+			byUser[u] = append(byUser[u], sess)
+		}
+	}
+
+	var ending []*session
+	n := 0
+	for user, sessions := range byUser {
+		allowed, ok := limit(user)
+		if !ok || int32(len(sessions)) <= allowed {
+			continue
+		}
+		// Ids are handed out in order, so this is arrival order.
+		slices.SortFunc(sessions, func(a, b *session) int { return cmp.Compare(a.id, b.id) })
+		for _, sess := range sessions[allowed:] {
+			n++
+			if sess.latchRevoked() {
+				ending = append(ending, sess)
+			}
+		}
+	}
+	var wg sync.WaitGroup
+	for _, sess := range ending {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sess.endRevoked("the role holds more connections than its limit now allows")
 		}()
 	}
 	wg.Wait()
