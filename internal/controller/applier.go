@@ -581,9 +581,20 @@ func (a *Applier) targets(ctx context.Context, m catalog.DDLMigration, set strin
 func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, key string, id int32, s catalog.ShardMigration) catalog.ShardMigration {
 	if m.Strategy != "multistep" {
 		resumed := s.State == catalog.ShardRunning || s.State == catalog.ShardRetrying
+		// Whether an EARLIER PROCESS may have committed this statement,
+		// which is not the same question as whether this pass has attempted
+		// it before. running is saved immediately before the statement is
+		// sent, so a process that died holding it may have got as far as
+		// COMMIT. retrying is saved after a transient failure -- a lock
+		// timeout or a refused dial -- which did not.
+		//
+		// It is captured once and never moves, unlike resumed, which is set
+		// after every attempt including the ones that never reached the
+		// server.
+		priorRun := s.State == catalog.ShardRunning
 		return a.retrying(ctx, logger, m, key, id, s, func() (string, error) {
 			defer func() { resumed = true }()
-			return a.step(ctx, m, key, id, resumed)
+			return a.step(ctx, m, key, id, resumed, priorRun)
 		})
 	}
 	steps := m.Meta.Steps
@@ -768,7 +779,7 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 // checks whether the object already matches (the previous attempt may have
 // committed before its progress was saved); an index left invalid by an
 // interrupted CREATE INDEX CONCURRENTLY is dropped and built again.
-func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string, id int32, resumed bool) (string, error) {
+func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string, id int32, resumed, priorRun bool) (string, error) {
 	db := m.Database
 	if m.Meta.Object.Kind == "role" || m.Meta.Object.Kind == "database" || strings.HasSuffix(m.Kind, "ROLE") {
 		db = ""
@@ -826,6 +837,22 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 	if err != nil {
 		if m.Scope == "existing" && missingObject(err) {
 			return "", &skippedError{err}
+		}
+		// A DROP whose object is already gone, on a shard an earlier
+		// process left running, is the state the migration asked for: that
+		// process committed the drop and died before the catalog was told.
+		// Only the drops the planner can mark with an object are covered by
+		// the resume check above -- a trigger, a policy, a rule, a type, a
+		// sequence and a DROP TABLE naming several tables carry none -- so
+		// without this the replay's 42704 fails a migration whose every
+		// shard is correct.
+		//
+		// priorRun, not resumed: resumed is true after any attempt at all,
+		// including a refused dial and a lock timeout, neither of which can
+		// have committed anything. Forgiving those reported a migration
+		// complete when nothing had been dropped anywhere.
+		if priorRun && missingObject(err) && strings.HasPrefix(m.Kind, "DROP ") {
+			return catalog.ShardApplied, nil
 		}
 		return "", err
 	}
