@@ -301,6 +301,17 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		return status.Errorf(codes.Unavailable, "start replication: %v", err)
 	}
 	deliver := func(batch *pgshardv1.ChangeBatch) error {
+		// Here rather than only at the top of the loop, because that check
+		// runs BEFORE Receive: a batch that arrived inside a Receive the
+		// view moved under would otherwise be decoded and emitted, and a
+		// position recorded for it, before the next pass tested the view
+		// again. Every batch leaves through this function -- the batcher's
+		// flushes, its size cap, and the keepalives sent directly -- so
+		// this is the one place that covers all of them. It costs one
+		// atomic read per batch.
+		if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
+			return fenceStatus(e)
+		}
 		if err := emit(batch); err != nil {
 			return err
 		}
@@ -333,11 +344,11 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 			return nil
 		}
 		// Re-checked every pass, not only at the open: the fence that
-		// matters for a stream is the one that ends it. A promotion moves
-		// the shard's epoch while this call sits in Receive, and the
-		// router's own check only runs after a batch has already been
-		// delivered -- so without this the commits in that batch reach the
-		// consumer, and a position is recorded for them.
+		// matters for a stream is the one that ends it, and the router's
+		// own check only runs after a batch has already been delivered.
+		// This one ends a stream whose shard moved on while nothing is
+		// arriving; the check in deliver above is what stops a batch that
+		// arrives after the move.
 		if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
 			return fenceStatus(e)
 		}

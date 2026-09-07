@@ -198,11 +198,23 @@ func (h *pgHarness) testStream(t *testing.T) {
 // The first batch is taken before the view moves, deliberately: it proves
 // the stream was established and running, so what ends it is the re-check
 // and not the one at the open.
+//
+// This covers the loop's check. It does NOT distinguish that one from the
+// check in the delivery path, and no test here does: the window the second
+// closes needs a batch to arrive inside the very Receive the view moved
+// under, and a client cannot place the move there -- its own view of where
+// the server has got to is always behind what the server has already sent.
+// Pinning it would mean injecting a fake replication connection into the
+// stream path, which is a larger change than the window is worth.
 func (h *pgHarness) testStreamEndsOnEpochChange(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// Its own publication as well as its own slot: with only the slot this
+	// subtest passed on keepalives alone when run by itself, because the
+	// publication it decoded through belonged to another subtest.
 	for _, sql := range []string{
 		"create table fenced (id int primary key)",
+		"create publication pgshard_fenced for table fenced",
 		"select pg_create_logical_replication_slot('pgshard_fenced_shard0', 'pgoutput')",
 	} {
 		if _, err := h.admin.Exec(ctx, sql); err != nil {
@@ -211,12 +223,13 @@ func (h *pgHarness) testStreamEndsOnEpochChange(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_, _ = h.admin.Exec(context.Background(), "select pg_drop_replication_slot('pgshard_fenced_shard0')")
+		_, _ = h.admin.Exec(context.Background(), "drop publication if exists pgshard_fenced")
 	})
 	t.Cleanup(func() {
 		h.src.Set(View{Generation: 3, Epoch: 1, Role: pgshardv1.HealthStatus_ROLE_PRIMARY})
 	})
 
-	stream, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Stream: "fenced", Generation: gen(3, 1)})
+	stream, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Stream: "fenced", Publication: "pgshard_fenced", Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
