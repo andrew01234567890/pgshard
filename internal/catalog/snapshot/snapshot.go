@@ -155,6 +155,12 @@ type Snapshot struct {
 	// Sequences names the rows of pgshard.sequences, the global sequences
 	// the router answers nextval() for.
 	Sequences map[string]bool
+	// ScalarFunctions names the non-built-in functions a scatter may
+	// project, per database. A name is in it when pgshard.functions has a
+	// scalar row for it and no aggregate row: an aggregate concatenated
+	// across shards answers with one partial row per shard and no error,
+	// and nothing in a parse tree tells the two apart.
+	ScalarFunctions map[FunctionKey]bool
 	// WriteFence is set while the cluster pauses writes for a certified
 	// restore point; routers hold new writes until it clears.
 	WriteFence bool
@@ -168,6 +174,15 @@ type Snapshot struct {
 	// means it was not computed, which SamePlanning reads as "assume they
 	// differ".
 	rev uint64
+}
+
+// FunctionKey names a function within one database. The schema is not part
+// of it: resolving an unqualified call against search_path is not something
+// the router does, so a name that is a scalar in one schema and an aggregate
+// in another is refused rather than guessed at.
+type FunctionKey struct {
+	Database string
+	Name     string
 }
 
 // SamePlanning reports whether b says the same thing about the catalog as

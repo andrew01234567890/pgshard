@@ -34,13 +34,14 @@ func LoadServing(ctx context.Context, db Beginner) (*Snapshot, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	s := &Snapshot{
-		LoadedAt:  time.Now(),
-		Partial:   true,
-		ShardSets: map[string][]Range{},
-		Serving:   map[ShardKey]Serving{},
-		Databases: map[string]catalog.Database{},
-		Tables:    map[TableKey]Placement{},
-		Sequences: map[string]bool{},
+		LoadedAt:        time.Now(),
+		Partial:         true,
+		ShardSets:       map[string][]Range{},
+		Serving:         map[ShardKey]Serving{},
+		Databases:       map[string]catalog.Database{},
+		Tables:          map[TableKey]Placement{},
+		Sequences:       map[string]bool{},
+		ScalarFunctions: map[FunctionKey]bool{},
 	}
 	if s.ShardMapGeneration, s.DesiredGeneration, err = catalog.Generations(ctx, tx); err != nil {
 		return nil, fmt.Errorf("snapshot: generations: %w", err)
@@ -72,12 +73,13 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	s := &Snapshot{
-		LoadedAt:  time.Now(),
-		ShardSets: map[string][]Range{},
-		Serving:   map[ShardKey]Serving{},
-		Databases: map[string]catalog.Database{},
-		Tables:    map[TableKey]Placement{},
-		Sequences: map[string]bool{},
+		LoadedAt:        time.Now(),
+		ShardSets:       map[string][]Range{},
+		Serving:         map[ShardKey]Serving{},
+		Databases:       map[string]catalog.Database{},
+		Tables:          map[TableKey]Placement{},
+		Sequences:       map[string]bool{},
+		ScalarFunctions: map[FunctionKey]bool{},
 	}
 	if s.ShardMapGeneration, s.DesiredGeneration, err = catalog.Generations(ctx, tx); err != nil {
 		return nil, fmt.Errorf("snapshot: generations: %w", err)
@@ -193,6 +195,26 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	}
 	for _, n := range names {
 		s.Sequences[n] = true
+	}
+	funcs, err := catalog.ListDeclaredFunctions(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: functions: %w", err)
+	}
+	// Two passes, because one aggregate row anywhere in the database
+	// withdraws the name however many scalar rows it has: the router
+	// matches by name alone, so an ambiguous name is not a name it can
+	// decide.
+	aggregates := map[FunctionKey]bool{}
+	for _, f := range funcs {
+		if f.Aggregate() {
+			aggregates[FunctionKey{Database: f.Database, Name: f.Name}] = true
+		}
+	}
+	for _, f := range funcs {
+		k := FunctionKey{Database: f.Database, Name: f.Name}
+		if !f.Aggregate() && !aggregates[k] {
+			s.ScalarFunctions[k] = true
+		}
 	}
 	s.index()
 	return s, tx.Commit(ctx)

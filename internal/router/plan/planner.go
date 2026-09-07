@@ -1205,7 +1205,13 @@ func builtinFunc(fc *pgquerypb.FuncCall) (string, bool) {
 // then answers with one partial row per shard and no error at all. Nothing
 // in the parse tree separates that call from a user-defined scalar, so a
 // scatter refuses both.
-func unknownFunction(node *pgquerypb.Node) string {
+// declared is a function name the operator has classified as a scalar in
+// pgshard.functions for this session's database. A nil one classifies
+// nothing, which is the state of every cluster that has not filled that
+// table in.
+type declared func(name string) bool
+
+func unknownFunction(node *pgquerypb.Node, scalar declared) string {
 	unknown := ""
 	visit(node, func(n *pgquerypb.Node) bool {
 		fc := n.GetFuncCall()
@@ -1213,13 +1219,32 @@ func unknownFunction(node *pgquerypb.Node) string {
 			return true
 		}
 		name, builtin := builtinFunc(fc)
-		if !builtin || (!aggregateNames[name] && !functionNames[name]) {
-			unknown = name
-			return false
+		if builtin && (aggregateNames[name] || functionNames[name]) {
+			return true
 		}
-		return true
+		// Not a built-in, so the only thing that can say what it is, is the
+		// operator. The lookup is by the last name element, so ext.f(x) and
+		// f(x) are the same question -- which is deliberate, since the
+		// router does not resolve search_path.
+		if scalar != nil && scalar(name) {
+			return true
+		}
+		unknown = name
+		return false
 	})
 	return unknown
+}
+
+// scalarFunctions answers for this session's database, and answers nothing
+// when the snapshot has no view of the catalog to answer from.
+func (w *walker) scalarFunctions() declared {
+	snap := w.sess.Snapshot
+	if snap == nil {
+		return nil
+	}
+	return func(name string) bool {
+		return snap.ScalarFunctions[snapshot.FunctionKey{Database: w.sess.Database, Name: name}]
+	}
 }
 
 // hasStar reports whether the expression expands to an unknown number of
@@ -1491,7 +1516,7 @@ func (w *walker) crossShardJoinError() error {
 		if !contains(blockers, "set operations") {
 			blockers = append(blockers, "set operations")
 		}
-		_, err := buildMerge(w.tree, nil, "", blockers, nil, false)
+		_, err := buildMerge(w.tree, nil, "", blockers, nil, false, w.scalarFunctions())
 		return err
 	}
 	if w.refPreserved {
@@ -1538,7 +1563,7 @@ func (w *walker) crossShardJoinError() error {
 	// Where the walk recorded no join and did record something else, that
 	// something else is the answer.
 	if len(w.scatterBlockers) > 0 && !contains(w.scatterBlockers, "joins") {
-		_, err := buildMerge(w.tree, nil, "", w.scatterBlockers, nil, false)
+		_, err := buildMerge(w.tree, nil, "", w.scatterBlockers, nil, false, w.scalarFunctions())
 		return err
 	}
 	return notYet("cross-shard join is not available yet",
@@ -2103,7 +2128,7 @@ func (w *walker) mergeSpec() {
 			sharded[r.name] = true
 		}
 	}
-	p.merge, p.mergeErr = buildMerge(w.tree, w.outer, key, blockers, sharded, onlySharded)
+	p.merge, p.mergeErr = buildMerge(w.tree, w.outer, key, blockers, sharded, onlySharded, w.scalarFunctions())
 }
 
 func without(list []string, drop string) []string {
