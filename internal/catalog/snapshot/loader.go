@@ -103,6 +103,13 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		// A retired set still has rows for as long as its groups are kept.
 		// Counting its major would hold the cluster's SQL surface down to
 		// the version it was upgraded away from.
+		//
+		// A set that is only proposed or provisioning does count, and that
+		// is safe rather than lucky: a reshard stamps the pending set with
+		// the serving set's own major, and an upgrade only starts when the
+		// spec asks for a higher one, so nothing writes a pending major
+		// below what already serves. A downgrade path would break that, and
+		// would have to narrow this to the serving set.
 		if set.State == catalog.ShardSetRetired || set.PGMajor == nil {
 			continue
 		}
