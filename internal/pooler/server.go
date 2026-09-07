@@ -621,6 +621,12 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 			return r.refuse(&pgshardv1.Error{Sqlstate: "57P03", Message: "pooler is draining"})
 		}
 	}
+	// Everything past here reads or writes the backend socket, and none of
+	// those calls take a context. The router giving up -- a cancel, a
+	// deadline, a stream it aborted -- reached this handler as a cancelled
+	// ctx and nothing else, so it went on waiting for PostgreSQL and held
+	// the backend and the session entry with it. This is where that ends.
+	defer b.watch(ctx)()
 	if _, isFlush := req.Message.(*pgshardv1.ExecuteRequest_Flush); isFlush {
 		// Flush itself is answered by nothing, so it is not counted.
 		b.send(fm)

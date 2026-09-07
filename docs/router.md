@@ -216,7 +216,11 @@ the rest with `0A000`. See *Routing* below.
   nothing. It reaches a `COPY ... FROM STDIN` too, whose transfer is a loop
   of socket reads that never consults a context: the limit becomes that
   socket's read deadline for as long as the transfer lasts, and comes off
-  with it.
+  with it. The pooler answers to the same cancellation: the backend socket
+  takes the Execute stream's context as a deadline, so a router that gives
+  up releases the pooler's session and backend instead of leaving them held
+  until PostgreSQL answers. A backend cut short that way is discarded, not
+  pooled -- its protocol state is unknown.
 - **COPY.** `COPY ... FROM STDIN` relays client chunks to the pooler until
   `CopyDone`/`CopyFail`; `COPY ... TO STDOUT` streams back.
 - **`ParameterStatus`.** A GUC_REPORT setting a backend reports as changed
