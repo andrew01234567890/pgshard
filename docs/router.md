@@ -130,9 +130,18 @@ the rest with `0A000`. See *Routing* below.
   names are hashed).
 - **Refused.** `LISTEN`/`NOTIFY`/`UNLISTEN`, `WITH HOLD` cursors and
   temporary tables are refused with `0A000` before reaching a shard, as are
-  the shapes listed under *Routing*; multi-statement simple queries are
-  refused by the wire layer. Text the bound PostgreSQL 18 grammar cannot
-  parse is forwarded to the home shard so the backend reports it.
+  the shapes listed under *Routing*. Text the bound PostgreSQL 18 grammar
+  cannot parse is forwarded to the home shard so the backend reports it.
+- **Multi-statement simple queries.** A semicolon-separated batch runs
+  statement by statement, each with its own results, and one
+  `ReadyForQuery` at the end. A batch the client did not already wrap in a
+  transaction runs in one the router opens: an error stops the batch there
+  and undoes all of it, so a migration script cannot leave half of itself
+  applied. That transaction is the router's, and a transaction control
+  statement inside such a batch is refused with `0A000` -- PostgreSQL lets
+  a `BEGIN` there adopt the implicit transaction and a `COMMIT` end it, and
+  that handover is not implemented. Inside the client's own transaction the
+  batch opens nothing and its `COMMIT` is the client's to send.
 - **Transactions.** `BEGIN` … `COMMIT`/`ROLLBACK` are forwarded; the pooler
   keeps the backend while its `ReadyForQuery` status is not idle. The
   router's own status indicator is the pooler's. A transaction that touches

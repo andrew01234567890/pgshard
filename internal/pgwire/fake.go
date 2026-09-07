@@ -227,6 +227,19 @@ func (f *FakeExecutor) Flush(ctx context.Context, w ResultWriter) error {
 	return nil
 }
 
+// BeginImplicit implements Executor.
+func (f *FakeExecutor) BeginImplicit(ctx context.Context) error {
+	return f.SimpleQuery(ctx, "BEGIN", discardWriter{})
+}
+
+// EndImplicit implements Executor.
+func (f *FakeExecutor) EndImplicit(ctx context.Context, commit bool) error {
+	if commit {
+		return f.SimpleQuery(ctx, "COMMIT", discardWriter{})
+	}
+	return f.SimpleQuery(ctx, "ROLLBACK", discardWriter{})
+}
+
 // TransactionStatus implements Executor.
 func (f *FakeExecutor) TransactionStatus() TxStatus {
 	f.mu.Lock()

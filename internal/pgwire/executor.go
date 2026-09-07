@@ -85,6 +85,14 @@ type Executor interface {
 	// and without a ReadyForQuery. An executor that cannot answer a
 	// particular batch early returns nil and leaves it staged for Sync.
 	Flush(ctx context.Context, w ResultWriter) error
+	// BeginImplicit opens the transaction a multi-statement simple query
+	// runs in. PostgreSQL wraps such a batch in one transaction nobody
+	// asked for: each statement sees the ones before it, and an error
+	// anywhere undoes all of them. It is called only when the session is
+	// not already in a transaction of its own.
+	BeginImplicit(ctx context.Context) error
+	// EndImplicit commits or rolls back what BeginImplicit opened.
+	EndImplicit(ctx context.Context, commit bool) error
 	TransactionStatus() TxStatus
 	// Release frees any resources when the session ends.
 	Release()

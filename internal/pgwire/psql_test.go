@@ -85,10 +85,12 @@ func TestPsqlConformance(t *testing.T) {
 			t.Fatalf("psql -tA: %v %q", err, out)
 		}
 	})
-	t.Run("multi-statement refused", func(t *testing.T) {
-		out, err := run(t, "s3cret", "-c", "select 1; select 1")
-		if err == nil || !strings.Contains(out, "multi-statement simple queries are not supported") {
-			t.Fatalf("psql: %v %q", err, out)
+	// psql -c sends the whole string as one simple query. A batch used to
+	// come back refused, which is what a migration script or a dump does.
+	t.Run("multi-statement batch", func(t *testing.T) {
+		out, err := run(t, "s3cret", "-tA", "-c", "select 1; select 1")
+		if err != nil || out != "1\n1\n" {
+			t.Fatalf("psql: %v %q, want each statement's own result", err, out)
 		}
 	})
 	t.Run("wrong password", func(t *testing.T) {

@@ -128,11 +128,15 @@ type Executor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	conn     *poolerStream
-	pinned   bool
-	tx       pgwire.TxStatus
-	lastTag  string
-	txnEnded bool
+	conn   *poolerStream
+	pinned bool
+	tx     pgwire.TxStatus
+	// implicitTx marks the transaction this executor opened for a
+	// multi-statement simple query, which the client never asked for and
+	// cannot be told about.
+	implicitTx bool
+	lastTag    string
+	txnEnded   bool
 	// cancelSent dedupes cancel requests within one statement, and
 	// cancelFor is the statement context it was reset for. The reset used
 	// to happen on every pump, and a statement pumps more than once -- the
@@ -654,9 +658,61 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	return e.guard("SimpleQuery", func() error { return e.simpleQuery(ctx, sql, w) })
 }
 
+// refuseTxnControlInBatch refuses a transaction control statement inside a
+// batch this executor opened a transaction for.
+//
+// PostgreSQL does not refuse it: a BEGIN there adopts the implicit
+// transaction and a COMMIT ends it, and the statements after either run in
+// a new one. Nothing here implements that handover, and running the
+// statement anyway would be worse than refusing it -- a COMMIT would commit
+// a transaction the client did not open and cannot see, leaving the rest of
+// its own batch to apply on its own.
+//
+// implicitTx is set after BeginImplicit's own BEGIN and cleared before
+// EndImplicit's COMMIT, so neither refuses itself.
+func (e *Executor) refuseTxnControlInBatch(class StmtClass) error {
+	if !e.implicitTx || class.Txn == plan.TxnNone {
+		return nil
+	}
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
+		"a transaction control statement is not available inside a multi-statement simple query")
+	err.Hint = "send the batch inside your own BEGIN and COMMIT, or send its statements one at a time"
+	return err
+}
+
+// BeginImplicit implements pgwire.Executor: it opens the transaction a
+// multi-statement simple query runs in. It is a BEGIN like any other, so
+// the shard is pinned and the transaction escalates to two-phase commit the
+// same way -- what differs is that the client never sent it, so nothing it
+// answers reaches the client.
+func (e *Executor) BeginImplicit(ctx context.Context) error {
+	if err := e.guard("BeginImplicit", func() error {
+		return e.simpleQuery(ctx, "BEGIN", discardWriter{})
+	}); err != nil {
+		return err
+	}
+	e.implicitTx = true
+	return nil
+}
+
+// EndImplicit implements pgwire.Executor.
+func (e *Executor) EndImplicit(ctx context.Context, commit bool) error {
+	sql := "ROLLBACK"
+	if commit {
+		sql = "COMMIT"
+	}
+	e.implicitTx = false
+	return e.guard("EndImplicit", func() error {
+		return e.simpleQuery(ctx, sql, discardWriter{})
+	})
+}
+
 func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
 	pl, err := e.plan(ctx, sql)
 	if err != nil {
+		return err
+	}
+	if err := e.refuseTxnControlInBatch(pl.Class); err != nil {
 		return err
 	}
 	if pl.Kind == plan.MigrationKind {
