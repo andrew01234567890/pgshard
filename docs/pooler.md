@@ -101,12 +101,17 @@
   primary's PostgreSQL before the operator bumps the epoch (see
   [ha.md](ha.md)); the epoch is the fence against a stale router, and this
   probe is the fence against a stale route to a demoted member.
-  A change stream is fenced at its open **and on every pass of the receive
-  loop**, because the fence that matters for a long-lived call is the one
-  that ends it: a promotion moves the shard's epoch while the call sits in
-  `Receive`, and the router's own check runs only after a batch has been
-  delivered — one batch too late, since those commits have already reached
-  the consumer and a position has been recorded for them. `Ack` is fenced
+  A change stream is fenced at its open, **on every pass of the receive
+  loop, and again before any batch is handed on**, because the fence that
+  matters for a long-lived call is the one that ends it: a promotion moves
+  the shard's epoch while the call sits in `Receive`, and the router's own
+  check runs only after a batch has been delivered — one batch too late,
+  since those commits have already reached the consumer and a position has
+  been recorded for them. The loop's own check runs *before* `Receive`, so
+  it cannot cover the batch that arrives inside the wait it opened; the
+  check in the delivery path is what covers that one, and every batch
+  leaves through it — decoded commits, size-capped flushes and keepalives
+  alike. `Ack` is fenced
   because advancing a slot is a write: confirming a position on a member the
   shard has moved off discards WAL the new primary's slot still needs.
   `CopyTables` is fenced before it does anything, because it creates the

@@ -198,11 +198,30 @@ func (h *pgHarness) testStream(t *testing.T) {
 // The first batch is taken before the view moves, deliberately: it proves
 // the stream was established and running, so what ends it is the re-check
 // and not the one at the open.
+//
+// The commit is made AFTER the view moves so that this asks the stronger
+// question -- no change from beyond the fence may reach the consumer, not
+// merely "the stream stops eventually". It still does not distinguish the
+// loop's check from the one in the delivery path: with the second removed
+// this passed five runs out of five, because the loop notices at the top of
+// a pass before the commit's WAL arrives. PostgreSQL's own keepalives wake
+// Receive often enough that the loop always gets there first.
+//
+// Pinning the delivery-path check would need a batch to arrive inside the
+// very Receive the view moved under, and a client cannot place the move
+// there: its view of where the server has got to is always behind what the
+// server has already sent. It would mean injecting a fake replication
+// connection into the stream path, which is a larger change than a
+// one-batch window is worth.
 func (h *pgHarness) testStreamEndsOnEpochChange(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// Its own publication as well as its own slot: with only the slot this
+	// subtest passed on keepalives alone when run by itself, because the
+	// publication it decoded through belonged to another subtest.
 	for _, sql := range []string{
 		"create table fenced (id int primary key)",
+		"create publication pgshard_fenced for table fenced",
 		"select pg_create_logical_replication_slot('pgshard_fenced_shard0', 'pgoutput')",
 	} {
 		if _, err := h.admin.Exec(ctx, sql); err != nil {
@@ -211,27 +230,43 @@ func (h *pgHarness) testStreamEndsOnEpochChange(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_, _ = h.admin.Exec(context.Background(), "select pg_drop_replication_slot('pgshard_fenced_shard0')")
+		_, _ = h.admin.Exec(context.Background(), "drop publication if exists pgshard_fenced")
 	})
 	t.Cleanup(func() {
 		h.src.Set(View{Generation: 3, Epoch: 1, Role: pgshardv1.HealthStatus_ROLE_PRIMARY})
 	})
 
-	stream, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Stream: "fenced", Generation: gen(3, 1)})
+	stream, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Stream: "fenced", Publication: "pgshard_fenced", Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := stream.Recv(); err != nil {
 		t.Fatalf("the stream never started: %v", err)
 	}
-	// Now the shard fails over under the running stream.
+	// The shard fails over under the running stream, and only THEN is the
+	// row committed: its WAL arrives inside a Receive the loop opened
+	// before the view moved, which is the batch the loop's own check --
+	// made before that Receive -- cannot cover. Not one commit from after
+	// the move may reach the consumer; it would record a position on a
+	// timeline the shard has left. A keepalive is tolerated: one may
+	// already have been in the transport when the view moved.
 	h.src.Set(View{Generation: 3, Epoch: 2, Role: pgshardv1.HealthStatus_ROLE_PRIMARY})
+	if _, err := h.admin.Exec(ctx, "insert into fenced values (424242)"); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if _, err := stream.Recv(); err != nil {
+		batch, err := stream.Recv()
+		if err != nil {
 			if !strings.Contains(err.Error(), "stale primary epoch") {
 				t.Fatalf("the stream ended with %v, want the epoch fence", err)
 			}
 			return
+		}
+		for _, ev := range batch.GetEvents() {
+			if ev.GetKeepalive() == nil {
+				t.Fatalf("a change from after the epoch moved reached the consumer: %v", ev)
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the stream went on delivering after the shard's epoch moved")
