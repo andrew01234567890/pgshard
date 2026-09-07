@@ -307,8 +307,10 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		// position recorded for it, before the next pass tested the view
 		// again. Every batch leaves through this function -- the batcher's
 		// flushes, its size cap, and the keepalives sent directly -- so
-		// this is the one place that covers all of them. It costs one
-		// atomic read per batch.
+		// this is the one place that covers all of them. The cost is one
+		// View() per batch: an atomic load, a staleness compare and a map
+		// lookup for the production source, with no lock and no catalog
+		// read.
 		if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
 			return fenceStatus(e)
 		}
