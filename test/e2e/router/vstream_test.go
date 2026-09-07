@@ -482,7 +482,21 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 	}
 	defer func() { _ = primary.Close(ctx) }()
 	deadline := time.Now().Add(120 * time.Second)
+	var lastSyncErr error
 	for {
+		// Driven, not waited for. sync_replication_slots=on runs a worker
+		// whose interval backs off to 30s when there is nothing to do, and
+		// a synced slot is persisted only by an attempt made after the
+		// standby has caught up -- so the test was waiting on that
+		// schedule, and 120 seconds of it is a handful of attempts. Asking
+		// for the sync each pass makes it hundreds.
+		//
+		// The error is kept rather than ignored: the worker holds a flag
+		// while it syncs and this answers "cannot synchronize replication
+		// slots concurrently" if it lands there, which is expected and
+		// harmless -- but any OTHER error is why the slot never syncs, and
+		// it belongs in the failure below.
+		_, lastSyncErr = standby.Exec(ctx, "select pg_sync_replication_slots()")
 		var synced bool
 		var replay, current int64
 		_ = standby.QueryRow(ctx, "select coalesce((select synced and not temporary from pg_replication_slots where slot_name = 'pgshard_orders_shard1'), false)").Scan(&synced)
@@ -519,8 +533,8 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 			if err := primary.QueryRow(ctx, "select coalesce((select to_jsonb(s)::text from pg_replication_slots s where slot_name = 'pgshard_orders_shard1'), 'no such slot on the primary')").Scan(&primaryRow); err != nil {
 				primaryRow = "could not be read: " + err.Error()
 			}
-			t.Fatalf("slot not synchronized in time (synced=%t replay=%d primary confirmed_flush=%d)\nstandby slot: %s\nprimary slot: %s",
-				synced, replay, current, row, primaryRow)
+			t.Fatalf("slot not synchronized in time (synced=%t replay=%d primary confirmed_flush=%d)\nstandby slot: %s\nprimary slot: %s\nlast pg_sync_replication_slots(): %v",
+				synced, replay, current, row, primaryRow, lastSyncErr)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
