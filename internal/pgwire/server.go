@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -263,10 +264,33 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		for _, sess := range sessions {
 			sess.forceClose()
 		}
-		<-done
+		// Bounded, because this runs AFTER the deadline has already
+		// expired. forceClose cancels the query and closes the socket, but
+		// a handler blocked somewhere neither of those reaches -- on a
+		// pooler that never finishes a session, say -- would otherwise
+		// make Shutdown wait for ever past the one moment a deadline
+		// exists to rule out. Saying so beats hanging: the caller learns
+		// the sessions are still running rather than never hearing back.
+		t := time.NewTimer(forceCloseGrace)
+		defer t.Stop()
+		select {
+		case <-done:
+		case <-t.C:
+			return fmt.Errorf("%w: sessions still running after being closed", ctx.Err())
+		}
 		return ctx.Err()
 	}
 }
+
+// forceCloseGrace bounds the wait for sessions to end after they have been
+// force-closed. A variable so tests need not spend it.
+//
+// Deliberately far longer than one session's teardown: ending a session
+// releases each shard it holds in turn, and every one of those waits its own
+// grace on a pooler stream and then its own release timeout. A grace as short
+// as one of those would report sessions that are ending, not sessions that
+// never will.
+var forceCloseGrace = 30 * time.Second
 
 // TerminateWhere ends every session whose role revoked reports, and returns
 // how many it asked to end. The caller decides from the roles it holds now
