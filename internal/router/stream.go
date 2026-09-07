@@ -201,11 +201,26 @@ func (ps *poolerStream) took(r recvResult) (*pgshardv1.ExecuteResponse, error) {
 }
 
 // close half-closes the stream and waits until the pooler has finished the
-// session so a following Release is accepted.
+// session so a following Release is accepted -- but only for cancelGrace.
+//
+// The wait used to be unbounded. A pooler blocked on a backend PostgreSQL
+// will not interrupt never finishes the session, and this goroutine then
+// held the router's drain and its shutdown open with nothing able to end
+// them: forceClose cancels the query context and closes the client socket,
+// and neither is what this waits on. Aborting the gRPC stream is what wakes
+// the reader, so past the grace that is what happens -- at the cost of a
+// session the pooler has to expire on its own, which it does.
 func (ps *poolerStream) close() {
 	ps.once.Do(func() { close(ps.gone) })
 	_ = ps.stream.CloseSend()
-	<-ps.done
+	t := time.NewTimer(cancelGrace)
+	defer t.Stop()
+	select {
+	case <-ps.done:
+	case <-t.C:
+		ps.cancel()
+		<-ps.done
+	}
 	ps.cancel()
 }
 
