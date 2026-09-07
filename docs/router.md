@@ -993,11 +993,15 @@ one legal message would refuse it for ever. It is off by default, and with
 it set the ceiling can be raised for the messages that need it without
 multiplying by the session count.
 
-A session holding budget for a body that is not arriving loses its
+A session holding budget for a body that has stopped arriving loses its
 connection after 30 seconds, and one that waits that long to be granted
 budget is failed rather than parked: the memory is committed on that
 client's say-so, so that client is what gives way, not the rest of the
-router.
+router. It is idleness that is bounded and not the transfer, so a large
+message arriving steadily over a slow link keeps its budget for as long as
+it keeps coming. A body larger than the whole budget is refused by the
+per-message ceiling as soon as its header is read, rather than waiting for
+a grant that could never come.
 
 `--max-sessions-per-role` bounds what a *single credential* can take of that,
 for the roles whose `pgshard.roles.connection_limit` is unset (the catalog

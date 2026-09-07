@@ -14,8 +14,6 @@ import (
 
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/sync/semaphore"
 )
 
 // Cancel-key layouts. Protocol 3.2 keys carry the router instance prefix and
@@ -107,7 +105,7 @@ type Server struct {
 	startupSem chan struct{}
 	// bodyBudget is what every session's declared-but-unarrived message
 	// bodies are charged against. nil when the server does not bound one.
-	bodyBudget *semaphore.Weighted
+	bodyBudget *bodyBudget
 	// afterAccept runs between Accept returning and the handler being
 	// registered. Tests set it to hold Serve exactly where Shutdown used to
 	// be able to overtake it; it is nil everywhere else.

@@ -115,7 +115,7 @@ func newSession(s *Server, conn net.Conn, id uint64) *session {
 func (s *session) resetIO(conn net.Conn) {
 	s.conn = conn
 	s.reader = bufio.NewReader(conn)
-	s.framed = newFramedReader(s.reader, conn, s.server.bodyBudget)
+	s.framed = newFramedReader(s.reader, conn, s.server.bodyBudget, s.server.shutdownCh)
 	s.be = pgproto3.NewBackend(s.framed, conn)
 	s.be.SetMaxBodyLen(min(preAuthMaxMessageBodyLen, s.maxBodyLen()))
 }
@@ -745,11 +745,12 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Unlock()
 	s.be.Send(&pgproto3.AuthenticationOk{})
 	_ = s.be.SetAuthType(pgproto3.AuthTypeOk)
-	// Authenticated: this session may now declare the full body length,
-	// and from here every message it sends is framed the same way, so the
-	// reader can start charging the large ones to the server's budget.
+	// Authenticated: this session may now declare the full body length, and
+	// the large ones start costing the server's shared budget. The framing
+	// itself has been on since the first byte; only the charge waits for a
+	// client that has proved who it is.
 	s.be.SetMaxBodyLen(s.maxBodyLen())
-	s.framed.arm()
+	s.framed.startCharging()
 	for _, kv := range s.parameterStatus() {
 		s.be.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 	}
