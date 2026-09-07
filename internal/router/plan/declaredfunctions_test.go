@@ -60,12 +60,35 @@ func TestAQualifiedCallAsksTheSameQuestion(t *testing.T) {
 	}
 }
 
-// What the declaration must never do is let an aggregate through. The
-// loader is what enforces that -- an aggregate row withdraws the name -- but
-// the planner must also not treat a built-in aggregate as declarable: a
-// scatter concatenating sum() is a partial answer per shard whatever the
-// catalog says.
-func TestADeclarationCannotTurnAnAggregateIntoAScalar(t *testing.T) {
+// A declaration says a name is a scalar; it does not say the call is one.
+// Aggregate syntax is decided from the parse tree before the declaration is
+// consulted, so a declared name used with DISTINCT, FILTER, ORDER BY, OVER
+// or an aggregate argument is still refused -- which is what stops a
+// declaration from being a way to smuggle an aggregate past the merge.
+func TestADeclarationDoesNotExcuseAggregateSyntax(t *testing.T) {
+	snap := fixture(t)
+	snap.ScalarFunctions = map[snapshot.FunctionKey]bool{{Database: fixtureDB, Name: "first"}: true}
+	// The control: the plain call is what the declaration is for.
+	if _, err := New().Plan(context.Background(), session(snap), "select first(status) from orders"); err != nil {
+		t.Fatalf("a declared scalar is refused, so this test proves nothing: %v", err)
+	}
+	for _, sql := range []string{
+		"select first(distinct status) from orders",
+		"select first(status) filter (where id > 1) from orders",
+		"select first(status) over () from orders",
+		"select first(status order by id) from orders",
+		// An aggregate inside it is still an aggregate.
+		"select first(sum(amount)) from orders",
+	} {
+		if _, err := New().Plan(context.Background(), session(snap), sql); err == nil {
+			t.Errorf("%s: planned, so a declaration let aggregate syntax through", sql)
+		}
+	}
+}
+
+// And a built-in aggregate is never a declarable name: the built-in tables
+// are consulted first, so sum() is merged whatever the catalog says.
+func TestADeclarationCannotTurnABuiltinAggregateIntoAScalar(t *testing.T) {
 	snap := fixture(t)
 	snap.ScalarFunctions = map[snapshot.FunctionKey]bool{{Database: fixtureDB, Name: "sum"}: true}
 	p, err := New().Plan(context.Background(), session(snap), "select sum(amount) from orders")

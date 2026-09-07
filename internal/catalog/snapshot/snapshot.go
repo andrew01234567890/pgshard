@@ -290,6 +290,17 @@ func (s *Snapshot) fingerprint() uint64 {
 		str(name)
 		flag(s.Sequences[name])
 	}
+	// A declaration changes what a scatter may project, so a prepared
+	// statement planned before it has to be replanned. Withdrawing one is
+	// the case that matters: an operator who mis-declared an aggregate as a
+	// scalar corrects it by adding the aggregate row, and every session
+	// that had already prepared the scatter would otherwise go on
+	// concatenating one partial answer per shard.
+	for _, k := range slices.SortedFunc(maps.Keys(s.ScalarFunctions), compareFunctionKeys) {
+		str(k.Database)
+		str(k.Name)
+		flag(s.ScalarFunctions[k])
+	}
 	return h.Sum64()
 }
 
@@ -298,6 +309,13 @@ func compareShardKeys(a, b ShardKey) int {
 		return c
 	}
 	return cmp.Compare(a.ShardID, b.ShardID)
+}
+
+func compareFunctionKeys(a, b FunctionKey) int {
+	if c := cmp.Compare(a.Database, b.Database); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Name, b.Name)
 }
 
 func compareTableKeys(a, b TableKey) int {
