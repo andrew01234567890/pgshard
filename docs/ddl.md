@@ -28,6 +28,18 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    | unsharded tables and views/grants over them only | `home` — the database's home shard |
    | `DROP`/`ALTER`/`REINDEX INDEX`, `DROP`/`ALTER VIEW` (owning table unknown to the router) | `existing` — every shard, shards without the object are skipped; failed if no shard had it |
 
+   An object that belongs to a table follows the table: `DROP`/`ALTER … RENAME`
+   of a `TRIGGER`, `POLICY` or `RULE`, and `ALTER TABLE … RENAME CONSTRAINT`,
+   take the table's scope like any other statement over it.
+
+   Every other `DROP`, `RENAME`, `OWNER TO` and `SET SCHEMA` the router does
+   not list explicitly — `FUNCTION`, `AGGREGATE`, `EXTENSION`, `DOMAIN`,
+   `OPERATOR`, `COLLATION`, `CAST`, the text search objects, `STATISTICS`,
+   `SERVER`, `PUBLICATION` — is **refused**. A database exists in every
+   group, so the objects inside one do too, and pgshard cannot fan the
+   statement out because it never created the object: the matching `CREATE`
+   is refused as well. Change it on each group the way it was created.
+
    Sharded-table rules are enforced here: `CREATE TABLE` must define the
    shard key column and every PRIMARY KEY/UNIQUE (also `CREATE UNIQUE INDEX`
    and `ALTER TABLE ADD PRIMARY KEY/UNIQUE`) must include it; the shard key

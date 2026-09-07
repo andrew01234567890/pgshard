@@ -467,11 +467,54 @@ func (w *walker) rename(s *pgquerypb.RenameStmt) error {
 	case pgquerypb.ObjectType_OBJECT_SCHEMA, pgquerypb.ObjectType_OBJECT_TYPE,
 		pgquerypb.ObjectType_OBJECT_DATABASE:
 		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRenameType()), Scope: ScopeAll})
+	case pgquerypb.ObjectType_OBJECT_TRIGGER, pgquerypb.ObjectType_OBJECT_POLICY,
+		pgquerypb.ObjectType_OBJECT_RULE, pgquerypb.ObjectType_OBJECT_TABCONSTRAINT:
+		// The same rule DROP follows: an object attached to a table lives
+		// where the table does. Renaming a sharded table's constraint on
+		// the home shard alone left every other shard holding the old name
+		// -- and ALTER TABLE ... RENAME CONSTRAINT is a statement any
+		// migration tool emits.
+		r, err := w.lookup(s.GetRelation())
+		if err != nil {
+			return err
+		}
+		scope, err := w.relScope([]*rel{r})
+		if err != nil {
+			return err
+		}
+		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRelationType()), Scope: scope})
 	}
-	return w.unshardedOnly()
+	return refuseUnfannable("ALTER " + objectWord(s.GetRenameType()) + " RENAME")
+}
+
+// refuseUnfannable turns down a statement over an object that exists in
+// every group, because a database does, and that pgshard cannot fan out
+// because it never created it. Sending it to the home shard alone left
+// every other shard holding the old object, silently.
+func refuseUnfannable(what string) error {
+	return notYet(what+" is not available through the router",
+		"pgshard does not manage these objects: the matching CREATE is refused too, so change it on each group the way it was created")
 }
 
 func objectWord(t pgquerypb.ObjectType) string {
+	// A few enum names are not what a user typed, and a refusal that names
+	// something no statement contains is a refusal nobody can act on.
+	switch t {
+	case pgquerypb.ObjectType_OBJECT_STATISTIC_EXT:
+		return "STATISTICS"
+	case pgquerypb.ObjectType_OBJECT_TSCONFIGURATION:
+		return "TEXT SEARCH CONFIGURATION"
+	case pgquerypb.ObjectType_OBJECT_TSDICTIONARY:
+		return "TEXT SEARCH DICTIONARY"
+	case pgquerypb.ObjectType_OBJECT_TSPARSER:
+		return "TEXT SEARCH PARSER"
+	case pgquerypb.ObjectType_OBJECT_TSTEMPLATE:
+		return "TEXT SEARCH TEMPLATE"
+	case pgquerypb.ObjectType_OBJECT_FOREIGN_SERVER:
+		return "SERVER"
+	case pgquerypb.ObjectType_OBJECT_FDW:
+		return "FOREIGN DATA WRAPPER"
+	}
 	return strings.TrimPrefix(t.String(), "OBJECT_")
 }
 
@@ -531,8 +574,51 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 		return w.migration(Migration{Kind: kind, Scope: ScopeAll})
 	case pgquerypb.ObjectType_OBJECT_TYPE:
 		return w.migration(Migration{Kind: kind, Scope: ScopeAll})
+	case pgquerypb.ObjectType_OBJECT_TRIGGER, pgquerypb.ObjectType_OBJECT_POLICY,
+		pgquerypb.ObjectType_OBJECT_RULE:
+		return w.dropOnRelation(kind, d)
 	}
-	return w.unshardedOnly()
+	// Everything else -- a function, an aggregate, an extension, a domain,
+	// an operator, a collation, a cast, a text search object, extended
+	// statistics, a foreign server -- exists in EVERY group, because a
+	// database does. Dropping it
+	// on the home shard alone leaves the other shards holding it, silently,
+	// and pgshard cannot fan the drop out because it never created the
+	// object: CREATE FUNCTION, CREATE AGGREGATE and CREATE EXTENSION are
+	// all refused here. It is dropped the way it was created, on each
+	// group.
+	return refuseUnfannable(kind)
+}
+
+// dropOnRelation drops an object that belongs to a table -- a trigger, a
+// policy, a rule. Where it lives is where the table does: one copy on the home shard for an unsharded table, one per shard
+// otherwise. Sending them all to the home shard removed a sharded table's
+// trigger from shard 0 and left it on every other, with no error; for a
+// row-level security policy that is a table protected on some shards and
+// not others.
+func (w *walker) dropOnRelation(kind string, d *pgquerypb.DropStmt) error {
+	var rvs []*pgquerypb.RangeVar
+	for _, obj := range d.GetObjects() {
+		names := stringList(obj.GetList().GetItems())
+		// The object's own name is last; what precedes it names the table.
+		if len(names) < 2 {
+			return notYet(kind+" without a table name is not available yet", "name the table the object belongs to")
+		}
+		rv := &pgquerypb.RangeVar{Relname: names[len(names)-2]}
+		if len(names) >= 3 {
+			rv.Schemaname = names[len(names)-3]
+		}
+		rvs = append(rvs, rv)
+	}
+	rels, err := w.lookupList(rvs)
+	if err != nil {
+		return err
+	}
+	scope, err := w.relScope(rels)
+	if err != nil {
+		return err
+	}
+	return w.migration(Migration{Kind: kind, Scope: scope})
 }
 
 // qualifiedName turns a List of name parts into a RangeVar.
@@ -816,7 +902,10 @@ func (w *walker) alterObject(kind string, objType pgquerypb.ObjectType, rv *pgqu
 		pgquerypb.ObjectType_OBJECT_DATABASE:
 		return w.migration(Migration{Kind: "ALTER " + objectWord(objType), Scope: ScopeAll})
 	}
-	return w.unshardedOnly()
+	// kind is written for the table case ("ALTER TABLE OWNER"), so a
+	// refusal built from it would name a table in a statement about a
+	// function. The object type is what the user typed.
+	return refuseUnfannable("ALTER " + objectWord(objType) + " " + strings.TrimPrefix(kind, "ALTER TABLE "))
 }
 
 // vacuumFull reports whether a VACUUM statement carries the FULL option.
