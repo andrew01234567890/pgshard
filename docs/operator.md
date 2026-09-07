@@ -87,8 +87,19 @@ identity it does not list, members roll one at a time with the primary
 that pointed every standby at the new role while the primary still ran the
 old pod would restart a standby that cannot stream, drop the sync set, and
 hold the roll before reaching the primary that would have admitted it. So a
-member's `primary_conninfo` names the role only once the primary's own pod
-carries `pgshard.io/replication-login`, and names the superuser until then.
+member's `primary_conninfo` names the role only once **every** member pod of
+the group carries `pgshard.io/replication-login`, and names the superuser
+until then. Every pod, not just the primary's: a failover mid-roll, or a
+demoted former primary still on the old pod, would otherwise flip it while
+an old-shape pod is still there, and that pod would then be told to read a
+Secret it does not mount.
+
+Maintaining the role is skipped on a primary whose writes are paused --
+`CREATE ROLE`, `ALTER ROLE` and `GRANT` are writes, and a paused primary
+refuses them with 25006 -- and is never fatal to the pass. The password is
+reapplied only when it differs from the one the role holds: `ALTER ROLE`
+draws a fresh SCRAM salt every time, so doing it unconditionally would write
+`pg_authid` and its WAL on every pass for every group.
 
 The controller reaches the catalog as `pgshard_controller`: `pgshard_system`
 membership for the schema it drives, plus `pg_read_all_stats` and the

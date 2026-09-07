@@ -34,6 +34,26 @@ func TestAMemberStreamsAsTheReplicationRole(t *testing.T) {
 		t.Errorf("primary_conninfo carries a password: %q", cfg.PrimaryConninfo)
 	}
 
+	// The two files are rendered by different packages from different
+	// inputs, and pg_hba rejects an identity it does not list by name. This
+	// asks the agent's own renderer about the operator's own conninfo,
+	// rather than about a string the test made up -- and about both
+	// connection types, because a replication line does not admit pg_rewind
+	// and an "all" line does not admit a walsender.
+	hba := agent.RenderPgHBAConf(&cfg)
+	admitted := map[string]bool{}
+	for _, line := range strings.Split(hba, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 5 && strings.HasPrefix(f[0], "host") && f[2] == catalog.ReplicationRole && f[4] == "scram-sha-256" {
+			admitted[f[1]] = true
+		}
+	}
+	for _, db := range []string{"replication", "all"} {
+		if !admitted[db] {
+			t.Errorf("the pg_hba a member renders does not admit %s for %s:\n%s", catalog.ReplicationRole, db, hba)
+		}
+	}
+
 	pod := Renderer{}.Pod(c, g, 0, RolePrimary, "pvc", Template(c, g, nil, nil))
 	if pod.Annotations[AnnotationReplicationLogin] != "true" {
 		t.Error("the pod does not record that it admits the replication role, so no standby will ever be pointed at it as one")

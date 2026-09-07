@@ -928,27 +928,37 @@ func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alp
 	})
 }
 
-// primaryAdmitsReplicationRole reports whether this group's primary is
-// running a pod whose pg_hba lists the replication role. A standby pointed
-// at a primary that does not is a standby that cannot stream, and the
-// rollout holds before it reaches the primary that would fix it.
+// groupAdmitsReplicationRole reports whether EVERY member pod of this group
+// that exists renders a pg_hba listing the replication role. A standby
+// pointed at a primary that does not is a standby that cannot stream, and
+// the rollout holds before it reaches the primary that would fix it.
 //
-// A group with no primary pod yet is a group whose pods are all about to be
+// Every pod, not just the primary's: a failover mid-roll, or a demoted
+// former primary still on the old pod, would otherwise flip this true while
+// an old-shape pod is still there -- and that pod would then read a config
+// naming a Secret it does not mount the moment its container restarted.
+// Asking about all of them also makes the answer stop flapping, which
+// matters because the answer is part of the template hash and every flip
+// is another roll.
+//
+// A group with no pods at all is a group whose pods are all about to be
 // created from the current template, so it starts with the role rather than
 // taking an extra roll to get there.
-func (r *ClusterReconciler) primaryAdmitsReplicationRole(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, state groupState) (bool, error) {
-	if state.primary == "" {
-		return true, nil
+func (r *ClusterReconciler) groupAdmitsReplicationRole(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) (bool, error) {
+	for _, name := range g.MemberNames() {
+		var pod corev1.Pod
+		err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &pod)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if pod.Annotations[AnnotationReplicationLogin] != "true" {
+			return false, nil
+		}
 	}
-	var pod corev1.Pod
-	err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: state.primary}, &pod)
-	if apierrors.IsNotFound(err) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return pod.Annotations[AnnotationReplicationLogin] == "true", nil
+	return true, nil
 }
 
 func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, password string, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) (groupObservation, error) {
@@ -966,7 +976,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	} else if sum != "" {
 		obs.template.InternalTLS += ":" + sum
 	}
-	admits, err := r.primaryAdmitsReplicationRole(ctx, c, state)
+	admits, err := r.groupAdmitsReplicationRole(ctx, c, g)
 	if err != nil {
 		return obs, err
 	}
@@ -1098,14 +1108,17 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	}
 	obs.primaryOK = true
 	obs.writesPaused = pstate.WritesPaused
-	// Before the slots and the sync set, because a standby that cannot log
-	// in streams from nothing: the role has to exist on this group's
-	// primary before any member of it is rendered with a conninfo naming
-	// it. Physical replication carries the role to this group's standbys,
-	// so only the primary is told.
-	if err := r.ensureReplicationRole(ctx, c, dsn); err != nil {
-		obs.primaryErr = "replication role: " + err.Error()
-		return obs, nil
+	// CREATE ROLE, ALTER ROLE and GRANT are all writes, and a paused
+	// primary refuses them with 25006 -- so while a barrier or a cutover
+	// holds the pause this is skipped rather than attempted, and it is
+	// never fatal to the pass either way. Failing here used to take the
+	// slots, synchronous_standby_names and the rollout down with it for as
+	// long as the pause lasted.
+	if !pstate.WritesPaused {
+		if err := r.ensureReplicationRole(ctx, c, dsn); err != nil {
+			logf.FromContext(ctx).Info("could not maintain the replication role; continuing",
+				"group", g.Name(), "err", err)
+		}
 	}
 	// Reported, never fatal to the pass: the fence lives in the catalog
 	// group, which is itself rebuilt member by member on a storage-class

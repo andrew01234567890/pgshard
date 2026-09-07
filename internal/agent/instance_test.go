@@ -316,3 +316,35 @@ func TestTheSourcePasswordBelongsToTheRoleTheConninfoNames(t *testing.T) {
 		t.Errorf("without a replication Secret the password is %q, want the superuser's", cfg.Password)
 	}
 }
+
+// A conninfo with no dbname does not mean "the default database": libpq and
+// pgx leave it to the server, and the server uses THE USER NAME. So the
+// moment primary_conninfo stopped saying user=postgres, every ordinary
+// connection to a source started asking for a database called
+// pgshard_replication, which does not exist -- a clone that never
+// bootstraps, a rejoin that never rewinds, a slot that is never created.
+// It cost nothing for as long as the two names happened to coincide.
+func TestASourceConnectionNamesADatabaseThatExists(t *testing.T) {
+	in := newTestInstance(t)
+	for _, c := range []struct{ source, want string }{
+		{"host=src user=" + replicationRole, "postgres"},
+		{"host=src user=" + superuserRole, "postgres"},
+		{"host=src user=" + replicationRole + " dbname=app", "app"},
+	} {
+		cfg, err := in.sourceConfig(c.source)
+		if err != nil {
+			t.Fatalf("%s: %v", c.source, err)
+		}
+		if cfg.Database != c.want {
+			t.Errorf("%s: database %q, want %q", c.source, cfg.Database, c.want)
+		}
+	}
+	// pg_rewind takes a string rather than a config and libpq defaults it
+	// the same way, so that path needs the same treatment.
+	if got := withDatabase("host=src user=" + replicationRole); !strings.Contains(got, "dbname=postgres") {
+		t.Errorf("pg_rewind source = %q, want a dbname", got)
+	}
+	if got := withDatabase("host=src dbname=app"); strings.Contains(got, "dbname=postgres") {
+		t.Errorf("an explicit dbname was overridden: %q", got)
+	}
+}

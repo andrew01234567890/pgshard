@@ -15,7 +15,7 @@ JSON config per member into the group ConfigMap (`<member>.json`) and runs
 | Field | Value |
 |---|---|
 | `role` | `primary` for the designated primary, `standby` otherwise |
-| `primaryConninfo` | `host=<cluster>-<group>-rw.<ns>.svc port=5432 user=pgshard_replication` (clone, rewind and streaming source); `user=postgres` until the primary's own pod admits the role, see [operator.md](operator.md) |
+| `primaryConninfo` | `host=<cluster>-<group>-rw.<ns>.svc port=5432 user=pgshard_replication dbname=postgres` (clone, rewind and streaming source); `user=postgres` until every member pod of the group admits the role, see [operator.md](operator.md). The `dbname` is not decoration: an ordinary connection that omits it asks for a database named after the *user*. |
 | `peerFailsafeURLs` | every other member's `http://<member>.<group>-peers.<ns>.svc:8080/failsafe` |
 | `lease` | `{enabled: true, namespace: <ns>}`; the Lease is `<cluster>-<group>-primary` |
 | `postgres.synchronousStandbyNames` | initial value; the operator maintains it afterwards |

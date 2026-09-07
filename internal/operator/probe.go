@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -786,9 +787,21 @@ func (PgxProber) EnsureReplicationRole(ctx context.Context, dsn, password string
 	END $$`); err != nil {
 		return err
 	}
-	if _, err := conn.Exec(ctx, `ALTER ROLE `+role+
-		` WITH LOGIN REPLICATION NOSUPERUSER PASSWORD `+quoteLiteral(password)); err != nil {
+	// Only when it does not already hold this password. ALTER ROLE draws a
+	// fresh SCRAM salt every time, so running it on every pass would write
+	// pg_authid and its WAL on every pass for every group -- and under
+	// log_statement=ddl it would put the password in each primary's log
+	// that often too.
+	var current *string
+	if err := conn.QueryRow(ctx,
+		`SELECT rolpassword FROM pg_authid WHERE rolname = $1`, catalog.ReplicationRole).Scan(&current); err != nil {
 		return err
+	}
+	if !scramMatches(current, password) {
+		if _, err := conn.Exec(ctx, `ALTER ROLE `+role+
+			` WITH LOGIN REPLICATION NOSUPERUSER PASSWORD `+quoteLiteral(password)); err != nil {
+			return err
+		}
 	}
 	for _, fn := range []string{
 		"pg_catalog.pg_ls_dir(text, boolean, boolean)",
@@ -801,6 +814,25 @@ func (PgxProber) EnsureReplicationRole(ctx context.Context, dsn, password string
 		}
 	}
 	return nil
+}
+
+// scramMatches reports whether stored is the verifier of password. The salt
+// is the stored one, so a match means the same password rather than the same
+// ALTER ROLE.
+func scramMatches(stored *string, password string) bool {
+	if stored == nil || *stored == "" {
+		return false
+	}
+	v, err := pgwire.ParseSCRAMVerifier(*stored)
+	if err != nil {
+		return false
+	}
+	want, err := pgwire.BuildSCRAMVerifier(password, v.Salt, v.Iterations)
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(want.StoredKey, v.StoredKey) == 1 &&
+		subtle.ConstantTimeCompare(want.ServerKey, v.ServerKey) == 1
 }
 
 // SeedBootstrapRole implements Prober. Nothing else writes pgshard.roles

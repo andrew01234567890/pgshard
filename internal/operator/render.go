@@ -182,14 +182,21 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 		// A standby streams as its own role, not as the superuser. This
 		// string is written into every standby's postgresql.auto.conf and
 		// travels in every clone, so the credential behind it should be the
-		// one that can do the least.
-		ReplicationPasswordFile: replicationDir + "/" + secretKey,
-		PrimaryConninfo:         fmt.Sprintf("host=%s.%s.svc port=%d user=%s", g.ServiceRW(), c.Namespace, postgresPort, replicationUser(tpl)),
-		PodCIDR:                 "all",
-		PeerFailsafeURLs:        peers,
-		Port:                    postgresPort,
-		HTTPAddr:                fmt.Sprintf(":%d", agentHTTPPort),
-		GRPCAddr:                fmt.Sprintf(":%d", agentGRPCPort),
+		// one that can do the least. Both fields move together: a pod that
+		// does not mount the Secret must not be told to read it.
+		ReplicationPasswordFile: replicationPasswordFile(tpl),
+		// dbname is not decoration: an ordinary connection that omits it
+		// asks for a database named after the USER, and there is no
+		// database called pgshard_replication. pg_rewind, the wait for the
+		// source and the slot this member creates on it all dial this
+		// string as it stands.
+		PrimaryConninfo: fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres",
+			g.ServiceRW(), c.Namespace, postgresPort, replicationUser(tpl)),
+		PodCIDR:          "all",
+		PeerFailsafeURLs: peers,
+		Port:             postgresPort,
+		HTTPAddr:         fmt.Sprintf(":%d", agentHTTPPort),
+		GRPCAddr:         fmt.Sprintf(":%d", agentGRPCPort),
 		Postgres: agent.PostgresSettings{
 			// Every member except this one. The value is only read where
 			// the member is the primary, and a member that is promoted
@@ -222,8 +229,18 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 	return &cfg
 }
 
+// replicationPasswordFile is where a member reads the streaming password
+// from, and empty until the group is on pods that mount it.
+func replicationPasswordFile(tpl MemberTemplate) string {
+	if !tpl.Replication {
+		return ""
+	}
+	return replicationDir + "/" + secretKey
+}
+
 // replicationUser is the identity a member dials its primary with: its own
-// role once the primary admits it, and the superuser until then.
+// role once every member of the group admits it, and the superuser until
+// then.
 func replicationUser(tpl MemberTemplate) string {
 	if tpl.Replication {
 		return catalog.ReplicationRole

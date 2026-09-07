@@ -204,7 +204,7 @@ func (in *Instance) baseBackup(ctx context.Context) error {
 }
 
 func (in *Instance) pgRewind(ctx context.Context, source string) error {
-	args := []string{"--target-pgdata=" + in.cfg.PGData, "--source-server=" + source, "--no-ensure-shutdown"}
+	args := []string{"--target-pgdata=" + in.cfg.PGData, "--source-server=" + withDatabase(source), "--no-ensure-shutdown"}
 	if in.cfg.Postgres.RestoreCommand != "" {
 		args = append(args, "--restore-target-wal")
 	}
@@ -262,8 +262,33 @@ func (in *Instance) sourceConfig(source string) (*pgx.ConnConfig, error) {
 		return nil, err
 	}
 	cfg.Password = pw
+	cfg.Database = sourceDatabase(cfg.Database)
 	cfg.ConnectTimeout = 5 * time.Second
 	return cfg, nil
+}
+
+// sourceDatabase names the database an ordinary connection to a source
+// opens. libpq and pgx both leave it to the server when the conninfo omits
+// it, and the server then uses THE USER NAME -- so the moment the conninfo
+// stopped saying user=postgres, every one of these connections started
+// asking for a database called pgshard_replication, which does not exist.
+// It cost nothing while the two names happened to coincide.
+func sourceDatabase(db string) string {
+	if db == "" {
+		return "postgres"
+	}
+	return db
+}
+
+// withDatabase is sourceDatabase for a conninfo string, which is what
+// pg_rewind takes: libpq defaults it the same way.
+func withDatabase(source string) string {
+	for _, kv := range strings.Fields(source) {
+		if strings.HasPrefix(kv, "dbname=") {
+			return source
+		}
+	}
+	return source + " dbname=postgres"
 }
 
 // dsnUser reads the user out of a keyword/value conninfo. Empty means the
@@ -271,7 +296,7 @@ func (in *Instance) sourceConfig(source string) (*pgx.ConnConfig, error) {
 func dsnUser(dsn string) string {
 	for _, kv := range strings.Fields(dsn) {
 		if v, ok := strings.CutPrefix(kv, "user="); ok {
-			return v
+			return strings.Trim(v, "'")
 		}
 	}
 	return superuserRole
@@ -297,7 +322,10 @@ func (in *Instance) replicationPassword() (string, error) {
 	}
 	pw := strings.TrimRight(string(b), "\r\n")
 	if pw == "" {
-		return "", fmt.Errorf("replication password: %s is empty", in.cfg.ReplicationPasswordFile)
+		// The path is deliberately not in the message: a field whose name
+		// ends in PasswordFile is read as sensitive by the secret scanners
+		// in CI, and the agent's own log is where this ends up.
+		return "", errors.New("the replication password file is empty")
 	}
 	return pw, nil
 }
