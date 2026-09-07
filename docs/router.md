@@ -345,9 +345,12 @@ verdict, and scatters as usual.
 Refused with `0A000` (message names the reason): `avg()` and every other
 aggregate PostgreSQL ships ("multi-shard avg() is not available yet" —
 compute `sum(x)` and `count(x)`), `JSON_ARRAYAGG`/`JSON_OBJECTAGG`,
-any function that is not a PostgreSQL built-in and has not been declared in
-`pgshard.functions` ("multi-shard first() is not available yet: it is not a
-PostgreSQL built-in") — the router classifies a function by name, from the
+an aggregate in `ORDER BY` without a shard-key `GROUP BY` (an aggregate
+anywhere in a `SELECT` makes the whole statement return one row, so
+concatenating the shards returns one row per shard),
+any function in the target list **or `ORDER BY`** that is not a PostgreSQL
+built-in and has not been declared in `pgshard.functions` ("multi-shard
+first() is not available yet: it is not a PostgreSQL built-in") — the router classifies a function by name, from the
 `pg_proc` of the majors it targets, and nothing in a parse tree separates a
 user-defined aggregate from a user-defined scalar, so it refuses both rather
 than concatenate one partial row per shard; declaring the name a `scalar` in

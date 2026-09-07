@@ -174,6 +174,20 @@ func (b *mergeBuilder) run() error {
 			break
 		}
 	}
+	// ORDER BY as well as the target list. An aggregate anywhere in a
+	// SELECT without GROUP BY makes the whole statement an aggregate query
+	// returning ONE row -- "select 1 from t order by max(amount)" is one
+	// row on a single server, and reading only the target list made that a
+	// plain scatter: four shards, four rows, no error. Most shapes of this
+	// are rejected by the shard itself (a bare column in the target list is
+	// 42803), which is why it survived: the ones that are not rejected are
+	// the ones that project no column at all.
+	for _, o := range s.GetSortClause() {
+		if hasAggregate(o.GetSortBy().GetNode()) {
+			aggregated = true
+			break
+		}
+	}
 	if aggregated && !shardLocal {
 		if err := b.aggregates(); err != nil {
 			return err
@@ -185,7 +199,7 @@ func (b *mergeBuilder) run() error {
 		// partial row per shard, reported as the answer. Refuse the call
 		// this router cannot classify instead. Grouping on the shard key
 		// makes every group shard-local, which is why shardLocal is exempt.
-		for _, t := range s.GetTargetList() {
+		for _, t := range targetsAndSorts(s) {
 			if name := unknownFunction(t, b.scalar); name != "" {
 				return notYet("multi-shard "+name+"() is not available yet: it is not a PostgreSQL built-in, and a user-defined aggregate cannot be told from a scalar function by name",
 					"declare it in pgshard.functions, filter on one shard key value, or group by the shard key \""+b.shardKey+"\" so that every group lives on one shard")
@@ -500,4 +514,18 @@ func isCCollation(cc *pgquerypb.CollateClause) bool {
 	names := stringList(cc.GetCollname())
 	n := len(names)
 	return n > 0 && (names[n-1] == "C" || names[n-1] == "POSIX")
+}
+
+// targetsAndSorts is every expression a scatter evaluates and then has to
+// combine: the target list, and the ORDER BY expressions that become hidden
+// target columns. Classifying only the first left a function in ORDER BY
+// unexamined, which is the same question about the same value.
+func targetsAndSorts(s *pgquerypb.SelectStmt) []*pgquerypb.Node {
+	out := append([]*pgquerypb.Node(nil), s.GetTargetList()...)
+	for _, o := range s.GetSortClause() {
+		if n := o.GetSortBy().GetNode(); n != nil {
+			out = append(out, n)
+		}
+	}
+	return out
 }
