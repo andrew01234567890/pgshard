@@ -1597,6 +1597,19 @@ func (p *Placer) catchUp(ctx context.Context, wf *placementWorkflow, drain bool)
 	return lag, applied, nil
 }
 
+// peekChanges bounds how many rows one peek returns, and is NOT a bound on
+// memory however it looks.
+//
+// pg_logical_slot_peek_binary_changes checks this only after decoding a
+// transaction's commit record, so it never stops mid-transaction: measured
+// on PostgreSQL 18, one 5000-row transaction peeked with a limit of 10
+// returns 5003 rows. What it actually bounds is how many WHOLE
+// transactions come back at once.
+//
+// The retry that used to sit below -- quadruple the limit when a peek
+// filled without reaching a commit, and read again from the same slot --
+// could therefore never run, and is gone. A non-empty peek always ends at
+// a commit.
 const peekChanges = 2000
 
 // applyFlushOps bounds how many committed operations catch-up holds before
@@ -1618,11 +1631,13 @@ const applyFlushBytes = 8 << 20
 // flush can shorten: its operations cannot be applied until it commits, so
 // they are held whole.
 //
-// A peek that fills without reaching a commit quadruples its limit and
-// starts again from the slot, decoding the same transaction from its
-// beginning each time and retaining more of it. Nothing stopped that, so a
-// large enough source transaction took the controller's memory -- and the
-// controller is not running only this workflow.
+// It is checked while the rows are still arriving, so a transaction too
+// large to hold is refused partway through rather than after all of it has
+// been read. What that does NOT bound is the source: the peek is a
+// materialising function, so PostgreSQL has already built the whole
+// transaction on the shard before it sends the first row. This is the
+// controller's bound, and the controller is not running only this
+// workflow.
 //
 // Failing is the answer rather than spilling, for now. A workflow that
 // stops with a message naming the table and the size is one an operator
@@ -1636,17 +1651,9 @@ var catchUpMaxOpenBytes = 256 << 20
 func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn ShardConn, targets targetConns, s int32, drain bool) (int64, int, error) {
 	dec := NewDecoder()
 	applied := 0
-	limit := peekChanges
 	for round := 0; ; round++ {
 		rows, err := conn.Query(ctx, `SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication_names', $3)`,
-			wf.slotName(s), limit, wf.publicationName())
-		if err != nil {
-			return 0, applied, err
-		}
-		msgs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[struct {
-			LSN  string
-			Data []byte
-		}])
+			wf.slotName(s), peekChanges, wf.publicationName())
 		if err != nil {
 			return 0, applied, err
 		}
@@ -1668,18 +1675,36 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			ready, readyN, readyBytes = nil, 0, 0
 			return nil
 		}
-		for _, m := range msgs {
-			c, committed, err := dec.Decode(m.Data)
+		// Decoded as the rows arrive rather than collected first. A peek
+		// returns whole transactions whatever limit it is given -- see
+		// peekChanges -- so collecting the result meant an entire source
+		// transaction was resident as raw rows BEFORE a byte of it was
+		// examined, and catchUpMaxOpenBytes below was consulted only
+		// afterwards. The bound fired after the memory it exists to save
+		// had already been spent, and spent twice: once as the rows and
+		// again as the operations decoded from them.
+		msgCount := 0
+		for rows.Next() {
+			var lsn string
+			var data []byte
+			if err := rows.Scan(&lsn, &data); err != nil {
+				rows.Close()
+				return 0, applied, err
+			}
+			msgCount++
+			c, committed, err := dec.Decode(data)
 			if err != nil {
+				rows.Close()
 				return 0, applied, err
 			}
 			if committed {
 				ready = append(ready, open...)
 				readyN += n
 				readyBytes += openBytes
-				open, n, openBytes, commitLSN = nil, 0, 0, m.LSN
+				open, n, openBytes, commitLSN = nil, 0, 0, lsn
 				if len(ready) >= applyFlushOps || readyBytes >= applyFlushBytes {
 					if err := flush(); err != nil {
+						rows.Close()
 						return 0, applied, err
 					}
 				}
@@ -1689,21 +1714,28 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 				continue
 			}
 			if !slices.Equal(c.Relation.Columns, wf.st.Columns) {
+				rows.Close()
 				return 0, applied, fatal("columns of %s changed during the workflow (%v)", wf.spec.table(), c.Relation.Columns)
 			}
 			ops, err := routeChange(wf.rt, wf.shape, wf.shadow(), c)
 			if err != nil {
+				rows.Close()
 				return 0, applied, fatal("%w", err)
 			}
 			for _, op := range ops {
 				openBytes += op.bytes(wf.shape)
 			}
 			if openBytes > catchUpMaxOpenBytes {
+				rows.Close()
 				return 0, applied, fatal("a single source transaction on %s/%d holds %d bytes of changes to %s, past the %d-byte catch-up bound: it cannot be applied until it commits, so it cannot be flushed",
 					wf.st.SourceSet, s, openBytes, wf.spec.table(), catchUpMaxOpenBytes)
 			}
 			open = append(open, ops...)
 			n++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return 0, applied, err
 		}
 		if err := flush(); err != nil {
 			return 0, applied, err
@@ -1713,22 +1745,28 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			if _, err := conn.Exec(ctx, `SELECT pg_replication_slot_advance($1, $2::pg_lsn)`, wf.slotName(s), commitLSN); err != nil {
 				return 0, applied, err
 			}
-		case len(msgs) == 0:
+		case msgCount == 0:
 			// Nothing decodes between the slot and the end of WAL: a
 			// transaction that commits later is decoded in full from its
 			// start, so the slot may follow the WAL end.
 			if _, err := conn.Exec(ctx, `SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())`, wf.slotName(s)); err != nil {
 				return 0, applied, err
 			}
-		case len(msgs) >= limit:
-			limit *= 4
-			continue
+		default:
+			// Rows but no commit. Argued to be impossible above -- a peek
+			// stops only after a commit record -- and asserted rather than
+			// assumed, because the cost of being wrong changed when the
+			// retry went. There is no limit left to grow: a drain would
+			// re-peek the same rows forever, making no progress and
+			// raising nothing, which is a worse failure than saying so.
+			return 0, applied, fatal("a peek of %d rows on %s/%d ended without a commit, which the slot should never produce",
+				msgCount, wf.st.SourceSet, s)
 		}
 		lag, err := slotLag(ctx, conn, wf.slotName(s))
 		if err != nil {
 			return 0, applied, err
 		}
-		if len(msgs) < limit || !drain {
+		if msgCount < peekChanges || !drain {
 			return lag, applied, nil
 		}
 	}

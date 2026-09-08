@@ -35,9 +35,9 @@ func TestTheHoldIsBoundedByBytesNotOnlyOperations(t *testing.T) {
 // TestTheOpenTransactionHasABoundNoFlushCanProvide: the committed hold can
 // always be shortened by flushing it. The transaction being decoded cannot
 // -- its operations are not applicable until it commits -- so it needs a
-// bound of its own, and without one a peek that fills without reaching a
-// commit quadruples its limit and decodes the same transaction again from
-// the start, retaining more of it each round.
+// bound of its own: a peek hands back a whole transaction however small a
+// limit it is given, so without this bound a source transaction larger
+// than the controller can hold has nothing to stop it.
 func TestTheOpenTransactionHasABoundNoFlushCanProvide(t *testing.T) {
 	if catchUpMaxOpenBytes <= applyFlushBytes {
 		t.Fatalf("the open bound (%d) is not above the flush bound (%d); an ordinary round would trip it",
