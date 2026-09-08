@@ -1628,7 +1628,10 @@ const applyFlushBytes = 8 << 20
 // stops with a message naming the table and the size is one an operator
 // can act on; a controller killed by the kernel takes every other workflow
 // with it and says nothing.
-const catchUpMaxOpenBytes = 256 << 20
+// It is a var so a test can lower it: the bound is only interesting
+// once it trips, and tripping it as written means holding a quarter of a
+// gigabyte of test data.
+var catchUpMaxOpenBytes = 256 << 20
 
 func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn ShardConn, targets targetConns, s int32, drain bool) (int64, int, error) {
 	dec := NewDecoder()
@@ -1693,7 +1696,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 				return 0, applied, fatal("%w", err)
 			}
 			for _, op := range ops {
-				openBytes += len(op.sql)
+				openBytes += op.bytes()
 			}
 			if openBytes > catchUpMaxOpenBytes {
 				return 0, applied, fatal("a single source transaction on %s/%d holds %d bytes of changes to %s, past the %d-byte catch-up bound: it cannot be applied until it commits, so it cannot be flushed",
@@ -1743,8 +1746,11 @@ const applyBatchBytes = 1 << 20
 
 // applyOps applies the operations to their targets. Order is preserved per
 // target - a row inserted then deleted must stay deleted - but not across
-// targets, which is sound because a target only ever holds keys no other
-// target holds, so no two targets order the same row.
+// targets. That is sound for the final state whether or not a key lives on
+// one target: a reference table gives every shard the same ordered
+// sequence for the row, and a row that moves gives the two shards a delete
+// and an insert of a key the other one is not holding. See the reasoning
+// on the concurrency below for what it does to the transient window.
 //
 // Each target's work goes out as one multi-statement query in a transaction
 // rather than a statement per operation. That is the difference between one
@@ -1765,8 +1771,8 @@ func applyOps(ctx context.Context, targets targetConns, shape rowShape, table st
 		byTarget[op.shard] = append(byTarget[op.shard], op)
 	}
 	stmts := make(map[int32][]string, len(byTarget))
-	for shard, group := range byTarget {
-		stmts[shard] = coalesce(shape, table, group)
+	for _, shard := range order {
+		stmts[shard] = coalesce(shape, table, byTarget[shard])
 	}
 	conns := make([]ShardConn, len(order))
 	for i, shard := range order {
@@ -2656,7 +2662,7 @@ func coalesce(shape rowShape, table string, ops []applyOp) []string {
 		}
 		seen[k] = true
 		run = append(run, op.up)
-		runBytes += rowBytes(op.up)
+		runBytes += op.bytes()
 	}
 	flush()
 	return out
@@ -2676,17 +2682,4 @@ func pkKey(shape rowShape, row *Tuple) string {
 		fmt.Fprintf(&b, "%d:%s|", len(*v), *v)
 	}
 	return b.String()
-}
-
-// rowBytes is what a row contributes to the statement it joins, near
-// enough to bound it: the literals dominate, and the column names and
-// punctuation around them do not grow with the data.
-func rowBytes(row *Tuple) int {
-	n := 0
-	for _, v := range row.Values {
-		if v != nil {
-			n += len(*v)
-		}
-	}
-	return n
 }

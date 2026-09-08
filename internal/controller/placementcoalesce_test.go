@@ -105,3 +105,29 @@ func TestCoalesceBoundsOneStatement(t *testing.T) {
 		t.Fatalf("five rows of %d bytes rendered as one statement", len(wide))
 	}
 }
+
+// The byte bounds on the hold and on the open transaction have to count
+// the rows an operation CARRIES, not only the ones it has already
+// rendered. A plain upsert is carried as a tuple now, so an accounting
+// that reads op.sql sees nothing at all for the ordinary case -- and both
+// bounds exist to stop the controller holding a whole bulk load in memory.
+func TestAnOperationsSizeCountsTheRowItCarries(t *testing.T) {
+	shape := coalesceShape()
+	big := strings.Repeat("x", 4096)
+	carried := applyOp{shard: 0, up: plain("1", big)}
+	if got := carried.bytes(); got < len(big) {
+		t.Fatalf("a carried row of %d bytes was accounted as %d; the hold and the open-transaction bound both count this",
+			len(big), got)
+	}
+	rendered := applyOp{shard: 0, sql: shape.DeleteSQL("t", plain("1", big))}
+	if got := rendered.bytes(); got != len(rendered.sql) {
+		t.Fatalf("a rendered statement of %d bytes was accounted as %d", len(rendered.sql), got)
+	}
+	// Escaping is what a literal actually costs in the statement, so a
+	// value made entirely of quotes must not be accounted at half its
+	// rendered size.
+	quotes := strings.Repeat("'", 1000)
+	if got := (applyOp{shard: 0, up: plain("2", quotes)}).bytes(); got < 2*len(quotes) {
+		t.Fatalf("%d quotes render as %d bytes but were accounted as %d", len(quotes), 2*len(quotes), got)
+	}
+}

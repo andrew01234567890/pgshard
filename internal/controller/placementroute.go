@@ -377,3 +377,31 @@ func upsertOps(shape rowShape, table string, shard int32, row *Tuple) []applyOp 
 	}
 	return ops
 }
+
+// bytes is what an operation will occupy in the statement that carries it.
+//
+// Every bound in catch-up is expressed in these: how much of a committed
+// hold goes out in one flush, how much of one uncommitted transaction the
+// controller will retain, and how large a single statement may grow. A
+// plain upsert is carried as a tuple rather than rendered, so reading
+// op.sql alone would account the ordinary case as nothing and leave all
+// three bounds counting only deletes.
+//
+// The literals dominate and they are counted as they will be WRITTEN: a
+// value of quotes or backslashes doubles in length on the way into the
+// statement, and a bound that ignored that would be out by that factor
+// for exactly the values most likely to be large.
+func (op applyOp) bytes() int {
+	if op.up == nil {
+		return len(op.sql)
+	}
+	n := 0
+	for _, v := range op.up.Values {
+		if v == nil {
+			n += len("NULL")
+			continue
+		}
+		n += len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
+	}
+	return n
+}

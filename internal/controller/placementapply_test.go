@@ -151,6 +151,9 @@ func TestApplyOpsFailingTargetReleasesTheOthers(t *testing.T) {
 		if err == nil {
 			t.Fatal("a failing target was reported as a successful flush")
 		}
+		if !errors.Is(err, bad.err) {
+			t.Fatalf("the flush reported %v rather than the failure that caused it", err)
+		}
 	case <-time.After(10 * time.Second):
 		close(slow.release)
 		t.Fatal("the flush was still waiting on a target that nothing would answer after another target had already failed")
