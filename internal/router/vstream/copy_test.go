@@ -248,3 +248,33 @@ func TestKeylessCopyRestartsRatherThanResumingFromACtid(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A copy is finite, but it is not immune to a promotion: a source that is
+// promoted away mid-copy sends no more and raises nothing, so a reader
+// waiting on it waits on a node that will never finish. It has to restart
+// the copy from its checkpoint on the new primary.
+//
+// Every other copy failure here ends with an error the reader can see.
+// This one ends with silence, which is what the real thing looks like.
+func TestACopyFollowsAPromotionWhenTheOldPrimaryGoesSilent(t *testing.T) {
+	h := newHarness(t, 1)
+	h.pool[0].copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		sc := script(cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["2"]`, "1", "2"))
+		sc.stall = true
+		return sc
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.open(ctx, copyStart(nil))
+	waitFor(t, func() bool { return len(h.pool[0].copyRequests()) == 1 })
+
+	promoted := newFakePooler(t)
+	promoted.copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		return script(cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["3"]`, "3"), cpTableDone("t"), cpDone())
+	}
+	h.topo.promote(shard0, promoted)
+	waitFor(t, func() bool { return len(promoted.copyRequests()) == 1 })
+	if r := promoted.copyRequests(); r[0].GetStream() != "plain" {
+		t.Fatalf("the copy did not restart on the promoted primary: %v", r)
+	}
+}

@@ -77,16 +77,27 @@ func (r *reader) copyOnce(ctx context.Context) error {
 	defer cancel()
 	// A copy creates the stream slot and exports a snapshot on it, so it
 	// carries the same fence an Execute does.
-	g := &pgshardv1.Generation{ShardMapGeneration: r.topo.Generation(), PrimaryEpoch: r.topo.Epoch(r.shard)}
+	epoch := r.topo.Epoch(r.shard)
+	g := &pgshardv1.Generation{ShardMapGeneration: r.topo.Generation(), PrimaryEpoch: epoch}
 	stream, err := client.CopyTables(sctx, r.copy.request(r.stream, r.database, r.twoPhase, g))
 	if err != nil {
 		return err
 	}
+	// A copy is finite, but it is not immune: a source that is promoted
+	// away or frozen mid-copy leaves this Recv waiting on a node that will
+	// send no more, and the copy has to be restarted from its checkpoint
+	// on the new primary rather than waited out.
+	moved := r.watchEpoch(sctx, cancel, epoch)
 	sh := shardRef(r.shard)
 	var rel *relMeta
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
+			select {
+			case <-moved:
+				return errEpochChanged
+			default:
+			}
 			return err
 		}
 		var u *unit

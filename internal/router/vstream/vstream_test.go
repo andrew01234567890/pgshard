@@ -784,3 +784,49 @@ func (b *lockedBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+// The reconnect window is for a shard that cannot be reached, so a stream
+// that HAS been reached since must not be counted against it.
+//
+// once never returns nil -- every exit is an error -- so clearing the
+// window only on a nil return meant it was never cleared at all. One
+// benign reconnect early in a stream's life then armed the window for the
+// whole of its life, and a single transient failure any time later ended
+// the reader with SHARD_UNAVAILABLE as though the shard had been
+// unreachable throughout.
+func TestTheReconnectWindowIsClearedByProgressNotOnlyByASuccessfulReturn(t *testing.T) {
+	h := newHarness(t, 1)
+	h.server.ReconnectWindow = 300 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain"})
+	h.pool[0].feed("plain", batch(0, evRelation(1, "t", "id")))
+	h.pool[0].feed("plain", txn(1, 1, 1, 1000, "1"))
+	recvN(t, st, 5, 5*time.Second)
+
+	// A promotion: benign, and the only thing that arms the window here.
+	promoted := newFakePooler(t)
+	h.topo.promote(shard0, promoted)
+	waitFor(t, func() bool { return len(promoted.startLSNs()) == 1 })
+
+	// Progress on the new primary, well after the window would have run out.
+	promoted.feed("plain", batch(0, evRelation(1, "t", "id")))
+	promoted.feed("plain", txn(1, 2, 2, 1100, "2"))
+	recvN(t, st, 4, 5*time.Second)
+	time.Sleep(2 * h.server.ReconnectWindow)
+
+	// One transient failure now must be reconnected through, not treated
+	// as the end of a shard that has been unavailable since the promotion.
+	promoted.fail(status.Error(codes.Unavailable, "pooler restarting"))
+	promoted.feed("plain", batch(0, evRelation(1, "t", "id")))
+	promoted.feed("plain", txn(1, 3, 3, 1200, "3"))
+	got := recvN(t, st, 4, 5*time.Second)
+	for _, ev := range got {
+		if e := ev.GetError(); e != nil {
+			t.Fatalf("the reader gave up on a shard it had just been reading: %v", e)
+		}
+	}
+	if describe(got[3]) != "vgtid gen=7 {0:1200}" {
+		t.Fatalf("after a transient failure: %v", lines(got))
+	}
+}

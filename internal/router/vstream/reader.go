@@ -93,6 +93,9 @@ func (r *reader) run(ctx context.Context) {
 		maxBytes: r.maxBytes, maxOpen: r.maxOpen, meter: r.meter}
 	backoff := 200 * time.Millisecond
 	var firstFailure time.Time
+	// What the reader had delivered when the window was last cleared:
+	// progress since then means the shard is answering.
+	lastDelivered := r.delivered
 	for {
 		var err error
 		if r.copy != nil {
@@ -103,10 +106,19 @@ func (r *reader) run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err == nil {
+		// The window is for a shard that cannot be reached, so anything
+		// that DID reach it clears it. once never returns nil -- every
+		// exit is an error -- so waiting for that left a single benign
+		// reconnect early in a stream's life arming the window for the
+		// whole of it, and a lone transient failure an hour later ended
+		// the reader as if the shard had been unavailable throughout.
+		if err == nil || r.delivered != lastDelivered {
 			firstFailure = time.Time{}
 			backoff = 200 * time.Millisecond
-			continue
+			lastDelivered = r.delivered
+			if err == nil {
+				continue
+			}
 		}
 		if ev := fatal(err, r.shard); ev != nil {
 			r.push(ctx, &unit{shard: r.shard, err: ev})
@@ -203,6 +215,41 @@ func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 	return &pgshardv1.VEvent_Error{Code: code, Message: fmt.Sprintf("shard %s/%d: %s", sh.Set, sh.ID, st.Message()), Shard: shardRef(sh)}
 }
 
+// watchEpoch cancels a stream's own context when the shard's primary epoch
+// moves, and reports through the returned channel that it was the reason.
+//
+// A reader parked in Recv cannot notice a promotion on its own: the old
+// primary has nothing left to send, so no batch arrives to check against
+// and no error is raised. Cancelling the STREAM's context is what makes
+// Recv answer; the parent is untouched, so the caller reconnects to the
+// new primary instead of shutting down.
+//
+// The goroutine ends with the stream, and may run one last poll in the
+// gap before its context is cancelled -- an atomic read of the snapshot
+// and an idempotent cancel, both harmless.
+func (r *reader) watchEpoch(sctx context.Context, cancel context.CancelFunc, epoch uint64) <-chan struct{} {
+	moved := make(chan struct{})
+	go func() {
+		t := time.NewTicker(epochPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-t.C:
+				if r.topo.Epoch(r.shard) != epoch {
+					// Closed before the cancel, so the caller's check
+					// after Recv always sees it.
+					close(moved)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return moved
+}
+
 // once opens one pooler stream at the last delivered position and consumes
 // it until it fails, the context ends or the shard's primary epoch changes.
 func (r *reader) once(ctx context.Context) error {
@@ -237,23 +284,7 @@ func (r *reader) once(ctx context.Context) error {
 	// Cancelling the stream's own context is what makes Recv answer. The
 	// parent context is untouched, so the outer loop reconnects to the new
 	// primary instead of shutting the reader down.
-	moved := make(chan struct{})
-	go func() {
-		t := time.NewTicker(epochPoll)
-		defer t.Stop()
-		for {
-			select {
-			case <-sctx.Done():
-				return
-			case <-t.C:
-				if r.topo.Epoch(r.shard) != epoch {
-					close(moved)
-					cancel()
-					return
-				}
-			}
-		}
-	}()
+	moved := r.watchEpoch(sctx, cancel, epoch)
 	r.asm.reset()
 	for {
 		batch, err := stream.Recv()
