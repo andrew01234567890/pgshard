@@ -107,11 +107,21 @@ func TestGivingUpDoesNotReachABackendAlreadyBackInThePool(t *testing.T) {
 	// this the reset finishes first and the assertion below holds whether
 	// the watcher was scoped correctly or not.
 	time.Sleep(100 * time.Millisecond)
+	before := h.pg.dials.Load()
 	close(h.pg.releaseDiscard)
+
+	// The reset runs on the pooler's own goroutine and the backend is
+	// pooled when it returns, so the next session has to be opened after
+	// that has happened -- not merely after the fake stopped holding it.
+	// Opening it first makes the pool dial a second backend for want of an
+	// idle one, which is the very thing this asserts does not happen.
+	waitFor(t, func() bool {
+		_, idle := h.srv.cfg.Pool.Stats()
+		return idle == 1
+	})
 
 	// The backend finished its reset and was pooled, so the next session
 	// gets it rather than dialling a new one.
-	before := h.pg.dials.Load()
 	fresh, err := h.client.Execute(context.Background())
 	if err != nil {
 		t.Fatal(err)
