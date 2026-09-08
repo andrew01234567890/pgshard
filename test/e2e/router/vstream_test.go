@@ -174,12 +174,18 @@ func (r *streamReader) next(within time.Duration) (*pgshardv1.VEvent, error) {
 	}
 }
 
-// consume reads from the stream until stop returns true after a VGtid, or
+// consume reads from the reader until stop returns true after a VGtid, or
 // the stream ends.
-func consume(tb testing.TB, st pgshardv1.VStream_StreamClient, stop func(c *consumed) bool) *consumed {
+//
+// It takes a reader rather than a stream because the reader must outlive
+// it. Recv runs on its own goroutine, so when consume returns that
+// goroutine is parked in a Recv whose event nothing is waiting for; a
+// reader created per call would drop that event, and the next consume on
+// the same stream would start one event late -- a Row with no Begin, which
+// is a failure rather than a flake. Two consumes on one stream is exactly
+// what the failover test does.
+func consume(tb testing.TB, r *streamReader, stop func(c *consumed) bool) *consumed {
 	tb.Helper()
-	r := newStreamReader(st)
-	defer r.close()
 	c := &consumed{}
 	var cur []int
 	var curShard string
@@ -310,13 +316,17 @@ func TestRouterVStream(t *testing.T) {
 	// First consumer dies after a dozen rows; the second resumes from its
 	// last VGtid. Together they see every id exactly once.
 	st, cancel := open(nil)
-	first := consume(t, st, func(c *consumed) bool { return len(flatten(c)) >= 12 })
+	reader := newStreamReader(st)
+	first := consume(t, reader, func(c *consumed) bool { return len(flatten(c)) >= 12 })
 	cancel()
+	reader.close()
 	if first.last == nil || len(first.last.GetShards()) == 0 {
 		t.Fatalf("no vgtid after %d rows", len(flatten(first)))
 	}
 	st, cancel = open(first.last)
-	second := consume(t, st, func(c *consumed) bool {
+	reader = newStreamReader(st)
+	defer reader.close()
+	second := consume(t, reader, func(c *consumed) bool {
 		return len(flatten(first))+len(flatten(c)) >= total && len(first.committed)+len(c.committed) >= 2
 	})
 	ids := append(flatten(first), flatten(second)...)
@@ -386,6 +396,8 @@ func TestRouterVStream(t *testing.T) {
 	// A stream cannot be opened twice on the same slots while the first
 	// reader is still attached, but a fresh one after cancel is fine; it
 	// sees nothing new and heartbeats.
+	// Read directly here rather than through a streamReader: a reader
+	// would start a Recv of its own and race this loop for the events.
 	st, cancel = open(final)
 	hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer hbCancel()
@@ -536,7 +548,11 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 	if err := st.Send(&pgshardv1.VStreamRequest{Request: &pgshardv1.VStreamRequest_Start_{Start: &pgshardv1.VStreamRequest_Start{Stream: "orders"}}}); err != nil {
 		t.Fatal(err)
 	}
-	before := consume(t, st, func(c *consumed) bool { return len(flatten(c)) >= 20 })
+	// One reader for the one stream: this test consumes from it twice, and
+	// a reader per consume would lose the event between them.
+	reader := newStreamReader(st)
+	defer reader.close()
+	before := consume(t, reader, func(c *consumed) bool { return len(flatten(c)) >= 20 })
 	if err := st.Send(&pgshardv1.VStreamRequest{Request: &pgshardv1.VStreamRequest_Ack{Ack: before.last}}); err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +674,7 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 	// Probe rows (999) may have been written to, and streamed from, the old
 	// primary before the router and the stream followed the promotion; the
 	// ids 11..20 only ever exist on the promoted standby.
-	after := consume(t, st, func(c *consumed) bool {
+	after := consume(t, reader, func(c *consumed) bool {
 		n := 0
 		for _, id := range flatten(c) {
 			if id != 999 {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,15 +20,29 @@ import (
 type fakeStream struct {
 	grpc.ClientStream
 	events []*pgshardv1.VEvent
+	mu     sync.Mutex
 	i      int
 	stall  bool
 }
 
+// asked is how many events have been requested, which is what makes the
+// dropped-event case observable: the reader takes one more than the
+// consumer used.
+func (f *fakeStream) asked() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.i
+}
+
 func (f *fakeStream) Recv() (*pgshardv1.VEvent, error) {
+	f.mu.Lock()
 	if f.i < len(f.events) {
 		f.i++
-		return f.events[f.i-1], nil
+		ev := f.events[f.i-1]
+		f.mu.Unlock()
+		return ev, nil
 	}
+	f.mu.Unlock()
 	if f.stall {
 		select {} // never answers, which is the case under test
 	}
@@ -85,5 +100,52 @@ func TestStreamReaderReportsTheEndOfTheStream(t *testing.T) {
 	}
 	if _, err := r.next(10 * time.Second); !errors.Is(err, io.EOF) {
 		t.Fatalf("the end of the stream came back as %v, want io.EOF", err)
+	}
+}
+
+// Two consumes on ONE reader must not lose the event between them.
+//
+// consume returns while its reader is parked in a Recv whose event nothing
+// is waiting for yet. A reader created per consume would drop that event,
+// and the next consume would start one event late -- which arrives as a
+// Row with no Begin, so the failover test fails rather than flakes. That
+// test consumes twice from one stream, so this is its exact shape.
+func TestTwoConsumesOnOneReaderLoseNothingBetweenThem(t *testing.T) {
+	shard := &pgshardv1.ShardRef{ShardId: 1}
+	row := func(id string) *pgshardv1.VEvent {
+		return &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Row_{Row: &pgshardv1.VEvent_Row{
+			Shard: shard, Kind: pgshardv1.VEvent_Row_KIND_INSERT,
+			New: &pgshardv1.VTuple{Columns: []*pgshardv1.VColumn{{}, {Value: []byte(id)}}}}}}
+	}
+	begin := &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Begin_{Begin: &pgshardv1.VEvent_Begin{Shard: shard}}}
+	commit := &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Commit_{Commit: &pgshardv1.VEvent_Commit{}}}
+	vgtid := &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Vgtid{Vgtid: &pgshardv1.VEvent_VGtid{Position: &pgshardv1.VPosition{}}}}
+
+	// Two whole transactions, each ended by the VGtid that stops a consume.
+	fake := &fakeStream{events: []*pgshardv1.VEvent{
+		begin, row("1"), commit, vgtid,
+		begin, row("2"), commit, vgtid,
+	}}
+	r := newStreamReader(fake)
+	defer r.close()
+
+	first := consume(t, r, func(c *consumed) bool { return len(flatten(c)) >= 1 })
+	if ids := flatten(first); len(ids) != 1 || ids[0] != 1 {
+		t.Fatalf("first consume got %v, want [1]", ids)
+	}
+	// Wait until the reader has taken the event AFTER the one that stopped
+	// the first consume -- the fifth, the second transaction's Begin. That
+	// is the event a per-consume reader drops, and waiting for it is what
+	// makes this deterministic rather than a race the fix usually wins.
+	deadline := time.Now().Add(10 * time.Second)
+	for fake.asked() < 5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the reader never asked for the event after the one that stopped the consume (asked %d)", fake.asked())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	second := consume(t, r, func(c *consumed) bool { return len(flatten(c)) >= 1 })
+	if ids := flatten(second); len(ids) != 1 || ids[0] != 2 {
+		t.Fatalf("second consume got %v, want [2]: the Begin between the two was dropped", ids)
 	}
 }
