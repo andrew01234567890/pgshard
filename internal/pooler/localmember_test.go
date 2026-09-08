@@ -55,13 +55,10 @@ func TestAPoolerInFrontOfADemotedPrimaryRefuses(t *testing.T) {
 func TestADemotedPrimaryIsRefusedOnBothRequestPaths(t *testing.T) {
 	view := View{Generation: 7, Epoch: 3, Serving: true, Standby: true}
 	s := NewServer(Config{Source: notServing{view}})
-	res, err := s.Reserve(context.Background(), &pgshardv1.ReserveRequest{SessionId: "r",
+	_, err := s.Reserve(context.Background(), &pgshardv1.ReserveRequest{SessionId: "r",
 		Generation: &pgshardv1.Generation{ShardMapGeneration: 7, PrimaryEpoch: 3}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.GetError() == nil || !strings.Contains(res.GetError().GetMessage(), "in recovery") {
-		t.Fatalf("Reserve on a demoted member: %v", res.GetError())
+	if e := refusalOf(t, err); !strings.Contains(e.GetMessage(), "in recovery") {
+		t.Fatalf("Reserve on a demoted member: %v", e)
 	}
 
 	h := startHarness(t, PoolConfig{})

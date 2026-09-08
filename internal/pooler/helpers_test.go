@@ -14,7 +14,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -305,4 +307,25 @@ func (h *harness) attached() bool {
 	defer h.srv.mu.Unlock()
 	se := h.srv.sessions["s"]
 	return se != nil && se.attached
+}
+
+// refusalOf recovers the pooler's own Error from a refused RPC's status. A
+// refusal travels as a status code with the Error as a detail, so a test
+// that only read a code would not notice a wrong SQLSTATE and one that only
+// read a body would not notice a successful status.
+func refusalOf(t *testing.T, err error) *pgshardv1.Error {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the call succeeded where a refusal was expected")
+	}
+	if c := status.Code(err); c != codes.FailedPrecondition {
+		t.Fatalf("refusal came back as %v, want FailedPrecondition: %v", c, err)
+	}
+	for _, d := range status.Convert(err).Details() {
+		if e, ok := d.(*pgshardv1.Error); ok {
+			return e
+		}
+	}
+	t.Fatalf("refusal carried no Error detail: %v", err)
+	return nil
 }

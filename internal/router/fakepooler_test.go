@@ -330,7 +330,15 @@ func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
 func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgshardv1.ReserveResponse, error) {
 	f.gate.wait()
 	if e := f.fence(req.Generation); e != nil {
-		return &pgshardv1.ReserveResponse{Error: e}, nil
+		// The same channel the real pooler uses: a refusal is a status
+		// with the Error as a detail, not an Error in an OK response. A
+		// double that answered OK would let the router's recovery of the
+		// refusal be wrong and every test here still pass.
+		st := status.New(codes.FailedPrecondition, e.GetMessage())
+		if d, derr := st.WithDetails(e); derr == nil {
+			st = d
+		}
+		return nil, st.Err()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

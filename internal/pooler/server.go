@@ -854,14 +854,26 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 		return nil, errUnavailable
 	}
 	view := s.cfg.Source.View()
+	// FailedPrecondition with the Error as a detail, not an Error in an OK
+	// response. A reserve that was refused did not happen, and returning
+	// it as a successful RPC made it OK to every interceptor, retry policy
+	// and metric that sees only the status -- while Ack, which refuses on
+	// exactly the same three conditions, already used the status channel.
+	// The detail carries the SQLSTATE and reason, so a caller that needs
+	// to tell a stale generation from a demoted member still can.
+	//
+	// ReserveResponse.Error is therefore never set now. The field stays on
+	// the wire rather than being removed, so a pooler and a router of
+	// different builds still speak: an older router reads an empty Error
+	// and an err, which it already handles as a refusal.
 	if e := member(view); e != nil {
-		return &pgshardv1.ReserveResponse{Error: e}, nil
+		return nil, refusalStatus(e)
 	}
 	if e := serving(view); e != nil {
-		return &pgshardv1.ReserveResponse{Error: e}, nil
+		return nil, refusalStatus(e)
 	}
 	if e := fence(view, req.Generation); e != nil {
-		return &pgshardv1.ReserveResponse{Error: e}, nil
+		return nil, refusalStatus(e)
 	}
 	if req.SessionId == "" {
 		return nil, status.Error(codes.InvalidArgument, "session_id is required")
