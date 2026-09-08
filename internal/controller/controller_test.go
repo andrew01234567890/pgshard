@@ -76,22 +76,14 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 		_ = exec.Command("docker", "rm", "-f", id).Run()
 	})
 	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", dockertest.HostPort(t, id, "5432"))
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	dockertest.WaitReady(t, id, func(ctx context.Context) error {
 		conn, err := pgx.Connect(ctx, dsn)
-		cancel()
-		if err == nil {
-			_ = conn.Close(context.Background())
-			return dsn
+		if err != nil {
+			return err
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	// A bare timeout says nothing about why; the container's own log
-	// usually does, and it is gone as soon as the cleanup removes it.
-	logs, _ := exec.Command("docker", "logs", "--tail", "20", id).CombinedOutput()
-	t.Fatalf("postgres did not become ready; container log:\n%s", logs)
-	return ""
+		return conn.Close(context.Background())
+	})
+	return dsn
 }
 
 func connect(t *testing.T, dsn string) *pgx.Conn {
