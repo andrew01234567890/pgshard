@@ -112,6 +112,13 @@ type StreamConfig struct {
 // unchanged: 200k inserts moved at 101k/sec at 250ms and 104k/sec at
 // 25ms, which is noise. A busy stream never reaches the timeout at all.
 //
+// That cost is per stream, and a pooler holds one per consumer per shard.
+// A wakeup is a timer, a syscall that returns EAGAIN and two allocations,
+// so a thousand idle streams on one pooler is forty thousand of them a
+// second -- single-digit percent of a core, where at 250ms it was a tenth
+// of that. Fine at any fan-out this has been sized for, and the number to
+// revisit if a pooler is ever expected to hold thousands.
+//
 // This is the ack latency PGS-213 asked about, answered by shortening the
 // wait rather than by interrupting a receive in progress. Interrupting one
 // would have to establish that pgconn tolerates a read being cut and
