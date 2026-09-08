@@ -2,8 +2,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -70,3 +73,94 @@ func TestApplyOpsSplitsAStatementThatWouldGrowUnbounded(t *testing.T) {
 		t.Fatalf("%d operations went out in %d statements, want 2", len(ops), len(one.execs))
 	}
 }
+
+// barrierRecorder answers Exec only once every target has reached it, so a
+// serial applyOps cannot get past the first one.
+type barrierRecorder struct {
+	mu      sync.Mutex
+	execs   []string
+	arrive  chan struct{}
+	release chan struct{}
+}
+
+func (r *barrierRecorder) Exec(ctx context.Context, sql string, _ ...any) (CommandTag, error) {
+	r.mu.Lock()
+	r.execs = append(r.execs, sql)
+	r.mu.Unlock()
+	r.arrive <- struct{}{}
+	select {
+	case <-r.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r *barrierRecorder) Query(context.Context, string, ...any) (pgx.Rows, error) { panic("unused") }
+func (r *barrierRecorder) Close(context.Context) error                             { return nil }
+
+// A flush costs the largest target's round trip, not the sum of them. The
+// targets are separate shards on separate connections, and catch-up
+// latency is what decides whether the slot converges before the write
+// fence, so this is the difference between converging and not on a split
+// into several targets.
+func TestApplyOpsSendsToEveryTargetAtOnce(t *testing.T) {
+	const n = 4
+	arrive := make(chan struct{}, n)
+	release := make(chan struct{})
+	targets := targetConns{}
+	var ops []applyOp
+	for i := range n {
+		targets[int32(i)] = &barrierRecorder{arrive: arrive, release: release}
+		ops = append(ops, applyOp{shard: int32(i), sql: "x"})
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- applyOps(context.Background(), targets, ops) }()
+
+	// Every target must be inside Exec before any of them is answered.
+	for i := range n {
+		select {
+		case <-arrive:
+		case <-time.After(10 * time.Second):
+			close(release)
+			t.Fatalf("only %d of %d targets had been sent their operations; the flush costs the sum of the target round trips, not the largest", i, n)
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A target that fails cancels the ones still in flight rather than leaving
+// the flush waiting on them. The slow target is first, so a version that
+// did not carry the group's context into applyToTarget would sit on it
+// forever; catch-up re-decodes the round either way, because the slot has
+// not advanced.
+func TestApplyOpsFailingTargetReleasesTheOthers(t *testing.T) {
+	slow := &barrierRecorder{arrive: make(chan struct{}, 1), release: make(chan struct{})}
+	bad := &errRecorder{err: errors.New("gone")}
+	done := make(chan error, 1)
+	go func() {
+		done <- applyOps(context.Background(), targetConns{1: slow, 0: bad},
+			[]applyOp{{shard: 1, sql: "y"}, {shard: 0, sql: "x"}})
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a failing target was reported as a successful flush")
+		}
+	case <-time.After(10 * time.Second):
+		close(slow.release)
+		t.Fatal("the flush was still waiting on a target that nothing would answer after another target had already failed")
+	}
+}
+
+type errRecorder struct{ err error }
+
+func (r *errRecorder) Exec(context.Context, string, ...any) (CommandTag, error) {
+	return nil, r.err
+}
+func (r *errRecorder) Query(context.Context, string, ...any) (pgx.Rows, error) { panic("unused") }
+func (r *errRecorder) Close(context.Context) error                             { return nil }

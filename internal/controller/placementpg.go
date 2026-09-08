@@ -1764,16 +1764,46 @@ func applyOps(ctx context.Context, targets targetConns, ops []applyOp) error {
 		}
 		byTarget[op.shard] = append(byTarget[op.shard], op.sql)
 	}
-	for _, shard := range order {
+	conns := make([]ShardConn, len(order))
+	for i, shard := range order {
 		conn, ok := targets[shard]
 		if !ok {
 			return fmt.Errorf("no connection to target shard %d", shard)
 		}
-		if err := applyToTarget(ctx, conn, byTarget[shard]); err != nil {
-			return fmt.Errorf("target %d: %w", shard, err)
-		}
+		conns[i] = conn
 	}
-	return nil
+	// One goroutine per target, because the targets are separate shards on
+	// separate connections and a flush otherwise costs the SUM of their
+	// round trips where it could cost the largest. Catch-up latency is what
+	// decides whether the slot converges before the write fence, so on a
+	// split into n targets this is the difference between converging and
+	// not.
+	//
+	// Each target keeps its own operations in order, which is the ordering
+	// that matters: an upsert and a later delete of the same row are always
+	// on the same shard. Two targets are only ever both involved in a row
+	// that MOVES between shards, which is a delete on the old one and an
+	// insert on the new one; the serial version already ran those in
+	// whichever order the targets happened to fall in, so the row was
+	// already briefly on both shards or on neither. This widens that window
+	// rather than opening it, and catch-up runs before the fence, when no
+	// client reads the shadow tables.
+	//
+	// A target that fails leaves the others' work committed. That was true
+	// serially too, and it is safe for the same reason: the slot advances
+	// only after the whole flush succeeds, so the round is decoded again,
+	// and every statement it applies is idempotent -- upserts carry ON
+	// CONFLICT and deletes name a primary key.
+	g, gctx := errgroup.WithContext(ctx)
+	for i, shard := range order {
+		g.Go(func() error {
+			if err := applyToTarget(gctx, conns[i], byTarget[shard]); err != nil {
+				return fmt.Errorf("target %d: %w", shard, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 func applyToTarget(ctx context.Context, conn ShardConn, stmts []string) error {
