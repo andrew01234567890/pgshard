@@ -19,13 +19,19 @@ func parseReq(name, sql string, oids []uint32) *pgshardv1.ExecuteRequest {
 
 func bindReq(portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) *pgshardv1.ExecuteRequest {
 	b := &pgshardv1.Bind{Portal: portal, Statement: statement, ParamFormats: toInt32s(paramFormats), ResultFormats: toInt32s(resultFormats)}
+	// One array for the values and one for the pointers into it, rather
+	// than an allocation per parameter. A bind of forty parameters was
+	// forty-one; it is two. They share the message's lifetime, so nothing
+	// outlives anything else by being kept together.
+	vals := make([]pgshardv1.Value, len(params))
 	b.Params = make([]*pgshardv1.Value, len(params))
 	for i, p := range params {
 		if p == nil {
-			b.Params[i] = &pgshardv1.Value{Null: true}
+			vals[i].Null = true
 		} else {
-			b.Params[i] = &pgshardv1.Value{Data: p}
+			vals[i].Data = p
 		}
+		b.Params[i] = &vals[i]
 	}
 	return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Bind{Bind: b}}
 }
