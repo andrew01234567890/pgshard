@@ -87,10 +87,8 @@ func (p *Poolers) Client(sh Shard) (pgshardv1.PoolerClient, error) {
 	now := p.now()
 	c, ok := p.conns[ep]
 	if !ok {
-		cc, err := grpc.NewClient(ep, grpc.WithTransportCredentials(p.creds), grpc.WithIdleTimeout(poolerIdleTimeout),
-			grpc.WithKeepaliveParams(pooler.Keepalive),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(pooler.MaxMessageBytes), grpc.MaxCallSendMsgSize(pooler.MaxMessageBytes)))
+		cc, err := grpc.NewClient(ep, pooler.DialOptions(
+			grpc.WithTransportCredentials(p.creds), grpc.WithIdleTimeout(poolerIdleTimeout))...)
 		if err != nil {
 			return nil, fmt.Errorf("router: dial pooler %s: %w", ep, err)
 		}

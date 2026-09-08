@@ -3,6 +3,7 @@ package pooler
 import (
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -33,6 +34,35 @@ import (
 // rather than a thing that cannot be done.
 const MaxMessageBytes = 4 << 20
 
+// TransportBufferBytes is the read and write buffer grpc-go puts between
+// the HTTP/2 framer and the socket, on both halves of a router-to-pooler
+// connection.
+//
+// grpc-go defaults to 32 KiB. On a stream of 4 KiB rows -- a scatter
+// draining a shard, a COPY, a change stream -- 128 KiB moves the same
+// bytes about 20% faster, because the framer stops handing the kernel a
+// write every eight rows. 256 KiB measured no better than 128 KiB, so this
+// is the knee rather than the largest number that helped.
+//
+// It costs one buffer of this size per direction per connection, and a
+// router holds one connection per pooler endpoint, so the footprint is
+// bounded by the topology rather than by the session count.
+//
+// The flow-control windows are deliberately left alone. Raising them is
+// worth a further ~16% on the same stream, but grpc-go's options for it
+// also switch off the BDP estimator, and the measured cost is that one
+// stalled consumer parks its whole stream window instead of the 192 KiB it
+// parks today: 4 MiB windows made it 4.05 MiB. A router fans a scatter
+// across every shard and holds a change stream per consumer, so that
+// multiplies by exactly the thing that is already the memory pressure.
+//
+// MaxConnectionAge is left alone for the same kind of reason: it exists to
+// rebalance long-lived connections, and the connections here are long-lived
+// on purpose. A change stream that is cut every N minutes has to re-derive
+// its position, which is a real cost in exchange for a rebalance the
+// catalog's endpoint map already performs.
+const TransportBufferBytes = 128 << 10
+
 // Keepalive is how the router keeps a pooler connection honest, and
 // KeepaliveEnforcement is what the pooler's server must permit for it. They
 // live together because they are one setting with two halves: gRPC's DEFAULT
@@ -58,3 +88,27 @@ var (
 		PermitWithoutStream: true,
 	}
 )
+
+// ServerOptions and DialOptions are the two halves of the router-to-pooler
+// transport, together in one place because several of them only work in
+// pairs: the keepalive enforcement answers the client's pings, and a buffer
+// or message cap raised on one side alone still meets the other side's.
+//
+// Credentials are the caller's -- they differ between a pooler serving
+// mTLS and a test dialing loopback -- and everything else is fixed here so
+// that the settings are one decision rather than two that drift.
+func ServerOptions(creds ...grpc.ServerOption) []grpc.ServerOption {
+	return append(creds,
+		grpc.KeepaliveEnforcementPolicy(KeepaliveEnforcement),
+		grpc.ReadBufferSize(TransportBufferBytes), grpc.WriteBufferSize(TransportBufferBytes),
+		grpc.MaxRecvMsgSize(MaxMessageBytes), grpc.MaxSendMsgSize(MaxMessageBytes))
+}
+
+// DialOptions is the client half. See ServerOptions.
+func DialOptions(creds ...grpc.DialOption) []grpc.DialOption {
+	return append(creds,
+		grpc.WithKeepaliveParams(Keepalive),
+		grpc.WithReadBufferSize(TransportBufferBytes), grpc.WithWriteBufferSize(TransportBufferBytes),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(MaxMessageBytes), grpc.MaxCallSendMsgSize(MaxMessageBytes)))
+}
