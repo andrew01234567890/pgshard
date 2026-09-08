@@ -175,18 +175,12 @@ func startPostgres18(t *testing.T) string {
 	id := strings.TrimSpace(string(out))
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
 	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	dockertest.WaitReady(t, id, func(ctx context.Context) error {
 		conn, err := pgx.Connect(ctx, dsn)
-		cancel()
-		if err == nil {
-			_ = conn.Close(context.Background())
-			return dsn
+		if err != nil {
+			return err
 		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	logs, _ := exec.Command("docker", "logs", id).CombinedOutput()
-	t.Fatalf("postgres did not become ready:\n%s", logs)
-	return ""
+		return conn.Close(context.Background())
+	})
+	return dsn
 }

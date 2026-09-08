@@ -117,19 +117,14 @@ func startProbePostgresWith(t *testing.T, opts ...string) string {
 	hostPort := strings.TrimSpace(strings.SplitN(string(pout), "\n", 2)[0])
 	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", hostPort)
 
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		conn, cerr := pgx.Connect(ctx, dsn)
-		cancel()
-		if cerr == nil {
-			_ = conn.Close(context.Background())
-			return dsn
+	dockertest.WaitReady(t, id, func(ctx context.Context) error {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return err
 		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatal("postgres did not become ready")
-	return ""
+		return conn.Close(context.Background())
+	})
+	return dsn
 }
 
 // TestPublishShardStatusIsQuietWhenNothingChanged: a Ready cluster reconciles

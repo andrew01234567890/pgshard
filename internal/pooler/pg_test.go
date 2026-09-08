@@ -78,20 +78,14 @@ func startPostgres(t testing.TB, image string) (addr, adminDSN string) {
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
 	addr = dockertest.HostPort(t, id, "5432")
 	adminDSN = fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", addr)
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	dockertest.WaitReady(t, id, func(ctx context.Context) error {
 		conn, err := pgx.Connect(ctx, adminDSN)
-		cancel()
-		if err == nil {
-			_ = conn.Close(context.Background())
-			return addr, adminDSN
+		if err != nil {
+			return err
 		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	logs, _ := exec.Command("docker", "logs", id).CombinedOutput()
-	t.Fatalf("postgres did not become ready:\n%s", logs)
-	return "", ""
+		return conn.Close(context.Background())
+	})
+	return addr, adminDSN
 }
 
 // deriveKeys recomputes ClientKey/ServerKey the way the router recovers them

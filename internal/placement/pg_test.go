@@ -51,19 +51,17 @@ func startPostgres(t *testing.T, image string) *pgx.Conn {
 	id := strings.TrimSpace(string(out))
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
 	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		conn, err := pgx.Connect(ctx, dsn)
-		cancel()
-		if err == nil {
-			t.Cleanup(func() { _ = conn.Close(context.Background()) })
-			return conn
+	var conn *pgx.Conn
+	dockertest.WaitReady(t, id, func(ctx context.Context) error {
+		c, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return err
 		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatal("postgres did not become ready")
-	return nil
+		conn = c
+		return nil
+	})
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	return conn
 }
 
 const sampleCount = 10000
