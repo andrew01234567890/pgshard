@@ -414,6 +414,8 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		b.max = int(req.GetBatchBytes())
 	}
 	dec := pgoutput.NewDecoder()
+	frames := conn.Reader(ctx)
+	defer frames.Close()
 	lastSent := time.Now()
 	lastStatus := time.Now()
 	var serverEnd pgrepl.LSN
@@ -446,9 +448,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 			}
 		default:
 		}
-		rctx, cancel := context.WithTimeout(ctx, cfg.ReceiveTimeout)
-		msg, err := conn.Receive(rctx)
-		cancel()
+		msg, err := frames.Next(cfg.ReceiveTimeout)
 		switch {
 		case err == nil:
 		case ctx.Err() != nil:

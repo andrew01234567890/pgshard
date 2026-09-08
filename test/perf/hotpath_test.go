@@ -7,7 +7,10 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -368,4 +371,77 @@ func BenchmarkGRPCPoolerBulkStream(b *testing.B) {
 			}
 		}
 	}
+}
+
+// BenchmarkStreamFrameWait measures the per-frame cost of bounding one
+// replication read, which a change stream pays once per WAL message.
+//
+// "context" is the shape the pooler used to run: a timer context per frame,
+// registered on the stream's context, with pgconn registering its own
+// cancellation hook on top. "deadline" is what pgrepl.Reader does instead --
+// the same socket deadline pgconn's hook would set, set directly.
+//
+// Neither sub-benchmark reads: the read is identical either way, and what is
+// being compared is the bookkeeping around it.
+func BenchmarkStreamFrameWait(b *testing.B) {
+	nc := loopbackConn(b)
+	const within = 250 * time.Millisecond
+
+	b.Run("context", func(b *testing.B) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		defer cancelParent()
+		w := ctxwatch.NewContextWatcher(&pgconn.DeadlineContextWatcherHandler{Conn: nc})
+		b.ReportAllocs()
+		for b.Loop() {
+			ctx, cancel := context.WithTimeout(parent, within)
+			w.Watch(ctx)
+			w.Unwatch()
+			cancel()
+		}
+	})
+
+	b.Run("deadline", func(b *testing.B) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		defer cancelParent()
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := nc.SetReadDeadline(time.Now().Add(within)); err != nil {
+				b.Fatal(err)
+			}
+			if parent.Err() != nil {
+				b.Fatal(parent.Err())
+			}
+		}
+	})
+}
+
+// loopbackConn is a real TCP connection, because a deadline on one is a
+// runtime netpoller operation and a deadline on a pipe is not.
+func loopbackConn(b *testing.B) net.Conn {
+	b.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = lis.Close() })
+	done := make(chan net.Conn, 1)
+	go func() {
+		c, err := lis.Accept()
+		if err != nil {
+			done <- nil
+			return
+		}
+		done <- c
+	}()
+	c, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = c.Close() })
+	peer := <-done
+	if peer == nil {
+		b.Fatal("no peer connection")
+	}
+	b.Cleanup(func() { _ = peer.Close() })
+	return c
 }
