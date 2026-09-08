@@ -493,16 +493,14 @@ func (e *Executor) referenceTarget() Shard {
 	set := e.userSet()
 	var ids []int32
 	if snap := e.r.cfg.Snapshot(); snap != nil {
-		for _, r := range snap.ShardSets[set] {
-			if !slices.Contains(ids, r.ShardID) {
-				ids = append(ids, r.ShardID)
-			}
-		}
+		// The snapshot computed this list once when it was loaded; this
+		// rebuilt it, deduplicated and sorted it, on every reference read.
+		// Read-only here: the slice is shared with every plan that asks.
+		ids = snap.ShardIDs(set)
 	}
 	if len(ids) == 0 {
 		return e.Home()
 	}
-	slices.Sort(ids)
 	return Shard{Set: set, ID: ids[e.info.ID%uint64(len(ids))]}
 }
 
