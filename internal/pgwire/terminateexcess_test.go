@@ -61,7 +61,9 @@ func TestLoweringALimitShedsTheSessionsAboveIt(t *testing.T) {
 		t.Fatal("a role with no limit of its own lost a session")
 	}
 
-	// Running it again finds nothing left to do.
+	// Running it again finds nothing left to do, whether or not the
+	// sessions it ended have finished closing: a sweep counts what it
+	// latched, and they are latched already.
 	if n := ts.TerminateExcess(limit); n != 0 {
 		t.Fatalf("a second sweep terminated %d more", n)
 	}

@@ -424,8 +424,13 @@ func (s *Server) TerminateExcess(limit func(user string) (int32, bool)) int {
 		// Ids are handed out in order, so this is arrival order.
 		slices.SortFunc(sessions, func(a, b *session) int { return cmp.Compare(a.id, b.id) })
 		for _, sess := range sessions[allowed:] {
-			n++
+			// Counted when this sweep is the one that latched it. A
+			// session stays in the map until its own goroutine finishes
+			// closing, so a sweep that ran a moment later would otherwise
+			// report the same sessions again -- and the count is what the
+			// log line means by "terminated".
 			if sess.latchRevoked() {
+				n++
 				ending = append(ending, sess)
 			}
 		}
