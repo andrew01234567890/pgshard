@@ -272,11 +272,67 @@ func (s rowShape) upsert(table string, rows []*Tuple, skip []bool) string {
 
 // DeleteSQL renders a DELETE of one row by primary key.
 func (s rowShape) DeleteSQL(table string, row *Tuple) string {
-	var conds []string
-	for _, i := range s.pkIndexes() {
-		conds = append(conds, QuoteIdent(s.Columns[i])+" = "+quoteLiteralE(row.Values[i]))
+	return s.DeleteManySQL(table, []*Tuple{row})
+}
+
+// DeleteManySQL renders a DELETE of several rows by primary key, as one
+// IN list rather than one statement each.
+//
+// A single-column key gets a plain IN; a composite one gets a row
+// constructor, which PostgreSQL compares element by element, so
+// (a, b) IN ((1, 2)) is exactly a = 1 AND b = 2.
+//
+// A NULL in a key value matches nothing either way, so batching cannot
+// change what a delete removes. Checked on PostgreSQL 18 rather than
+// reasoned about: ("a","b") IN (('1',NULL),('3','4')) deletes the second
+// pair and not the first, exactly as the two separate statements did.
+// A real primary key cannot hold one; this says what happens if it did.
+func (s rowShape) DeleteManySQL(table string, rows []*Tuple) string {
+	idx := s.pkIndexes()
+	var b strings.Builder
+	b.WriteString("DELETE FROM " + s.qualified(table) + " WHERE ")
+	if len(rows) == 1 {
+		// The equality form for the single row, which is most of them:
+		// identical in meaning to a one-element IN list and the shape
+		// every existing test and log line already reads.
+		conds := make([]string, len(idx))
+		for i, j := range idx {
+			conds[i] = QuoteIdent(s.Columns[j]) + " = " + quoteLiteralE(rows[0].Values[j])
+		}
+		b.WriteString(strings.Join(conds, " AND "))
+		return b.String()
 	}
-	return "DELETE FROM " + s.qualified(table) + " WHERE " + strings.Join(conds, " AND ")
+	if len(idx) == 1 {
+		b.WriteString(QuoteIdent(s.Columns[idx[0]]) + " IN (")
+		for i, row := range rows {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(quoteLiteralE(row.Values[idx[0]]))
+		}
+		b.WriteString(")")
+		return b.String()
+	}
+	cols := make([]string, len(idx))
+	for i, j := range idx {
+		cols[i] = QuoteIdent(s.Columns[j])
+	}
+	b.WriteString("(" + strings.Join(cols, ", ") + ") IN (")
+	for i, row := range rows {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(")
+		for k, j := range idx {
+			if k > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(quoteLiteralE(row.Values[j]))
+		}
+		b.WriteString(")")
+	}
+	b.WriteString(")")
+	return b.String()
 }
 
 // applyOp is one statement bound for one shard. up is set instead of sql
@@ -288,6 +344,7 @@ type applyOp struct {
 	shard int32
 	sql   string
 	up    *Tuple
+	del   *Tuple
 }
 
 // routeChange turns a decoded change into the statements the shadow tables
@@ -313,7 +370,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 			targets = r.Holders()
 		}
 		for _, t := range targets {
-			ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, c.Old)})
+			ops = append(ops, applyOp{shard: t, del: c.Old})
 		}
 	case OpUpdate:
 		if c.Old != nil {
@@ -337,7 +394,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 		}
 		for _, t := range oldTargets {
 			if !slices.Contains(newTargets, t) {
-				ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, old)})
+				ops = append(ops, applyOp{shard: t, del: old})
 			}
 		}
 		// A changed GENERATED ALWAYS identity is replayed the same way a
@@ -347,7 +404,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 		replace := !samePK(shape, old, c.New) || shape.alwaysIdentityChanged(c.Old, c.New)
 		for _, t := range newTargets {
 			if replace && slices.Contains(oldTargets, t) {
-				ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, old)})
+				ops = append(ops, applyOp{shard: t, del: old})
 			}
 			ops = append(ops, upsertOps(shape, table, t, c.New)...)
 		}
@@ -391,7 +448,20 @@ func upsertOps(shape rowShape, table string, shard int32, row *Tuple) []applyOp 
 // value of quotes or backslashes doubles in length on the way into the
 // statement, and a bound that ignored that would be out by that factor
 // for exactly the values most likely to be large.
-func (op applyOp) bytes() int {
+func (op applyOp) bytes(shape rowShape) int {
+	if op.del != nil {
+		// Only the KEY columns reach the statement, which is the whole
+		// point of asking the shape rather than the tuple: a delete's old
+		// row is the entire row under REPLICA IDENTITY FULL, and on the
+		// key-change path it is the new row, so counting every column
+		// would make one wide row fill the run bound on its own and take
+		// the batching with it.
+		n := 3
+		for _, i := range shape.pkIndexes() {
+			n += literalBytes(op.del.Values[i]) + 2
+		}
+		return n
+	}
 	if op.up == nil {
 		return len(op.sql)
 	}
@@ -400,14 +470,21 @@ func (op applyOp) bytes() int {
 	// accounted as far smaller than the statement it becomes.
 	n := 2*len(op.up.Values) + 3
 	for _, v := range op.up.Values {
-		if v == nil {
-			n += len("NULL")
-			continue
-		}
-		n += len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
-		if strings.ContainsRune(*v, '\\') {
-			n += len("E") // quoteLiteralE prefixes a literal that carries one
-		}
+		n += literalBytes(v)
+	}
+	return n
+}
+
+// literalBytes is what one value occupies once quoteLiteralE has written
+// it: escaping doubles a quote or a backslash, and a value carrying a
+// backslash also earns the E prefix.
+func literalBytes(v *string) int {
+	if v == nil {
+		return len("NULL")
+	}
+	n := len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
+	if strings.ContainsRune(*v, '\\') {
+		n += len("E")
 	}
 	return n
 }

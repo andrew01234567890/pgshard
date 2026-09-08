@@ -265,8 +265,11 @@ func TestRouteChangeReplacesAChangedAlwaysIdentity(t *testing.T) {
 // it to the others bound for the same shard; these tests are about which
 // statement goes where, so they want the single-row rendering.
 func sqlOf(shape rowShape, op applyOp) string {
-	if op.up == nil {
-		return op.sql
+	switch {
+	case op.up != nil:
+		return shape.UpsertSQL("orders__pgshard_new", []*Tuple{op.up})[0]
+	case op.del != nil:
+		return shape.DeleteSQL("orders__pgshard_new", op.del)
 	}
-	return shape.UpsertSQL("orders__pgshard_new", []*Tuple{op.up})[0]
+	return op.sql
 }
