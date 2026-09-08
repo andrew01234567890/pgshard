@@ -44,9 +44,12 @@ const MaxMessageBytes = 4 << 20
 // write every eight rows. 256 KiB measured no better than 128 KiB, so this
 // is the knee rather than the largest number that helped.
 //
-// It costs one buffer of this size per direction per connection, and a
-// router holds one connection per pooler endpoint, so the footprint is
-// bounded by the topology rather than by the session count.
+// It costs a fixed read buffer of this size per connection, and a write
+// buffer only while a connection is mid-flush: grpc-go's SharedWriteBuffer
+// is on by default, so the write side is taken from a pool at the first
+// write and returned on Flush. A router holds one connection per pooler
+// endpoint, so either way the footprint is bounded by the topology rather
+// than by the session count.
 //
 // The flow-control windows are deliberately left alone. Raising them is
 // worth a further ~16% on the same stream, but grpc-go's options for it
@@ -98,7 +101,10 @@ var (
 // mTLS and a test dialing loopback -- and everything else is fixed here so
 // that the settings are one decision rather than two that drift.
 func ServerOptions(creds ...grpc.ServerOption) []grpc.ServerOption {
-	return append(creds,
+	// Full slice expression: a caller's slice with spare capacity would
+	// otherwise have this appended into its own array, so a second call
+	// would rewrite the first result's tail.
+	return append(creds[:len(creds):len(creds)],
 		grpc.KeepaliveEnforcementPolicy(KeepaliveEnforcement),
 		grpc.ReadBufferSize(TransportBufferBytes), grpc.WriteBufferSize(TransportBufferBytes),
 		grpc.MaxRecvMsgSize(MaxMessageBytes), grpc.MaxSendMsgSize(MaxMessageBytes))
@@ -106,7 +112,8 @@ func ServerOptions(creds ...grpc.ServerOption) []grpc.ServerOption {
 
 // DialOptions is the client half. See ServerOptions.
 func DialOptions(creds ...grpc.DialOption) []grpc.DialOption {
-	return append(creds,
+	// See ServerOptions on the full slice expression.
+	return append(creds[:len(creds):len(creds)],
 		grpc.WithKeepaliveParams(Keepalive),
 		grpc.WithReadBufferSize(TransportBufferBytes), grpc.WithWriteBufferSize(TransportBufferBytes),
 		grpc.WithDefaultCallOptions(

@@ -127,3 +127,24 @@ func TestThePoolerWritesInLargerPiecesThanTheDefault(t *testing.T) {
 	}
 	t.Logf("mean socket write: %d bytes default, %d bytes with TransportBufferBytes=%d", base, tuned, pooler.TransportBufferBytes)
 }
+
+// Two calls with the same caller slice must not write into one backing
+// array. ServerOptions/DialOptions append to what the caller passes, and a
+// caller whose slice has spare capacity would otherwise have the second
+// call rewrite the first result's tail -- silently, since the first result
+// keeps its length and only its contents change.
+func TestTheOptionHelpersDoNotWriteIntoTheCallersArray(t *testing.T) {
+	insec := insecure.NewCredentials()
+
+	srvIn := make([]grpc.ServerOption, 1, 16)
+	srvIn[0] = grpc.Creds(insec)
+	if a, b := pooler.ServerOptions(srvIn...), pooler.ServerOptions(srvIn...); &a[len(srvIn)] == &b[len(srvIn)] {
+		t.Error("ServerOptions returned two slices sharing the caller's array")
+	}
+
+	dialIn := make([]grpc.DialOption, 1, 16)
+	dialIn[0] = grpc.WithTransportCredentials(insec)
+	if a, b := pooler.DialOptions(dialIn...), pooler.DialOptions(dialIn...); &a[len(dialIn)] == &b[len(dialIn)] {
+		t.Error("DialOptions returned two slices sharing the caller's array")
+	}
+}
