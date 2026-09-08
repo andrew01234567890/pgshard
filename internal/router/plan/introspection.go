@@ -73,6 +73,14 @@ func (w *walker) hideReservedFromIntrospection() error {
 		// and still cost the re-plan that a non-empty Rewritten forces.
 		return nil
 	}
+	// Cheap first: the walker met every relation of this statement while
+	// planning it, so it already knows whether either filtered catalog is
+	// among them. Without this an ordinary statement -- which is nearly all
+	// of them -- paid two full walks of its parse tree to discover it names
+	// neither, and the walk is the dominant cost of planning.
+	if !w.mentionsFilteredCatalog() {
+		return nil
+	}
 	if w.referencesCatalogDirectly() {
 		// Two ways a statement can depend on the catalog being a table
 		// rather than a subquery over one: naming it by schema
@@ -92,6 +100,17 @@ func (w *walker) hideReservedFromIntrospection() error {
 	}
 	w.plan.Rewritten = sql
 	return nil
+}
+
+// mentionsFilteredCatalog reports whether the statement named a catalog
+// this filters, from the relations the planner already resolved.
+func (w *walker) mentionsFilteredCatalog() bool {
+	for _, r := range w.rels {
+		if _, ok := reservedColumnFilters[strings.ToLower(r.name)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // filterIntrospection replaces every range var naming one of those
