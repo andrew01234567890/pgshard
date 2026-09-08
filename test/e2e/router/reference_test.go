@@ -170,7 +170,14 @@ func (s *shardedStack) clearProbeRows(tb testing.TB) {
 		_, err = conn.Exec(ctx, "delete from regions where id = $1", probeID)
 		_ = conn.Close(ctx)
 		if err != nil {
-			tb.Fatalf("clearing the reference probe rows on shard %d: %v", shard, err)
+			// An EOF here is the backend going away mid-statement rather
+			// than a SQL error, and the bare message cannot say which of
+			// the two ways that happens it was: the server is gone, or
+			// the server is fine and this one connection was terminated.
+			// A second connection separates them, and PGS-711 has one
+			// sighting and no reproduction precisely because the first
+			// one did not.
+			tb.Fatalf("clearing the reference probe rows on shard %d: %v\nthe shard %s", shard, err, shardLiveness(ctx, s.appDSN(shard)))
 		}
 	}
 }
@@ -484,4 +491,21 @@ func TestRouterGlobalSequences(t *testing.T) {
 			time.Sleep(time.Second)
 		}
 	})
+}
+
+// shardLiveness reports whether the shard answers a fresh connection,
+// which is what tells a terminated backend from a server that has gone.
+func shardLiveness(ctx context.Context, dsn string) string {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(cctx, dsn)
+	if err != nil {
+		return fmt.Sprintf("did not accept a new connection either (%v), so the server went rather than the backend", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var up string
+	if err := conn.QueryRow(cctx, "select to_char(pg_postmaster_start_time(), 'YYYY-MM-DD HH24:MI:SS')").Scan(&up); err != nil {
+		return fmt.Sprintf("accepted a new connection but would not answer it (%v)", err)
+	}
+	return fmt.Sprintf("accepted a new connection and has been up since %s, so this backend was terminated rather than the server lost", up)
 }
