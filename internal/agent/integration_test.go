@@ -331,7 +331,24 @@ func runAgentSuite(t *testing.T, image, bin string) {
 		}
 		time.Sleep(time.Second)
 	}
+	// Dropping it on the primary is not enough to be rid of it. The
+	// standby's copy is persistent now, so it survives the promotion
+	// below, and the slot assertion after that expects exactly one row.
+	// The slotsync worker drops an obsolete copy on its next cycle, and
+	// its nap doubles toward thirty seconds when it has nothing to do, so
+	// this waits for the copy rather than assuming the drop reached it.
 	p.psql("SELECT pg_drop_replication_slot('failover_probe')")
+	goneBy := time.Now().Add(60 * time.Second)
+	for {
+		if got := s.psql("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'failover_probe'"); got == "0" {
+			break
+		}
+		if time.Now().After(goneBy) {
+			t.Fatalf("the standby still holds the probe slot after it was dropped on the primary; it would outlive the promotion below: %q",
+				s.psql("SELECT coalesce((SELECT to_jsonb(x)::text FROM pg_replication_slots x WHERE slot_name = 'failover_probe'), 'absent')"))
+		}
+		time.Sleep(time.Second)
+	}
 	if st := s.status(); st.GetRole() != pgshardv1.StatusResponse_ROLE_STANDBY || !st.GetRunning() || st.GetEpoch() != 0 {
 		t.Fatalf("standby status: %v", st)
 	}

@@ -110,7 +110,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	// clock of its own, because on a quiet cluster nothing else does and
 	// the standbys' synced copies of those slots cannot persist without
 	// one. See needsStandbySnapshot.
-	go srv.runStandbySnapshots(ctx, StandbySnapshotEvery)
+	go srv.runStandbySnapshots(ctx, standbySnapshotEvery)
 
 	reg := metrics.NewRegistry("agent")
 	am := metrics.NewAgent(reg,

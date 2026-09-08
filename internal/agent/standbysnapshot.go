@@ -5,13 +5,13 @@ import (
 	"time"
 )
 
-// StandbySnapshotEvery is how often a primary holding failover slots writes
+// standbySnapshotEvery is how often a primary holding failover slots writes
 // a running-xacts record so that standbys can finish synchronising them.
 //
 // It is deliberately close to the bgwriter's own LOG_SNAPSHOT_INTERVAL_MS:
 // on a busy cluster these records already appear at that rate and this
 // changes nothing, and on a quiet one it supplies the only ones there are.
-const StandbySnapshotEvery = 15 * time.Second
+const standbySnapshotEvery = 15 * time.Second
 
 // needsStandbySnapshot reports whether this instance should write one.
 //
@@ -54,7 +54,11 @@ func (s *Server) runStandbySnapshots(ctx context.Context, every time.Duration) {
 		case <-t.C:
 		}
 		if err := s.logStandbySnapshot(ctx); err != nil && ctx.Err() == nil {
-			s.log.Info("could not write a running-xacts record for the standbys' slot sync", "err", err.Error())
+			// Debug, not Info: PostgreSQL is down for minutes during a
+			// rewind or a re-clone, and one line every fifteen seconds
+			// through that is noise about a record nothing is waiting for
+			// while there is no server to hold slots anyway.
+			s.log.Debug("could not write a running-xacts record for the standbys' slot sync", "err", err.Error())
 		}
 	}
 }
