@@ -580,6 +580,27 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 		// slots concurrently" if it lands there, which is expected and
 		// harmless -- but any OTHER error is why the slot never syncs, and
 		// it belongs in the failure below.
+		// Emit a running-xacts record on the primary first, which is what
+		// lets its slot's restart_lsn and catalog_xmin advance at all.
+		//
+		// A synced slot is created TEMPORARY and is persisted only once the
+		// remote slot has caught up to the position the standby reserved
+		// locally; update_local_synced_slot declines while
+		// TransactionIdPrecedes(remote catalog_xmin, local catalog_xmin),
+		// which is exactly what the observed failure showed -- standby
+		// catalog xmin 769 against the primary slot's 758. The primary's
+		// slot only advances on an xl_running_xacts record, which the
+		// bgwriter writes every fifteen seconds and only while there is WAL
+		// activity, so on a quiet cluster the standby's slot can stay
+		// temporary for as long as the test is prepared to wait.
+		//
+		// PostgreSQL's own failover-slot tests do this for the same reason
+		// (src/test/recovery/t/040_standby_failover_slots_sync.pl: "Create
+		// xl_running_xacts on the primary to speed up restart_lsn
+		// advancement").
+		if _, err := primary.Exec(ctx, "select pg_log_standby_snapshot()"); err != nil {
+			t.Fatalf("could not ask the primary for a running-xacts record: %v", err)
+		}
 		_, lastSyncErr = standby.Exec(ctx, "select pg_sync_replication_slots()")
 		var synced bool
 		var replay, current int64
