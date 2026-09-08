@@ -282,10 +282,11 @@ func (s rowShape) DeleteSQL(table string, row *Tuple) string {
 // constructor, which PostgreSQL compares element by element, so
 // (a, b) IN ((1, 2)) is exactly a = 1 AND b = 2.
 //
-// A NULL in a key value matches nothing either way -- it cannot occur in a
-// real primary key, and where it reaches here it comes from the fallback
-// that deletes an unroutable old row from every holder, which was already
-// matching nothing for that column.
+// A NULL in a key value matches nothing either way, so batching cannot
+// change what a delete removes. Checked on PostgreSQL 18 rather than
+// reasoned about: ("a","b") IN (('1',NULL),('3','4')) deletes the second
+// pair and not the first, exactly as the two separate statements did.
+// A real primary key cannot hold one; this says what happens if it did.
 func (s rowShape) DeleteManySQL(table string, rows []*Tuple) string {
 	idx := s.pkIndexes()
 	var b strings.Builder
@@ -447,15 +448,17 @@ func upsertOps(shape rowShape, table string, shard int32, row *Tuple) []applyOp 
 // value of quotes or backslashes doubles in length on the way into the
 // statement, and a bound that ignored that would be out by that factor
 // for exactly the values most likely to be large.
-func (op applyOp) bytes() int {
+func (op applyOp) bytes(shape rowShape) int {
 	if op.del != nil {
-		// Only the key columns reach the statement, and the parentheses
-		// and comma around them.
+		// Only the KEY columns reach the statement, which is the whole
+		// point of asking the shape rather than the tuple: a delete's old
+		// row is the entire row under REPLICA IDENTITY FULL, and on the
+		// key-change path it is the new row, so counting every column
+		// would make one wide row fill the run bound on its own and take
+		// the batching with it.
 		n := 3
-		for _, v := range op.del.Values {
-			if v != nil {
-				n += len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
-			}
+		for _, i := range shape.pkIndexes() {
+			n += literalBytes(op.del.Values[i]) + 2
 		}
 		return n
 	}
@@ -467,14 +470,21 @@ func (op applyOp) bytes() int {
 	// accounted as far smaller than the statement it becomes.
 	n := 2*len(op.up.Values) + 3
 	for _, v := range op.up.Values {
-		if v == nil {
-			n += len("NULL")
-			continue
-		}
-		n += len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
-		if strings.ContainsRune(*v, '\\') {
-			n += len("E") // quoteLiteralE prefixes a literal that carries one
-		}
+		n += literalBytes(v)
+	}
+	return n
+}
+
+// literalBytes is what one value occupies once quoteLiteralE has written
+// it: escaping doubles a quote or a backslash, and a value carrying a
+// backslash also earns the E prefix.
+func literalBytes(v *string) int {
+	if v == nil {
+		return len("NULL")
+	}
+	n := len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
+	if strings.ContainsRune(*v, '\\') {
+		n += len("E")
 	}
 	return n
 }

@@ -1696,7 +1696,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 				return 0, applied, fatal("%w", err)
 			}
 			for _, op := range ops {
-				openBytes += op.bytes()
+				openBytes += op.bytes(wf.shape)
 			}
 			if openBytes > catchUpMaxOpenBytes {
 				return 0, applied, fatal("a single source transaction on %s/%d holds %d bytes of changes to %s, past the %d-byte catch-up bound: it cannot be applied until it commits, so it cannot be flushed",
@@ -2669,7 +2669,7 @@ func coalesce(shape rowShape, table string, ops []applyOp) []string {
 			}
 			seen[k] = true
 			ups = append(ups, op.up)
-			upBytes += op.bytes()
+			upBytes += op.bytes(shape)
 		case op.del != nil:
 			// Repeats need no break here: naming a key twice in an IN list
 			// deletes it once and is not an error, which is the whole
@@ -2679,7 +2679,7 @@ func coalesce(shape rowShape, table string, ops []applyOp) []string {
 				flushDels()
 			}
 			dels = append(dels, op.del)
-			delBytes += op.bytes()
+			delBytes += op.bytes(shape)
 		default:
 			flush()
 			out = append(out, op.sql)

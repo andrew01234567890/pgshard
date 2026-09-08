@@ -167,3 +167,52 @@ func (r *errRecorder) Exec(context.Context, string, ...any) (CommandTag, error) 
 }
 func (r *errRecorder) Query(context.Context, string, ...any) (pgx.Rows, error) { panic("unused") }
 func (r *errRecorder) Close(context.Context) error                             { return nil }
+
+// What the batching is actually worth, counted where it is decided rather
+// than inferred from the server's statistics: applyToTarget sends one
+// "BEGIN;...;COMMIT" per applyBatchOps STATEMENTS, so one statement per
+// row is a commit per 500 rows, and coalescing the same rows into eight
+// statements is a single commit.
+//
+// pg_stat_database cannot pin this. Its counters flush on the backend's
+// own schedule with a one-second minimum, so a delta taken around a
+// sub-second run reports whatever happens to have been flushed.
+func TestCoalescingCostsOneCommitWhereOneStatementPerRowCostsMany(t *testing.T) {
+	shape := rowShape{Schema: "public", Name: "t", Columns: []string{"id", "note"}, PK: []string{"id"}}
+	const rows = 4000
+	row := func(i int) *Tuple {
+		return &Tuple{Values: []*string{s(itoa(int64(i))), s("n")}, Unchanged: []bool{false, false}}
+	}
+
+	for _, c := range []struct {
+		name string
+		op   func(i int) applyOp
+		want int
+	}{
+		{"one statement per row", func(i int) applyOp {
+			return applyOp{shard: 0, sql: shape.UpsertSQL("t", []*Tuple{row(i)})[0]}
+		}, (rows + applyBatchOps - 1) / applyBatchOps},
+		{"coalesced upserts", func(i int) applyOp { return applyOp{shard: 0, up: row(i)} }, 1},
+		{"one delete per statement", func(i int) applyOp {
+			return applyOp{shard: 0, sql: shape.DeleteSQL("t", row(i))}
+		}, (rows + applyBatchOps - 1) / applyBatchOps},
+		{"batched deletes", func(i int) applyOp { return applyOp{shard: 0, del: row(i)} }, 1},
+	} {
+		rec := &applyRecorder{}
+		var ops []applyOp
+		for i := range rows {
+			ops = append(ops, c.op(i))
+		}
+		if err := applyOps(context.Background(), targetConns{0: rec}, shape, "t", ops); err != nil {
+			t.Fatal(err)
+		}
+		if len(rec.execs) != c.want {
+			t.Errorf("%s: %d rows took %d transactions, want %d", c.name, rows, len(rec.execs), c.want)
+		}
+		for _, sql := range rec.execs {
+			if !strings.HasPrefix(sql, "BEGIN;") || !strings.HasSuffix(sql, "COMMIT") {
+				t.Errorf("%s: not a transaction: %.40s", c.name, sql)
+			}
+		}
+	}
+}

@@ -115,25 +115,25 @@ func TestAnOperationsSizeCountsTheRowItCarries(t *testing.T) {
 	shape := coalesceShape()
 	big := strings.Repeat("x", 4096)
 	carried := applyOp{shard: 0, up: plain("1", big)}
-	if got := carried.bytes(); got < len(big) {
+	if got := carried.bytes(shape); got < len(big) {
 		t.Fatalf("a carried row of %d bytes was accounted as %d; the hold and the open-transaction bound both count this",
 			len(big), got)
 	}
 	// A delete carries its row too, so it is the same hazard: an
 	// accounting that only understood upserts would count a flush of
 	// deletes as nothing.
-	if got := (applyOp{shard: 0, del: plain(strings.Repeat("7", 200), "n")}).bytes(); got < 200 {
+	if got := (applyOp{shard: 0, del: plain(strings.Repeat("7", 200), "n")}).bytes(shape); got < 200 {
 		t.Fatalf("a delete of a 200-byte key was accounted as %d bytes", got)
 	}
 	rendered := applyOp{shard: 0, sql: shape.DeleteSQL("t", plain("1", big))}
-	if got := rendered.bytes(); got != len(rendered.sql) {
+	if got := rendered.bytes(shape); got != len(rendered.sql) {
 		t.Fatalf("a rendered statement of %d bytes was accounted as %d", len(rendered.sql), got)
 	}
 	// Escaping is what a literal actually costs in the statement, so a
 	// value made entirely of quotes must not be accounted at half its
 	// rendered size.
 	quotes := strings.Repeat("'", 1000)
-	if got := (applyOp{shard: 0, up: plain("2", quotes)}).bytes(); got < 2*len(quotes) {
+	if got := (applyOp{shard: 0, up: plain("2", quotes)}).bytes(shape); got < 2*len(quotes) {
 		t.Fatalf("%d quotes render as %d bytes but were accounted as %d", len(quotes), 2*len(quotes), got)
 	}
 	// What the bounds need is that the accounting TRACKS the statement the
@@ -153,7 +153,7 @@ func TestAnOperationsSizeCountsTheRowItCarries(t *testing.T) {
 		for i := range 50 {
 			row := &Tuple{Values: []*string{s(itoa(int64(i))), v}, Unchanged: []bool{false, false}}
 			rows = append(rows, row)
-			accounted += (applyOp{shard: 0, up: row}).bytes()
+			accounted += (applyOp{shard: 0, up: row}).bytes(shape)
 		}
 		rendered := len(shape.UpsertSQL("t", rows)[0])
 		if accounted < rendered*9/10 {
@@ -246,5 +246,32 @@ func TestDeleteManySQLShapes(t *testing.T) {
 	if got, want := comp.DeleteManySQL("t", []*Tuple{row("1", "2"), row("3", "4")}),
 		`DELETE FROM "public"."t" WHERE ("a", "b") IN (('1', '2'), ('3', '4'))`; got != want {
 		t.Errorf("composite, two rows:\n got %s\nwant %s", got, want)
+	}
+}
+
+// A delete only names key columns, so a wide non-key column must not make
+// a delete fill the run bound on its own. Under REPLICA IDENTITY FULL the
+// old row is the whole row, and on the key-change path it is the new row,
+// so counting every column would quietly turn delete batching off for
+// exactly the tables it helps most.
+func TestADeletesSizeIsItsKeyNotItsRow(t *testing.T) {
+	shape := coalesceShape()
+	wide := &Tuple{
+		Values:    []*string{s("1"), s(strings.Repeat("x", applyBatchBytes))},
+		Unchanged: []bool{false, false},
+	}
+	if got := (applyOp{shard: 0, del: wide}).bytes(shape); got >= applyBatchBytes {
+		t.Fatalf("a delete of a 1-byte key with a %d-byte non-key column was accounted as %d bytes",
+			applyBatchBytes, got)
+	}
+	var ops []applyOp
+	for i := range 10 {
+		ops = append(ops, applyOp{shard: 0, del: &Tuple{
+			Values:    []*string{s(itoa(int64(i))), s(strings.Repeat("x", applyBatchBytes))},
+			Unchanged: []bool{false, false},
+		}})
+	}
+	if got := coalesce(shape, "t", ops); len(got) != 1 {
+		t.Fatalf("10 deletes of wide rows rendered as %d statements, want 1: their non-key columns are being counted", len(got))
 	}
 }
