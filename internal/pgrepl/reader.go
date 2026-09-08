@@ -3,6 +3,7 @@ package pgrepl
 import (
 	"context"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type Reader struct {
 	nc   net.Conn
 	done chan struct{}
 	stop func() bool
+	once sync.Once
 }
 
 // Reader returns a frame reader bound to ctx. Cancelling ctx interrupts a
@@ -34,7 +36,11 @@ type Reader struct {
 func (c *Conn) Reader(ctx context.Context) *Reader {
 	r := &Reader{c: c, ctx: ctx, nc: c.pc.Conn(), done: make(chan struct{})}
 	r.stop = context.AfterFunc(ctx, func() {
-		_ = r.nc.SetDeadline(time.Now())
+		// The read half only. The write half is what SendStandbyStatus
+		// uses, and expiring it turns a cancel that races an ack into a
+		// write failure the caller reports as an error -- when all that
+		// happened is that its own context ended.
+		_ = r.nc.SetReadDeadline(time.Now())
 		close(r.done)
 	})
 	return r
@@ -72,15 +78,23 @@ func (r *Reader) Next(within time.Duration) (any, error) {
 	return msg, err
 }
 
-// Close releases the cancellation hook and clears the read deadline.
+// Close releases the cancellation hook and clears the read deadline. It may
+// be called more than once.
 func (r *Reader) Close() {
-	// The hook runs in its own goroutine, so a cancel that is already in
-	// flight can set its deadline after this one clears it and leave the
-	// connection unreadable for every later caller. Wait for it. The
-	// context check keeps a Close on an uncancelled reader -- where the
-	// hook will never run and never close done -- from waiting forever.
-	if !r.stop() && r.ctx.Err() != nil {
-		<-r.done
-	}
-	_ = r.nc.SetDeadline(time.Time{})
+	// Once, because the second call cannot tell the two reasons stop
+	// reports false apart: a hook that is running now, which must be
+	// waited for, and a hook the first Close already cancelled, which
+	// will never close done and so would be waited for forever.
+	r.once.Do(func() {
+		// The hook runs in its own goroutine, so a cancel already in
+		// flight can set its deadline after this one clears it and leave
+		// the connection unreadable for every later caller. Wait for it.
+		// The context check keeps a Close on an uncancelled reader --
+		// where the hook never runs -- from waiting on a channel nothing
+		// will close.
+		if !r.stop() && r.ctx.Err() != nil {
+			<-r.done
+		}
+		_ = r.nc.SetReadDeadline(time.Time{})
+	})
 }

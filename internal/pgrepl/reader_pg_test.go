@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // nextWithin runs one Next and fails if it does not return at all, so that a
@@ -34,7 +36,7 @@ func nextWithin(t *testing.T, r *Reader, within, watchdog time.Duration) (any, t
 // on, against a real server: a wait that expires leaves the connection
 // usable, a cancelled context ends a wait that is already blocked, and Close
 // hands the connection back with no deadline on it.
-func testReader(t *testing.T, rc *Conn) {
+func testReader(t *testing.T, rc *Conn, dsn string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -72,6 +74,48 @@ func testReader(t *testing.T, rc *Conn) {
 		_, _, err := nextWithin(t, r, time.Minute, 30*time.Second)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancel: %v", err)
+		}
+	})
+
+	t.Run("close is idempotent", func(t *testing.T) {
+		wctx, wcancel := context.WithCancel(ctx)
+		defer wcancel()
+		r := rc.Reader(wctx)
+		r.Close()
+		wcancel()
+		// The second Close cannot see whether the hook it is being asked
+		// to wait for was cancelled by the first one. Waiting for a hook
+		// that will never run wedges the caller, and the loop that owns a
+		// stream closes its reader from a defer.
+		done := make(chan struct{})
+		go func() { r.Close(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the second Close did not return")
+		}
+	})
+
+	t.Run("a cancel leaves the write half alone", func(t *testing.T) {
+		// Its own connection: this leaves an unread result behind.
+		wc, err := Connect(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = wc.Close(context.Background()) }()
+		wctx, wcancel := context.WithCancel(ctx)
+		defer wcancel()
+		r := wc.Reader(wctx)
+		defer r.Close()
+		wcancel()
+		<-r.done
+		// A cancel that expires the write deadline too turns an ack
+		// racing it into a write error, which the pooler reports as
+		// Unavailable rather than as the clean end of a cancelled stream.
+		fe := wc.pc.Frontend()
+		fe.SendQuery(&pgproto3.Query{String: "SELECT 1"})
+		if err := fe.Flush(); err != nil {
+			t.Fatalf("write after cancel: %v", err)
 		}
 	})
 

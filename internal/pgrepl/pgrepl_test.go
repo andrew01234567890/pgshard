@@ -245,7 +245,7 @@ func runCaptures(t *testing.T, image, label string) {
 	if sys.Timeline != 1 || sys.DBName != "postgres" || sys.XLogPos == 0 || sys.SystemID == "" {
 		t.Fatalf("identify: %+v", sys)
 	}
-	t.Run("reader", func(t *testing.T) { testReader(t, rc) })
+	t.Run("reader", func(t *testing.T) { testReader(t, rc, dsn) })
 
 	dir := filepath.Join("..", "pgoutput", "testdata", label)
 	for _, sc := range scenarios {
