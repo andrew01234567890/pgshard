@@ -62,18 +62,21 @@ func shardRef(sh router.Shard) *pgshardv1.ShardRef {
 // to whatever pooler serves the shard after a promotion, and assembles the
 // batches into units pushed to out.
 type reader struct {
-	shard     router.Shard
-	stream    string
-	database  string
-	twoPhase  bool
-	topo      Topology
-	out       chan *unit
-	ready     chan<- struct{}
-	window    time.Duration
-	delivered uint64
-	maxBytes  int
-	maxOpen   int
-	meter     Meter
+	shard    router.Shard
+	stream   string
+	database string
+	twoPhase bool
+	topo     Topology
+	out      chan *unit
+	ready    chan<- struct{}
+	window   time.Duration
+	// progressed records that something was delivered since the reconnect
+	// window was last cleared.
+	progressed bool
+	delivered  uint64
+	maxBytes   int
+	maxOpen    int
+	meter      Meter
 	// copy is the pending initial copy; nil once streaming.
 	copy *copyPhase
 
@@ -93,9 +96,6 @@ func (r *reader) run(ctx context.Context) {
 		maxBytes: r.maxBytes, maxOpen: r.maxOpen, meter: r.meter}
 	backoff := 200 * time.Millisecond
 	var firstFailure time.Time
-	// What the reader had delivered when the window was last cleared:
-	// progress since then means the shard is answering.
-	lastDelivered := r.delivered
 	for {
 		var err error
 		if r.copy != nil {
@@ -112,10 +112,16 @@ func (r *reader) run(ctx context.Context) {
 		// reconnect early in a stream's life arming the window for the
 		// whole of it, and a lone transient failure an hour later ended
 		// the reader as if the shard had been unavailable throughout.
-		if err == nil || r.delivered != lastDelivered {
+		//
+		// The signal is a unit delivered rather than the position moving,
+		// because a copy delivers for as long as it takes and moves the
+		// position only once: its units carry one only for the first
+		// snapshot, and only when the stream started from nothing. A copy
+		// of any length would otherwise never clear the window.
+		if err == nil || r.progressed {
 			firstFailure = time.Time{}
 			backoff = 200 * time.Millisecond
-			lastDelivered = r.delivered
+			r.progressed = false
 			if err == nil {
 				continue
 			}
@@ -334,6 +340,10 @@ func (r *reader) once(ctx context.Context) error {
 func (r *reader) push(ctx context.Context, u *unit) bool {
 	select {
 	case r.out <- u:
+		// Anything delivered is the shard answering, which is what the
+		// reconnect window is asking about. Written and read on this
+		// goroutine only: once, copyOnce and run are the same one.
+		r.progressed = true
 	case <-ctx.Done():
 		return false
 	}
