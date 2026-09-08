@@ -119,6 +119,12 @@ func TestAnOperationsSizeCountsTheRowItCarries(t *testing.T) {
 		t.Fatalf("a carried row of %d bytes was accounted as %d; the hold and the open-transaction bound both count this",
 			len(big), got)
 	}
+	// A delete carries its row too, so it is the same hazard: an
+	// accounting that only understood upserts would count a flush of
+	// deletes as nothing.
+	if got := (applyOp{shard: 0, del: plain(strings.Repeat("7", 200), "n")}).bytes(); got < 200 {
+		t.Fatalf("a delete of a 200-byte key was accounted as %d bytes", got)
+	}
 	rendered := applyOp{shard: 0, sql: shape.DeleteSQL("t", plain("1", big))}
 	if got := rendered.bytes(); got != len(rendered.sql) {
 		t.Fatalf("a rendered statement of %d bytes was accounted as %d", len(rendered.sql), got)
@@ -154,5 +160,91 @@ func TestAnOperationsSizeCountsTheRowItCarries(t *testing.T) {
 			t.Errorf("%s: 50 rows accounted as %d bytes render as %d; a bound counting these fires too late",
 				name, accounted, rendered)
 		}
+	}
+}
+
+func del(id string) *Tuple {
+	return &Tuple{Values: []*string{s(id), s("n")}, Unchanged: []bool{false, false}}
+}
+
+// A run of deletes is one statement too. They cannot share the upserts'
+// statement, so the two kinds break each other's runs -- which is also
+// what keeps a delete after an upsert of the same row in that order.
+func TestCoalesceJoinsARunOfDeletes(t *testing.T) {
+	shape := coalesceShape()
+	var ops []applyOp
+	for i := range 50 {
+		ops = append(ops, applyOp{shard: 0, del: del(itoa(int64(i)))})
+	}
+	got := coalesce(shape, "t", ops)
+	if len(got) != 1 {
+		t.Fatalf("50 deletes rendered as %d statements, want 1: %q", len(got), got)
+	}
+	if !strings.HasPrefix(got[0], "DELETE") || !strings.Contains(got[0], `"id" IN (`) {
+		t.Fatalf("not one IN list: %s", got[0])
+	}
+	if n := strings.Count(got[0], ", "); n != 49 {
+		t.Fatalf("the statement carries %d separators, want 49", n)
+	}
+}
+
+// A repeated key is fine in an IN list -- it deletes the row once -- so
+// unlike the upsert side a delete run does not break on one. If it did,
+// a workload that deletes and re-deletes would fall back to a statement
+// each for no reason.
+func TestCoalesceDoesNotBreakADeleteRunOnARepeatedKey(t *testing.T) {
+	got := coalesce(coalesceShape(), "t", []applyOp{
+		{shard: 0, del: del("1")}, {shard: 0, del: del("1")},
+	})
+	if len(got) != 1 {
+		t.Fatalf("a repeated delete key split the run into %d statements: %q", len(got), got)
+	}
+}
+
+func TestCoalesceKeepsUpsertsAndDeletesApartAndInOrder(t *testing.T) {
+	got := coalesce(coalesceShape(), "t", []applyOp{
+		{shard: 0, up: plain("1", "a")},
+		{shard: 0, del: del("2")},
+		{shard: 0, up: plain("3", "c")},
+	})
+	if len(got) != 3 {
+		t.Fatalf("got %d statements, want 3: %q", len(got), got)
+	}
+	if !strings.HasPrefix(got[0], "INSERT") || !strings.HasPrefix(got[1], "DELETE") || !strings.HasPrefix(got[2], "INSERT") {
+		t.Fatalf("the order was not kept: %q", got)
+	}
+}
+
+func TestCoalesceBoundsADeleteStatement(t *testing.T) {
+	var ops []applyOp
+	for i := range applyBatchOps + 1 {
+		ops = append(ops, applyOp{shard: 0, del: del(itoa(int64(i)))})
+	}
+	if got := coalesce(coalesceShape(), "t", ops); len(got) != 2 {
+		t.Fatalf("%d deletes rendered as %d statements, want 2", len(ops), len(got))
+	}
+}
+
+// One row keeps the equality form it has always had; several become a row
+// constructor, which PostgreSQL compares element by element.
+func TestDeleteManySQLShapes(t *testing.T) {
+	single := rowShape{Schema: "public", Name: "t", Columns: []string{"id", "note"}, PK: []string{"id"}}
+	if got, want := single.DeleteSQL("t", del("1")), `DELETE FROM "public"."t" WHERE "id" = '1'`; got != want {
+		t.Errorf("one row:\n got %s\nwant %s", got, want)
+	}
+	if got, want := single.DeleteManySQL("t", []*Tuple{del("1"), del("2")}),
+		`DELETE FROM "public"."t" WHERE "id" IN ('1', '2')`; got != want {
+		t.Errorf("two rows:\n got %s\nwant %s", got, want)
+	}
+	comp := rowShape{Schema: "public", Name: "t", Columns: []string{"a", "b", "note"}, PK: []string{"a", "b"}}
+	row := func(a, b string) *Tuple {
+		return &Tuple{Values: []*string{s(a), s(b), s("n")}, Unchanged: []bool{false, false, false}}
+	}
+	if got, want := comp.DeleteSQL("t", row("1", "2")), `DELETE FROM "public"."t" WHERE "a" = '1' AND "b" = '2'`; got != want {
+		t.Errorf("composite, one row:\n got %s\nwant %s", got, want)
+	}
+	if got, want := comp.DeleteManySQL("t", []*Tuple{row("1", "2"), row("3", "4")}),
+		`DELETE FROM "public"."t" WHERE ("a", "b") IN (('1', '2'), ('3', '4'))`; got != want {
+		t.Errorf("composite, two rows:\n got %s\nwant %s", got, want)
 	}
 }

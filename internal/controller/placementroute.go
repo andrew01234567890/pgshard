@@ -272,11 +272,66 @@ func (s rowShape) upsert(table string, rows []*Tuple, skip []bool) string {
 
 // DeleteSQL renders a DELETE of one row by primary key.
 func (s rowShape) DeleteSQL(table string, row *Tuple) string {
-	var conds []string
-	for _, i := range s.pkIndexes() {
-		conds = append(conds, QuoteIdent(s.Columns[i])+" = "+quoteLiteralE(row.Values[i]))
+	return s.DeleteManySQL(table, []*Tuple{row})
+}
+
+// DeleteManySQL renders a DELETE of several rows by primary key, as one
+// IN list rather than one statement each.
+//
+// A single-column key gets a plain IN; a composite one gets a row
+// constructor, which PostgreSQL compares element by element, so
+// (a, b) IN ((1, 2)) is exactly a = 1 AND b = 2.
+//
+// A NULL in a key value matches nothing either way -- it cannot occur in a
+// real primary key, and where it reaches here it comes from the fallback
+// that deletes an unroutable old row from every holder, which was already
+// matching nothing for that column.
+func (s rowShape) DeleteManySQL(table string, rows []*Tuple) string {
+	idx := s.pkIndexes()
+	var b strings.Builder
+	b.WriteString("DELETE FROM " + s.qualified(table) + " WHERE ")
+	if len(rows) == 1 {
+		// The equality form for the single row, which is most of them:
+		// identical in meaning to a one-element IN list and the shape
+		// every existing test and log line already reads.
+		conds := make([]string, len(idx))
+		for i, j := range idx {
+			conds[i] = QuoteIdent(s.Columns[j]) + " = " + quoteLiteralE(rows[0].Values[j])
+		}
+		b.WriteString(strings.Join(conds, " AND "))
+		return b.String()
 	}
-	return "DELETE FROM " + s.qualified(table) + " WHERE " + strings.Join(conds, " AND ")
+	if len(idx) == 1 {
+		b.WriteString(QuoteIdent(s.Columns[idx[0]]) + " IN (")
+		for i, row := range rows {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(quoteLiteralE(row.Values[idx[0]]))
+		}
+		b.WriteString(")")
+		return b.String()
+	}
+	cols := make([]string, len(idx))
+	for i, j := range idx {
+		cols[i] = QuoteIdent(s.Columns[j])
+	}
+	b.WriteString("(" + strings.Join(cols, ", ") + ") IN (")
+	for i, row := range rows {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(")
+		for k, j := range idx {
+			if k > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(quoteLiteralE(row.Values[j]))
+		}
+		b.WriteString(")")
+	}
+	b.WriteString(")")
+	return b.String()
 }
 
 // applyOp is one statement bound for one shard. up is set instead of sql
@@ -288,6 +343,7 @@ type applyOp struct {
 	shard int32
 	sql   string
 	up    *Tuple
+	del   *Tuple
 }
 
 // routeChange turns a decoded change into the statements the shadow tables
@@ -313,7 +369,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 			targets = r.Holders()
 		}
 		for _, t := range targets {
-			ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, c.Old)})
+			ops = append(ops, applyOp{shard: t, del: c.Old})
 		}
 	case OpUpdate:
 		if c.Old != nil {
@@ -337,7 +393,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 		}
 		for _, t := range oldTargets {
 			if !slices.Contains(newTargets, t) {
-				ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, old)})
+				ops = append(ops, applyOp{shard: t, del: old})
 			}
 		}
 		// A changed GENERATED ALWAYS identity is replayed the same way a
@@ -347,7 +403,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 		replace := !samePK(shape, old, c.New) || shape.alwaysIdentityChanged(c.Old, c.New)
 		for _, t := range newTargets {
 			if replace && slices.Contains(oldTargets, t) {
-				ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, old)})
+				ops = append(ops, applyOp{shard: t, del: old})
 			}
 			ops = append(ops, upsertOps(shape, table, t, c.New)...)
 		}
@@ -392,6 +448,17 @@ func upsertOps(shape rowShape, table string, shard int32, row *Tuple) []applyOp 
 // statement, and a bound that ignored that would be out by that factor
 // for exactly the values most likely to be large.
 func (op applyOp) bytes() int {
+	if op.del != nil {
+		// Only the key columns reach the statement, and the parentheses
+		// and comma around them.
+		n := 3
+		for _, v := range op.del.Values {
+			if v != nil {
+				n += len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
+			}
+		}
+		return n
+	}
 	if op.up == nil {
 		return len(op.sql)
 	}

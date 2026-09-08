@@ -2620,7 +2620,8 @@ func sortedInt32Keys[V any](m map[int32]V) []int32 {
 }
 
 // coalesce renders one target's operations, joining each run of plain
-// upserts into a single multi-row statement.
+// upserts into one multi-row statement and each run of deletes into one
+// IN list.
 //
 // The rows of a run go out as one INSERT ... VALUES (..),(..) ON CONFLICT,
 // which is the whole point: an operation otherwise carries one row and its
@@ -2640,29 +2641,49 @@ func sortedInt32Keys[V any](m map[int32]V) []int32 {
 // row are both on this target and stay in sequence.
 func coalesce(shape rowShape, table string, ops []applyOp) []string {
 	var out []string
-	var run []*Tuple
-	runBytes := 0
+	var ups, dels []*Tuple
+	upBytes, delBytes := 0, 0
 	seen := map[string]bool{}
-	flush := func() {
-		if len(run) == 0 {
+	flushUps := func() {
+		if len(ups) == 0 {
 			return
 		}
-		out = append(out, shape.UpsertSQL(table, run)...)
-		run, runBytes, seen = nil, 0, map[string]bool{}
+		out = append(out, shape.UpsertSQL(table, ups)...)
+		ups, upBytes, seen = nil, 0, map[string]bool{}
 	}
+	flushDels := func() {
+		if len(dels) == 0 {
+			return
+		}
+		out = append(out, shape.DeleteManySQL(table, dels))
+		dels, delBytes = nil, 0
+	}
+	flush := func() { flushUps(); flushDels() }
 	for _, op := range ops {
-		if op.up == nil {
+		switch {
+		case op.up != nil:
+			flushDels()
+			k := pkKey(shape, op.up)
+			if seen[k] || len(ups) >= applyBatchOps || upBytes >= applyBatchBytes {
+				flushUps()
+			}
+			seen[k] = true
+			ups = append(ups, op.up)
+			upBytes += op.bytes()
+		case op.del != nil:
+			// Repeats need no break here: naming a key twice in an IN list
+			// deletes it once and is not an error, which is the whole
+			// difference from the upsert side.
+			flushUps()
+			if len(dels) >= applyBatchOps || delBytes >= applyBatchBytes {
+				flushDels()
+			}
+			dels = append(dels, op.del)
+			delBytes += op.bytes()
+		default:
 			flush()
 			out = append(out, op.sql)
-			continue
 		}
-		k := pkKey(shape, op.up)
-		if seen[k] || len(run) >= applyBatchOps || runBytes >= applyBatchBytes {
-			flush()
-		}
-		seen[k] = true
-		run = append(run, op.up)
-		runBytes += op.bytes()
 	}
 	flush()
 	return out
