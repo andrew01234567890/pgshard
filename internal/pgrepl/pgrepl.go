@@ -301,6 +301,41 @@ type StandbyStatus struct {
 	ReplyRequested bool
 }
 
+// FeedbackWriteTimeout bounds one standby status write.
+//
+// Without a bound the write has none: 34 bytes go into the kernel's send
+// buffer and return at once for as long as the walsender keeps reading, and
+// block forever the moment it stops -- a wedged server, a host that
+// vanished, a partition that leaves the socket open. The caller is a change
+// stream's loop, so a write that never returns is a goroutine that never
+// returns, and with it the deferred work that releases the slot: the next
+// consumer of that slot is refused for the life of the process.
+//
+// A deadline rather than a context because that is what bounds a write on a
+// socket, and because the alternative -- expiring the deadline when the
+// stream's context is cancelled -- makes an ordinary cancel that races an
+// ack look like a write failure.
+//
+// Ten seconds is long enough that no reachable server reaches it (the
+// stream loop sends one of these per ack and at most one per ten seconds
+// otherwise) and short enough that a wedged one is reported rather than
+// waited on.
+//
+// What this does NOT do is detect a walsender that has stopped reading. A
+// write only blocks once the kernel's send buffer is full, which for
+// 34-byte frames is on the order of a hundred thousand of them, so a peer
+// that is deaf but idle accepts statuses into the buffer indefinitely and
+// they succeed. This bounds the wait, not the silence: there is no
+// client-side equivalent of wal_sender_timeout here, and the stream ends
+// when its context does. A stream that must notice a silent peer wants a
+// reply-requested status and a deadline on the answer, which is a
+// different mechanism and not one this ticket asked for.
+//
+// A var so a test can lower it: the bound is only interesting once it
+// trips, and tripping it as written means holding a socket open for ten
+// seconds.
+var FeedbackWriteTimeout = 10 * time.Second
+
 // SendStandbyStatus sends a Standby status update frame.
 func (c *Conn) SendStandbyStatus(st StandbyStatus) error {
 	buf := make([]byte, 34)
@@ -312,6 +347,11 @@ func (c *Conn) SendStandbyStatus(st StandbyStatus) error {
 	if st.ReplyRequested {
 		buf[33] = 1
 	}
+	nc := c.pc.Conn()
+	if err := nc.SetWriteDeadline(time.Now().Add(FeedbackWriteTimeout)); err != nil {
+		return err
+	}
+	defer func() { _ = nc.SetWriteDeadline(time.Time{}) }()
 	fe := c.pc.Frontend()
 	fe.Send(&pgproto3.CopyData{Data: buf})
 	return fe.Flush()
