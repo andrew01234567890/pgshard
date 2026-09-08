@@ -308,6 +308,30 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if got := p.psql("SELECT application_name FROM pg_stat_replication"); got != "s0-1" {
 		t.Fatalf("application_name: %q", got)
 	}
+
+	// A failover slot on a QUIET primary must still become usable on the
+	// standby. A synced slot is created temporary and persists only once
+	// the remote slot catches up to the position the standby reserved
+	// locally, and the primary's slot advances that only on a
+	// running-xacts record -- which the bgwriter writes every fifteen
+	// seconds AND ONLY WHILE THERE IS WAL ACTIVITY. Nothing writes here,
+	// so without the agent's own record the standby's copy stays
+	// temporary, the promotion below loses it, and every change stream on
+	// it has to re-copy. See needsStandbySnapshot.
+	p.psql("SELECT pg_create_logical_replication_slot('failover_probe', 'pgoutput', false, false, true)")
+	slotDeadline := time.Now().Add(90 * time.Second)
+	for {
+		if got := s.psql("SELECT coalesce((SELECT synced AND NOT temporary FROM pg_replication_slots WHERE slot_name = 'failover_probe'), false)"); got == "t" {
+			break
+		}
+		if time.Now().After(slotDeadline) {
+			t.Fatalf("the standby's synced slot never persisted on an idle primary; standby slot: %q, primary slot: %q",
+				s.psql("SELECT coalesce((SELECT to_jsonb(x)::text FROM pg_replication_slots x WHERE slot_name = 'failover_probe'), 'absent')"),
+				p.psql("SELECT coalesce((SELECT to_jsonb(x)::text FROM pg_replication_slots x WHERE slot_name = 'failover_probe'), 'absent')"))
+		}
+		time.Sleep(time.Second)
+	}
+	p.psql("SELECT pg_drop_replication_slot('failover_probe')")
 	if st := s.status(); st.GetRole() != pgshardv1.StatusResponse_ROLE_STANDBY || !st.GetRunning() || st.GetEpoch() != 0 {
 		t.Fatalf("standby status: %v", st)
 	}

@@ -106,6 +106,11 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		_ = sup.Stop(stopCtx, ShutdownFast, time.Duration(cfg.ShutdownTimeout))
 	})
 	inst.startStanzaWorker(ctx, stanzaRetry)
+	// A primary holding failover slots writes a running-xacts record on a
+	// clock of its own, because on a quiet cluster nothing else does and
+	// the standbys' synced copies of those slots cannot persist without
+	// one. See needsStandbySnapshot.
+	go srv.runStandbySnapshots(ctx, StandbySnapshotEvery)
 
 	reg := metrics.NewRegistry("agent")
 	am := metrics.NewAgent(reg,
