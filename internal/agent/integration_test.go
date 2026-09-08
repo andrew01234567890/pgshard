@@ -308,6 +308,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if got := p.psql("SELECT application_name FROM pg_stat_replication"); got != "s0-1" {
 		t.Fatalf("application_name: %q", got)
 	}
+
 	if st := s.status(); st.GetRole() != pgshardv1.StatusResponse_ROLE_STANDBY || !st.GetRunning() || st.GetEpoch() != 0 {
 		t.Fatalf("standby status: %v", st)
 	}
