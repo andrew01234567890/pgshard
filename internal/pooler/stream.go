@@ -88,11 +88,43 @@ type StreamConfig struct {
 	// Heartbeat is the idle interval between Keepalive batches; zero means 5s.
 	Heartbeat time.Duration
 	// ReceiveTimeout bounds one wait for server data so acks and heartbeats
-	// are serviced; zero means 250ms.
+	// are serviced; zero means defaultReceiveTimeout.
 	ReceiveTimeout time.Duration
 	// MaxBatchBytes caps a batch; zero means 64 KiB.
 	MaxBatchBytes int
 }
+
+// defaultReceiveTimeout is how long the stream loop waits for server data
+// before servicing acks and heartbeats, and so is what an ack on an idle
+// stream waits out: the loop notices a wake only between receives, and an
+// ack that arrives just after one began waits the rest of the window.
+//
+// Measured against PostgreSQL 18, acking a position that had just moved:
+// with a 250ms window and the ack sent 30ms into it, every one of 40 acks
+// took 220ms; with a 25ms window and the ack sent 5ms in, 20ms. The
+// latency is the remainder of the window, not a distribution.
+//
+// 25ms rather than 250ms because the window is nearly free to shorten now.
+// It costs one more socket deadline per wakeup -- 126ns, since a wait is
+// bounded by the connection's own deadline rather than by a context per
+// frame -- so an idle stream wakes forty times a second instead of four
+// and pays microseconds a second for it. Streaming throughput is
+// unchanged: 200k inserts moved at 101k/sec at 250ms and 104k/sec at
+// 25ms, which is noise. A busy stream never reaches the timeout at all.
+//
+// That cost is per stream, and a pooler holds one per consumer per shard.
+// A wakeup is a timer, a syscall that returns EAGAIN and two allocations,
+// so a thousand idle streams on one pooler is forty thousand of them a
+// second -- single-digit percent of a core, where at 250ms it was a tenth
+// of that. Fine at any fan-out this has been sized for, and the number to
+// revisit if a pooler is ever expected to hold thousands.
+//
+// This is the ack latency PGS-213 asked about, answered by shortening the
+// wait rather than by interrupting a receive in progress. Interrupting one
+// would have to establish that pgconn tolerates a read being cut and
+// resumed around a concurrent feedback write; shortening the window
+// establishes nothing new.
+const defaultReceiveTimeout = 25 * time.Millisecond
 
 // ackConfirmTimeout bounds how long an ack waits for the server to confirm
 // the position it advanced to.
@@ -171,7 +203,7 @@ func (s *Server) streamDefaults() StreamConfig {
 		c.Heartbeat = 5 * time.Second
 	}
 	if c.ReceiveTimeout <= 0 {
-		c.ReceiveTimeout = 250 * time.Millisecond
+		c.ReceiveTimeout = defaultReceiveTimeout
 	}
 	if c.MaxBatchBytes <= 0 {
 		c.MaxBatchBytes = 64 << 10
@@ -414,6 +446,8 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		b.max = int(req.GetBatchBytes())
 	}
 	dec := pgoutput.NewDecoder()
+	frames := conn.Reader(ctx)
+	defer frames.Close()
 	lastSent := time.Now()
 	lastStatus := time.Now()
 	var serverEnd pgrepl.LSN
@@ -446,9 +480,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 			}
 		default:
 		}
-		rctx, cancel := context.WithTimeout(ctx, cfg.ReceiveTimeout)
-		msg, err := conn.Receive(rctx)
-		cancel()
+		msg, err := frames.Next(cfg.ReceiveTimeout)
 		switch {
 		case err == nil:
 		case ctx.Err() != nil:
