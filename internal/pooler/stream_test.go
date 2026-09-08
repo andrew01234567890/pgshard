@@ -182,7 +182,7 @@ func TestStreamRefusals(t *testing.T) {
 		t.Fatal("slot not released")
 	}
 	d := s.streamDefaults()
-	if d.Heartbeat != 5*time.Second || d.ReceiveTimeout != 250*time.Millisecond || d.MaxBatchBytes != 64<<10 {
+	if d.Heartbeat != 5*time.Second || d.ReceiveTimeout != 25*time.Millisecond || d.MaxBatchBytes != 64<<10 {
 		t.Fatalf("defaults: %+v", d)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
