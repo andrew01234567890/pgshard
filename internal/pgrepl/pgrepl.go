@@ -321,6 +321,16 @@ type StandbyStatus struct {
 // otherwise) and short enough that a wedged one is reported rather than
 // waited on.
 //
+// What this does NOT do is detect a walsender that has stopped reading. A
+// write only blocks once the kernel's send buffer is full, which for
+// 34-byte frames is on the order of a hundred thousand of them, so a peer
+// that is deaf but idle accepts statuses into the buffer indefinitely and
+// they succeed. This bounds the wait, not the silence: there is no
+// client-side equivalent of wal_sender_timeout here, and the stream ends
+// when its context does. A stream that must notice a silent peer wants a
+// reply-requested status and a deadline on the answer, which is a
+// different mechanism and not one this ticket asked for.
+//
 // A var so a test can lower it: the bound is only interesting once it
 // trips, and tripping it as written means holding a socket open for ten
 // seconds.
