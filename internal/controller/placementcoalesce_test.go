@@ -260,9 +260,14 @@ func TestADeletesSizeIsItsKeyNotItsRow(t *testing.T) {
 		Values:    []*string{s("1"), s(strings.Repeat("x", applyBatchBytes))},
 		Unchanged: []bool{false, false},
 	}
-	if got := (applyOp{shard: 0, del: wide}).bytes(shape); got >= applyBatchBytes {
-		t.Fatalf("a delete of a 1-byte key with a %d-byte non-key column was accounted as %d bytes",
-			applyBatchBytes, got)
+	// Exact, so this fails both ways round: counting the non-key column
+	// gives a megabyte, and losing the key columns altogether gives the
+	// bare base. One key column of one byte is that byte plus the two
+	// quotes around it and two of separator, on top of the three the row
+	// itself costs.
+	if got, want := (applyOp{shard: 0, del: wide}).bytes(shape), 3+(1+2)+2; got != want {
+		t.Fatalf("a delete of a 1-byte key with a %d-byte non-key column was accounted as %d bytes, want %d",
+			applyBatchBytes, got, want)
 	}
 	var ops []applyOp
 	for i := range 10 {

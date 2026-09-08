@@ -98,7 +98,9 @@ func TestCatchUpAppliesMoreOperationsASecondWhenItCoalescesThem(t *testing.T) {
 	if coalesced < 1.5*perRow {
 		t.Errorf("coalescing is only %.1fx one statement per row; it was 2.9x to 3.7x when written", coalesced/perRow)
 	}
-	assertRowsLanded(t, raw, "coalesced", rateRows)
+	for _, table := range []string{"per_row", "coalesced"} {
+		assertRowsLanded(t, raw, table, rateRows)
+	}
 }
 
 // The other half of PGS-355's batching, measured the same way, plus the
