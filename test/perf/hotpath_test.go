@@ -445,3 +445,101 @@ func loopbackConn(b *testing.B) net.Conn {
 	b.Cleanup(func() { _ = peer.Close() })
 	return c
 }
+
+// BenchmarkVStreamPerEventSend is PGS-212's premise as a number: the router
+// sends one gRPC message per row change to a VStream consumer, where the
+// pooler hands it batches.
+//
+// The two arms send the same rows over the same real socket with the same
+// transport settings, one event per message and then eventsPerBatch of them
+// per message, so the difference is the per-message cost alone: a
+// length-prefixed HTTP/2 DATA frame, a flow-control accounting, and a
+// marshal call with its own allocation, paid per row rather than per batch.
+//
+// It uses ChangeBatch rather than VEvent because VEvent has no batch form --
+// that absence IS the ticket. ChangeEvent.Row and VEvent.Row carry the same
+// shape, so the per-message overhead this isolates is the same one a
+// batched VEvent would remove.
+//
+// Measured on this machine, 100-byte rows, ns and allocations per EVENT:
+//
+//	  1 per message   2100 ns   1977 B   27 allocs
+//	  8 per message   1200 ns   1420 B   15 allocs
+//	 64 per message   1018 ns   1064 B   13 allocs
+//	256 per message    803 ns   1063 B   13 allocs
+//
+// So a batch of 64 buys about half the per-event cost and half the
+// allocations, and the allocation count stops falling there. The sizes are
+// kept rather than reduced to two because where the curve flattens is what
+// decides the batch size, and that is the question the ticket has to answer
+// before it changes an API.
+func BenchmarkVStreamPerEventSend(b *testing.B) {
+	const rowBytes = 100
+	for _, per := range []int{1, 8, 64, 256} {
+		b.Run(fmt.Sprintf("events-per-message-%d", per), func(b *testing.B) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				b.Fatal(err)
+			}
+			insec := insecure.NewCredentials()
+			srv := grpc.NewServer(pooler.ServerOptions(grpc.Creds(insec))...)
+			sink := &changeSink{per: per, rowBytes: rowBytes}
+			pgshardv1.RegisterPoolerServer(srv, sink)
+			go func() { _ = srv.Serve(lis) }()
+			b.Cleanup(srv.Stop)
+
+			cc, err := grpc.NewClient(lis.Addr().String(), pooler.DialOptions(grpc.WithTransportCredentials(insec))...)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = cc.Close() })
+			stream, err := pgshardv1.NewPoolerClient(cc).Stream(context.Background(),
+				&pgshardv1.StreamRequest{Stream: "bench"})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(rowBytes)
+			events := 0
+			for b.Loop() {
+				if events == 0 {
+					batch, err := stream.Recv()
+					if err != nil {
+						b.Fatal(err)
+					}
+					events = len(batch.GetEvents())
+					if events == 0 {
+						b.Fatal("empty batch")
+					}
+				}
+				events--
+			}
+		})
+	}
+}
+
+// changeSink streams row events forever, per of them to a message.
+type changeSink struct {
+	pgshardv1.UnimplementedPoolerServer
+	per      int
+	rowBytes int
+}
+
+func (s *changeSink) Stream(_ *pgshardv1.StreamRequest, srv pgshardv1.Pooler_StreamServer) error {
+	val := bytes.Repeat([]byte("x"), s.rowBytes)
+	for {
+		batch := &pgshardv1.ChangeBatch{Events: make([]*pgshardv1.ChangeEvent, 0, s.per)}
+		for i := 0; i < s.per; i++ {
+			batch.Events = append(batch.Events, &pgshardv1.ChangeEvent{
+				Event: &pgshardv1.ChangeEvent_Row_{Row: &pgshardv1.ChangeEvent_Row{
+					Kind:   pgshardv1.ChangeEvent_Row_KIND_INSERT,
+					Schema: "public", Table: "bulk",
+					New: []*pgshardv1.Value{{Data: val}},
+				}},
+			})
+		}
+		if err := srv.Send(batch); err != nil {
+			return nil
+		}
+	}
+}
