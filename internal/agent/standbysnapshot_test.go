@@ -2,25 +2,26 @@ package agent
 
 import "testing"
 
-// The record is WAL, so only a primary can write one, and only a primary
-// holding a failover slot has anything waiting on it. Writing them
-// anywhere else is WAL for nothing -- on an otherwise idle cluster it is
-// the only WAL there is, and it would keep archive_timeout busy for no
-// reader.
-func TestOnlyAPrimaryHoldingFailoverSlotsWritesRunningXacts(t *testing.T) {
+// Each condition excludes a case where the record would be WAL that
+// changes nothing: a standby cannot write WAL at all; a primary with no
+// failover slot has nothing waiting on the record; and a failover slot
+// with no consumer never advances its catalog_xmin however many records
+// are written, because that only moves when a walsender decodes one and
+// the consumer confirms past it.
+func TestOnlyAPrimaryHoldingAnActiveFailoverSlotWritesRunningXacts(t *testing.T) {
 	for _, c := range []struct {
-		what          string
-		inRecovery    bool
-		failoverSlots int
-		want          bool
+		what                string
+		inRecovery          bool
+		activeFailoverSlots int
+		want                bool
 	}{
-		{"a primary with a failover slot", false, 1, true},
+		{"a primary with an active failover slot", false, 1, true},
 		{"a primary with several", false, 4, true},
-		{"a primary with none", false, 0, false},
+		{"a primary whose failover slots have no consumer", false, 0, false},
 		{"a standby, which cannot write WAL at all", true, 3, false},
 		{"a standby with none", true, 0, false},
 	} {
-		if got := needsStandbySnapshot(c.inRecovery, c.failoverSlots); got != c.want {
+		if got := needsStandbySnapshot(c.inRecovery, c.activeFailoverSlots); got != c.want {
 			t.Errorf("%s: got %t, want %t", c.what, got, c.want)
 		}
 	}
