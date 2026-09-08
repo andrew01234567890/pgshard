@@ -1658,7 +1658,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 		// transaction being decoded and of the ones already committed.
 		readyBytes, openBytes := 0, 0
 		flush := func() error {
-			if err := applyOps(ctx, targets, ready); err != nil {
+			if err := applyOps(ctx, targets, wf.shape, wf.shadow(), ready); err != nil {
 				return err
 			}
 			applied += readyN
@@ -1752,17 +1752,21 @@ const applyBatchBytes = 1 << 20
 // used to apply around 765 operations a second, which a single ordinary
 // writer outran, so slot lag grew instead of converging and the placement
 // never reached its cutover.
-func applyOps(ctx context.Context, targets targetConns, ops []applyOp) error {
+func applyOps(ctx context.Context, targets targetConns, shape rowShape, table string, ops []applyOp) error {
 	if len(ops) == 0 {
 		return nil
 	}
 	order := make([]int32, 0, len(targets))
-	byTarget := map[int32][]string{}
+	byTarget := map[int32][]applyOp{}
 	for _, op := range ops {
 		if _, seen := byTarget[op.shard]; !seen {
 			order = append(order, op.shard)
 		}
-		byTarget[op.shard] = append(byTarget[op.shard], op.sql)
+		byTarget[op.shard] = append(byTarget[op.shard], op)
+	}
+	stmts := make(map[int32][]string, len(byTarget))
+	for shard, group := range byTarget {
+		stmts[shard] = coalesce(shape, table, group)
 	}
 	conns := make([]ShardConn, len(order))
 	for i, shard := range order {
@@ -1797,7 +1801,7 @@ func applyOps(ctx context.Context, targets targetConns, ops []applyOp) error {
 	g, gctx := errgroup.WithContext(ctx)
 	for i, shard := range order {
 		g.Go(func() error {
-			if err := applyToTarget(gctx, conns[i], byTarget[shard]); err != nil {
+			if err := applyToTarget(gctx, conns[i], stmts[shard]); err != nil {
 				return fmt.Errorf("target %d: %w", shard, err)
 			}
 			return nil
@@ -2607,4 +2611,82 @@ func sortedInt32Keys[V any](m map[int32]V) []int32 {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// coalesce renders one target's operations, joining each run of plain
+// upserts into a single multi-row statement.
+//
+// The rows of a run go out as one INSERT ... VALUES (..),(..) ON CONFLICT,
+// which is the whole point: an operation otherwise carries one row and its
+// literals, so a thousand-row round trip was a thousand parses and a
+// thousand plans on the target.
+//
+// A run ENDS at a primary key it has already carried. Checked against
+// PostgreSQL 18: a second row with the same key in one command fails ON
+// CONFLICT DO UPDATE outright -- "cannot affect row a second time" -- and
+// the DO NOTHING form used when a table is all key columns does not fail
+// but keeps the FIRST row and drops the second. So a row that changes
+// twice inside one flush would either break catch-up or quietly apply the
+// older value; ending the run applies both, in order.
+//
+// A run also ends at anything that is not a plain upsert, which keeps the
+// other ordering that matters: an upsert and a later delete of the same
+// row are both on this target and stay in sequence.
+func coalesce(shape rowShape, table string, ops []applyOp) []string {
+	var out []string
+	var run []*Tuple
+	runBytes := 0
+	seen := map[string]bool{}
+	flush := func() {
+		if len(run) == 0 {
+			return
+		}
+		out = append(out, shape.UpsertSQL(table, run)...)
+		run, runBytes, seen = nil, 0, map[string]bool{}
+	}
+	for _, op := range ops {
+		if op.up == nil {
+			flush()
+			out = append(out, op.sql)
+			continue
+		}
+		k := pkKey(shape, op.up)
+		if seen[k] || len(run) >= applyBatchOps || runBytes >= applyBatchBytes {
+			flush()
+		}
+		seen[k] = true
+		run = append(run, op.up)
+		runBytes += rowBytes(op.up)
+	}
+	flush()
+	return out
+}
+
+// pkKey identifies a row within one coalescing run. The values are already
+// the decoder's own strings, so a separator that cannot appear in a length
+// prefix is enough to keep two columns from running together.
+func pkKey(shape rowShape, row *Tuple) string {
+	var b strings.Builder
+	for _, i := range shape.pkIndexes() {
+		v := row.Values[i]
+		if v == nil {
+			b.WriteString("\\N|")
+			continue
+		}
+		fmt.Fprintf(&b, "%d:%s|", len(*v), *v)
+	}
+	return b.String()
+}
+
+// rowBytes is what a row contributes to the statement it joins, near
+// enough to bound it: the literals dominate, and the column names and
+// punctuation around them do not grow with the data.
+func rowBytes(row *Tuple) int {
+	n := 0
+	for _, v := range row.Values {
+		if v != nil {
+			n += len(*v)
+		}
+	}
+	return n
 }

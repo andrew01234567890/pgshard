@@ -30,7 +30,7 @@ func TestApplyOpsCostsARoundTripPerTargetNotPerRow(t *testing.T) {
 	for i := range 300 {
 		ops = append(ops, applyOp{shard: 1, sql: "one" + itoa(int64(i))}, applyOp{shard: 2, sql: "two" + itoa(int64(i))})
 	}
-	if err := applyOps(context.Background(), targets, ops); err != nil {
+	if err := applyOps(context.Background(), targets, rowShape{}, "t", ops); err != nil {
 		t.Fatal(err)
 	}
 	for name, r := range map[string]*applyRecorder{"1": one, "2": two} {
@@ -52,7 +52,7 @@ func TestApplyOpsCostsARoundTripPerTargetNotPerRow(t *testing.T) {
 func TestApplyOpsKeepsEachTargetsOrder(t *testing.T) {
 	one := &applyRecorder{}
 	ops := []applyOp{{shard: 1, sql: "insert"}, {shard: 1, sql: "delete"}}
-	if err := applyOps(context.Background(), targetConns{1: one}, ops); err != nil {
+	if err := applyOps(context.Background(), targetConns{1: one}, rowShape{}, "t", ops); err != nil {
 		t.Fatal(err)
 	}
 	if want := "BEGIN;insert;delete;COMMIT"; one.execs[0] != want {
@@ -66,7 +66,7 @@ func TestApplyOpsSplitsAStatementThatWouldGrowUnbounded(t *testing.T) {
 	for range applyBatchOps + 1 {
 		ops = append(ops, applyOp{shard: 1, sql: "x"})
 	}
-	if err := applyOps(context.Background(), targetConns{1: one}, ops); err != nil {
+	if err := applyOps(context.Background(), targetConns{1: one}, rowShape{}, "t", ops); err != nil {
 		t.Fatal(err)
 	}
 	if len(one.execs) != 2 {
@@ -116,7 +116,7 @@ func TestApplyOpsSendsToEveryTargetAtOnce(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- applyOps(context.Background(), targets, ops) }()
+	go func() { done <- applyOps(context.Background(), targets, rowShape{}, "t", ops) }()
 
 	// Every target must be inside Exec before any of them is answered.
 	for i := range n {
@@ -143,7 +143,7 @@ func TestApplyOpsFailingTargetReleasesTheOthers(t *testing.T) {
 	bad := &errRecorder{err: errors.New("gone")}
 	done := make(chan error, 1)
 	go func() {
-		done <- applyOps(context.Background(), targetConns{1: slow, 0: bad},
+		done <- applyOps(context.Background(), targetConns{1: slow, 0: bad}, rowShape{}, "t",
 			[]applyOp{{shard: 1, sql: "y"}, {shard: 0, sql: "x"}})
 	}()
 	select {

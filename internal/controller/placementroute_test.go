@@ -168,11 +168,11 @@ func TestRouteChange(t *testing.T) {
 	rel := &Relation{Schema: "public", Name: "orders", Columns: cols}
 
 	ops, err := routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpInsert, Relation: rel, New: tup(s("1"), as, s("n"))})
-	if err != nil || len(ops) != 1 || ops[0].shard != 0 || !strings.HasPrefix(ops[0].sql, "INSERT") {
+	if err != nil || len(ops) != 1 || ops[0].shard != 0 || !strings.HasPrefix(sqlOf(shape, ops[0]), "INSERT") {
 		t.Fatalf("insert: %+v %v", ops, err)
 	}
 	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpDelete, Relation: rel, Old: tup(s("1"), bs, nil)})
-	if err != nil || len(ops) != 1 || ops[0].shard != 1 || !strings.HasPrefix(ops[0].sql, "DELETE") {
+	if err != nil || len(ops) != 1 || ops[0].shard != 1 || !strings.HasPrefix(sqlOf(shape, ops[0]), "DELETE") {
 		t.Fatalf("delete: %+v %v", ops, err)
 	}
 	// A delete whose old row cannot be routed (null key) goes to every holder.
@@ -182,22 +182,22 @@ func TestRouteChange(t *testing.T) {
 	}
 	// Same shard, same key: one upsert.
 	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("n")), New: tup(s("1"), as, s("m"))})
-	if err != nil || len(ops) != 1 || ops[0].shard != 0 || !strings.HasPrefix(ops[0].sql, "INSERT") {
+	if err != nil || len(ops) != 1 || ops[0].shard != 0 || !strings.HasPrefix(sqlOf(shape, ops[0]), "INSERT") {
 		t.Fatalf("in-place update: %+v %v", ops, err)
 	}
 	// Key change across shards: delete on the old shard, insert on the new.
 	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("n")), New: tup(s("1"), bs, s("n"))})
-	if err != nil || len(ops) != 2 || ops[0].shard != 0 || !strings.HasPrefix(ops[0].sql, "DELETE") || ops[1].shard != 1 || !strings.HasPrefix(ops[1].sql, "INSERT") {
+	if err != nil || len(ops) != 2 || ops[0].shard != 0 || !strings.HasPrefix(sqlOf(shape, ops[0]), "DELETE") || ops[1].shard != 1 || !strings.HasPrefix(sqlOf(shape, ops[1]), "INSERT") {
 		t.Fatalf("moved update: %+v %v", ops, err)
 	}
 	// Primary key change on one shard: delete the old row, insert the new.
 	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("n")), New: tup(s("2"), as, s("n"))})
-	if err != nil || len(ops) != 2 || !strings.HasPrefix(ops[0].sql, "DELETE") || !strings.Contains(ops[0].sql, `"id" = '1'`) || !strings.HasPrefix(ops[1].sql, "INSERT") {
+	if err != nil || len(ops) != 2 || !strings.HasPrefix(sqlOf(shape, ops[0]), "DELETE") || !strings.Contains(sqlOf(shape, ops[0]), `"id" = '1'`) || !strings.HasPrefix(sqlOf(shape, ops[1]), "INSERT") {
 		t.Fatalf("pk update: %+v %v", ops, err)
 	}
 	// An unchanged TOAST column of a moved row is filled from the old row.
 	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("big")), New: tup(s("1"), bs, nil, 3)})
-	if err != nil || len(ops) != 2 || !strings.Contains(ops[1].sql, "'big'") {
+	if err != nil || len(ops) != 2 || !strings.Contains(sqlOf(shape, ops[1]), "'big'") {
 		t.Fatalf("toast fill: %+v %v", ops, err)
 	}
 	// Without an old row the update identifies the row by its new key.
@@ -247,15 +247,26 @@ func TestRouteChangeReplacesAChangedAlwaysIdentity(t *testing.T) {
 	if err != nil || len(ops) != 2 {
 		t.Fatalf("a new always-identity value needs a delete and an insert: %+v %v", ops, err)
 	}
-	if !strings.HasPrefix(ops[0].sql, "DELETE") || !strings.Contains(ops[0].sql, `"id" = '1'`) {
-		t.Fatalf("first op: %s", ops[0].sql)
+	if !strings.HasPrefix(sqlOf(shape, ops[0]), "DELETE") || !strings.Contains(sqlOf(shape, ops[0]), `"id" = '1'`) {
+		t.Fatalf("first op: %s", sqlOf(shape, ops[0]))
 	}
-	if !strings.HasPrefix(ops[1].sql, "INSERT") || !strings.Contains(ops[1].sql, "OVERRIDING SYSTEM VALUE") || !strings.Contains(ops[1].sql, "'6'") {
-		t.Fatalf("second op: %s", ops[1].sql)
+	if !strings.HasPrefix(sqlOf(shape, ops[1]), "INSERT") || !strings.Contains(sqlOf(shape, ops[1]), "OVERRIDING SYSTEM VALUE") || !strings.Contains(sqlOf(shape, ops[1]), "'6'") {
+		t.Fatalf("second op: %s", sqlOf(shape, ops[1]))
 	}
 	// An identity that did not move still takes the cheap path.
 	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: row("5"), New: row("5")})
-	if err != nil || len(ops) != 1 || !strings.HasPrefix(ops[0].sql, "INSERT") {
+	if err != nil || len(ops) != 1 || !strings.HasPrefix(sqlOf(shape, ops[0]), "INSERT") {
 		t.Fatalf("an unchanged identity must stay an upsert: %+v %v", ops, err)
 	}
+}
+
+// sqlOf renders one operation the way it would reach its target on its own.
+// routeChange carries a plain upsert as a tuple so that coalesce can join
+// it to the others bound for the same shard; these tests are about which
+// statement goes where, so they want the single-row rendering.
+func sqlOf(shape rowShape, op applyOp) string {
+	if op.up == nil {
+		return op.sql
+	}
+	return shape.UpsertSQL("orders__pgshard_new", []*Tuple{op.up})[0]
 }
