@@ -112,15 +112,83 @@ type consumed struct {
 	shards    []string
 }
 
+// consumeWithin bounds how long consume waits for the stream to deliver
+// the next event.
+//
+// Every other wait in these tests is bounded and says what it saw. This one
+// was not, so a stream that stopped delivering blocked in Recv until the
+// 45-minute package timeout, which kills every other test in the package
+// and leaves a goroutine dump in place of a diagnosis. That is how PGS-712
+// has presented, and the dump says only that Recv is waiting -- true, and
+// useless.
+const consumeWithin = 90 * time.Second
+
+// errStreamStalled is what a reader reports when the stream delivers
+// nothing within consumeWithin.
+var errStreamStalled = errors.New("the stream delivered nothing more")
+
+// streamReader turns a stream into a channel of events so a read can be
+// bounded, and so the bound is testable without a stream that hangs.
+//
+// Recv keeps its own goroutine because there is no way to abandon a call
+// already inside it. On a timeout that goroutine is left blocked, which is
+// what a test about to fail can afford; close ends it if the stream ever
+// answers.
+type streamReader struct {
+	events chan recvd
+	done   chan struct{}
+}
+
+type recvd struct {
+	ev  *pgshardv1.VEvent
+	err error
+}
+
+func newStreamReader(st pgshardv1.VStream_StreamClient) *streamReader {
+	r := &streamReader{events: make(chan recvd), done: make(chan struct{})}
+	go func() {
+		for {
+			ev, err := st.Recv()
+			select {
+			case r.events <- recvd{ev, err}:
+			case <-r.done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return r
+}
+
+func (r *streamReader) close() { close(r.done) }
+
+// next is the next event, or errStreamStalled if none arrives in time.
+func (r *streamReader) next(within time.Duration) (*pgshardv1.VEvent, error) {
+	select {
+	case got := <-r.events:
+		return got.ev, got.err
+	case <-time.After(within):
+		return nil, errStreamStalled
+	}
+}
+
 // consume reads from the stream until stop returns true after a VGtid, or
 // the stream ends.
 func consume(tb testing.TB, st pgshardv1.VStream_StreamClient, stop func(c *consumed) bool) *consumed {
 	tb.Helper()
+	r := newStreamReader(st)
+	defer r.close()
 	c := &consumed{}
 	var cur []int
 	var curShard string
 	for {
-		ev, err := st.Recv()
+		ev, err := r.next(consumeWithin)
+		if errors.Is(err, errStreamStalled) {
+			tb.Fatalf("%v within %s; waiting on it forever kills the whole package instead of saying so."+
+				"\ntransactions so far: %v\nshards: %v\nlast position: %v", err, consumeWithin, c.txns, c.shards, c.last)
+		}
 		if errors.Is(err, io.EOF) {
 			return c
 		}
