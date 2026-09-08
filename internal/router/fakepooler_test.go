@@ -36,11 +36,15 @@ type fakePooler struct {
 	backends map[string]*fakeBackend
 	reserved map[string]bool
 	reserves []string
-	releases []string
-	cancels  []string
-	users    []string
-	sleeping map[string]chan struct{}
-	attached map[string]chan struct{}
+	// legacyRefusal makes Reserve answer the way a pooler did before the
+	// refusal moved to the status channel: an OK response with the Error
+	// in the body.
+	legacyRefusal atomic.Bool
+	releases      []string
+	cancels       []string
+	users         []string
+	sleeping      map[string]chan struct{}
+	attached      map[string]chan struct{}
 	// attaches counts Execute streams ever opened per session, so a test
 	// can tell a session that kept its stream from one that reconnected.
 	attaches map[string]int
@@ -330,7 +334,21 @@ func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
 func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgshardv1.ReserveResponse, error) {
 	f.gate.wait()
 	if e := f.fence(req.Generation); e != nil {
-		return &pgshardv1.ReserveResponse{Error: e}, nil
+		if f.legacyRefusal.Load() {
+			// A pooler from before the refusal moved to the status
+			// channel, so the router's compatibility read has something
+			// to read.
+			return &pgshardv1.ReserveResponse{Error: e}, nil
+		}
+		// The same channel the real pooler uses: a refusal is a status
+		// with the Error as a detail, not an Error in an OK response. A
+		// double that answered OK would let the router's recovery of the
+		// refusal be wrong and every test here still pass.
+		st := status.New(codes.FailedPrecondition, e.GetMessage())
+		if d, derr := st.WithDetails(e); derr == nil {
+			st = d
+		}
+		return nil, st.Err()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

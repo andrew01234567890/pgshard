@@ -788,11 +788,16 @@ func (e *Executor) preparePart(ctx context.Context, sh Shard) (*txnPart, error) 
 	p := &txnPart{shard: sh, ps: ps, tx: pgwire.TxIdle, known: map[string]bool{}}
 	if e.needsPin() {
 		resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.r.cfg.Poolers.Generation(sh)})
-		if err != nil {
-			return p, err
+		if pe := resp.GetError(); pe != nil {
+			// See scatter.go: a pooler from before the refusal moved to
+			// the status channel.
+			return p, toPgwireError(pe)
 		}
-		if resp.Error != nil {
-			return p, toPgwireError(resp.Error)
+		if err != nil {
+			if pe := poolerRefusal(err); pe != nil {
+				return p, toPgwireError(pe)
+			}
+			return p, err
 		}
 		p.pinned = true
 		if settings := e.sessionSettings(); len(settings) > 0 {

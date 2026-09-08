@@ -1772,11 +1772,16 @@ func (e *Executor) ensurePinned(ctx context.Context) error {
 		return err
 	}
 	resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.generation()})
-	if err != nil {
-		return e.poolerRefused(err)
+	if pe := resp.GetError(); pe != nil {
+		// See scatter.go: a pooler from before the refusal moved to the
+		// status channel.
+		return toPgwireError(pe)
 	}
-	if resp.Error != nil {
-		return toPgwireError(resp.Error)
+	if err != nil {
+		if pe := poolerRefusal(err); pe != nil {
+			return toPgwireError(pe)
+		}
+		return e.poolerRefused(err)
 	}
 	e.pinned = true
 	return nil

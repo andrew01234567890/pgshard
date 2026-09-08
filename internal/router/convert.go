@@ -1,6 +1,8 @@
 package router
 
 import (
+	"google.golang.org/grpc/status"
+
 	"errors"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -141,6 +143,23 @@ func valueRow(cols []*pgshardv1.Value) [][]byte {
 		}
 	}
 	return out
+}
+
+// poolerRefusal recovers the pooler's own Error from a gRPC status, which
+// is how a refused whole RPC travels: the status says a caller that only
+// reads codes should not treat it as success, and the detail says which
+// refusal it was. Returns nil when err carries no refusal, so a caller can
+// tell "the pooler said no" from "the call did not get there".
+func poolerRefusal(err error) *pgshardv1.Error {
+	if err == nil {
+		return nil
+	}
+	for _, d := range status.Convert(err).Details() {
+		if e, ok := d.(*pgshardv1.Error); ok {
+			return e
+		}
+	}
+	return nil
 }
 
 func toPgwireError(e *pgshardv1.Error) error {

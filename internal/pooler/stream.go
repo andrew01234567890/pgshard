@@ -281,6 +281,18 @@ func (s *Server) StreamChanges(req *pgshardv1.StreamRequest, srv pgshardv1.Poole
 	}, true)
 }
 
+// refusalStatus turns a refusal into a gRPC status carrying the refusal
+// itself as a detail, which is how a whole-RPC failure travels: the code
+// for anything that only reads statuses, the Error for a caller that has
+// to tell one refusal from another.
+func refusalStatus(e *pgshardv1.Error) error {
+	st := status.New(codes.FailedPrecondition, e.GetMessage())
+	if d, err := st.WithDetails(e); err == nil {
+		st = d
+	}
+	return st.Err()
+}
+
 // ackErr is how an ack that did not advance the slot fails its RPC.
 //
 // An ack is one operation with no partial answer, so its failure belongs in

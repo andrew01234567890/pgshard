@@ -81,9 +81,9 @@ func TestFencingRefusesBeforeBackend(t *testing.T) {
 	if h.pg.queries.Load() != 2 {
 		t.Fatal("stale mid-stream request reached PostgreSQL")
 	}
-	res, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "r", Generation: gen(7, 3)})
-	if err != nil || res.Error == nil || res.Error.Sqlstate != "55000" {
-		t.Fatalf("Reserve with stale generation: %v %v", res, err)
+	_, rerr := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "r", Generation: gen(7, 3)})
+	if e := refusalOf(t, rerr); e.GetSqlstate() != "55000" {
+		t.Fatalf("Reserve with stale generation: %v", e)
 	}
 }
 

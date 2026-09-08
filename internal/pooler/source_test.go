@@ -48,15 +48,10 @@ func (s notServing) View() View { return s.v }
 // on a shard whose ranges may have moved.
 func TestAPoolerThatCannotSeeTheCatalogRefusesEvenAMatchingGeneration(t *testing.T) {
 	s := NewServer(Config{Source: notServing{View{Generation: 7, Epoch: 3}}})
-	res, err := s.Reserve(context.Background(), &pgshardv1.ReserveRequest{SessionId: "r",
+	_, err := s.Reserve(context.Background(), &pgshardv1.ReserveRequest{SessionId: "r",
 		Generation: &pgshardv1.Generation{ShardMapGeneration: 7, PrimaryEpoch: 3}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.GetError() == nil {
-		t.Fatal("a stale pooler admitted a request because its last-read generation happened to match")
-	}
-	if got := res.GetError().GetMessage(); !strings.Contains(got, "catalog view is stale") {
+	e := refusalOf(t, err)
+	if got := e.GetMessage(); !strings.Contains(got, "catalog view is stale") {
 		t.Errorf("refusal %q must name the pooler as the stale party, not the router", got)
 	}
 }

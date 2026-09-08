@@ -344,11 +344,21 @@ func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup st
 	// missed it would evaluate the query as the login role.
 	if setup != "" {
 		resp, rerr := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: p.sid, Generation: gen})
-		if rerr != nil {
-			return p, pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, rerr)
+		if e := resp.GetError(); e != nil {
+			// A pooler from before the refusal moved to the status
+			// channel. Read for one release: without it this router
+			// treats that pooler's refusal as a success and reserves a
+			// backend the pooler never pinned.
+			return p, toPgwireError(e)
 		}
-		if resp.Error != nil {
-			return p, toPgwireError(resp.Error)
+		if rerr != nil {
+			// A refusal the pooler described is the shard saying no, not
+			// the connection failing: it keeps its own SQLSTATE and
+			// reason so a stale generation still reads as one.
+			if e := poolerRefusal(rerr); e != nil {
+				return p, toPgwireError(e)
+			}
+			return p, pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, rerr)
 		}
 		p.reserved = true
 		if err := ps.send(simpleQuery(setup), p.sid, gen, e.ident, e.info.Database); err != nil {

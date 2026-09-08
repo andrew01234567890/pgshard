@@ -139,7 +139,16 @@ func (s *Server) Create(ctx context.Context, req *pgshardv1.CreateVStreamRequest
 	if err != nil {
 		return nil, err
 	}
-	resp := &pgshardv1.CreateVStreamResponse{Error: r.GetError()}
+	if e := r.GetError(); e != nil {
+		// The same channel Drop below uses, and for the same reason: a
+		// create that did not happen is not a successful RPC.
+		st := status.New(codes.FailedPrecondition, e.GetMessage())
+		if d, derr := st.WithDetails(e); derr == nil {
+			st = d
+		}
+		return nil, st.Err()
+	}
+	resp := &pgshardv1.CreateVStreamResponse{}
 	for _, sl := range r.GetSlots() {
 		resp.Slots = append(resp.Slots, &pgshardv1.VStreamSlot{Shard: sl.GetShard(), Slot: sl.GetSlot(), ConfirmedFlushLsn: sl.GetLsn()})
 	}
@@ -155,7 +164,17 @@ func (s *Server) Drop(ctx context.Context, req *pgshardv1.DropVStreamRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	return &pgshardv1.DropVStreamResponse{Error: r.GetError()}, nil
+	if e := r.GetError(); e != nil {
+		// The controller's refusal, forwarded as a status rather than as
+		// an OK response carrying an error. A drop that did not happen is
+		// not a successful RPC.
+		st := status.New(codes.FailedPrecondition, e.GetMessage())
+		if d, derr := st.WithDetails(e); derr == nil {
+			st = d
+		}
+		return nil, st.Err()
+	}
+	return &pgshardv1.DropVStreamResponse{}, nil
 }
 
 // List implements VStream.List from the catalog.
