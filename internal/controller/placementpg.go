@@ -1631,11 +1631,13 @@ const applyFlushBytes = 8 << 20
 // flush can shorten: its operations cannot be applied until it commits, so
 // they are held whole.
 //
-// A peek that fills without reaching a commit quadruples its limit and
-// starts again from the slot, decoding the same transaction from its
-// beginning each time and retaining more of it. Nothing stopped that, so a
-// large enough source transaction took the controller's memory -- and the
-// controller is not running only this workflow.
+// It is checked while the rows are still arriving, so a transaction too
+// large to hold is refused partway through rather than after all of it has
+// been read. What that does NOT bound is the source: the peek is a
+// materialising function, so PostgreSQL has already built the whole
+// transaction on the shard before it sends the first row. This is the
+// controller's bound, and the controller is not running only this
+// workflow.
 //
 // Failing is the answer rather than spilling, for now. A workflow that
 // stops with a message naming the table and the size is one an operator
@@ -1690,11 +1692,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 				return 0, applied, err
 			}
 			msgCount++
-			m := struct {
-				LSN  string
-				Data []byte
-			}{lsn, data}
-			c, committed, err := dec.Decode(m.Data)
+			c, committed, err := dec.Decode(data)
 			if err != nil {
 				rows.Close()
 				return 0, applied, err
@@ -1703,7 +1701,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 				ready = append(ready, open...)
 				readyN += n
 				readyBytes += openBytes
-				open, n, openBytes, commitLSN = nil, 0, 0, m.LSN
+				open, n, openBytes, commitLSN = nil, 0, 0, lsn
 				if len(ready) >= applyFlushOps || readyBytes >= applyFlushBytes {
 					if err := flush(); err != nil {
 						rows.Close()
@@ -1754,6 +1752,15 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			if _, err := conn.Exec(ctx, `SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())`, wf.slotName(s)); err != nil {
 				return 0, applied, err
 			}
+		default:
+			// Rows but no commit. Argued to be impossible above -- a peek
+			// stops only after a commit record -- and asserted rather than
+			// assumed, because the cost of being wrong changed when the
+			// retry went. There is no limit left to grow: a drain would
+			// re-peek the same rows forever, making no progress and
+			// raising nothing, which is a worse failure than saying so.
+			return 0, applied, fatal("a peek of %d rows on %s/%d ended without a commit, which the slot should never produce",
+				msgCount, wf.st.SourceSet, s)
 		}
 		lag, err := slotLag(ctx, conn, wf.slotName(s))
 		if err != nil {

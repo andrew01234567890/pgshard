@@ -62,9 +62,8 @@ func (c *peekConn) Close(context.Context) error                              { r
 
 // The bound on the ONE transaction being decoded exists because those
 // operations cannot be applied until it commits, so nothing can shorten
-// them: without it a peek that fills without reaching a commit quadruples
-// its limit and decodes the same transaction again, retaining more of it
-// each round, until the controller is killed and takes every other
+// them: a source transaction larger than the controller can hold has to be
+// refused rather than allowed to take the process, and every other
 // workflow with it.
 //
 // This drives catchUpSource with an uncommitted transaction of plain
