@@ -395,13 +395,19 @@ func (op applyOp) bytes() int {
 	if op.up == nil {
 		return len(op.sql)
 	}
-	n := 0
+	// Two bytes a column and three a row for the parentheses, commas and
+	// separator the values sit in, so that a run of narrow rows is not
+	// accounted as far smaller than the statement it becomes.
+	n := 2*len(op.up.Values) + 3
 	for _, v := range op.up.Values {
 		if v == nil {
 			n += len("NULL")
 			continue
 		}
 		n += len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
+		if strings.ContainsRune(*v, '\\') {
+			n += len("E") // quoteLiteralE prefixes a literal that carries one
+		}
 	}
 	return n
 }

@@ -130,4 +130,29 @@ func TestAnOperationsSizeCountsTheRowItCarries(t *testing.T) {
 	if got := (applyOp{shard: 0, up: plain("2", quotes)}).bytes(); got < 2*len(quotes) {
 		t.Fatalf("%d quotes render as %d bytes but were accounted as %d", len(quotes), 2*len(quotes), got)
 	}
+	// What the bounds need is that the accounting TRACKS the statement the
+	// rows become: under-counting lets a hold grow past the bound that is
+	// supposed to stop it. Measured over a run long enough that the fixed
+	// INSERT header is noise, for each shape a value can take -- ordinary,
+	// one that doubles on escaping, one that also earns the E prefix, and
+	// a null.
+	for name, v := range map[string]*string{
+		"ordinary":  s(strings.Repeat("a", 100)),
+		"quoted":    s(strings.Repeat("'", 100)),
+		"backslash": s(strings.Repeat(`\`, 100)),
+		"null":      nil,
+	} {
+		var rows []*Tuple
+		accounted := 0
+		for i := range 50 {
+			row := &Tuple{Values: []*string{s(itoa(int64(i))), v}, Unchanged: []bool{false, false}}
+			rows = append(rows, row)
+			accounted += (applyOp{shard: 0, up: row}).bytes()
+		}
+		rendered := len(shape.UpsertSQL("t", rows)[0])
+		if accounted < rendered*9/10 {
+			t.Errorf("%s: 50 rows accounted as %d bytes render as %d; a bound counting these fires too late",
+				name, accounted, rendered)
+		}
+	}
 }
