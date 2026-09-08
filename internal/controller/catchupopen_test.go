@@ -30,11 +30,15 @@ func (r *peekRows) Values() ([]any, error) { return nil, nil }
 func (r *peekRows) RawValues() [][]byte    { return nil }
 func (r *peekRows) Conn() *pgx.Conn        { return nil }
 
-type peekConn struct{ rows *peekRows }
+type peekConn struct {
+	rows *peekRows
+	last *peekRows // the peek this connection actually served
+}
 
 func (c *peekConn) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 	if strings.Contains(sql, "peek_binary_changes") {
-		return &peekRows{lsn: c.rows.lsn, data: c.rows.data}, nil
+		c.last = &peekRows{lsn: c.rows.lsn, data: c.rows.data}
+		return c.last, nil
 	}
 	// Whatever else catch-up asks this connection is the slot lag, which
 	// this test does not reach unless the bound failed to trip.
@@ -99,11 +103,20 @@ func TestAnOpenTransactionOfPlainUpsertsTripsTheOpenBound(t *testing.T) {
 		rt:    r,
 		shape: shape,
 	}
-	_, _, err := (&Placer{}).catchUpSource(context.Background(), wf, &peekConn{rows: rows}, targetConns{}, 0, false)
+	conn := &peekConn{rows: rows}
+	_, _, err := (&Placer{}).catchUpSource(context.Background(), wf, conn, targetConns{}, 0, false)
 	if err == nil {
 		t.Fatal("an open transaction of 8 KiB of rows did not trip a 4 KiB bound; its size is not being counted")
 	}
 	if !strings.Contains(err.Error(), "catch-up bound") {
 		t.Fatalf("failed for another reason: %v", err)
+	}
+	// And it tripped BEFORE reading the whole peek. That is the point of
+	// decoding the rows as they arrive: a peek returns whole transactions
+	// however small a limit it is given, so a result that is collected
+	// first is already resident by the time any bound is consulted, and
+	// the bound saves nothing it was written to save.
+	if conn.last.i >= len(rows.lsn) {
+		t.Fatalf("the bound tripped only after reading all %d rows of the peek; the whole transaction was resident first", len(rows.lsn))
 	}
 }
