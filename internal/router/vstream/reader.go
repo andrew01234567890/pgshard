@@ -82,6 +82,12 @@ type reader struct {
 
 var errEpochChanged = errors.New("primary epoch changed")
 
+// epochPoll is how often a reader parked in Recv checks whether the shard
+// has been promoted underneath it. The topology is a snapshot read, so
+// this is cheap; it bounds how long a stream keeps waiting on a primary
+// that is no longer one.
+const epochPoll = 500 * time.Millisecond
+
 func (r *reader) run(ctx context.Context) {
 	r.asm = assembler{shard: r.shard, relations: map[uint32]*relMeta{}, streamed: map[uint32]*unit{},
 		maxBytes: r.maxBytes, maxOpen: r.maxOpen, meter: r.meter}
@@ -220,10 +226,46 @@ func (r *reader) once(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Watch the epoch rather than only checking it after a batch. A
+	// promotion moves the writes to the new primary, so the stream this
+	// reader still holds on the OLD one has nothing left to deliver: Recv
+	// blocks, the check below never runs, and the reader waits for a batch
+	// that is never coming while the rows it is supposed to be following
+	// are written somewhere else. That is a hang with no error in it, and
+	// nothing above can time it out because once never returns.
+	//
+	// Cancelling the stream's own context is what makes Recv answer. The
+	// parent context is untouched, so the outer loop reconnects to the new
+	// primary instead of shutting the reader down.
+	moved := make(chan struct{})
+	go func() {
+		t := time.NewTicker(epochPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-t.C:
+				if r.topo.Epoch(r.shard) != epoch {
+					close(moved)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	r.asm.reset()
 	for {
 		batch, err := stream.Recv()
 		if err != nil {
+			// The watcher's cancel, not the caller's: report it as what it
+			// is so the outer loop reconnects at once rather than backing
+			// off on what looks like a transport failure.
+			select {
+			case <-moved:
+				return errEpochChanged
+			default:
+			}
 			return err
 		}
 		if r.topo.Epoch(r.shard) != epoch {

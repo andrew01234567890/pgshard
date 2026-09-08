@@ -485,6 +485,39 @@ func TestFailoverMovesTheShardStreamToTheNewPrimary(t *testing.T) {
 	}
 }
 
+// A promotion moves the writes to the new primary, so the stream the
+// reader still holds on the OLD one has nothing left to deliver. The
+// reader has to notice that WITHOUT a batch arriving, because none will.
+//
+// Every other failover case here hands the old pooler something first --
+// an error, or a keepalive -- so the epoch check after Recv gets a chance
+// to run. That is why this went unnoticed: in a real promotion on a quiet
+// shard, Recv simply blocks, and the reader waited for a batch that was
+// never coming while the rows it was following were written elsewhere.
+func TestFailoverMovesTheStreamEvenWhenTheOldPrimaryGoesSilent(t *testing.T) {
+	h := newHarness(t, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain"})
+	h.pool[0].feed("plain", batch(0, evRelation(1, "t", "id")))
+	h.pool[0].feed("plain", txn(1, 1, 1, 1000, "1"))
+	recvN(t, st, 5, 2*time.Second)
+
+	// The promotion is the ONLY event: the old pooler is neither fed nor
+	// failed, exactly as a demoted primary with no more writes behaves.
+	promoted := newFakePooler(t)
+	h.topo.promote(shard0, promoted)
+	waitFor(t, func() bool { return len(promoted.startLSNs()) == 1 })
+	if s := promoted.startLSNs(); s[0] != 1000 {
+		t.Fatalf("the reader came back at lsn %v, want 1000", s)
+	}
+	promoted.feed("plain", batch(0, evRelation(1, "t", "id")))
+	promoted.feed("plain", txn(1, 2, 2, 1100, "2"))
+	if got := recvN(t, st, 4, 5*time.Second); describe(got[3]) != "vgtid gen=7 {0:1100}" {
+		t.Fatalf("after a silent failover: %v", lines(got))
+	}
+}
+
 // TestAlignmentHoldsAFastShardButReleasesItOnTheTimeout: the hold expires
 // whether or not the slow shard caught up. That release is why alignment
 // is presentation and not an ordering guarantee, so it is worth keeping
