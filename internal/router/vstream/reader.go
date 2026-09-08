@@ -62,18 +62,21 @@ func shardRef(sh router.Shard) *pgshardv1.ShardRef {
 // to whatever pooler serves the shard after a promotion, and assembles the
 // batches into units pushed to out.
 type reader struct {
-	shard     router.Shard
-	stream    string
-	database  string
-	twoPhase  bool
-	topo      Topology
-	out       chan *unit
-	ready     chan<- struct{}
-	window    time.Duration
-	delivered uint64
-	maxBytes  int
-	maxOpen   int
-	meter     Meter
+	shard    router.Shard
+	stream   string
+	database string
+	twoPhase bool
+	topo     Topology
+	out      chan *unit
+	ready    chan<- struct{}
+	window   time.Duration
+	// progressed records that something was delivered since the reconnect
+	// window was last cleared.
+	progressed bool
+	delivered  uint64
+	maxBytes   int
+	maxOpen    int
+	meter      Meter
 	// copy is the pending initial copy; nil once streaming.
 	copy *copyPhase
 
@@ -81,6 +84,12 @@ type reader struct {
 }
 
 var errEpochChanged = errors.New("primary epoch changed")
+
+// epochPoll is how often a reader parked in Recv checks whether the shard
+// has been promoted underneath it. The topology is a snapshot read, so
+// this is cheap; it bounds how long a stream keeps waiting on a primary
+// that is no longer one.
+const epochPoll = 500 * time.Millisecond
 
 func (r *reader) run(ctx context.Context) {
 	r.asm = assembler{shard: r.shard, relations: map[uint32]*relMeta{}, streamed: map[uint32]*unit{},
@@ -97,10 +106,25 @@ func (r *reader) run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err == nil {
+		// The window is for a shard that cannot be reached, so anything
+		// that DID reach it clears it. once never returns nil -- every
+		// exit is an error -- so waiting for that left a single benign
+		// reconnect early in a stream's life arming the window for the
+		// whole of it, and a lone transient failure an hour later ended
+		// the reader as if the shard had been unavailable throughout.
+		//
+		// The signal is a unit delivered rather than the position moving,
+		// because a copy delivers for as long as it takes and moves the
+		// position only once: its units carry one only for the first
+		// snapshot, and only when the stream started from nothing. A copy
+		// of any length would otherwise never clear the window.
+		if err == nil || r.progressed {
 			firstFailure = time.Time{}
 			backoff = 200 * time.Millisecond
-			continue
+			r.progressed = false
+			if err == nil {
+				continue
+			}
 		}
 		if ev := fatal(err, r.shard); ev != nil {
 			r.push(ctx, &unit{shard: r.shard, err: ev})
@@ -197,6 +221,41 @@ func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 	return &pgshardv1.VEvent_Error{Code: code, Message: fmt.Sprintf("shard %s/%d: %s", sh.Set, sh.ID, st.Message()), Shard: shardRef(sh)}
 }
 
+// watchEpoch cancels a stream's own context when the shard's primary epoch
+// moves, and reports through the returned channel that it was the reason.
+//
+// A reader parked in Recv cannot notice a promotion on its own: the old
+// primary has nothing left to send, so no batch arrives to check against
+// and no error is raised. Cancelling the STREAM's context is what makes
+// Recv answer; the parent is untouched, so the caller reconnects to the
+// new primary instead of shutting down.
+//
+// The goroutine ends with the stream, and may run one last poll in the
+// gap before its context is cancelled -- an atomic read of the snapshot
+// and an idempotent cancel, both harmless.
+func (r *reader) watchEpoch(sctx context.Context, cancel context.CancelFunc, epoch uint64) <-chan struct{} {
+	moved := make(chan struct{})
+	go func() {
+		t := time.NewTicker(epochPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-t.C:
+				if r.topo.Epoch(r.shard) != epoch {
+					// Closed before the cancel, so the caller's check
+					// after Recv always sees it.
+					close(moved)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return moved
+}
+
 // once opens one pooler stream at the last delivered position and consumes
 // it until it fails, the context ends or the shard's primary epoch changes.
 func (r *reader) once(ctx context.Context) error {
@@ -220,10 +279,30 @@ func (r *reader) once(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Watch the epoch rather than only checking it after a batch. A
+	// promotion moves the writes to the new primary, so the stream this
+	// reader still holds on the OLD one has nothing left to deliver: Recv
+	// blocks, the check below never runs, and the reader waits for a batch
+	// that is never coming while the rows it is supposed to be following
+	// are written somewhere else. That is a hang with no error in it, and
+	// nothing above can time it out because once never returns.
+	//
+	// Cancelling the stream's own context is what makes Recv answer. The
+	// parent context is untouched, so the outer loop reconnects to the new
+	// primary instead of shutting the reader down.
+	moved := r.watchEpoch(sctx, cancel, epoch)
 	r.asm.reset()
 	for {
 		batch, err := stream.Recv()
 		if err != nil {
+			// The watcher's cancel, not the caller's: report it as what it
+			// is so the outer loop reconnects at once rather than backing
+			// off on what looks like a transport failure.
+			select {
+			case <-moved:
+				return errEpochChanged
+			default:
+			}
 			return err
 		}
 		if r.topo.Epoch(r.shard) != epoch {
@@ -261,6 +340,10 @@ func (r *reader) once(ctx context.Context) error {
 func (r *reader) push(ctx context.Context, u *unit) bool {
 	select {
 	case r.out <- u:
+		// Anything delivered is the shard answering, which is what the
+		// reconnect window is asking about. Written and read on this
+		// goroutine only: once, copyOnce and run are the same one.
+		r.progressed = true
 	case <-ctx.Done():
 		return false
 	}

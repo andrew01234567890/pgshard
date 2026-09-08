@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -246,5 +247,88 @@ func TestKeylessCopyRestartsRatherThanResumingFromACtid(t *testing.T) {
 			t.Fatalf("the resumed stream never reached the pooler: %d requests", len(reqs))
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A copy is finite, but it is not immune to a promotion: a source that is
+// promoted away mid-copy sends no more and raises nothing, so a reader
+// waiting on it waits on a node that will never finish. It has to restart
+// the copy from its checkpoint on the new primary.
+//
+// Every other copy failure here ends with an error the reader can see.
+// This one ends with silence, which is what the real thing looks like.
+func TestACopyFollowsAPromotionWhenTheOldPrimaryGoesSilent(t *testing.T) {
+	h := newHarness(t, 1)
+	h.pool[0].copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		sc := script(cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["2"]`, "1", "2"))
+		sc.stall = true
+		return sc
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.open(ctx, copyStart(nil))
+	waitFor(t, func() bool { return len(h.pool[0].copyRequests()) == 1 })
+
+	promoted := newFakePooler(t)
+	promoted.copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		return script(cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["3"]`, "3"), cpTableDone("t"), cpDone())
+	}
+	h.topo.promote(shard0, promoted)
+	waitFor(t, func() bool { return len(promoted.copyRequests()) == 1 })
+	if r := promoted.copyRequests(); r[0].GetStream() != "plain" {
+		t.Fatalf("the copy did not restart on the promoted primary: %v", r)
+	}
+}
+
+// A copy that is delivering is the shard answering, and the reconnect
+// window has to see that.
+//
+// A copy's units carry a position only for the first snapshot, and only
+// when the stream started from nothing, so the position does not move for
+// the whole of a copy however many rows it sends. A window cleared by the
+// position alone therefore stays armed across a copy of any length: one
+// benign reconnect at the start, and the next transient failure ends the
+// reader as if the shard had been unreachable the entire time.
+//
+// The window is short enough here that the reconnect backoff alone
+// outlasts it, so the SECOND failure lands past it -- which is the case
+// that separates a window cleared by delivery from one that is not.
+func TestACopyDeliveringRowsClearsTheReconnectWindow(t *testing.T) {
+	h := newHarness(t, 1)
+	h.server.ReconnectWindow = 100 * time.Millisecond
+	var mu sync.Mutex
+	attempts := 0
+	h.pool[0].copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		switch n {
+		case 1, 2:
+			// Each delivers real rows and then drops. The second drop is
+			// more than a window after the first, so it is the one that
+			// ends the reader unless delivery has cleared the window.
+			sc := script(cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["`+itoa(n)+`"]`, itoa(n), "x"))
+			sc.failAfter, sc.err = 3, status.Error(codes.Unavailable, "pooler restarting")
+			return sc
+		}
+		return script(cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["9"]`, "9"), cpTableDone("t"), cpDone())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, copyStart(nil))
+
+	// A reader that gave up pushes an Error and stops, so it never asks a
+	// third time. Waiting for the third attempt is therefore the whole
+	// assertion; the events are drained afterwards to name the reason.
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return attempts >= 3
+	})
+	for _, ev := range recvN(t, st, 8, 10*time.Second) {
+		if e := ev.GetError(); e != nil {
+			t.Fatalf("the reader gave up on a copy that was delivering: %v", e)
+		}
 	}
 }

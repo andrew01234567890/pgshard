@@ -38,6 +38,9 @@ type copyScript struct {
 	msgs      []*pgshardv1.CopyTablesResponse
 	failAfter int
 	err       error
+	// stall holds the call open after its messages, the way a source that
+	// has been promoted away or frozen does: no more data, no error.
+	stall bool
 }
 
 func (f *fakePooler) CopyTables(req *pgshardv1.CopyTablesRequest, srv pgshardv1.Pooler_CopyTablesServer) error {
@@ -60,6 +63,10 @@ func (f *fakePooler) CopyTables(req *pgshardv1.CopyTablesRequest, srv pgshardv1.
 		if err := srv.Send(m); err != nil {
 			return err
 		}
+	}
+	if sc.stall {
+		<-srv.Context().Done()
+		return srv.Context().Err()
 	}
 	if sc.failAfter >= len(sc.msgs) {
 		return sc.err
