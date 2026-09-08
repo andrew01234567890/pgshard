@@ -3,6 +3,7 @@ package dockertest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,15 +11,15 @@ import (
 
 func refused(context.Context) error { return errors.New("connection refused") }
 
-func probes(running bool, why string, size func() int) dockerProbes {
+func probes(running bool, why string, size func() string) dockerProbes {
 	return dockerProbes{
 		running: func(string) (bool, string) { return running, why },
-		logSize: func(string) int { return size() },
+		mark:    func(string) string { return size() },
 		log:     func(string) string { return "the container said this" },
 	}
 }
 
-func steady(n int) func() int { return func() int { return n } }
+func steady(n string) func() string { return func() string { return n } }
 
 func TestWaitReadyReturnsWhenTheServerAnswers(t *testing.T) {
 	calls := 0
@@ -29,7 +30,7 @@ func TestWaitReadyReturnsWhenTheServerAnswers(t *testing.T) {
 		}
 		return nil
 	}
-	if err := waitReady("c", connect, probes(true, "running", steady(10)), time.Minute, time.Minute); err != nil {
+	if err := waitReady("c", connect, probes(true, "running", steady("one line")), time.Minute, time.Minute); err != nil {
 		t.Fatalf("a server that came up was reported as %v", err)
 	}
 }
@@ -39,7 +40,7 @@ func TestWaitReadyReturnsWhenTheServerAnswers(t *testing.T) {
 // only that PostgreSQL never became ready.
 func TestWaitReadyGivesUpAtOnceOnAContainerThatStopped(t *testing.T) {
 	start := time.Now()
-	err := waitReady("c", refused, probes(false, "exited exit=1", steady(10)), time.Minute, time.Minute)
+	err := waitReady("c", refused, probes(false, "exited exit=1", steady("one line")), time.Minute, time.Minute)
 	if err == nil {
 		t.Fatal("a stopped container was reported as ready")
 	}
@@ -59,7 +60,7 @@ func TestWaitReadyGivesUpAtOnceOnAContainerThatStopped(t *testing.T) {
 // machine, which is when it is least likely to be a real defect.
 func TestWaitReadyKeepsWaitingWhileTheContainerIsStillLogging(t *testing.T) {
 	size := 0
-	growing := func() int { size += 10; return size }
+	growing := func() string { size++; return fmt.Sprint("line ", size) }
 	start := time.Now()
 	err := waitReady("c", refused, probes(true, "running", growing), 300*time.Millisecond, 2*time.Second)
 	if err == nil {
@@ -79,7 +80,7 @@ func TestWaitReadyKeepsWaitingWhileTheContainerIsStillLogging(t *testing.T) {
 // forever either.
 func TestWaitReadyGivesUpWhenNothingProgresses(t *testing.T) {
 	start := time.Now()
-	err := waitReady("c", refused, probes(true, "running", steady(10)), 300*time.Millisecond, time.Minute)
+	err := waitReady("c", refused, probes(true, "running", steady("one line")), 300*time.Millisecond, time.Minute)
 	if err == nil {
 		t.Fatal("it never gave up")
 	}
@@ -88,5 +89,32 @@ func TestWaitReadyGivesUpWhenNothingProgresses(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "logged nothing") {
 		t.Errorf("gave up for the wrong reason: %v", err)
+	}
+}
+
+// Docker is asked on its own, slower clock than the server is.
+//
+// Connecting is a local socket; asking docker is two processes and a
+// daemon round trip, and doing both at the connect interval put a hundred
+// docker calls a second on a machine already slow enough to need this
+// wait -- so the loop's own cost lengthened the startup it was measuring.
+func TestWaitReadyAsksDockerFarLessOftenThanItConnects(t *testing.T) {
+	var connects, probes int
+	connect := func(context.Context) error { connects++; return errors.New("not yet") }
+	p := dockerProbes{
+		running: func(string) (bool, string) { probes++; return true, "running" },
+		mark:    func(string) string { return "one line" },
+		log:     func(string) string { return "" },
+	}
+	if err := waitReady("c", connect, p, 2*time.Second, time.Minute); err == nil {
+		t.Fatal("it never gave up")
+	}
+	// Two seconds of idle bound: about twenty connects and about two or
+	// three probes. The assertion is the ratio, not the counts.
+	if connects < 10 {
+		t.Fatalf("only %d connection attempts in two seconds", connects)
+	}
+	if probes*4 > connects {
+		t.Errorf("%d docker probes against %d connection attempts; docker is being asked at the connect interval", probes, connects)
 	}
 }

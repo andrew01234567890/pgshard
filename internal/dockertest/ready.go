@@ -26,6 +26,12 @@ import (
 const (
 	ReadyIdle = 90 * time.Second
 	ReadyCap  = 6 * time.Minute
+
+	// connectEvery is how often the server is asked, and probeEvery how
+	// often docker is. They differ by an order of magnitude because their
+	// costs do.
+	connectEvery = 100 * time.Millisecond
+	probeEvery   = time.Second
 )
 
 // Connector reports whether the server is accepting connections. It is a
@@ -37,7 +43,7 @@ type Connector func(ctx context.Context) error
 // container stops, stops making progress, or reaches ReadyCap.
 func WaitReady(tb testing.TB, id string, connect Connector) {
 	tb.Helper()
-	if err := waitReady(id, connect, dockerProbes{running: containerRunning, logSize: containerLogSize, log: containerLog}, ReadyIdle, ReadyCap); err != nil {
+	if err := waitReady(id, connect, dockerProbes{running: containerRunning, mark: containerLogMark, log: containerLog}, ReadyIdle, ReadyCap); err != nil {
 		tb.Fatal(err)
 	}
 }
@@ -48,7 +54,7 @@ func WaitReady(tb testing.TB, id string, connect Connector) {
 // them is reachable from a test that needs a real slow container.
 type dockerProbes struct {
 	running func(id string) (bool, string)
-	logSize func(id string) int
+	mark    func(id string) string
 	log     func(id string) string
 }
 
@@ -60,7 +66,9 @@ type dockerProbes struct {
 // PostgreSQL never became ready.
 func waitReady(id string, connect Connector, probe dockerProbes, idle, limit time.Duration) error {
 	start := time.Now()
-	lastProgress, lastSize := start, probe.logSize(id)
+	// The first probe happens on the first pass, so a container that is
+	// already gone is reported at once rather than after an interval.
+	lastProgress, lastMark, lastProbe := start, probe.mark(id), start.Add(-probeEvery)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		err := connect(ctx)
@@ -68,12 +76,22 @@ func waitReady(id string, connect Connector, probe dockerProbes, idle, limit tim
 		if err == nil {
 			return nil
 		}
+		// Connecting is a local socket; asking docker is two processes and
+		// a daemon round trip. Doing both at the connect interval put a
+		// hundred docker calls a second on a machine that is already the
+		// reason this wait exists, so the loop's own cost lengthened the
+		// startup it was measuring. Ask docker on its own, slower clock.
+		if time.Since(lastProbe) < probeEvery {
+			time.Sleep(connectEvery)
+			continue
+		}
+		lastProbe = time.Now()
 		if running, why := probe.running(id); !running {
 			return fmt.Errorf("the container stopped after %s without accepting a connection (%s); last error %w\ncontainer log:\n%s",
 				time.Since(start).Round(time.Second), why, err, probe.log(id))
 		}
-		if size := probe.logSize(id); size != lastSize {
-			lastProgress, lastSize = time.Now(), size
+		if mark := probe.mark(id); mark != lastMark {
+			lastProgress, lastMark = time.Now(), mark
 		}
 		switch {
 		case time.Since(lastProgress) > idle:
@@ -83,7 +101,7 @@ func waitReady(id string, connect Connector, probe dockerProbes, idle, limit tim
 			return fmt.Errorf("the container did not accept a connection within %s, though it was still logging; last error %w\ncontainer log:\n%s",
 				limit, err, probe.log(id))
 		}
-		time.Sleep(min(100*time.Millisecond, idle/4))
+		time.Sleep(connectEvery)
 	}
 }
 
@@ -108,12 +126,17 @@ func containerLog(id string) string {
 	return string(out)
 }
 
-// containerLogSize is the progress signal: a container that is still
+// containerLogMark is the progress signal: a container that is still
 // writing is still starting, however slowly the machine is running it.
-func containerLogSize(id string) int {
-	out, err := exec.Command("docker", "logs", id).CombinedOutput()
+//
+// It is the last line WITH ITS TIMESTAMP rather than the size of the whole
+// log, so it costs the same on a container that has logged a megabyte as
+// on one that has logged a line, and so that a line repeated verbatim
+// still reads as progress.
+func containerLogMark(id string) string {
+	out, err := exec.Command("docker", "logs", "--timestamps", "--tail", "1", id).CombinedOutput()
 	if err != nil {
-		return -1
+		return "unreadable"
 	}
-	return len(out)
+	return string(out)
 }
