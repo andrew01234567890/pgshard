@@ -601,6 +601,32 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 		if _, err := primary.Exec(ctx, "select pg_log_standby_snapshot()"); err != nil {
 			t.Fatalf("could not ask the primary for a running-xacts record: %v", err)
 		}
+		// Then write, read and acknowledge, so the primary's slot actually
+		// MOVES past that record.
+		//
+		// The record alone is not enough. A primary slot's catalog_xmin
+		// advances only through LogicalConfirmReceivedLocation -- the
+		// walsender decodes the record and then the CONSUMER confirms past
+		// it -- and the pooler sends the position this client has
+		// acknowledged. With nothing written there is nothing to deliver,
+		// nothing to acknowledge, and the slot stands still however many
+		// records are emitted. That is why this wait failed on CI while
+		// passing here: a standby that still holds WAL back to the slot's
+		// position reserves AT it and its copy persists unaided, and one
+		// whose redo pointer has moved past reserves AHEAD, leaving a gap
+		// only the primary's slot advancing can close.
+		//
+		// The probe id is 999, which the assertions after the promotion
+		// already filter out, and it is deleted again so the row count is
+		// unchanged.
+		insert(t1, 999)
+		probe := consume(t, reader, func(c *consumed) bool { return len(flatten(c)) >= 1 })
+		if err := st.Send(&pgshardv1.VStreamRequest{Request: &pgshardv1.VStreamRequest_Ack{Ack: probe.last}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, fmt.Sprintf("delete from orders where tenant_id = %d and id = 999", t1), pgx.QueryExecModeSimpleProtocol); err != nil {
+			t.Fatalf("clearing the slot probe: %v", err)
+		}
 		_, lastSyncErr = standby.Exec(ctx, "select pg_sync_replication_slots()")
 		var synced bool
 		var replay, current int64
