@@ -90,8 +90,10 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 	// cannot answer truthfully is refused whatever else it does, and the
 	// answer depends on the snapshot, so it cannot live in the memoised
 	// per-tree scan above.
-	if err := w.sequenceRefusal(raw.GetStmt()); err != nil {
-		return refusalErr(err)
+	if scan.sequenceFunc {
+		if err := w.sequenceRefusal(raw.GetStmt()); err != nil {
+			return refusalErr(err)
+		}
 	}
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
@@ -319,6 +321,20 @@ type preScan struct {
 	// advisoryLock names a session-scoped advisory-lock function the
 	// statement calls, empty when it calls none.
 	advisoryLock string
+	// sequenceFunc is set when the statement calls one of the sequence
+	// built-ins whose answer the router may have to refuse. Whether it IS
+	// refused depends on the snapshot -- which sequences are registered as
+	// global -- so only this much can be memoised; but a statement calling
+	// none of them cannot be refused for one, and that is nearly all of
+	// them, so the walk that decides is skipped.
+	sequenceFunc bool
+}
+
+// sequenceFuncs are the built-ins sequenceRefusal has something to say
+// about. Kept beside the scan that looks for them so the two cannot drift.
+var sequenceFuncs = map[string]bool{
+	"lastval": true, "currval": true, "setval": true, "nextval": true,
+	"pg_sequence_last_value": true,
 }
 
 func scanStatement(root *pgquerypb.Node) preScan {
@@ -351,6 +367,12 @@ func scanStatement(root *pgquerypb.Node) preScan {
 		}
 		if out.advisoryLock == "" {
 			out.advisoryLock = sessionAdvisoryLock(n)
+		}
+		if fc := n.GetFuncCall(); fc != nil && !out.sequenceFunc {
+			names := stringList(fc.GetFuncname())
+			if len(names) > 0 && sequenceFuncs[strings.ToLower(names[len(names)-1])] {
+				out.sequenceFunc = true
+			}
 		}
 		return true
 	})
