@@ -513,6 +513,18 @@ func (f *fakePooler) dropCount() int {
 	return f.dropped
 }
 
+// sessionsSeen reports every session id that has opened an Execute stream
+// on this shard.
+func (f *fakePooler) sessionsSeen() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]int, len(f.attaches))
+	for sid, n := range f.attaches {
+		out[sid] = n
+	}
+	return out
+}
+
 // cancelled reports the session ids cancelled so far.
 func (f *fakePooler) cancelled() []string {
 	f.mu.Lock()
