@@ -1628,7 +1628,10 @@ const applyFlushBytes = 8 << 20
 // stops with a message naming the table and the size is one an operator
 // can act on; a controller killed by the kernel takes every other workflow
 // with it and says nothing.
-const catchUpMaxOpenBytes = 256 << 20
+// It is a var so a test can lower it: the bound is only interesting
+// once it trips, and tripping it as written means holding a quarter of a
+// gigabyte of test data.
+var catchUpMaxOpenBytes = 256 << 20
 
 func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn ShardConn, targets targetConns, s int32, drain bool) (int64, int, error) {
 	dec := NewDecoder()
@@ -1658,7 +1661,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 		// transaction being decoded and of the ones already committed.
 		readyBytes, openBytes := 0, 0
 		flush := func() error {
-			if err := applyOps(ctx, targets, ready); err != nil {
+			if err := applyOps(ctx, targets, wf.shape, wf.shadow(), ready); err != nil {
 				return err
 			}
 			applied += readyN
@@ -1693,7 +1696,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 				return 0, applied, fatal("%w", err)
 			}
 			for _, op := range ops {
-				openBytes += len(op.sql)
+				openBytes += op.bytes()
 			}
 			if openBytes > catchUpMaxOpenBytes {
 				return 0, applied, fatal("a single source transaction on %s/%d holds %d bytes of changes to %s, past the %d-byte catch-up bound: it cannot be applied until it commits, so it cannot be flushed",
@@ -1743,8 +1746,11 @@ const applyBatchBytes = 1 << 20
 
 // applyOps applies the operations to their targets. Order is preserved per
 // target - a row inserted then deleted must stay deleted - but not across
-// targets, which is sound because a target only ever holds keys no other
-// target holds, so no two targets order the same row.
+// targets. That is sound for the final state whether or not a key lives on
+// one target: a reference table gives every shard the same ordered
+// sequence for the row, and a row that moves gives the two shards a delete
+// and an insert of a key the other one is not holding. See the reasoning
+// on the concurrency below for what it does to the transient window.
 //
 // Each target's work goes out as one multi-statement query in a transaction
 // rather than a statement per operation. That is the difference between one
@@ -1752,28 +1758,62 @@ const applyBatchBytes = 1 << 20
 // used to apply around 765 operations a second, which a single ordinary
 // writer outran, so slot lag grew instead of converging and the placement
 // never reached its cutover.
-func applyOps(ctx context.Context, targets targetConns, ops []applyOp) error {
+func applyOps(ctx context.Context, targets targetConns, shape rowShape, table string, ops []applyOp) error {
 	if len(ops) == 0 {
 		return nil
 	}
 	order := make([]int32, 0, len(targets))
-	byTarget := map[int32][]string{}
+	byTarget := map[int32][]applyOp{}
 	for _, op := range ops {
 		if _, seen := byTarget[op.shard]; !seen {
 			order = append(order, op.shard)
 		}
-		byTarget[op.shard] = append(byTarget[op.shard], op.sql)
+		byTarget[op.shard] = append(byTarget[op.shard], op)
 	}
+	stmts := make(map[int32][]string, len(byTarget))
 	for _, shard := range order {
+		stmts[shard] = coalesce(shape, table, byTarget[shard])
+	}
+	conns := make([]ShardConn, len(order))
+	for i, shard := range order {
 		conn, ok := targets[shard]
 		if !ok {
 			return fmt.Errorf("no connection to target shard %d", shard)
 		}
-		if err := applyToTarget(ctx, conn, byTarget[shard]); err != nil {
-			return fmt.Errorf("target %d: %w", shard, err)
-		}
+		conns[i] = conn
 	}
-	return nil
+	// One goroutine per target, because the targets are separate shards on
+	// separate connections and a flush otherwise costs the SUM of their
+	// round trips where it could cost the largest. Catch-up latency is what
+	// decides whether the slot converges before the write fence, so on a
+	// split into n targets this is the difference between converging and
+	// not.
+	//
+	// Each target keeps its own operations in order, which is the ordering
+	// that matters: an upsert and a later delete of the same row are always
+	// on the same shard. Two targets are only ever both involved in a row
+	// that MOVES between shards, which is a delete on the old one and an
+	// insert on the new one; the serial version already ran those in
+	// whichever order the targets happened to fall in, so the row was
+	// already briefly on both shards or on neither. This widens that window
+	// rather than opening it, and catch-up runs before the fence, when no
+	// client reads the shadow tables.
+	//
+	// A target that fails leaves the others' work committed. That was true
+	// serially too, and it is safe for the same reason: the slot advances
+	// only after the whole flush succeeds, so the round is decoded again,
+	// and every statement it applies is idempotent -- upserts carry ON
+	// CONFLICT and deletes name a primary key.
+	g, gctx := errgroup.WithContext(ctx)
+	for i, shard := range order {
+		g.Go(func() error {
+			if err := applyToTarget(gctx, conns[i], stmts[shard]); err != nil {
+				return fmt.Errorf("target %d: %w", shard, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 func applyToTarget(ctx context.Context, conn ShardConn, stmts []string) error {
@@ -2577,4 +2617,69 @@ func sortedInt32Keys[V any](m map[int32]V) []int32 {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// coalesce renders one target's operations, joining each run of plain
+// upserts into a single multi-row statement.
+//
+// The rows of a run go out as one INSERT ... VALUES (..),(..) ON CONFLICT,
+// which is the whole point: an operation otherwise carries one row and its
+// literals, so a thousand-row round trip was a thousand parses and a
+// thousand plans on the target.
+//
+// A run ENDS at a primary key it has already carried. Checked against
+// PostgreSQL 18: a second row with the same key in one command fails ON
+// CONFLICT DO UPDATE outright -- "cannot affect row a second time" -- and
+// the DO NOTHING form used when a table is all key columns does not fail
+// but keeps the FIRST row and drops the second. So a row that changes
+// twice inside one flush would either break catch-up or quietly apply the
+// older value; ending the run applies both, in order.
+//
+// A run also ends at anything that is not a plain upsert, which keeps the
+// other ordering that matters: an upsert and a later delete of the same
+// row are both on this target and stay in sequence.
+func coalesce(shape rowShape, table string, ops []applyOp) []string {
+	var out []string
+	var run []*Tuple
+	runBytes := 0
+	seen := map[string]bool{}
+	flush := func() {
+		if len(run) == 0 {
+			return
+		}
+		out = append(out, shape.UpsertSQL(table, run)...)
+		run, runBytes, seen = nil, 0, map[string]bool{}
+	}
+	for _, op := range ops {
+		if op.up == nil {
+			flush()
+			out = append(out, op.sql)
+			continue
+		}
+		k := pkKey(shape, op.up)
+		if seen[k] || len(run) >= applyBatchOps || runBytes >= applyBatchBytes {
+			flush()
+		}
+		seen[k] = true
+		run = append(run, op.up)
+		runBytes += op.bytes()
+	}
+	flush()
+	return out
+}
+
+// pkKey identifies a row within one coalescing run. The values are already
+// the decoder's own strings, so a separator that cannot appear in a length
+// prefix is enough to keep two columns from running together.
+func pkKey(shape rowShape, row *Tuple) string {
+	var b strings.Builder
+	for _, i := range shape.pkIndexes() {
+		v := row.Values[i]
+		if v == nil {
+			b.WriteString("\\N|")
+			continue
+		}
+		fmt.Fprintf(&b, "%d:%s|", len(*v), *v)
+	}
+	return b.String()
 }

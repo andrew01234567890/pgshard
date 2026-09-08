@@ -279,10 +279,15 @@ func (s rowShape) DeleteSQL(table string, row *Tuple) string {
 	return "DELETE FROM " + s.qualified(table) + " WHERE " + strings.Join(conds, " AND ")
 }
 
-// applyOp is one statement bound for one shard.
+// applyOp is one statement bound for one shard. up is set instead of sql
+// for a plain upsert -- one carrying every column, so it can share a
+// multi-row statement with the other plain upserts bound for its shard.
+// A row with unchanged (TOAST) columns names only the columns it carries,
+// so it cannot join them and arrives rendered like a delete does.
 type applyOp struct {
 	shard int32
 	sql   string
+	up    *Tuple
 }
 
 // routeChange turns a decoded change into the statements the shadow tables
@@ -300,9 +305,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 			return nil, err
 		}
 		for _, t := range targets {
-			for _, sql := range shape.UpsertSQL(table, []*Tuple{c.New}) {
-				ops = append(ops, applyOp{t, sql})
-			}
+			ops = append(ops, upsertOps(shape, table, t, c.New)...)
 		}
 	case OpDelete:
 		targets, err := r.Route(c.Old.Values)
@@ -310,7 +313,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 			targets = r.Holders()
 		}
 		for _, t := range targets {
-			ops = append(ops, applyOp{t, shape.DeleteSQL(table, c.Old)})
+			ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, c.Old)})
 		}
 	case OpUpdate:
 		if c.Old != nil {
@@ -334,7 +337,7 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 		}
 		for _, t := range oldTargets {
 			if !slices.Contains(newTargets, t) {
-				ops = append(ops, applyOp{t, shape.DeleteSQL(table, old)})
+				ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, old)})
 			}
 		}
 		// A changed GENERATED ALWAYS identity is replayed the same way a
@@ -344,11 +347,9 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 		replace := !samePK(shape, old, c.New) || shape.alwaysIdentityChanged(c.Old, c.New)
 		for _, t := range newTargets {
 			if replace && slices.Contains(oldTargets, t) {
-				ops = append(ops, applyOp{t, shape.DeleteSQL(table, old)})
+				ops = append(ops, applyOp{shard: t, sql: shape.DeleteSQL(table, old)})
 			}
-			for _, sql := range shape.UpsertSQL(table, []*Tuple{c.New}) {
-				ops = append(ops, applyOp{t, sql})
-			}
+			ops = append(ops, upsertOps(shape, table, t, c.New)...)
 		}
 	}
 	return ops, nil
@@ -362,4 +363,51 @@ func samePK(shape rowShape, a, b *Tuple) bool {
 		}
 	}
 	return true
+}
+
+// upsertOps is one row's upsert for one shard: carried as a tuple when it
+// can join a multi-row statement, rendered when it cannot.
+func upsertOps(shape rowShape, table string, shard int32, row *Tuple) []applyOp {
+	if !slices.Contains(row.Unchanged, true) {
+		return []applyOp{{shard: shard, up: row}}
+	}
+	var ops []applyOp
+	for _, sql := range shape.UpsertSQL(table, []*Tuple{row}) {
+		ops = append(ops, applyOp{shard: shard, sql: sql})
+	}
+	return ops
+}
+
+// bytes is what an operation will occupy in the statement that carries it.
+//
+// Every bound in catch-up is expressed in these: how much of a committed
+// hold goes out in one flush, how much of one uncommitted transaction the
+// controller will retain, and how large a single statement may grow. A
+// plain upsert is carried as a tuple rather than rendered, so reading
+// op.sql alone would account the ordinary case as nothing and leave all
+// three bounds counting only deletes.
+//
+// The literals dominate and they are counted as they will be WRITTEN: a
+// value of quotes or backslashes doubles in length on the way into the
+// statement, and a bound that ignored that would be out by that factor
+// for exactly the values most likely to be large.
+func (op applyOp) bytes() int {
+	if op.up == nil {
+		return len(op.sql)
+	}
+	// Two bytes a column and three a row for the parentheses, commas and
+	// separator the values sit in, so that a run of narrow rows is not
+	// accounted as far smaller than the statement it becomes.
+	n := 2*len(op.up.Values) + 3
+	for _, v := range op.up.Values {
+		if v == nil {
+			n += len("NULL")
+			continue
+		}
+		n += len(*v) + strings.Count(*v, "'") + strings.Count(*v, `\`) + len("''")
+		if strings.ContainsRune(*v, '\\') {
+			n += len("E") // quoteLiteralE prefixes a literal that carries one
+		}
+	}
+	return n
 }
