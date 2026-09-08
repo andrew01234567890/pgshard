@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -25,6 +26,13 @@ func TestLoweringALimitShedsTheSessionsAboveIt(t *testing.T) {
 	if res := other.startupAs(ProtocolVersion30, "other"); res.ready == nil {
 		t.Fatalf("startup: %+v", res)
 	}
+	// ReadyForQuery is flushed before the session marks itself serving, so
+	// a client that has one may still be uncounted for a moment -- and the
+	// sweep counts only sessions that finished authenticating. Waiting for
+	// the count is the difference between asserting on the state and
+	// asserting on whichever part of it had arrived.
+	waitServing(t, ts, "busy", 4)
+	waitServing(t, ts, "other", 1)
 
 	// The limit drops to two, so the two newest of busy's four go and the
 	// unrelated role is untouched.
@@ -69,6 +77,7 @@ func TestARoleExactlyAtItsLimitKeepsEverySession(t *testing.T) {
 			t.Fatalf("startup: %+v", res)
 		}
 	}
+	waitServing(t, ts, "busy", 3)
 	if n := ts.TerminateExcess(func(string) (int32, bool) { return 3, true }); n != 0 {
 		t.Fatalf("terminated %d sessions of a role that is exactly at its limit", n)
 	}
@@ -141,10 +150,35 @@ func TestUnauthenticatedClaimantsDoNotEvictARolesSessions(t *testing.T) {
 		}
 	}
 
+	waitServing(t, ts, "busy", 1)
 	if n := ts.TerminateExcess(func(string) (int32, bool) { return 2, true }); n != 0 {
 		t.Fatalf("terminated %d sessions; the role holds one, and two strangers claiming its name are not its own", n)
 	}
 	if !stillOpen(t, genuine) {
 		t.Fatal("the role's own session was shed to make room for peers that never authenticated")
+	}
+}
+
+// waitServing blocks until user holds n sessions that finished
+// authenticating, which is the set the sweep counts.
+func waitServing(t *testing.T, ts *testServer, user string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := 0
+		ts.mu.Lock()
+		for _, sess := range ts.sessions {
+			if u, serving := sess.role(); serving && u == user {
+				got++
+			}
+		}
+		ts.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%q holds %d serving sessions, want %d", user, got, n)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
