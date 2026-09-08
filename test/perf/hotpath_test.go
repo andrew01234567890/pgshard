@@ -19,6 +19,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/andrew01234567890/pgshard/internal/placement"
+	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
@@ -295,6 +296,76 @@ func BenchmarkParserCacheMiss(b *testing.B) {
 		sql := fmt.Sprintf("SELECT abalance FROM pgbench_accounts WHERE aid = %d", i)
 		if _, err := p.Parse(ctx, sql); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// bulkPooler answers each Sync with 4 MiB of 4 KiB rows: the shape a
+// scatter draining a shard, a COPY or a change stream puts on the
+// router-to-pooler transport, where per-message cost stops mattering and
+// how the framer meets the socket starts to.
+type bulkPooler struct {
+	pgshardv1.UnimplementedPoolerServer
+}
+
+func (bulkPooler) Execute(stream grpc.BidiStreamingServer[pgshardv1.ExecuteRequest, pgshardv1.ExecuteResponse]) error {
+	row := make([]byte, 4096)
+	for {
+		if _, err := stream.Recv(); err != nil {
+			return nil
+		}
+		for range 1024 {
+			if err := stream.Send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_DataRow{
+				DataRow: &pgshardv1.DataRow{Columns: []*pgshardv1.Value{{Data: row}}}}}); err != nil {
+				return err
+			}
+		}
+		if err := stream.Send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_ReadyForQuery{
+			ReadyForQuery: &pgshardv1.ReadyForQuery{}}}); err != nil {
+			return err
+		}
+	}
+}
+
+// BenchmarkGRPCPoolerBulkStream is 4 MiB of rows over a real loopback
+// socket with the transport settings the pooler and router actually use.
+// BenchmarkGRPCPoolerHop above measures the per-statement cost over
+// bufconn, which has no socket and so cannot see them.
+func BenchmarkGRPCPoolerBulkStream(b *testing.B) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	insec := insecure.NewCredentials()
+	srv := grpc.NewServer(pooler.ServerOptions(grpc.Creds(insec))...)
+	pgshardv1.RegisterPoolerServer(srv, bulkPooler{})
+	go func() { _ = srv.Serve(lis) }()
+	b.Cleanup(srv.Stop)
+
+	cc, err := grpc.NewClient(lis.Addr().String(), pooler.DialOptions(grpc.WithTransportCredentials(insec))...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = cc.Close() })
+	stream, err := pgshardv1.NewPoolerClient(cc).Execute(context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(4 << 20)
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := stream.Send(&pgshardv1.ExecuteRequest{SessionId: "s1",
+			Message: &pgshardv1.ExecuteRequest_Sync{Sync: &pgshardv1.Sync{}}}); err != nil {
+			b.Fatal(err)
+		}
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, done := resp.Message.(*pgshardv1.ExecuteResponse_ReadyForQuery); done {
+				break
+			}
 		}
 	}
 }

@@ -222,9 +222,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	// answer those pings with GOAWAY too_many_pings and tear the connection
 	// down -- it permits one every five minutes and none at all without an
 	// active stream -- so the two halves have to be set together.
-	g := grpc.NewServer(grpc.Creds(creds),
-		grpc.KeepaliveEnforcementPolicy(pooler.KeepaliveEnforcement),
-		grpc.MaxRecvMsgSize(pooler.MaxMessageBytes), grpc.MaxSendMsgSize(pooler.MaxMessageBytes))
+	g := grpc.NewServer(pooler.ServerOptions(grpc.Creds(creds))...)
 	srv.Register(g)
 	mode := "mTLS"
 	if *insecureDev {
