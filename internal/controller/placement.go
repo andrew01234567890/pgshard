@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -176,6 +177,86 @@ type Placer struct {
 	CopyBatch int
 	// Now overrides the clock in tests.
 	Now func() time.Time
+
+	// peeks remembers, per workflow and source, the peek size that last
+	// reached a commit. See (*Placer).peekLimit.
+	//
+	// Behind a pointer so a Placer stays copyable: a second replica is
+	// made by copying one, and a struct holding a mutex cannot be. Two
+	// copies then share what they learn, which is right -- they drive the
+	// same workflows against the same sources.
+	peeks *peekMemory
+}
+
+type peekMemory struct {
+	mu     sync.Mutex
+	limits map[string]int
+}
+
+// peekInit guards only the lazy creation of a Placer's memory. Placers are
+// built as literals all over, so there is no constructor to do it in, and
+// a package-level lock is affordable for something reached once per
+// catch-up rather than once per row.
+var peekInit sync.Mutex
+
+func (p *Placer) peekMem() *peekMemory {
+	peekInit.Lock()
+	defer peekInit.Unlock()
+	if p.peeks == nil {
+		p.peeks = &peekMemory{limits: map[string]int{}}
+	}
+	return p.peeks
+}
+
+// peekLimit is the size catch-up should ask pg_logical_slot_peek_binary_changes
+// for on this source, and remember records what actually worked.
+//
+// A peek that fills without reaching a commit is wasted: nothing in it can
+// be applied, and the next attempt decodes the same changes again from the
+// slot. catchUpSource quadruples until a commit fits, which bounds the
+// number of attempts -- but it started from peekChanges on EVERY pass, so
+// a workflow whose transactions are consistently larger than that paid the
+// whole ramp every time, decoding the same rows two or three times over
+// before it could apply any of them.
+//
+// It is remembered in memory rather than in the workflow's state because
+// it is a hint and not a fact: losing it on a restart costs one ramp,
+// which is what happens today on every pass.
+func (p *Placer) peekLimit(wf *placementWorkflow, source int32) int {
+	m := p.peekMem()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n, ok := m.limits[peekKey(wf, source)]; ok && n > peekChanges {
+		return n
+	}
+	return peekChanges
+}
+
+func (p *Placer) rememberPeekLimit(wf *placementWorkflow, source int32, limit int) {
+	if limit <= peekChanges {
+		return
+	}
+	m := p.peekMem()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.limits[peekKey(wf, source)] = limit
+}
+
+// forgetPeekLimits drops what a finished workflow learned, so the map does
+// not grow with every placement the process ever drove.
+func (p *Placer) forgetPeekLimits(wf *placementWorkflow) {
+	m := p.peekMem()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k := range m.limits {
+		if strings.HasPrefix(k, wf.id+"/") {
+			delete(m.limits, k)
+		}
+	}
+}
+
+func peekKey(wf *placementWorkflow, source int32) string {
+	return fmt.Sprintf("%s/%d", wf.id, source)
 }
 
 // PlacementOutcome counts one pass.
@@ -368,6 +449,7 @@ func (p *Placer) saveTx(ctx context.Context, tx pgx.Tx, wf *placementWorkflow, m
 
 func (p *Placer) finish(ctx context.Context, wf *placementWorkflow, state, message string) error {
 	wf.state = state
+	p.forgetPeekLimits(wf)
 	return p.save(ctx, wf, message)
 }
 

@@ -1636,7 +1636,7 @@ var catchUpMaxOpenBytes = 256 << 20
 func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn ShardConn, targets targetConns, s int32, drain bool) (int64, int, error) {
 	dec := NewDecoder()
 	applied := 0
-	limit := peekChanges
+	limit := p.peekLimit(wf, s)
 	for round := 0; ; round++ {
 		rows, err := conn.Query(ctx, `SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication_names', $3)`,
 			wf.slotName(s), limit, wf.publicationName())
@@ -1722,6 +1722,7 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			}
 		case len(msgs) >= limit:
 			limit *= 4
+			p.rememberPeekLimit(wf, s, limit)
 			continue
 		}
 		lag, err := slotLag(ctx, conn, wf.slotName(s))
