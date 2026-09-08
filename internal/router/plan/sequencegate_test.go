@@ -3,11 +3,28 @@ package plan
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
 )
+
+// sequenceGateNames is written out rather than read from sequenceFuncs so
+// that a name leaving the map is a failure here instead of a case this file
+// silently stops covering.
+var sequenceGateNames = []string{"lastval", "currval", "setval", "pg_sequence_last_value", "nextval"}
+
+func TestTheGateNamesExactlyTheFunctionsTheRefusalHandles(t *testing.T) {
+	for _, name := range sequenceGateNames {
+		if !sequenceFuncs[name] {
+			t.Errorf("%s is refused but the gate does not name it, so its refusal would be skipped", name)
+		}
+	}
+	if len(sequenceFuncs) != len(sequenceGateNames) {
+		t.Errorf("the gate names %d functions, this test knows %d", len(sequenceFuncs), len(sequenceGateNames))
+	}
+}
 
 // The pre-filter decides whether the sequence refusal runs at all, so every
 // function that refusal has something to say about has to be in it. One
@@ -22,16 +39,25 @@ func TestEverySequenceFunctionTheGateNamesIsStillRefused(t *testing.T) {
 		"select currval('invoice_numbers')",
 		"select setval('invoice_numbers', 42)",
 		"select pg_sequence_last_value('invoice_numbers'::regclass)",
+		// Not `SELECT nextval(...)` on its own, which the router answers
+		// from the global counter; anywhere else it must be refused rather
+		// than allocated from one shard.
+		"select nextval('invoice_numbers') + 1",
 	} {
-		if _, err := p.Plan(ctx, session(snap), sql); err == nil {
+		_, err := p.Plan(ctx, session(snap), sql)
+		if err == nil {
 			t.Errorf("%s: planned without a refusal", sql)
+			continue
+		}
+		if !strings.Contains(err.Error(), "is not available") {
+			t.Errorf("%s: refused with %v, which is not the sequence refusal", sql, err)
 		}
 	}
 }
 
 // And the scan notices each of them, which is what lets the refusal run.
 func TestTheScanNoticesEverySequenceFunctionInTheGate(t *testing.T) {
-	for name := range sequenceFuncs {
+	for _, name := range sequenceGateNames {
 		sql := fmt.Sprintf("select %s()", name)
 		res, err := pgparser.Parse(sql)
 		if err != nil {
