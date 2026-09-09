@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -133,6 +134,51 @@ func sqlstate(err error) string {
 		return pe.Code
 	}
 	return ""
+}
+
+// TestAnOidAboveTheSignedBoundaryIsNotNegative: OID is unsigned and real
+// installations wrap through the whole 32-bit range. Decoded through int32
+// every value above 2147483647 came back negative, so an ascending merge put
+// it before every small OID and LIMIT 1 returned the wrong row. The text
+// format was always right, which made the two formats disagree.
+func TestAnOidAboveTheSignedBoundaryIsNotNegative(t *testing.T) {
+	be := func(u uint32) []byte { return []byte{byte(u >> 24), byte(u >> 16), byte(u >> 8), byte(u)} }
+	for _, c := range []struct {
+		a, b uint32
+		want int
+	}{
+		{1, 2147483648, -1},
+		{2147483648, 1, 1},
+		{2147483648, 2147483648, 0},
+		{2147483647, 2147483648, -1},
+		{4294967295, 2147483648, 1},
+	} {
+		cmp, err := ComparatorFor(oidOid, FormatBinary, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := cmp(be(c.a), be(c.b))
+		if err != nil || got != c.want {
+			t.Errorf("binary cmp(%d, %d) = %d, %v; want %d", c.a, c.b, got, err, c.want)
+		}
+		// The text format has always been right; the two must agree.
+		tcmp, err := ComparatorFor(oidOid, FormatText, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tgot, err := tcmp([]byte(strconv.FormatUint(uint64(c.a), 10)), []byte(strconv.FormatUint(uint64(c.b), 10)))
+		if err != nil || tgot != c.want {
+			t.Errorf("text cmp(%d, %d) = %d, %v; want %d", c.a, c.b, tgot, err, c.want)
+		}
+	}
+	// A plain int4 keeps its sign: the fix must not reach past OID.
+	cmp, err := ComparatorFor(oidInt4, FormatBinary, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := cmp(be(uint32(4294967295)), be(1)); err != nil || got != -1 {
+		t.Errorf("int4 -1 must still sort below 1: got %d, %v", got, err)
+	}
 }
 
 func TestRowComparatorDirectionsAndNulls(t *testing.T) {
