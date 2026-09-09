@@ -163,13 +163,28 @@ What that does to work in flight — **a revocation is not a drain**:
   blip would disconnect every session in the cluster, which is a worse
   outage than a revocation landing one interval later.
 
-**`CONNECTION LIMIT` is not part of this.** Lowering it refuses new sessions
-and leaves open ones alone, exactly as PostgreSQL does. The limit is also
-per router instance, so `n` behind an HPA of `r` routers admits up to
-`n × r` — PostgreSQL documents its own limit as approximate for a
-comparable reason, but the factor here is the router count rather than a
-race. Cluster-wide accounting, and whether lowering a limit should close
-sessions at all, are open (PGS-309).
+**`CONNECTION LIMIT` is part of this, and pgshard differs from PostgreSQL
+here.** PostgreSQL checks the limit only when a session connects, so
+lowering it leaves open sessions alone. pgshard also sheds them: each
+refresh counts a role's authenticated sessions and terminates the ones over
+the new allowance, **newest first** by arrival order. The client is told
+first, as a revoked one is: a `FATAL` carrying `57P01` (`admin_shutdown`),
+*"terminating connection because the role holds more connections than its
+limit now allows"*, on the same bounded write. Otherwise the sessions
+already open would keep whatever the old allowance let the role take,
+which is the thing being lowered.
+
+Sessions still proving who they are are not counted, and so are never shed:
+a session publishes the role it claims before it proves it -- so that a
+revocation reaches a client mid-exchange -- and counting those would let
+anyone who can reach the port claim a role, stall at the password prompt,
+and have that role's real sessions shed instead. The connect path counts
+the same set.
+
+The limit is per router instance, so `n` behind an HPA of `r` routers
+admits up to `n × r` -- PostgreSQL documents its own limit as approximate
+for a comparable reason, but the factor here is the router count rather
+than a race. Cluster-wide accounting is open (PGS-309).
 
 ## DEGRADED
 
