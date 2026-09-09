@@ -401,7 +401,7 @@ func waitRun(t *testing.T, r *BackupReconciler, b *pgshardv1alpha1.PgShardBackup
 	}
 }
 
-func TestBackupReconcilerRunsEveryGroupPrimaryInOrder(t *testing.T) {
+func TestBackupReconcilerBacksUpEveryGroupPrimaryThenExpires(t *testing.T) {
 	agents := &fakeBackupAgents{results: map[string]BackupResult{
 		"10.0.0.2:9090": {Label: "20260819-020000F_20260819-030000I", Type: "incr", StartLSN: 0x3000028, StopLSN: 0x4000050, ArchiveStart: "000000010000000000000003", ArchiveStop: "000000010000000000000004", SizeBytes: 200, RepoBytes: 20},
 	}}
@@ -426,6 +426,11 @@ func TestBackupReconcilerRunsEveryGroupPrimaryInOrder(t *testing.T) {
 	// would have to be rewritten every time the concurrency changed, and
 	// would fail for a reason that has nothing to do with what it protects.
 	journal := agents.journal()
+	// Length first: slicing a short journal would panic where the point is
+	// to say what was missing.
+	if len(journal) != 4 {
+		t.Fatalf("calls %v, want two backups then two expires", journal)
+	}
 	if want := []string{"backup 10.0.0.1:9090 incr", "backup 10.0.0.2:9090 incr"}; !sameSet(journal[:2], want) {
 		t.Fatalf("first two calls %v, want both backups", journal)
 	}
@@ -988,6 +993,13 @@ func sameSet(got, want []string) bool {
 // into the deadline.
 func TestBackupRunsItsGroupsConcurrently(t *testing.T) {
 	agents := &fakeBackupAgents{block: make(chan struct{})}
+	// Whatever happens, the gate opens: a test that fails on the deadline
+	// below would otherwise leave the run's workers parked on it until the
+	// process exits.
+	var once sync.Once
+	openGate := func() { once.Do(func() { close(agents.block) }) }
+	t.Cleanup(openGate)
+
 	r, _, b := backupFixture(t, agents)
 	if _, got := reconcileBackup(t, r, b); got.Status.Phase != pgshardv1alpha1.BackupPhaseRunning {
 		t.Fatalf("the run did not start: %+v", got.Status)
@@ -999,7 +1011,7 @@ func TestBackupRunsItsGroupsConcurrently(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	close(agents.block)
+	openGate()
 	waitRun(t, r, b)
 	_, got := reconcileBackup(t, r, b)
 	if got.Status.Phase != pgshardv1alpha1.BackupPhaseCompleted || got.Status.Error != "" {
