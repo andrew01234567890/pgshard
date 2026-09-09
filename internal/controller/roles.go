@@ -447,8 +447,20 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 			return fmt.Errorf("role %s: %w", r.Name, err)
 		}
 	}
+	var roleErrs []error
 	for _, m := range d.Members {
 		if superusers[m.Member] {
+			continue
+		}
+		// The GRANTED role matters as much as the member. Checking only the
+		// member left the shortest escalation in the system: an administrator
+		// who is deliberately not a superuser inserts the bootstrap superuser
+		// into pgshard.roles, then a membership row naming it, and the
+		// controller -- which dials every group as a superuser -- grants it to
+		// them everywhere. Refuse rather than skip, so the row is visible
+		// instead of quietly doing nothing.
+		if superusers[m.Role] {
+			roleErrs = append(roleErrs, fmt.Errorf("membership %s in %s: %w", m.Member, m.Role, catalog.ErrProtectedRole))
 			continue
 		}
 		sql := "GRANT " + pgx.Identifier{m.Role}.Sanitize() + " TO " + pgx.Identifier{m.Member}.Sanitize()
@@ -463,6 +475,13 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 		if superusers[s.Role] {
 			continue
 		}
+		// A per-role setting overrides the cluster-wide one, so this is how a
+		// role keeps writing through the write pause that cutover, rollback
+		// and barrier restore points depend on.
+		if err := catalog.CheckRoleSetting(s.Name); err != nil {
+			roleErrs = append(roleErrs, fmt.Errorf("setting of %s: %w", s.Role, err))
+			continue
+		}
 		sql := "ALTER ROLE " + pgx.Identifier{s.Role}.Sanitize()
 		if s.Database != "" {
 			sql += " IN DATABASE " + pgx.Identifier{s.Database}.Sanitize()
@@ -473,9 +492,9 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 		}
 	}
 	if !withGrants {
-		return nil
+		return errors.Join(roleErrs...)
 	}
-	var errs []error
+	errs := roleErrs
 	for _, db := range grantDatabases(d.Grants) {
 		dbConn, err := dial(ctx, db)
 		if err != nil {
@@ -499,6 +518,13 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 			// superuser on the shards. A privilege that is not a privilege
 			// is refused here rather than sent, whatever wrote the row.
 			if err := catalog.CheckPrivileges(g.Kind, g.Column, g.Privileges); err != nil {
+				errs = append(errs, fmt.Errorf("grant on %s %s to %s: %w", g.Kind, g.Name, g.Grantee, err))
+				continue
+			}
+			// The privileges being words is not enough: the OBJECT is
+			// concatenated too, and pg_catalog.pg_authid holds every role's
+			// SCRAM verifier.
+			if err := catalog.CheckGrantObject(g.Schema); err != nil {
 				errs = append(errs, fmt.Errorf("grant on %s %s to %s: %w", g.Kind, g.Name, g.Grantee, err))
 				continue
 			}
