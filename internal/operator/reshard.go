@@ -160,7 +160,15 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	if want != nil && *want == effective {
 		c.Status.AppliedShards = want
 	}
-	if pending == nil && want != nil && *want != effective && c.Status.AppliedShards != nil && *c.Status.AppliedShards == *want {
+	// A nil AppliedShards is an operator that has never acted on this
+	// spec.shards, not a fresh request: a cluster with no serving set
+	// materializes one from spec.shards above, so effective equals want on
+	// the first pass and the field is recorded. Reaching here with it unset
+	// means the catalog was resharded by something else -- or the operator
+	// predates the field -- and reading the difference as a request is the
+	// reverse reshard this guard exists to stop.
+	if pending == nil && want != nil && *want != effective && (c.Status.AppliedShards == nil || *c.Status.AppliedShards == *want) {
+		c.Status.AppliedShards = want
 		plan.cond.Status = metav1.ConditionTrue
 		plan.cond.Reason = "ShardCountConflict"
 		plan.cond.Message = fmt.Sprintf("spec.shards is %d and the serving shard set has %d: the catalog was resharded elsewhere and spec.shards has not changed since, so it is not being applied. Set spec.shards to %d to accept the catalog, or change it to reshard again",
