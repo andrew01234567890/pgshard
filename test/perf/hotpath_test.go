@@ -543,3 +543,67 @@ func (s *changeSink) Stream(_ *pgshardv1.StreamRequest, srv pgshardv1.Pooler_Str
 		}
 	}
 }
+
+// BenchmarkGRPCPoolerHopSocket is BenchmarkGRPCPoolerHop's workload on the
+// transport the router and pooler actually use: a loopback socket with the
+// pooler's dial and serve options, rather than bufconn.
+//
+// The two exist together because they answer different questions and the
+// difference between them IS an answer. bufconn has no socket, so it cannot
+// see the write buffers, the flow-control accounting or the syscalls -- the
+// per-message costs. Comparing the two says how much of a statement's
+// transport cost is per message, which is what PGS-190 proposes to remove
+// by batching the envelopes of one statement into fewer of them.
+//
+// Same three requests out and five responses back, so only the transport
+// differs. Measured on this machine, three runs each:
+//
+//	bufconn   32.7us  33.2us  32.9us   6.1 KB   167 allocs
+//	socket   134.0us 137.1us 135.0us   6.8 KB   167 allocs
+//
+// FOUR TIMES, at the SAME allocation count. About 100us per statement is
+// work bufconn does not do: eight messages of syscalls, framing, flow
+// control and scheduler handoffs. Anything measured on bufconn alone has
+// been measuring a transport that does not exist, which is why this one
+// exists beside it rather than instead of it.
+//
+// Loopback, so a real network is more, not less.
+func BenchmarkGRPCPoolerHopSocket(b *testing.B) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	insec := insecure.NewCredentials()
+	srv := grpc.NewServer(pooler.ServerOptions(grpc.Creds(insec))...)
+	pgshardv1.RegisterPoolerServer(srv, echoPooler{})
+	go func() { _ = srv.Serve(lis) }()
+	b.Cleanup(srv.Stop)
+	cc, err := grpc.NewClient(lis.Addr().String(), pooler.DialOptions(grpc.WithTransportCredentials(insec))...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = cc.Close() })
+	stream, err := pgshardv1.NewPoolerClient(cc).Execute(context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		reqs := []*pgshardv1.ExecuteRequest{
+			{SessionId: "s1", Message: &pgshardv1.ExecuteRequest_Bind{Bind: &pgshardv1.Bind{
+				Statement: "P0_1", Params: []*pgshardv1.Value{{Data: []byte("424242")}}}}},
+			{SessionId: "s1", Message: &pgshardv1.ExecuteRequest_Execute{Execute: &pgshardv1.ExecutePortal{}}},
+			{SessionId: "s1", Message: &pgshardv1.ExecuteRequest_Sync{Sync: &pgshardv1.Sync{}}},
+		}
+		for _, r := range reqs {
+			if err := stream.Send(r); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for range 5 {
+			if _, err := stream.Recv(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
