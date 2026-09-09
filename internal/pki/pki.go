@@ -331,6 +331,55 @@ var callers = map[string][]string{
 	ListenerVStream: {RoleConsumer},
 }
 
+// methods narrows what an ADMITTED caller may call, per listener and per
+// caller role. The callers table above decides who may connect; this
+// decides what connecting buys them.
+//
+// The two are not the same question, and the gap between them is written
+// into the RoleConsumer comment at the top of this file: the controller
+// admits {router, operator}, so before this table a router's certificate
+// was also a credential for CancelWorkflow, PauseWorkflow,
+// ResolveTransactions and CreateBarrier. The router needs two RPCs of the
+// controller and gets all of them.
+//
+// A listener/role pair with NO entry here is unrestricted, and that is
+// deliberate rather than an oversight. The entries are the ones whose full
+// set of calls can be PROVEN from the tree -- the router's controller
+// client is constructed in exactly one place and calls exactly these two
+// methods. An operator's certificate is also what a human administrator
+// presents today (RoleAdmin exists but is in no caller list), so narrowing
+// it would decide who may administer the cluster, which is a policy
+// question and not this table's to answer.
+var methods = map[string]map[string][]string{
+	RoleController: {
+		// internal/router/vstream/server.go, the only place the router
+		// builds a ControllerClient, calls these and nothing else.
+		RoleRouter: {
+			"/pgshard.v1.Controller/CreateStream",
+			"/pgshard.v1.Controller/DropStream",
+		},
+	},
+}
+
+// AllowedMethod reports whether id may call fullMethod on a listener
+// serving role. A pair with no rule is allowed: see methods.
+func AllowedMethod(role string, id Identity, fullMethod string) bool {
+	byRole, ok := methods[role]
+	if !ok {
+		return true
+	}
+	allowed, ok := byRole[id.Role]
+	if !ok {
+		return true
+	}
+	for _, m := range allowed {
+		if m == fullMethod {
+			return true
+		}
+	}
+	return false
+}
+
 // AllowedCallers reports whether an identity may call a listener serving
 // role, and whether role has a rule at all. A listener with no rule
 // authorises nothing and keeps accepting whatever chains to the CA.

@@ -273,7 +273,22 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "pgshard-controller run: %v\n", err)
 		return cli.ExitNotReady
 	}
-	g := grpc.NewServer(grpc.Creds(creds))
+	// Admitting a caller and letting it call everything are different
+	// decisions. The credentials above admit {router, operator}; these
+	// narrow what an admitted role may reach, so a router's certificate is
+	// not also a credential for CancelWorkflow.
+	serverOpts := []grpc.ServerOption{grpc.Creds(creds)}
+	//
+	// Not under --insecure-dev: there are no certificates, so there are no
+	// identities to judge, and every call would be refused for having
+	// none. grpccreds.Listener already drops Authorize for the same reason
+	// -- doing one and not the other is what turns a dev flag into a
+	// listener that answers PermissionDenied to everything while logging
+	// that it is up.
+	if unary, stream := grpccreds.MethodInterceptors(pki.RoleController, *authorizeCallers && !*insecureDev); unary != nil {
+		serverOpts = append(serverOpts, grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream))
+	}
+	g := grpc.NewServer(serverOpts...)
 	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams, Leader: leader})
 	mode := "mTLS"
 	if *insecureDev {
