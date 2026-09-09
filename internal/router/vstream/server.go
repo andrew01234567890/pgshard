@@ -135,7 +135,11 @@ func (s *Server) Create(ctx context.Context, req *pgshardv1.CreateVStreamRequest
 	if s.Controller == nil {
 		return nil, status.Error(codes.Unimplemented, "stream creation needs a controller endpoint (--controller)")
 	}
-	r, err := s.Controller.CreateStream(ctx, &pgshardv1.CreateStreamRequest{Stream: req.GetStream(), Database: req.GetDatabase(), TwoPhase: req.GetTwoPhase()})
+	// The set is forwarded rather than defaulted here: the controller owns
+	// what an empty set means when it makes the slots, and deciding it
+	// twice is how the two ends drift.
+	r, err := s.Controller.CreateStream(ctx, &pgshardv1.CreateStreamRequest{
+		Stream: req.GetStream(), Database: req.GetDatabase(), TwoPhase: req.GetTwoPhase(), ShardSet: req.GetShardSet()})
 	if err != nil {
 		return nil, err
 	}

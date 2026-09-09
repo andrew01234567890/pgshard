@@ -106,6 +106,16 @@ message CreateVStreamRequest {
   // Create the slots with two_phase so prepared transactions are decoded at
   // PREPARE time.
   bool two_phase = 3;
+  // Shard set whose shards get a slot; empty means the set now serving.
+  //
+  // The controller has always accepted one and this API could not name it,
+  // so a stream could only ever be created on the default set through the
+  // router -- while Stream could then be asked for any set, including one
+  // with no slots on it. Which set a stream READS is still decided at read
+  // time (an omitted set follows the serving topology, and a named one is
+  // honoured so a retired set can be drained on purpose); this says only
+  // where its slots are made.
+  string shard_set = 4;
 }
 
 // CreateVStreamResponse reports the created slots.

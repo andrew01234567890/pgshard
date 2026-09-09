@@ -408,7 +408,17 @@ type CreateVStreamRequest struct {
 	Database string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
 	// Create the slots with two_phase so prepared transactions are decoded at
 	// PREPARE time.
-	TwoPhase      bool `protobuf:"varint,3,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
+	TwoPhase bool `protobuf:"varint,3,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
+	// Shard set whose shards get a slot; empty means the set now serving.
+	//
+	// The controller has always accepted one and this API could not name it,
+	// so a stream could only ever be created on the default set through the
+	// router -- while Stream could then be asked for any set, including one
+	// with no slots on it. Which set a stream READS is still decided at read
+	// time (an omitted set follows the serving topology, and a named one is
+	// honoured so a retired set can be drained on purpose); this says only
+	// where its slots are made.
+	ShardSet      string `protobuf:"bytes,4,opt,name=shard_set,json=shardSet,proto3" json:"shard_set,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -462,6 +472,13 @@ func (x *CreateVStreamRequest) GetTwoPhase() bool {
 		return x.TwoPhase
 	}
 	return false
+}
+
+func (x *CreateVStreamRequest) GetShardSet() string {
+	if x != nil {
+		return x.ShardSet
+	}
+	return ""
 }
 
 // CreateVStreamResponse reports the created slots.
@@ -2850,11 +2867,12 @@ const file_pgshard_v1_vstream_proto_rawDesc = "" +
 	"\x05Table\x12\x16\n" +
 	"\x06schema\x18\x01 \x01(\tR\x06schema\x12\x14\n" +
 	"\x05table\x18\x02 \x01(\tR\x05table\x12\x16\n" +
-	"\x06lastpk\x18\x03 \x01(\fR\x06lastpk\"g\n" +
+	"\x06lastpk\x18\x03 \x01(\fR\x06lastpk\"\x84\x01\n" +
 	"\x14CreateVStreamRequest\x12\x16\n" +
 	"\x06stream\x18\x01 \x01(\tR\x06stream\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x1b\n" +
-	"\ttwo_phase\x18\x03 \x01(\bR\btwoPhase\"o\n" +
+	"\ttwo_phase\x18\x03 \x01(\bR\btwoPhase\x12\x1b\n" +
+	"\tshard_set\x18\x04 \x01(\tR\bshardSet\"o\n" +
 	"\x15CreateVStreamResponse\x12-\n" +
 	"\x05slots\x18\x01 \x03(\v2\x17.pgshard.v1.VStreamSlotR\x05slots\x12'\n" +
 	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\xb4\x01\n" +
