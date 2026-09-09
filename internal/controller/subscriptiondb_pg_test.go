@@ -101,7 +101,7 @@ func TestDroppingSubscriptionsOnlyTouchesThisDatabase(t *testing.T) {
 		return ci
 	}
 	name := SubscriptionName(5, 1, 0)
-	make := func(c *pgx.Conn, db string) {
+	subscribe := func(c *pgx.Conn, db string) {
 		t.Helper()
 		if _, err := c.Exec(ctx, `CREATE PUBLICATION p FOR ALL TABLES`); err != nil {
 			t.Fatal(err)
@@ -112,9 +112,9 @@ func TestDroppingSubscriptionsOnlyTouchesThisDatabase(t *testing.T) {
 		}
 	}
 	d1 := connect(t, inDB("d1"))
-	make(d1, "d1")
+	subscribe(d1, "d1")
 	d2 := connect(t, inDB("d2"))
-	make(d2, "d2")
+	subscribe(d2, "d2")
 
 	// The drop runs from d2, exactly as a Complete or Unwind pass does once
 	// it has dialled that database.
