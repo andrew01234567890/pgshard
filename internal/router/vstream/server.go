@@ -143,16 +143,18 @@ func (s *Server) Create(ctx context.Context, req *pgshardv1.CreateVStreamRequest
 	if err != nil {
 		return nil, err
 	}
-	if e := r.GetError(); e != nil {
-		// The same channel Drop below uses, and for the same reason: a
-		// create that did not happen is not a successful RPC.
-		st := status.New(codes.FailedPrecondition, e.GetMessage())
-		if d, derr := st.WithDetails(e); derr == nil {
-			st = d
-		}
-		return nil, st.Err()
-	}
-	resp := &pgshardv1.CreateVStreamResponse{}
+	// Create keeps its error in the BODY where Drop does not, and the
+	// difference is the rule rather than an inconsistency: a status is for
+	// a whole-RPC failure, an embedded error for a PARTIAL one.
+	//
+	// StreamAdmin.Create returns the slots it made alongside the error that
+	// stopped it -- "return out, fmt.Errorf(shard %s/%d: %w)" -- so a
+	// four-shard create that fails on the third has already made two
+	// replication slots, and those slots retain WAL until something drops
+	// them. Converting that to a status discards the list, and the caller
+	// cannot clean up what it is not told about. An earlier version of this
+	// function did exactly that (PR #804); this is the correction.
+	resp := &pgshardv1.CreateVStreamResponse{Error: r.GetError()}
 	for _, sl := range r.GetSlots() {
 		resp.Slots = append(resp.Slots, &pgshardv1.VStreamSlot{Shard: sl.GetShard(), Slot: sl.GetSlot(), ConfirmedFlushLsn: sl.GetLsn()})
 	}
