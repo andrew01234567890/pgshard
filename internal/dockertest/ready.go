@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,7 +44,7 @@ type Connector func(ctx context.Context) error
 // container stops, stops making progress, or reaches ReadyCap.
 func WaitReady(tb testing.TB, id string, connect Connector) {
 	tb.Helper()
-	if err := waitReady(id, connect, dockerProbes{running: containerRunning, mark: containerLogMark, log: containerLog}, ReadyIdle, ReadyCap); err != nil {
+	if err := waitReady(id, connect, dockerProbes{running: containerRunning, mark: containerLogMark, log: containerLog, ports: containerPorts}, ReadyIdle, ReadyCap); err != nil {
 		tb.Fatal(err)
 	}
 }
@@ -56,6 +57,9 @@ type dockerProbes struct {
 	running func(id string) (bool, string)
 	mark    func(id string) string
 	log     func(id string) string
+	// ports answers the question the log cannot: whether the failure is
+	// the server or the way to reach it.
+	ports func(id string) string
 }
 
 // waitReady is WaitReady's decision, separated so it can be tested.
@@ -95,14 +99,75 @@ func waitReady(id string, connect Connector, probe dockerProbes, idle, limit tim
 		}
 		switch {
 		case time.Since(lastProgress) > idle:
-			return fmt.Errorf("the container logged nothing for %s and never accepted a connection (%s in total); last error %w\ncontainer log:\n%s",
-				idle, time.Since(start).Round(time.Second), err, probe.log(id))
+			return fmt.Errorf("the container logged nothing for %s and never accepted a connection (%s in total); last error %w\n%s\ncontainer log:\n%s",
+				idle, time.Since(start).Round(time.Second), err, ports(probe, id), probe.log(id))
 		case time.Since(start) > limit:
-			return fmt.Errorf("the container did not accept a connection within %s, though it was still logging; last error %w\ncontainer log:\n%s",
-				limit, err, probe.log(id))
+			return fmt.Errorf("the container did not accept a connection within %s, though it was still logging; last error %w\n%s\ncontainer log:\n%s",
+				limit, err, ports(probe, id), probe.log(id))
 		}
 		time.Sleep(connectEvery)
 	}
+}
+
+// ports is probe.ports with a default, so a caller that did not set one --
+// every existing test -- still gets a message rather than a panic.
+func ports(probe dockerProbes, id string) string {
+	if probe.ports == nil {
+		return "published ports: (not probed)"
+	}
+	return probe.ports(id)
+}
+
+// containerPorts reports how docker published the container's ports and
+// whether anything on the host is listening on what it published.
+//
+// It is here because the log cannot answer the question that matters when
+// a container starts cleanly and is still unreachable. Seen repeatedly
+// (PGS-711): PostgreSQL logs "listening on IPv4 address 0.0.0.0, port
+// 5432", is ready, and the host gets connection refused on the mapped port
+// for the whole wait. That is not a slow server, and every minute spent
+// reading its log is a minute spent on the wrong half of the problem.
+//
+// A published port that no host socket is listening on means the mapping,
+// not the server -- docker-proxy, or a collision on the ephemeral port
+// docker chose. Both are worth retrying with a fresh port rather than
+// waiting longer.
+func containerPorts(id string) string {
+	out, err := exec.Command("docker", "port", id).CombinedOutput()
+	mapped := strings.TrimSpace(string(out))
+	if err != nil || mapped == "" {
+		return "published ports: none (docker port said " + strconv.Quote(mapped) + ")"
+	}
+	var b strings.Builder
+	b.WriteString("published ports:\n")
+	for _, line := range strings.Split(mapped, "\n") {
+		b.WriteString("  " + line + "  ->  " + hostListening(line) + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// hostListening reports whether a host socket is listening on the port a
+// `docker port` line published.
+func hostListening(mapping string) string {
+	_, hostAddr, ok := strings.Cut(mapping, " -> ")
+	if !ok {
+		return "unparsed"
+	}
+	_, port, ok := strings.Cut(strings.TrimSpace(hostAddr), ":")
+	if !ok {
+		return "unparsed"
+	}
+	out, err := exec.Command("ss", "-ltn").CombinedOutput()
+	if err != nil {
+		return "host listener unknown (ss unavailable)"
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, ":"+port+" ") {
+			return "host IS listening"
+		}
+	}
+	// The distinguishing case, and the reason this exists at all.
+	return "NOTHING is listening on the host: the mapping failed, not the server"
 }
 
 // containerRunning reports whether the container is still up, and what
