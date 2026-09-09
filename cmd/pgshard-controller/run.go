@@ -273,7 +273,15 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "pgshard-controller run: %v\n", err)
 		return cli.ExitNotReady
 	}
-	g := grpc.NewServer(grpc.Creds(creds))
+	// Admitting a caller and letting it call everything are different
+	// decisions. The credentials above admit {router, operator}; these
+	// narrow what an admitted role may reach, so a router's certificate is
+	// not also a credential for CancelWorkflow.
+	serverOpts := []grpc.ServerOption{grpc.Creds(creds)}
+	if unary, stream := grpccreds.MethodInterceptors(pki.RoleController, *authorizeCallers); unary != nil {
+		serverOpts = append(serverOpts, grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream))
+	}
+	g := grpc.NewServer(serverOpts...)
 	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams, Leader: leader})
 	mode := "mTLS"
 	if *insecureDev {
