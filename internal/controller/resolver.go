@@ -335,6 +335,17 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 			if d.State == "preparing" {
 				return nil
 			}
+			// The coordinator decided between the prepared-transaction scan
+			// and this read, so it was still preparing participants while
+			// that scan ran and the holder list for this gid is a list from
+			// before the transaction was complete. Finishing only what it
+			// names and then deleting the decision leaves the participants
+			// prepared after it with nothing to resolve them: the orphan
+			// sweep reads a prepared transaction with no decision as
+			// abandoned and rolls it back, which splits a transaction that
+			// durably committed. Keep the row and let the next pass finish
+			// it from a scan taken after the decision.
+			complete = false
 		} else {
 			d.State = "abort"
 		}
