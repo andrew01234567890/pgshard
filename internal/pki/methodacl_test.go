@@ -71,3 +71,32 @@ func TestAListenerWithNoMethodRuleIsUnrestricted(t *testing.T) {
 		t.Error("the agent has no method rule, so it must admit every method")
 	}
 }
+
+// A caller role added to a listener's callers list gets EVERY method until
+// someone remembers this table, because a pair with no rule is
+// unrestricted. Nothing couples the two tables, so this is what couples
+// them: adding a caller becomes a decision about what it may call, taken
+// deliberately here rather than by default elsewhere.
+//
+// Exempt roles are listed rather than inferred. The operator is exempt
+// because its certificate is also a human administrator's today (RoleAdmin
+// exists but is in no caller list), so narrowing it decides who may
+// administer a cluster -- a policy question, not a fact about the code.
+func TestEveryCallerOfARestrictedListenerHasAMethodRule(t *testing.T) {
+	exempt := map[string]map[string]bool{
+		RoleController: {RoleOperator: true},
+	}
+	for listener, byRole := range methods {
+		allowed, ok := callers[listener]
+		if !ok {
+			t.Errorf("listener %q has method rules but no caller rule, so nothing reaches them", listener)
+			continue
+		}
+		for _, caller := range allowed {
+			if exempt[listener][caller] || len(byRole[caller]) > 0 {
+				continue
+			}
+			t.Errorf("listener %q admits %q with no method rule and no exemption: it may call everything", listener, caller)
+		}
+	}
+}
