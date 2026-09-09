@@ -10,6 +10,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -491,9 +492,45 @@ func (r *ClusterReconciler) ensureReshardRecord(ctx context.Context, c *pgshardv
 	}
 	err := r.Create(ctx, rec)
 	if apierrors.IsAlreadyExists(err) {
-		return nil
+		return r.adoptReshardRecord(ctx, c, rec)
 	}
 	return err
+}
+
+// adoptReshardRecord accepts an existing record only if this operator would
+// have written exactly it.
+//
+// The name is derived from the cluster and the target generation, so anyone
+// who can create a PgShardReshard in the namespace can put an object there
+// first. Taking AlreadyExists for success adopted whatever they wrote, and
+// the reshard then ran from it: Mode is read back later, so a pre-claimed
+// record could turn a reshard into an upgrade, or move it to another shard
+// set or another target major. SetControllerReference is applied to the
+// object this call TRIED to create, never to the one that was already
+// there, so the impostor also kept whatever owner it came with -- including
+// none, which takes it out of the cluster's garbage collection.
+//
+// Refusing is the answer rather than overwriting. A record with the wrong
+// content is either a hand edit or a bug, and a reshard is not a thing to
+// start on a guess about which; the reconcile fails loudly and the object
+// is there to look at.
+func (r *ClusterReconciler) adoptReshardRecord(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, want *pgshardv1alpha1.PgShardReshard) error {
+	var have pgshardv1alpha1.PgShardReshard
+	if err := r.Get(ctx, client.ObjectKeyFromObject(want), &have); err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(&have, c) {
+		return fmt.Errorf("reshard record %s exists and is not controlled by cluster %s; "+
+			"the operator will not adopt it -- delete it or rename it out of the way", have.Name, c.Name)
+	}
+	if !equality.Semantic.DeepEqual(have.Spec, want.Spec) {
+		return fmt.Errorf("reshard record %s exists with a different spec than the catalog describes "+
+			"(have mode=%s shards=%d set=%s major=%d, want mode=%s shards=%d set=%s major=%d); "+
+			"the operator will not adopt it",
+			have.Name, have.Spec.Mode, have.Spec.TargetShards, have.Spec.TargetShardSet, have.Spec.TargetMajor,
+			want.Spec.Mode, want.Spec.TargetShards, want.Spec.TargetShardSet, want.Spec.TargetMajor)
+	}
+	return nil
 }
 
 func (r *ClusterReconciler) patchReshardStatus(ctx context.Context, rec *pgshardv1alpha1.PgShardReshard, mutate func(*pgshardv1alpha1.PgShardReshardStatus)) error {
