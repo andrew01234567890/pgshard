@@ -160,14 +160,20 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	if want != nil && *want == effective {
 		c.Status.AppliedShards = want
 	}
-	// A nil AppliedShards is an operator that has never acted on this
-	// spec.shards, not a fresh request: a cluster with no serving set
-	// materializes one from spec.shards above, so effective equals want on
-	// the first pass and the field is recorded. Reaching here with it unset
-	// means the catalog was resharded by something else -- or the operator
-	// predates the field -- and reading the difference as a request is the
-	// reverse reshard this guard exists to stop.
-	if pending == nil && want != nil && *want != effective && (c.Status.AppliedShards == nil || *c.Status.AppliedShards == *want) {
+	// A nil AppliedShards is ambiguous on its own. A cluster created without
+	// spec.shards never records one, so the first spec.shards it is ever
+	// given is a genuine request -- refusing that would break the ordinary
+	// way to reshard. But an operator upgraded from a version predating the
+	// field also has none, and there the difference is the catalog having
+	// moved, not a request.
+	//
+	// The serving generation separates them: generation 1 is the set the
+	// operator materialized itself and nobody has resharded since, so a
+	// spec.shards naming a different count is a request. Past that, the
+	// catalog was resharded by something, and reading the difference as a
+	// request is the reverse reshard this guard exists to stop.
+	unrecorded := c.Status.AppliedShards == nil && serving.Generation > 1
+	if pending == nil && want != nil && *want != effective && (unrecorded || (c.Status.AppliedShards != nil && *c.Status.AppliedShards == *want)) {
 		c.Status.AppliedShards = want
 		plan.cond.Status = metav1.ConditionTrue
 		plan.cond.Reason = "ShardCountConflict"

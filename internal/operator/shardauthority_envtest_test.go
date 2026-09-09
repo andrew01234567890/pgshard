@@ -96,7 +96,11 @@ func TestAnOperatorThatNeverRecordedAppliedShardsDoesNotReverseReshard(t *testin
 	bringUp(t, r, fp, c)
 
 	// What an operator upgrade leaves behind: a reconciled cluster whose
-	// status predates appliedShards.
+	// status predates appliedShards. A nil field alone is not enough to
+	// refuse on -- a cluster created WITHOUT spec.shards never records one
+	// either, and the first spec.shards it is given is a real request -- so
+	// the catalog below is moved to a later generation, which is what says
+	// something other than this operator resharded it.
 	get(t, c.Name, c)
 	c.Status.AppliedShards = nil
 	if err := k8sClient.Status().Update(context.Background(), c); err != nil {
