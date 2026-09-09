@@ -403,3 +403,58 @@ func LoadDesiredRoles(ctx context.Context, q Querier) (*DesiredRoles, error) {
 	}
 	return d, nil
 }
+
+// ErrProtectedSchema names a schema the desired-state grants may not reach.
+// A grant is executed on every group by the controller, which dials as a
+// superuser, so a row naming a system catalog turns a role that is
+// deliberately below superuser into one that can read every SCRAM verifier
+// out of pg_authid -- or write the catalogs outright.
+var ErrProtectedSchema = errors.New("grants may not name this schema")
+
+// ProtectedSchemas are refused as grant targets. pgshard is included
+// because the desired-state tables are the boundary itself: a grant on them
+// would let their own contents widen who may write them.
+var ProtectedSchemas = []string{"pg_catalog", "information_schema", "pgshard"}
+
+// CheckGrantObject reports whether a desired grant names a schema no
+// desired-state row may reach.
+func CheckGrantObject(schema string) error {
+	s := strings.ToLower(strings.TrimSpace(schema))
+	if s == "" {
+		return nil
+	}
+	if slices.Contains(ProtectedSchemas, s) || strings.HasPrefix(s, "pg_toast") || strings.HasPrefix(s, "pg_temp") {
+		return fmt.Errorf("%q: %w", schema, ErrProtectedSchema)
+	}
+	return nil
+}
+
+// ErrProtectedSetting names a per-role setting the desired state may not
+// carry. A per-role setting overrides the cluster-wide one, so a role that
+// carries default_transaction_read_only=off keeps writing through the write
+// pause that cutover, rollback and barrier restore points depend on.
+var ErrProtectedSetting = errors.New("this setting may not be set per role")
+
+// ProtectedSettings are refused in pgshard.role_settings.
+var ProtectedSettings = []string{
+	"default_transaction_read_only",
+	"session_replication_role",
+	"transaction_read_only",
+}
+
+// CheckRoleSetting reports whether a per-role setting would override a
+// control-plane guarantee. Anything in the pgshard namespace is refused
+// wholesale: those are the fences the router and the placement triggers
+// read, not user preferences.
+func CheckRoleSetting(name string) error {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if slices.Contains(ProtectedSettings, n) || strings.HasPrefix(n, "pgshard.") {
+		return fmt.Errorf("%q: %w", name, ErrProtectedSetting)
+	}
+	return nil
+}
+
+// ErrProtectedRole names a role the desired state may not grant. The
+// controller applies memberships on every group as a superuser, so a
+// membership naming a superuser role hands that superuser out.
+var ErrProtectedRole = errors.New("a superuser role may not be granted through the desired state")
