@@ -395,6 +395,14 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 			return err
 		}
 	}
+	// The batch reports its last key by ordering, not by max(): a cursor is
+	// only required to be ORDERABLE, and orderable is not aggregatable.
+	// PostgreSQL 18 has no max(uuid), so max() failed with 42883 on a uuid
+	// primary key -- the key type the guide recommends for sharded tables.
+	// Ordering descending reads the same index the batch already walks and
+	// works for every orderable type, so nothing has to know which types
+	// happen to have an aggregate.
+	//
 	// The bound is a statement of its own rather than "OR $1 IS NULL" in
 	// one: an OR over the cursor hides the range from the planner, which
 	// then scans from the head of the table anyway. The UPDATE takes the
@@ -405,7 +413,8 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 		return "WITH batch AS (SELECT " + cursor + " FROM " + table + " WHERE " + pred + where + order +
 			" LIMIT " + fmt.Sprint(batch) + "), upd AS (UPDATE " + table + " t SET " + set +
 			" WHERE t." + cursor + " = ANY (ARRAY(SELECT " + cursor + " FROM batch)))" +
-			" SELECT max(" + cursor + ")::text AS at FROM batch"
+			" SELECT (SELECT b." + cursor + " FROM batch b ORDER BY b." + cursor +
+			" DESC LIMIT 1)::text AS at"
 	}
 	// The batch reports the last key it selected, not how many rows it
 	// changed: a concurrent DELETE or primary-key change can remove a
