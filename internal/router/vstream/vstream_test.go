@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/router"
@@ -829,4 +831,58 @@ func TestTheReconnectWindowIsClearedByProgressNotOnlyByASuccessfulReturn(t *test
 	if describe(got[3]) != "vgtid gen=7 {0:1200}" {
 		t.Fatalf("after a transient failure: %v", lines(got))
 	}
+}
+
+// TestCreateCarriesTheShardSetToTheController: the controller has always
+// accepted a shard set when it makes a stream's slots, and this API had no
+// way to name one -- so through the router a stream could only ever be
+// created on the default set, while Stream could then be asked for any set,
+// including one with no slots on it (PGS-391).
+//
+// Which set a stream READS is decided at read time and is not this: an
+// omitted set follows the serving topology, and a named one is honoured so
+// a retired set can be drained deliberately. This is only where the slots
+// are made.
+func TestCreateCarriesTheShardSetToTheController(t *testing.T) {
+	ctx := context.Background()
+	fake := &recordingController{}
+	s := &Server{Controller: fake, Catalog: emptyCatalog{}}
+	if _, err := s.Create(ctx, &pgshardv1.CreateVStreamRequest{Stream: "s", Database: "app", ShardSet: "g2"}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.req.GetShardSet() != "g2" {
+		t.Fatalf("the controller was asked for shard set %q, want g2", fake.req.GetShardSet())
+	}
+	// Empty stays empty rather than being defaulted here: the controller
+	// owns what an empty set means when it makes the slots, and deciding
+	// it at both ends is how the two drift.
+	if _, err := s.Create(ctx, &pgshardv1.CreateVStreamRequest{Stream: "s", Database: "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.req.GetShardSet() != "" {
+		t.Fatalf("an omitted set reached the controller as %q", fake.req.GetShardSet())
+	}
+}
+
+// recordingController is the controller half of Create: it keeps the last
+// request so a test can assert what the router forwarded.
+type recordingController struct {
+	pgshardv1.ControllerClient
+	req *pgshardv1.CreateStreamRequest
+}
+
+func (c *recordingController) CreateStream(_ context.Context, in *pgshardv1.CreateStreamRequest, _ ...grpc.CallOption) (*pgshardv1.CreateStreamResponse, error) {
+	c.req = in
+	return &pgshardv1.CreateStreamResponse{}, nil
+}
+
+// emptyCatalog knows no streams; Create does not consult it.
+type emptyCatalog struct{}
+
+func (emptyCatalog) Lookup(context.Context, string) (catalog.Stream, error) {
+	return catalog.Stream{}, ErrUnknownStream
+}
+
+func (emptyCatalog) List(context.Context) ([]catalog.Stream, []catalog.StreamStatus, error) {
+	return nil, nil, nil
 }
