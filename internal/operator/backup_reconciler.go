@@ -25,6 +25,23 @@ const (
 	backupPollInterval = 5 * time.Second
 	// backupRunTimeout bounds one PgShardBackup across all groups.
 	backupRunTimeout = 12 * time.Hour
+
+	// backupGroupConcurrency is how many groups a backup runs at once.
+	//
+	// Sequential made a cluster backup take the SUM of its groups, so the
+	// recovery-point window of the last group widened with every shard
+	// added -- the one property a backup exists to bound. The groups are
+	// independent: each is a different primary on a different node, with
+	// its own stanza and its own repository, and pgBackRest takes its lock
+	// per stanza, so nothing here contends.
+	//
+	// Bounded rather than unbounded because what they share is the
+	// repository's network and the object store's rate limits, and because
+	// a cluster with many shards would otherwise open one agent stream per
+	// shard at once. Four is a first cut chosen to be obviously safe; the
+	// number to raise once a large-topology backup has been measured, and
+	// the knob to put on the policy if it needs to differ per cluster.
+	backupGroupConcurrency = 4
 	// ConditionRetentionApplied reports whether expire ran after the backup.
 	ConditionRetentionApplied = "RetentionApplied"
 )
@@ -334,39 +351,67 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 		defer close(run.done)
 		defer cancel()
 		runCtx := withClusterAgentToken(runCtx, r.Client, c.Namespace, c.Name)
-		failed := false
-		for _, t := range targets {
+		// One slot per target, filled in place: the groups run
+		// concurrently but their status is reported in topology order, so
+		// what an operator reads does not depend on which group finished
+		// first.
+		results := make([]pgshardv1alpha1.GroupBackupStatus, len(targets))
+		var ran sync.WaitGroup
+		sem := make(chan struct{}, backupGroupConcurrency)
+		for i, t := range targets {
 			// A cancelled run has nothing left to try; a failed GROUP does.
 			if runCtx.Err() != nil {
 				break
 			}
-			st := pgshardv1alpha1.GroupBackupStatus{Group: t.group.Name(), Stanza: t.stanza, StartedAt: ptrTime(r.now())}
-			res, err := r.Agents.Backup(runCtx, t.addr, typ)
-			st.CompletedAt = ptrTime(r.now())
-			st.Duration = st.CompletedAt.Sub(st.StartedAt.Time).Round(time.Second).String()
-			if err != nil {
-				// Every other group is still attempted. Each has its own
-				// stanza and its own repository, so one group's failure
-				// says nothing about the next -- and abandoning the run
-				// left every group after the failure with whatever backup
-				// it had from the previous run, which is exactly the
-				// recovery-point window a backup is taken to close.
-				st.Error = err.Error()
-				failed = true
-				log.Error(err, "group backup failed; continuing with the remaining groups",
-					"group", t.group.Name(), "log", strings.Join(res.Log, "\n"))
-				run.groups = append(run.groups, st)
+			ran.Add(1)
+			go func() {
+				defer ran.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				if runCtx.Err() != nil {
+					return
+				}
+				st := pgshardv1alpha1.GroupBackupStatus{Group: t.group.Name(), Stanza: t.stanza, StartedAt: ptrTime(r.now())}
+				res, err := r.Agents.Backup(runCtx, t.addr, typ)
+				st.CompletedAt = ptrTime(r.now())
+				st.Duration = st.CompletedAt.Sub(st.StartedAt.Time).Round(time.Second).String()
+				if err != nil {
+					// Every other group is still attempted. Each has its
+					// own stanza and its own repository, so one group's
+					// failure says nothing about the next -- and
+					// abandoning the run left every group after the
+					// failure with whatever backup it had from the
+					// previous run, which is exactly the recovery-point
+					// window a backup is taken to close.
+					st.Error = err.Error()
+					log.Error(err, "group backup failed; the other groups continue",
+						"group", t.group.Name(), "log", strings.Join(res.Log, "\n"))
+					results[i] = st
+					return
+				}
+				st.BackupID = res.Label
+				st.StartLSN = formatLSN(res.StartLSN)
+				st.StopLSN = formatLSN(res.StopLSN)
+				st.WALStart = res.ArchiveStart
+				st.WALStop = res.ArchiveStop
+				st.SizeBytes = int64(res.SizeBytes)
+				st.RepoSizeBytes = int64(res.RepoBytes)
+				results[i] = st
+				log.Info("group backup completed", "group", t.group.Name(), "label", res.Label)
+			}()
+		}
+		ran.Wait()
+		failed := false
+		for _, st := range results {
+			if st.Group == "" {
+				// Never started: the run was cancelled before this slot
+				// got its turn.
 				continue
 			}
-			st.BackupID = res.Label
-			st.StartLSN = formatLSN(res.StartLSN)
-			st.StopLSN = formatLSN(res.StopLSN)
-			st.WALStart = res.ArchiveStart
-			st.WALStop = res.ArchiveStop
-			st.SizeBytes = int64(res.SizeBytes)
-			st.RepoSizeBytes = int64(res.RepoBytes)
+			if st.Error != "" {
+				failed = true
+			}
 			run.groups = append(run.groups, st)
-			log.Info("group backup completed", "group", t.group.Name(), "label", res.Label)
 		}
 		// Only now, and only if every group succeeded: a group that
 		// expires as soon as its own backup lands can retire the set the

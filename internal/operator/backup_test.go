@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -413,12 +415,22 @@ func TestBackupReconcilerRunsEveryGroupPrimaryInOrder(t *testing.T) {
 	if got.Status.Phase != pgshardv1alpha1.BackupPhaseCompleted || got.Status.CompletedAt == nil || got.Status.BackupID != "20260819-020000F" || got.Status.Error != "" {
 		t.Fatalf("after finish: %+v", got.Status)
 	}
-	// Every backup first, then every expire. Expiring a group the moment
-	// its own backup lands can retire the set the last complete cluster
-	// backup depends on while a later group is still running; if that one
-	// then fails, nothing restorable cluster-wide is left.
-	if want := []string{"backup 10.0.0.1:9090 incr", "backup 10.0.0.2:9090 incr", "expire 10.0.0.1:9090", "expire 10.0.0.2:9090"}; strings.Join(agents.journal(), ",") != strings.Join(want, ",") {
-		t.Fatalf("calls %v", agents.journal())
+	// EVERY backup before ANY expire, which is the invariant -- not the
+	// order the backups themselves happen in, which is now concurrent.
+	// Expiring a group the moment its own backup lands can retire the set
+	// the last complete cluster backup depends on while a later group is
+	// still running; if that one then fails, nothing restorable
+	// cluster-wide is left.
+	//
+	// Asserted as a partition rather than a sequence: an exact journal
+	// would have to be rewritten every time the concurrency changed, and
+	// would fail for a reason that has nothing to do with what it protects.
+	journal := agents.journal()
+	if want := []string{"backup 10.0.0.1:9090 incr", "backup 10.0.0.2:9090 incr"}; !sameSet(journal[:2], want) {
+		t.Fatalf("first two calls %v, want both backups", journal)
+	}
+	if want := []string{"expire 10.0.0.1:9090", "expire 10.0.0.2:9090"}; !sameSet(journal[2:], want) {
+		t.Fatalf("last two calls %v, want both expires", journal)
 	}
 	shard := got.Status.Groups[1]
 	if shard.Group != "shard-0" || shard.BackupID != "20260819-020000F_20260819-030000I" || shard.StartLSN != "0/3000028" || shard.StopLSN != "0/4000050" || shard.WALStop != "000000010000000000000004" || shard.SizeBytes != 200 || shard.RepoSizeBytes != 20 || shard.Duration == "" || shard.Error != "" {
@@ -455,7 +467,9 @@ func TestBackupReconcilerBacksUpEveryGroupEvenAfterOneFails(t *testing.T) {
 	if len(got.Status.Groups) != 2 || got.Status.Groups[1].Group != "shard-0" || got.Status.Groups[1].Error != "" || got.Status.Groups[1].BackupID == "" {
 		t.Fatalf("the shard must be backed up although the catalog failed: %+v", got.Status.Groups)
 	}
-	if want := []string{"backup 10.0.0.1:9090 incr", "backup 10.0.0.2:9090 incr"}; strings.Join(agents.journal(), ",") != strings.Join(want, ",") {
+	// Both groups were attempted, in whichever order they ran: the point
+	// is that the failure of one did not skip the other.
+	if want := []string{"backup 10.0.0.1:9090 incr", "backup 10.0.0.2:9090 incr"}; !sameSet(agents.journal(), want) {
 		t.Fatalf("calls %v", agents.journal())
 	}
 	// Retention is the one thing that still waits for the whole run:
@@ -945,5 +959,55 @@ func TestDeletingABackupStopsIt(t *testing.T) {
 	}
 	if r.run(b.UID) != nil {
 		t.Error("the stopped run must not be left in the registry")
+	}
+}
+
+// sameSet reports whether got and want hold the same calls, in any order.
+func sameSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	g := append([]string(nil), got...)
+	w := append([]string(nil), want...)
+	sort.Strings(g)
+	sort.Strings(w)
+	return slices.Equal(g, w)
+}
+
+// TestBackupRunsItsGroupsConcurrently: a cluster backup used to take the
+// SUM of its groups, so the recovery-point window of the last group widened
+// with every shard added -- the one property a backup exists to bound. The
+// groups are independent (a different primary on a different node, its own
+// stanza, its own repository, and pgBackRest locks per stanza), so they run
+// together under a bound.
+//
+// The wait IS the assertion. Every group's Backup blocks on the gate, so
+// running them one at a time means the second never starts until the first
+// returns, and the first cannot return until this test closes the gate --
+// which it only does after seeing both in flight. Sequential, that deadlocks
+// into the deadline.
+func TestBackupRunsItsGroupsConcurrently(t *testing.T) {
+	agents := &fakeBackupAgents{block: make(chan struct{})}
+	r, _, b := backupFixture(t, agents)
+	if _, got := reconcileBackup(t, r, b); got.Status.Phase != pgshardv1alpha1.BackupPhaseRunning {
+		t.Fatalf("the run did not start: %+v", got.Status)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for len(agents.journal()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%v after 10s: the groups are running one at a time", agents.journal())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(agents.block)
+	waitRun(t, r, b)
+	_, got := reconcileBackup(t, r, b)
+	if got.Status.Phase != pgshardv1alpha1.BackupPhaseCompleted || got.Status.Error != "" {
+		t.Fatalf("status %+v", got.Status)
+	}
+	// Reported in topology order whichever finished first, so what an
+	// operator reads does not depend on a race.
+	if len(got.Status.Groups) != 2 || got.Status.Groups[0].Group != "catalog" || got.Status.Groups[1].Group != "shard-0" {
+		t.Fatalf("groups out of topology order: %+v", got.Status.Groups)
 	}
 }
