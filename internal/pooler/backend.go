@@ -220,6 +220,19 @@ func (b *Backend) send(msg pgproto3.FrontendMessage) {
 // simple query: that would flush the pending pipeline into PostgreSQL.
 func (b *Backend) hasUnflushed() bool { return b.unflushed > 0 }
 
+// markBroken records that this backend must not be reused. It exists for
+// the relay: when sending a reply to the router fails, the backend is left
+// with the REST of that reply unread in its socket, and nothing else can
+// tell. hasUnflushed watches the write side, and idle() reads the last
+// observed txStatus -- which is stale precisely because the ReadyForQuery
+// that would update it is one of the messages still queued.
+//
+// Left unmarked, recycle ran DISCARD ALL, whose drain stopped at the
+// aborted statement's ReadyForQuery and returned before DISCARD ALL's own
+// reply arrived. The backend went back to the pool with someone else's
+// messages in front, and the next session read them as its own.
+func (b *Backend) markBroken() { b.broken = true }
+
 func (b *Backend) flush() error {
 	if err := b.fe.Flush(); err != nil {
 		b.broken = true
