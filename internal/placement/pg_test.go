@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"net"
 	"os/exec"
 	"strings"
 	"testing"
@@ -34,31 +33,27 @@ func startPostgres(t *testing.T, image string) *pgx.Conn {
 			dockertest.Unavailable(t, "image %s unavailable: %v: %s", image, err, out)
 		}
 	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
-		"--entrypoint", "sh", image, "-ec",
-		`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
-		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker run: %v: %s", err, out)
-	}
-	id := strings.TrimSpace(string(out))
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
-	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
 	var conn *pgx.Conn
-	dockertest.WaitReady(t, id, func(ctx context.Context) error {
-		c, err := pgx.Connect(ctx, dsn)
+	dockertest.StartAndWait(t, 3, func() (string, dockertest.Connector) {
+		out, err := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1::5432",
+			"--entrypoint", "sh", image, "-ec",
+			`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
+			 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
+			 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
 		if err != nil {
-			return err
+			t.Fatalf("docker run: %v: %s", err, out)
 		}
-		conn = c
-		return nil
+		id := strings.TrimSpace(string(out))
+		t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
+		dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", dockertest.HostPort(t, id, "5432"))
+		return id, func(ctx context.Context) error {
+			c, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				return err
+			}
+			conn = c
+			return nil
+		}
 	})
 	t.Cleanup(func() { _ = conn.Close(context.Background()) })
 	return conn

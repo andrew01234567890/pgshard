@@ -2,6 +2,7 @@ package dockertest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -44,8 +45,52 @@ type Connector func(ctx context.Context) error
 // container stops, stops making progress, or reaches ReadyCap.
 func WaitReady(tb testing.TB, id string, connect Connector) {
 	tb.Helper()
-	if err := waitReady(id, connect, dockerProbes{running: containerRunning, mark: containerLogMark, log: containerLog, ports: containerPorts}, ReadyIdle, ReadyCap); err != nil {
+	if err := waitReady(id, connect, liveProbes(), ReadyIdle, ReadyCap); err != nil {
 		tb.Fatal(err)
+	}
+}
+
+func liveProbes() dockerProbes {
+	return dockerProbes{running: containerRunning, mark: containerLogMark, log: containerLog, ports: containerPorts}
+}
+
+// ErrPortMapping reports the failure that is not the container's: it came
+// up, it is running, and nothing on the host is listening on the port
+// docker published for it.
+//
+// The host port is chosen by the caller -- listen on :0, take the number,
+// close the listener, hand it to docker -- so between the close and
+// docker's bind anything else on the machine can take it. That is a race
+// against everything else starting a container at the same moment, which
+// is why it fires on a busy run and never in isolation.
+var ErrPortMapping = errors.New("the container's published port has nothing listening on the host: the mapping failed, not the server")
+
+// StartAndWait starts a container and waits for it, starting ANOTHER when
+// the failure was the port mapping.
+//
+// Waiting longer cannot help that case and the wait is 90 seconds, so a run
+// that hits it pays a minute and a half per container to learn nothing. A
+// fresh port is the whole fix, and start already picks one.
+//
+// Any other failure is the container's own and fails the test at once: a
+// container that died in initdb will die again, and retrying it would turn
+// one clear error into three.
+func StartAndWait(tb testing.TB, attempts int, start func() (id string, connect Connector)) string {
+	tb.Helper()
+	if attempts < 1 {
+		attempts = 1
+	}
+	for attempt := 1; ; attempt++ {
+		id, connect := start()
+		err := waitReady(id, connect, liveProbes(), ReadyIdle, ReadyCap)
+		if err == nil {
+			return id
+		}
+		if !errors.Is(err, ErrPortMapping) || attempt >= attempts {
+			tb.Fatal(err)
+		}
+		tb.Logf("attempt %d: %v\nstarting another container on a fresh port", attempt, err)
+		_ = exec.Command("docker", "rm", "-f", id).Run()
 	}
 }
 
@@ -99,14 +144,24 @@ func waitReady(id string, connect Connector, probe dockerProbes, idle, limit tim
 		}
 		switch {
 		case time.Since(lastProgress) > idle:
-			return fmt.Errorf("the container logged nothing for %s and never accepted a connection (%s in total); last error %w\n%s\ncontainer log:\n%s",
-				idle, time.Since(start).Round(time.Second), err, ports(probe, id), probe.log(id))
+			return mappingOr(probe, id, fmt.Errorf("the container logged nothing for %s and never accepted a connection (%s in total); last error %w\n%s\ncontainer log:\n%s",
+				idle, time.Since(start).Round(time.Second), err, ports(probe, id), probe.log(id)))
 		case time.Since(start) > limit:
-			return fmt.Errorf("the container did not accept a connection within %s, though it was still logging; last error %w\n%s\ncontainer log:\n%s",
-				limit, err, ports(probe, id), probe.log(id))
+			return mappingOr(probe, id, fmt.Errorf("the container did not accept a connection within %s, though it was still logging; last error %w\n%s\ncontainer log:\n%s",
+				limit, err, ports(probe, id), probe.log(id)))
 		}
 		time.Sleep(connectEvery)
 	}
+}
+
+// mappingOr marks err as ErrPortMapping when the ports probe says the host
+// side never came up. The message is unchanged either way -- what changes
+// is whether a caller may start another container instead of giving up.
+func mappingOr(probe dockerProbes, id string, err error) error {
+	if strings.Contains(ports(probe, id), noHostListener) {
+		return fmt.Errorf("%w\n%w", ErrPortMapping, err)
+	}
+	return err
 }
 
 // ports is probe.ports with a default, so a caller that did not set one --
@@ -167,8 +222,13 @@ func hostListening(mapping string) string {
 		}
 	}
 	// The distinguishing case, and the reason this exists at all.
-	return "NOTHING is listening on the host: the mapping failed, not the server"
+	return noHostListener
 }
+
+// noHostListener is the phrase that says the failure is docker's mapping
+// rather than the server. StartAndWait keys its retry on it, so it is a
+// constant rather than a string written twice.
+const noHostListener = "NOTHING is listening on the host: the mapping failed, not the server"
 
 // containerRunning reports whether the container is still up, and what
 // docker said if it is not.
