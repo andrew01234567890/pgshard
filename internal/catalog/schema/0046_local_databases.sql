@@ -63,11 +63,24 @@ CREATE TRIGGER local_databases_hold_no_distributed_tables
 
 CREATE FUNCTION pgshard.check_table_placement_against_local_database() RETURNS trigger
     LANGUAGE plpgsql AS $$
+DECLARE
+    is_local boolean;
 BEGIN
     IF NEW.placement = 'unsharded' THEN
         RETURN NEW;
     END IF;
-    IF EXISTS (SELECT 1 FROM pgshard.databases WHERE name = NEW.database AND local_only) THEN
+    -- FOR SHARE unconditionally, not a bare read, and not only when the
+    -- database already says local: the two checks guard each other across
+    -- transactions only if one of them blocks. Without the lock a session
+    -- declaring the database local and a session declaring a sharded table
+    -- each see the other's row as it was before, both commit, and the
+    -- database is left holding exactly what it says it cannot hold.
+    --
+    -- Declaring the database takes its row FOR UPDATE, so whichever runs
+    -- second waits for the first and then sees the committed answer.
+    SELECT local_only INTO is_local
+      FROM pgshard.databases WHERE name = NEW.database FOR SHARE;
+    IF is_local THEN
         RAISE EXCEPTION 'database % is declared local_only: every object in it lives on its home shard, so %.% cannot be %',
             NEW.database, NEW.schema_name, NEW.table_name, NEW.placement
             USING ERRCODE = 'raise_exception',
