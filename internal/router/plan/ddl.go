@@ -659,26 +659,24 @@ func (w *walker) createView(v *pgquerypb.ViewStmt) error {
 		if r.kind != placeUnsharded {
 			scope = ScopeAll
 		}
-		// A view over a SHARDED table is placed on every shard by the loop
-		// above, and then read from ONE of them: the planner has no view
-		// expansion, so the view is an undeclared relation and falls to the
-		// database default placement -- the home shard, or one arbitrary
-		// shard where the default is reference. The client gets that
-		// shard's rows and NO error.
-		//
-		// Refuse to create it. A refusal is recoverable and a silently
-		// partial answer is not, and the same fallback already refuses on a
-		// sharded-default database, so this makes the three defaults agree.
-		// Routing a view to its base table's shards needs the view's column
-		// mapping in the catalog, which is the work this refusal holds the
-		// place for.
-		if r.kind == placeSharded {
-			return notYet("a view over sharded table \""+r.name+"\" cannot be routed: reads of the view would answer from one shard",
-				"query the table directly, or declare the view's base table unsharded or reference")
-		}
+
 	}
 	m := Migration{Kind: "CREATE VIEW", Scope: scope, Object: relationRef(v.GetView(), objectPresent)}
 	m.View = viewChange(v, inner.rels)
+	// A view over a SHARDED table is routable only if its shape yields a
+	// column map to route by. Without one it would be created on every
+	// shard and then read from ONE -- the home shard, or an arbitrary shard
+	// where the database default is reference -- returning that shard's
+	// rows and no error. Refuse instead: a refusal is recoverable, a
+	// silently partial answer is not.
+	if m.View.Shape != catalog.ViewSimple {
+		for _, r := range inner.rels {
+			if r.kind == placeSharded {
+				return notYet("a view over sharded table \""+r.name+"\" cannot be routed: its query is not a projection of one table",
+					"project the table's columns directly, without joins, aggregates, expressions, DISTINCT, GROUP BY or *")
+			}
+		}
+	}
 	return w.migration(m)
 }
 

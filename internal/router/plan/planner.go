@@ -608,10 +608,16 @@ const (
 
 // rel is one relation reference in the statement.
 type rel struct {
-	alias    string
-	name     string
-	schema   string
-	kind     placementKind
+	alias  string
+	name   string
+	schema string
+	kind   placementKind
+	// viewOf and viewCols are set when this relation is a VIEW the
+	// planner resolved through pgshard.views: the base table it
+	// projects, and the map from its output columns to that table's.
+	// The shard key below is then named as the VIEW names it.
+	viewOf   snapshot.TableKey
+	viewCols map[string]string
 	shardKey string
 	// shardKeyType is that column's type on the shards, as the controller's
 	// inspection recorded it; the router normalises key values by it before
@@ -753,30 +759,42 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 			continue
 		}
 		key := snapshot.TableKey{Database: w.sess.Database, SchemaName: schema, TableName: name}
+		// A view is resolved through the relation it projects. Without this
+		// it is an undeclared relation and falls to the database default
+		// placement below -- which for a view over a sharded table is one
+		// shard's rows and NO error.
+		if v, isView := snap.Views[key]; isView {
+			if !v.Simple {
+				return nil, notYet("view \""+name+"\" cannot be routed: its query is not a projection of one table",
+					"query the base tables directly")
+			}
+			base, ok := snap.Tables[v.Base]
+			if !ok {
+				return nil, notYet("view \""+name+"\" cannot be routed: its base table \""+v.Base.TableName+"\" is not in the catalog",
+					"declare the base table in pgshard.tables")
+			}
+			r.viewOf, r.viewCols = v.Base, v.Columns
+			key = v.Base
+			w.plan.Tables = append(w.plan.Tables, key)
+			r.schema = schema
+			if err := applyPlacement(r, base, v.Base.TableName); err != nil {
+				return nil, err
+			}
+			// The shard key is named as the VIEW names it, so a predicate
+			// on the view's own column is recognised.
+			if r.shardKey != "" {
+				r.shardKey = viewAlias(v.Columns, r.shardKey)
+			}
+			return r, nil
+		}
 		pl, ok := snap.Tables[key]
 		if !ok {
 			continue
 		}
 		w.plan.Tables = append(w.plan.Tables, key)
 		r.schema = schema
-		switch pl.Placement {
-		case "sharded":
-			// The router hashes the key value the client sent; a copy, a
-			// row filter and a re-key hash the value the shard stored. For
-			// a blank-padded character(n) those differ for keys PostgreSQL
-			// calls equal, so the same key can be routed to one shard and
-			// copied to another. The controller asks the shards what the
-			// column really is; a table it faulted is not routable at all,
-			// reads included, because the read would go to the shard the
-			// row is not on.
-			if pl.ShardKeyError != "" {
-				return nil, notYet("table \""+name+"\" cannot be routed: "+pl.ShardKeyError,
-					"change the shard key to a column whose type hashes the way it compares, or move the table with a placement workflow")
-			}
-			r.kind, r.shardKey, r.seqCols = placeSharded, pl.ShardKey, pl.SequenceColumns
-			r.shardKeyType, r.shardKeyChecked = pl.ShardKeyType, pl.ShardKeyChecked
-		case "reference":
-			r.kind, r.refDeclared, r.refChecked, r.refHazards = placeReference, true, pl.ReferenceChecked, pl.ReferenceHazards
+		if err := applyPlacement(r, pl, name); err != nil {
+			return nil, err
 		}
 		r.hidden, r.visible = pl.HiddenColumns, pl.VisibleColumns
 		return r, nil
@@ -2395,5 +2413,49 @@ func hiddenDDLName(n *pgquerypb.Node) string {
 			return name
 		}
 	}
+	return ""
+}
+
+// applyPlacement copies a catalog placement onto the relation the planner
+// routes by. name is what the message calls the relation, which for a view
+// is its BASE table -- the client asked for the view, but the problem being
+// reported is the base table's.
+func applyPlacement(r *rel, pl snapshot.Placement, name string) error {
+	switch pl.Placement {
+	case "sharded":
+		// The router hashes the key value the client sent; a copy, a row
+		// filter and a re-key hash the value the shard stored. For a
+		// blank-padded character(n) those differ for keys PostgreSQL calls
+		// equal, so the same key can be routed to one shard and copied to
+		// another. The controller asks the shards what the column really
+		// is; a table it faulted is not routable at all, reads included,
+		// because the read would go to the shard the row is not on.
+		if pl.ShardKeyError != "" {
+			return notYet("table \""+name+"\" cannot be routed: "+pl.ShardKeyError,
+				"change the shard key to a column whose type hashes the way it compares, or move the table with a placement workflow")
+		}
+		r.kind, r.shardKey, r.seqCols = placeSharded, pl.ShardKey, pl.SequenceColumns
+		r.shardKeyType, r.shardKeyChecked = pl.ShardKeyType, pl.ShardKeyChecked
+	case "reference":
+		r.kind, r.refDeclared, r.refChecked, r.refHazards = placeReference, true, pl.ReferenceChecked, pl.ReferenceHazards
+	}
+	r.hidden, r.visible = pl.HiddenColumns, pl.VisibleColumns
+	return nil
+}
+
+// viewAlias names a base column the way the view exposes it. A view that
+// renames a column -- which is how a versioned-schema migration presents a
+// new physical column under the old name -- must still have its predicates
+// recognised, and the client writes the VIEW's name.
+func viewAlias(cols map[string]string, base string) string {
+	for out, b := range cols {
+		if b == base {
+			return out
+		}
+	}
+	// The view does not expose the base column at all. Returning the base
+	// name would silently match a different column of the view if one
+	// happened to share the name, so return nothing: the relation is then
+	// sharded with no usable key and scatters, which is correct.
 	return ""
 }
