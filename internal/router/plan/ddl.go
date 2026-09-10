@@ -546,6 +546,20 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 		m := Migration{Kind: kind, Scope: scope}
 		if len(rvs) == 1 {
 			m.Object = relationRef(rvs[0], objectAbsent)
+			// CASCADE takes the views over the table with it. Without
+			// CASCADE PostgreSQL refuses the drop while a view depends on
+			// it, so there is nothing to forget.
+			if d.GetBehavior() == pgquerypb.DropBehavior_DROP_CASCADE {
+				// The schema the name resolved to, not the one it was
+				// written with: an unqualified DROP TABLE means the table
+				// the client's search_path found, and that is the schema
+				// the view rows record as the base.
+				schema := rvs[0].GetSchemaname()
+				if schema == "" && len(rels) == 1 && rels[0] != nil {
+					schema = rels[0].schema
+				}
+				m.View = &catalog.ViewChange{BaseSchema: schema, BaseName: rvs[0].GetRelname(), DropBase: true}
+			}
 		}
 		return w.migration(m)
 	case pgquerypb.ObjectType_OBJECT_INDEX, pgquerypb.ObjectType_OBJECT_VIEW:
@@ -575,7 +589,15 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 	case pgquerypb.ObjectType_OBJECT_SCHEMA:
 		m := Migration{Kind: kind, Scope: ScopeAll}
 		if objs := d.GetObjects(); len(objs) == 1 {
-			m.Object = ObjectRef{Kind: "schema", Name: objs[0].GetString_().GetSval(), Expect: objectAbsent}
+			name := objs[0].GetString_().GetSval()
+			m.Object = ObjectRef{Kind: "schema", Name: name, Expect: objectAbsent}
+			// The views in it went with it. A routing row that outlives its
+			// view routes a relation that is gone, and then lends its
+			// column map to whatever is next created under that name --
+			// the danger DROP VIEW already names above. A versioned-schema
+			// migration tool drops a whole schema of views at every
+			// completed migration, so this is not a rare case.
+			m.View = &catalog.ViewChange{Schema: name, DropSchema: true}
 		}
 		return w.migration(m)
 	case pgquerypb.ObjectType_OBJECT_SEQUENCE:
