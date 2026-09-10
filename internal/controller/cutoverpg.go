@@ -52,6 +52,19 @@ type pgCutover struct {
 	srcIDs    []int32
 	srcRanges placement.RangeSet
 	dbs       []dbPlan
+	// pausedAt is each shard's OWN clock at the moment its write pause was
+	// confirmed in force. A transaction that started before then may be
+	// read-write, whether or not it has written yet, so the drain has to
+	// wait for it. Read on the shard rather than here: comparing a
+	// controller timestamp against a shard's xact_start is a clock-skew
+	// bug waiting to happen.
+	pausedAt map[pausedShard]time.Time
+}
+
+// pausedShard names one primary within a set.
+type pausedShard struct {
+	set string
+	id  int32
 }
 
 // driveCutover builds the PostgreSQL ops of one workflow and advances it.
@@ -1194,8 +1207,17 @@ func (o *pgCutover) pauseSet(ctx context.Context, set string, ids []int32, pause
 		stmt = `ALTER SYSTEM SET default_transaction_read_only = on`
 	}
 	for _, s := range ids {
-		if err := o.setReadOnly(ctx, set, s, stmt, pause); err != nil {
+		at, err := o.setReadOnly(ctx, set, s, stmt, pause)
+		if err != nil {
 			return fmt.Errorf("write pause on %s/%d: %w", set, s, err)
+		}
+		if pause {
+			if o.pausedAt == nil {
+				o.pausedAt = map[pausedShard]time.Time{}
+			}
+			o.pausedAt[pausedShard{set, s}] = at
+		} else {
+			delete(o.pausedAt, pausedShard{set, s})
 		}
 	}
 	return nil
@@ -1229,8 +1251,25 @@ func (o *pgCutover) drainWriters(ctx context.Context, set string, ids []int32) e
 
 // writingBackends counts client backends holding a transaction that has
 // written. A transaction is assigned an xid the first time it writes, so
-// backend_xid is exactly the question; readers and the replication workers
-// carrying the rollback are not counted.
+// backend_xid alone was NOT the question, and asking it that way is how an
+// acknowledged write was lost. A transaction takes an xid the first time it
+// WRITES, so a transaction that began before the pause and has so far only
+// read has none -- and default_transaction_read_only does not apply to a
+// transaction that already began, so it is still read-write and may write
+// after the drain says the set is quiet.
+//
+// The question is which transactions COULD still write. Anything that began
+// before its shard's pause was confirmed may be read-write, whether it has
+// written yet or not. Anything that began after is read-only by default, so
+// long reads started during the cutover do not hold it up -- which is why
+// this compares against the pause instant rather than counting every open
+// transaction.
+//
+// backend_xid stays in the predicate as well, for the one case the instant
+// does not cover: a client that began after the pause and explicitly asked
+// for SET TRANSACTION READ WRITE. It is deliberately overriding the pause,
+// and the router's own fence is what refuses it, but if it has reached the
+// point of writing here it must still be drained.
 func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32) (int, error) {
 	total := 0
 	for _, s := range ids {
@@ -1238,8 +1277,15 @@ func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32
 		if err != nil {
 			return 0, err
 		}
+		// A zero instant means this set was never paused -- the rollback
+		// path drains without pausing -- so fall back to the written-only
+		// question rather than waiting for every open transaction.
+		since := o.pausedAt[pausedShard{set, s}]
 		rows, err := conn.Query(ctx, `SELECT count(*)::int FROM pg_stat_activity
-			WHERE backend_xid IS NOT NULL AND backend_type = 'client backend' AND pid <> pg_backend_pid()`)
+			WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+			  AND (backend_xid IS NOT NULL
+			       OR ($1::timestamptz IS NOT NULL AND xact_start IS NOT NULL AND xact_start < $1::timestamptz))`,
+			nullTime(since))
 		var n int
 		if err == nil {
 			n, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int])
@@ -1253,14 +1299,23 @@ func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32
 	return total, nil
 }
 
+// nullTime renders a zero instant as SQL NULL, so an unpaused set falls back
+// to counting only transactions that have already written.
+func nullTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
 // writerDrainTimeout bounds the wait for in-flight write transactions to
 // end once new ones are refused.
 const writerDrainTimeout = 30 * time.Second
 
-func (o *pgCutover) setReadOnly(ctx context.Context, set string, s int32, stmt string, pause bool) error {
+func (o *pgCutover) setReadOnly(ctx context.Context, set string, s int32, stmt string, pause bool) (time.Time, error) {
 	conn, err := o.c.Shards.Dial(ctx, set, s)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	// ALTER SYSTEM cannot run inside a transaction block, so it and the
 	// reload go as separate statements.
@@ -1270,26 +1325,45 @@ func (o *pgCutover) setReadOnly(ctx context.Context, set string, s int32, stmt s
 	}
 	_ = conn.Close(ctx)
 	if err != nil || !pause {
-		return err
+		return time.Time{}, err
 	}
 	deadline := o.c.now().Add(pauseConfirmTimeout)
 	for {
 		on, err := o.refusesWrites(ctx, set, s)
 		if err != nil {
-			return err
+			return time.Time{}, err
 		}
 		if on {
-			return nil
+			// The shard's own clock, read now: this is the latest instant
+			// at which a read-write transaction could still have begun, so
+			// anything older than it has to be drained.
+			return o.shardNow(ctx, set, s)
 		}
 		if o.c.now().After(deadline) {
-			return fmt.Errorf("did not start refusing writes within %s", pauseConfirmTimeout)
+			return time.Time{}, fmt.Errorf("did not start refusing writes within %s", pauseConfirmTimeout)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return time.Time{}, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+// shardNow reads a shard's own clock, so an instant recorded here can be
+// compared with the xact_start of a transaction on that same shard.
+func (o *pgCutover) shardNow(ctx context.Context, set string, s int32) (time.Time, error) {
+	conn, err := o.c.Shards.Dial(ctx, set, s)
+	if err != nil {
+		return time.Time{}, err
+	}
+	rows, err := conn.Query(ctx, `SELECT clock_timestamp()`)
+	var at time.Time
+	if err == nil {
+		at, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[time.Time])
+	}
+	_ = conn.Close(ctx)
+	return at, err
 }
 
 // sourceRefusesWrites asks a backend started after the reload, since an
