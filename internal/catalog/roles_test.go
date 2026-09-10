@@ -47,6 +47,12 @@ func TestRoleMirrorStatements(t *testing.T) {
 		{"create with attributes", MigrationMeta{Role: "r", RoleOp: "create", Verifier: "v", Roles: &RoleChanges{Attributes: &RoleAttributes{Login: &yes, ConnectionLimit: &limit, ValidUntil: &until}}},
 			[]string{"INSERT INTO pgshard.roles (rolname, verifier, login, createdb, createrole, inherit, connection_limit, valid_until) [r v 0x"}},
 		{"alter without password or attributes touches nothing", MigrationMeta{Role: "r", RoleOp: "alter"}, nil},
+		// PASSWORD NULL revokes. It used to emit NOTHING, because an empty
+		// verifier is indistinguishable from "no PASSWORD clause" -- so the
+		// old verifier stayed in pgshard.roles and the router kept accepting
+		// the password that had just been removed.
+		{"alter PASSWORD NULL clears the verifier", MigrationMeta{Role: "r", RoleOp: "alter", ClearVerifier: true},
+			[]string{"INSERT INTO pgshard.roles (rolname, verifier, login"}},
 		{"alter attributes only", MigrationMeta{Role: "r", RoleOp: "alter", Roles: &RoleChanges{Attributes: &RoleAttributes{CreateDB: &no}}},
 			[]string{"INSERT INTO pgshard.roles (rolname, verifier, login, createdb"}},
 		{"drop several", MigrationMeta{RoleOp: "drop", Roles: &RoleChanges{DropRoles: []string{"a", "b"}}},

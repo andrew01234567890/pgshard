@@ -50,6 +50,10 @@ type Migration struct {
 	// mirrors the desired row in pgshard.roles.
 	Role     string
 	Verifier string
+	// ClearVerifier is PASSWORD NULL: the password is REVOKED, which an
+	// empty Verifier alone cannot say -- a statement with no PASSWORD
+	// clause produces an empty Verifier too and must leave it alone.
+	ClearVerifier bool
 	// RoleOp is "create", "alter", "set" or "drop" when Role is set.
 	RoleOp string
 	// Roles is the desired-state delta of a role, membership, grant or
@@ -741,11 +745,11 @@ func (w *walker) createRole(raw *pgquerypb.RawStmt, s *pgquerypb.CreateRoleStmt)
 	if err != nil {
 		return err
 	}
-	verifier, stmt, err := w.hashPassword(raw, s.GetOptions())
+	verifier, stmt, revoked, err := w.hashPassword(raw, s.GetOptions())
 	if err != nil {
 		return err
 	}
-	m.Verifier, m.Statement = verifier, stmt
+	m.Verifier, m.Statement, m.ClearVerifier = verifier, stmt, revoked
 	m.Roles = &catalog.RoleChanges{Attributes: attrs, GrantMembers: createRoleMembers(s.GetRole(), s.GetOptions())}
 	if s.GetStmtType() == pgquerypb.RoleStmtType_ROLESTMT_ROLE || s.GetStmtType() == pgquerypb.RoleStmtType_ROLESTMT_GROUP {
 		if attrs == nil || attrs.Login == nil {
@@ -768,11 +772,11 @@ func (w *walker) alterRole(raw *pgquerypb.RawStmt, s *pgquerypb.AlterRoleStmt) e
 	if err != nil {
 		return err
 	}
-	verifier, stmt, err := w.hashPassword(raw, s.GetOptions())
+	verifier, stmt, revoked, err := w.hashPassword(raw, s.GetOptions())
 	if err != nil {
 		return err
 	}
-	m.Verifier, m.Statement = verifier, stmt
+	m.Verifier, m.Statement, m.ClearVerifier = verifier, stmt, revoked
 	if attrs != nil {
 		m.Roles = &catalog.RoleChanges{Attributes: attrs}
 	}
@@ -796,9 +800,10 @@ func (w *walker) dropRole(s *pgquerypb.DropRoleStmt) error {
 }
 
 // hashPassword rewrites a PASSWORD 'plaintext' option into the SCRAM
-// verifier and returns it with the deparsed statement; a statement without
-// a plaintext password is left alone.
-func (w *walker) hashPassword(raw *pgquerypb.RawStmt, options []*pgquerypb.Node) (verifier, stmt string, err error) {
+// verifier and returns it with the deparsed statement. revoked reports
+// PASSWORD NULL (or PASSWORD ”), which REVOKES the password -- distinct
+// from a statement with no PASSWORD clause, which leaves it alone.
+func (w *walker) hashPassword(raw *pgquerypb.RawStmt, options []*pgquerypb.Node) (verifier, stmt string, revoked bool, err error) {
 	var pw *pgquerypb.DefElem
 	for _, o := range options {
 		d := o.GetDefElem()
@@ -807,27 +812,31 @@ func (w *walker) hashPassword(raw *pgquerypb.RawStmt, options []*pgquerypb.Node)
 		}
 	}
 	if pw == nil {
-		return "", "", nil
+		return "", "", false, nil
 	}
 	plain := pw.GetArg().GetString_().GetSval()
 	if plain == "" {
-		return "", "", nil
+		// PASSWORD NULL carries no argument at all, and PASSWORD '' carries
+		// an empty one; PostgreSQL removes the password for both. The
+		// distinction that matters is against pw == nil above, which is a
+		// statement that never mentioned PASSWORD.
+		return "", "", true, nil
 	}
 	if v, perr := pgwire.ParseSCRAMVerifier(plain); perr == nil {
-		return v.String(), "", nil
+		return v.String(), "", false, nil
 	}
 	v, err := pgwire.BuildSCRAMVerifier(plain, nil, pgwire.DefaultSCRAMIterations)
 	if err != nil {
-		return "", "", pgwire.Errorf(pgwire.CodeInternalError, "hashing the role password: %v", err)
+		return "", "", false, pgwire.Errorf(pgwire.CodeInternalError, "hashing the role password: %v", err)
 	}
 	clone := proto.Clone(raw).(*pgquerypb.RawStmt)
 	rewritePassword(clone.GetStmt(), v.String())
 	tree := &pgquerypb.ParseResult{Version: w.parseVersion(), Stmts: []*pgquerypb.RawStmt{clone}}
 	stmt, err = pgparser.Deparse(tree)
 	if err != nil {
-		return "", "", pgwire.Errorf(pgwire.CodeInternalError, "rewriting the role statement: %v", err)
+		return "", "", false, pgwire.Errorf(pgwire.CodeInternalError, "rewriting the role statement: %v", err)
 	}
-	return v.String(), stmt, nil
+	return v.String(), stmt, false, nil
 }
 
 func (w *walker) parseVersion() int32 {

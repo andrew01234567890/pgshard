@@ -185,8 +185,13 @@ func RoleMirrorStatements(database string, meta MigrationMeta) []Statement {
 	rc := meta.Roles
 	switch meta.RoleOp {
 	case "create", "alter":
-		if meta.Role != "" && (meta.RoleOp == "create" || meta.Verifier != "" || rc != nil && rc.Attributes != nil) {
-			out = append(out, upsertRole(meta.Role, meta.Verifier, attrsOf(rc)))
+		// ClearVerifier is PASSWORD NULL. Without it in this condition an
+		// ALTER ROLE that revoked a password emitted NOTHING, so the old
+		// verifier stayed in pgshard.roles and the router -- which
+		// terminates SCRAM against it -- kept accepting the password the
+		// administrator had just removed.
+		if meta.Role != "" && (meta.RoleOp == "create" || meta.Verifier != "" || meta.ClearVerifier || rc != nil && rc.Attributes != nil) {
+			out = append(out, upsertRole(meta.Role, meta.Verifier, meta.ClearVerifier, attrsOf(rc)))
 		}
 	case "drop":
 		names := []string{}
@@ -260,7 +265,7 @@ func attrsOf(rc *RoleChanges) RoleAttributes {
 
 // upsertRole writes verifier and the attributes that are set; unset ones
 // keep their current (or default) value.
-func upsertRole(name, verifier string, a RoleAttributes) Statement {
+func upsertRole(name, verifier string, revoked bool, a RoleAttributes) Statement {
 	var validUntil any
 	if a.ValidUntil != nil {
 		if *a.ValidUntil == "" {
@@ -269,17 +274,22 @@ func upsertRole(name, verifier string, a RoleAttributes) Statement {
 			validUntil = *a.ValidUntil
 		}
 	}
+	// $9 is PASSWORD NULL. An empty verifier alone cannot mean "revoke":
+	// a statement that never mentioned PASSWORD also produces one, and
+	// there the existing verifier has to survive -- which is what the
+	// coalesce below is for. Told to clear, the row is set to NULL.
 	return Statement{`INSERT INTO pgshard.roles (rolname, verifier, login, createdb, createrole, inherit, connection_limit, valid_until)
 		VALUES ($1, nullif($2, ''), coalesce($3, true), coalesce($4, false), coalesce($5, false), coalesce($6, true), coalesce($7, -1),
 		        CASE WHEN $8::text IS NULL OR $8 = '' THEN NULL ELSE $8::timestamptz END)
 		ON CONFLICT (rolname) DO UPDATE SET
-		verifier = coalesce(nullif(EXCLUDED.verifier, ''), pgshard.roles.verifier),
+		verifier = CASE WHEN $9::boolean THEN NULL
+		                ELSE coalesce(nullif(EXCLUDED.verifier, ''), pgshard.roles.verifier) END,
 		login = coalesce($3, pgshard.roles.login), createdb = coalesce($4, pgshard.roles.createdb),
 		createrole = coalesce($5, pgshard.roles.createrole), inherit = coalesce($6, pgshard.roles.inherit),
 		connection_limit = coalesce($7, pgshard.roles.connection_limit),
 		valid_until = CASE WHEN $8::text IS NULL THEN pgshard.roles.valid_until WHEN $8 = '' THEN NULL ELSE $8::timestamptz END,
 		updated_at = now()`,
-		[]any{name, verifier, a.Login, a.CreateDB, a.CreateRole, a.Inherit, a.ConnectionLimit, validUntil}}
+		[]any{name, verifier, a.Login, a.CreateDB, a.CreateRole, a.Inherit, a.ConnectionLimit, validUntil, revoked}}
 }
 
 func dedupe(in []string) []string {

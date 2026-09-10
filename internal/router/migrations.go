@@ -161,13 +161,14 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 	}
 	req := catalog.DDLMigration{Database: e.info.Database, Statement: m.Statement, Kind: m.Kind, Strategy: m.Strategy, Scope: m.Scope,
 		HomeShard: e.home.ID, Meta: catalog.MigrationMeta{
-			Object:   catalog.MigrationObject{Kind: m.Object.Kind, Schema: m.Object.Schema, Name: m.Object.Name, Expect: m.Object.Expect},
-			RunAs:    e.info.User,
-			Role:     m.Role,
-			RoleOp:   m.RoleOp,
-			Verifier: m.Verifier,
-			Roles:    m.Roles,
-			Database: m.Database, DatabaseOp: m.DatabaseOp, Steps: migrationSteps(m.Steps), Rewrite: m.Rewrite}}
+			Object:        catalog.MigrationObject{Kind: m.Object.Kind, Schema: m.Object.Schema, Name: m.Object.Name, Expect: m.Object.Expect},
+			RunAs:         e.info.User,
+			Role:          m.Role,
+			RoleOp:        m.RoleOp,
+			Verifier:      m.Verifier,
+			ClearVerifier: m.ClearVerifier,
+			Roles:         m.Roles,
+			Database:      m.Database, DatabaseOp: m.DatabaseOp, Steps: migrationSteps(m.Steps), Rewrite: m.Rewrite}}
 	id, err := e.r.cfg.Migrations.Enqueue(ctx, req)
 	if err != nil {
 		return pgwire.Errorf(codeConnectionFailure, "queueing the migration in the catalog failed: %v", err)
