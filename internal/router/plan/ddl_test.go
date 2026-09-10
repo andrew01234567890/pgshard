@@ -115,7 +115,15 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "alter type mood add value 'happy'", mig: "ALTER TYPE all"},
 		{sql: "drop type mood", mig: "DROP TYPE all"},
 		{sql: "create view v as select * from items", mig: "CREATE VIEW home", object: "relation:v:present"},
-		{sql: "create or replace view v as select * from orders where tenant_id = 1", mig: "CREATE VIEW all", object: "relation:v:present"},
+		// A view over a SHARDED table used to be created on every shard and
+		// then read from ONE of them, with no error -- the planner has no view
+		// expansion, so the view is an undeclared relation and falls to the
+		// database default placement. Refused now, because a silently partial
+		// answer is worse than a refusal.
+		{sql: "create or replace view v as select * from orders where tenant_id = 1", refuse: "a view over sharded table \"orders\" cannot be routed"},
+		// A view over a REFERENCE table is fine: every shard holds the whole
+		// table, so reading it from one is the right answer.
+		{sql: "create view rv as select * from regions", mig: "CREATE VIEW all", object: "relation:rv:present"},
 		{sql: "drop view v", mig: "DROP VIEW existing", object: "relation:v:absent"},
 		{sql: "create database shop", mig: "CREATE DATABASE all", object: "database:shop:present"},
 		{sql: "drop database shop", mig: "DROP DATABASE all", object: "database:shop:absent"},

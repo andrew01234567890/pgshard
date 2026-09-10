@@ -396,7 +396,10 @@ func golden() []want {
 		{sql: "create table t2 as select * from orders where tenant_id = 1", kind: Refuse, msg: "CREATE TABLE AS over sharded or reference tables is not available yet"},
 		{sql: "create table t2 as select * from items", kind: Unsharded, shards: "0"},
 		{sql: "create table orders as select 1", kind: Refuse, msg: "CREATE TABLE AS cannot create the sharded or reference table \"orders\""},
-		{sql: "create view v as select * from orders where tenant_id = 1", kind: MigrationKind, mig: "CREATE VIEW all"},
+		// Refused: the planner has no view expansion, so a view over a
+		// SHARDED table would be created everywhere and then read from one
+		// shard with no error. A view over a REFERENCE table, below, is fine.
+		{sql: "create view v as select * from orders where tenant_id = 1", kind: Refuse, msg: "a view over sharded table \"orders\" cannot be routed"},
 		{sql: "create view v as select * from regions", kind: MigrationKind, mig: "CREATE VIEW all"},
 		{sql: "create view orders as select 1", kind: MigrationKind, mig: "CREATE VIEW home"},
 		{sql: "copy orders from stdin", kind: Refuse, msg: "COPY on sharded and reference tables is not available yet"},
