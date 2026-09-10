@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
@@ -234,6 +236,112 @@ func TestRestoreReconcilerCreatesClusterAndFollowsRecovery(t *testing.T) {
 	}
 	if reqs := clusterToRestore(context.Background(), source); len(reqs) != 0 {
 		t.Fatalf("source cluster maps to %v", reqs)
+	}
+}
+
+// driveRestoreToRecovery walks a restore through the same steps the happy
+// path test does, up to and including the pass that would mark it Recovered.
+func driveRestoreToRecovery(t *testing.T, r *RestoreReconciler, cl client.Client, agents *fakeAgents) {
+	t.Helper()
+	ctx := context.Background()
+	reconcileRestore(t, r, "r1")
+	var created pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: "default", Name: "new"}, &created); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRestore(t, r, "r1")
+	for _, g := range Groups(&created) {
+		pg := &pgshardv1alpha1.PgShardGroup{ObjectMeta: metav1.ObjectMeta{Name: g.Prefix(), Namespace: "default"}}
+		if err := cl.Create(ctx, pg); err != nil {
+			t.Fatal(err)
+		}
+		pg.Status.Primary = g.MemberName(0)
+		if err := cl.Status().Update(ctx, pg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcileRestore(t, r, "r1")
+	if err := cl.Create(ctx, readyPod("new-catalog-0", "10.1.0.1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, readyPod("new-shard-0-0", "10.1.0.2")); err != nil {
+		t.Fatal(err)
+	}
+	agents.set("10.1.0.1", AgentStatus{Running: true, Primary: true, Timeline: 2}, nil)
+	agents.set("10.1.0.2", AgentStatus{Running: true, Primary: true, Timeline: 5}, nil)
+	reconcileRestore(t, r, "r1")
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: "default", Name: "new"}, &created); err != nil {
+		t.Fatal(err)
+	}
+	meta.SetStatusCondition(&created.Status.Conditions, metav1.Condition{Type: pgshardv1alpha1.ConditionReady, Status: metav1.ConditionTrue, Reason: "Ready"})
+	if err := cl.Status().Update(ctx, &created); err != nil {
+		t.Fatal(err)
+	}
+	// The pass that reaches the terminal phase, and so the cleanup.
+	_, _ = r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "default", Name: "r1"}})
+}
+
+// TestAFailedCleanupDoesNotStrandTheRestoreSourceAnnotation.
+//
+// Reconcile returns immediately for a Recovered restore, so anything left
+// undone when that phase is written is never retried. Clearing the
+// restore-source annotation used to run AFTER the status patch: one failed
+// patch, or a crash in the gap, left the annotation on the cluster forever
+// -- and a later primary bootstrap with an empty PGDATA acts on it, which
+// would restore the ORIGINAL source backup over the cluster that has been
+// running ever since.
+func TestAFailedCleanupDoesNotStrandTheRestoreSourceAnnotation(t *testing.T) {
+	source := boundCluster("old")
+	one := 1
+	source.Spec.Shards = &one
+	name := "before-purge"
+	rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new", BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Name: &name}})
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fail the cluster patch that clears the annotation, exactly once.
+	failures := 1
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(source, newPolicy(), completedBackup("b1", "old"), rs, superuserSecret("old")).
+		WithStatusSubresource(&pgshardv1alpha1.PgShardRestore{}, &pgshardv1alpha1.PgShardCluster{}, &pgshardv1alpha1.PgShardGroup{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if cl, ok := obj.(*pgshardv1alpha1.PgShardCluster); ok && failures > 0 {
+					if _, has := cl.Annotations[AnnotationRestoreSource]; !has {
+						failures--
+						return fmt.Errorf("simulated API failure clearing the restore source")
+					}
+				}
+				return c.Patch(ctx, obj, patch, opts...)
+			},
+		}).Build()
+	agents := newFakeAgents(nil)
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	r := &RestoreReconciler{Client: cl, Agents: agents, Now: func() time.Time { return now }}
+
+	driveRestoreToRecovery(t, r, cl, agents)
+
+	// The cleanup failed, so the restore must NOT be terminal -- if it were,
+	// nothing would ever come back for the annotation.
+	var got pgshardv1alpha1.PgShardRestore
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "r1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase == pgshardv1alpha1.RestorePhaseRecovered {
+		t.Fatal("the restore went terminal while its cleanup had failed: nothing will retry it")
+	}
+
+	// The next pass succeeds and converges.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "default", Name: "r1"}}); err != nil {
+		t.Fatal(err)
+	}
+	var created pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &created); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := created.Annotations[AnnotationRestoreSource]; ok {
+		t.Fatalf("the restore source annotation was never cleared: %v", created.Annotations)
 	}
 }
 
