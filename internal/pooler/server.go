@@ -783,6 +783,12 @@ func (r *relay) pumpFlush(b *Backend) error {
 		}
 		if resp := toResponse(msg, r.packed); resp != nil {
 			if err := r.send(resp); err != nil {
+				// The router is gone, and the REST of this reply is still
+				// queued on the backend. Reusing it would hand those
+				// messages to the next session, so it must not go back
+				// to the pool. One backend is the right price; a
+				// desynchronised one cascades to every session after it.
+				b.markBroken()
 				return err
 			}
 		}
@@ -819,6 +825,11 @@ func (r *relay) pump(b *Backend) error {
 		}
 		if resp := toResponse(msg, r.packed); resp != nil {
 			if err := r.send(resp); err != nil {
+				// Same as pumpFlush: the rest of this reply is still
+				// queued on the backend, and neither hasUnflushed nor
+				// idle() can see it -- the ReadyForQuery that would
+				// update the status is one of the queued messages.
+				b.markBroken()
 				return err
 			}
 		}
