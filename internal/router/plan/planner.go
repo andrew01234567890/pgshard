@@ -2312,6 +2312,12 @@ func (w *walker) insert(s *pgquerypb.InsertStmt) error {
 			}
 		}
 	}
+	// RETURNING is walked for the same reason as in update and delete: its
+	// relations were invisible, so a subquery in it was answered from the
+	// shard the INSERT routed to.
+	if err := w.exprs(s.GetReturningClause().GetExprs()); err != nil {
+		return err
+	}
 	return w.decide(true)
 }
 
@@ -2349,6 +2355,15 @@ func (w *walker) update(s *pgquerypb.UpdateStmt) error {
 	if err := w.exprs(s.GetTargetList()); err != nil {
 		return err
 	}
+	// RETURNING is part of the statement and was never walked, so the
+	// relations and routing requirements inside it were invisible:
+	// DELETE ... RETURNING (SELECT count(*) FROM other) was routed by
+	// the target table alone and answered from that one shard, with no
+	// error. Walking it registers the subquery's relations, so the plan
+	// accounts for them like any other read.
+	if err := w.exprs(s.GetReturningClause().GetExprs()); err != nil {
+		return err
+	}
 	return w.decide(true)
 }
 
@@ -2373,6 +2388,12 @@ func (w *walker) delete(s *pgquerypb.DeleteStmt) error {
 		}
 	}
 	if err := w.where(s.GetWhereClause(), w.rels[scope:]); err != nil {
+		return err
+	}
+	// RETURNING is walked for the same reason as in update: its
+	// relations were invisible, so a subquery in it was answered from
+	// the shard the DELETE routed to.
+	if err := w.exprs(s.GetReturningClause().GetExprs()); err != nil {
 		return err
 	}
 	return w.decide(true)
