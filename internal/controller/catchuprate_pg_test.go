@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,11 @@ func rateShape(table string) rowShape {
 
 const rateRows = 4000
 
+// sharedRunner reports whether this is a hosted CI runner, where a ratio
+// between two differently-bound workloads is not a measurement anyone can
+// act on. CI is set by GitHub Actions and by every other hosted runner.
+func sharedRunner() bool { return os.Getenv("CI") != "" }
+
 func rateRow(i int) *Tuple {
 	return &Tuple{
 		Values:    []*string{s(itoa(int64(i))), s("1"), s(strings.Repeat("x", 64))},
@@ -95,8 +101,25 @@ func TestCatchUpAppliesMoreOperationsASecondWhenItCoalescesThem(t *testing.T) {
 	// The floor sits between what a regression measures and what a bad
 	// runner measures: coalescing off is 1.2x, and best-of-three with it
 	// on has not been seen below 2.4x.
-	if coalesced < 1.5*perRow {
-		t.Errorf("coalescing is only %.1fx one statement per row; it was 2.9x to 3.7x when written", coalesced/perRow)
+	//
+	// That calibration does not hold on a shared CI runner, and the two
+	// arms are not equally affected -- measured 2026-09-09, the coalesced
+	// arm runs about 3.6x slower there while the per-row arm runs only
+	// about 1.4x slower, because per-row is bound by round trips the runner
+	// does fine and coalescing is bound by work it does badly. The ratio
+	// came out 1.3x and 1.4x on CI against 3.3x locally on the same commit,
+	// so the assertion failed repeatedly with nothing wrong.
+	//
+	// It stays an assertion where it can be trusted and a report where it
+	// cannot: a ratio that fails half the time on every PR gets worked
+	// around, which is worse than no guard at all. The nightly perf job is
+	// where a real regression has to be caught. See PGS-763.
+	switch ratio := coalesced / perRow; {
+	case ratio >= 1.5:
+	case sharedRunner():
+		t.Logf("coalescing is only %.1fx here; not asserted on a shared runner, where the arms are not equally affected", ratio)
+	default:
+		t.Errorf("coalescing is only %.1fx one statement per row; it was 2.9x to 3.7x when written", ratio)
 	}
 	for _, table := range []string{"per_row", "coalesced"} {
 		assertRowsLanded(t, raw, table, rateRows)
