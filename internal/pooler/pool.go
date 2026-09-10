@@ -289,7 +289,7 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 		if p.cfg.OnWait != nil {
 			p.cfg.OnWait()
 		}
-		reused, err := p.awaitSlot(ctx, rp, digest)
+		reused, err := p.awaitSlot(ctx, rp, role, digest)
 		if err != nil {
 			return nil, err
 		}
@@ -431,6 +431,43 @@ func (p *Pool) popIdle(rp *rolePool, digest [32]byte) *Backend {
 	}
 }
 
+// evictIdleOfRole closes the least recently used idle backend of this ROLE
+// in ANOTHER database, freeing a slot in the role's semaphore.
+//
+// The semaphore is shared by every database a role connects to, but idle
+// lists and waiters are per (database, role). So a role that went idle in
+// one database held a slot its own waiter in another database could neither
+// see nor reclaim: with MaxPerRole=1, querying database A and then database
+// B timed out on every acquire while A's connection sat idle and the
+// shard-wide budget had room. The pool-wide eviction path was never reached,
+// because that budget was never the thing exhausted.
+func (p *Pool) evictIdleOfRole(role string, want *rolePool) bool {
+	p.mu.Lock()
+	var victim *Backend
+	var owner *rolePool
+	var at int
+	for k, rp := range p.roles {
+		if k.role != role || rp == want {
+			continue
+		}
+		for i, b := range rp.idle {
+			if victim == nil || b.lastUsed.Before(victim.lastUsed) {
+				victim, owner, at = b, rp, i
+			}
+		}
+	}
+	if victim != nil {
+		owner.idle = append(owner.idle[:at], owner.idle[at+1:]...)
+	}
+	p.mu.Unlock()
+	if victim == nil {
+		return false
+	}
+	victim.close()
+	p.free(owner)
+	return true
+}
+
 // evictIdle closes one idle backend of any role, freeing its slot.
 // evictIdle closes the least recently used idle backend to make room, and
 // reports whether it found one. It used to take the last entry of whichever
@@ -471,7 +508,7 @@ func (p *Pool) evictIdle() bool {
 // sat there until its acquire timeout while a backend it could have used
 // was idle. It queues on the role too and rechecks the idle list, the same
 // way acquireTotal waits for the pool-wide budget.
-func (p *Pool) awaitSlot(ctx context.Context, rp *rolePool, digest [32]byte) (*Backend, error) {
+func (p *Pool) awaitSlot(ctx context.Context, rp *rolePool, role string, digest [32]byte) (*Backend, error) {
 	var w *waiter
 	for {
 		// Queue before looking, so a release between the look and the wait
@@ -490,6 +527,17 @@ func (p *Pool) awaitSlot(ctx context.Context, rp *rolePool, digest [32]byte) (*B
 		if b := p.popIdle(rp, digest); b != nil {
 			p.leave(&rp.waiters, w)
 			return b, nil
+		}
+		// Nothing idle HERE, and the role's slots may all be held by idle
+		// backends in another database, which this waiter can neither see
+		// nor reuse. Take one back rather than waiting out the acquire
+		// timeout beside a connection that is doing nothing.
+		if p.evictIdleOfRole(role, rp) {
+			// Unqueue before retrying, or the next turn parks this waiter a
+			// second time and a wake-up meant for it is spent on a ghost.
+			p.leave(&rp.waiters, w)
+			w = nil
+			continue
 		}
 		got, err := func() (bool, error) {
 			defer func() { p.leave(&rp.waiters, w) }()
