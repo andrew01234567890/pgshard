@@ -876,7 +876,7 @@ func (s *session) reportError(err error) {
 	if errors.Is(err, context.Canceled) {
 		err = Errorf(CodeQueryCanceled, "canceling statement due to user request")
 	}
-	s.be.Send(toErrorResponse(err))
+	_ = s.sendMsg(toErrorResponse(err))
 }
 
 // asQueryTimeout renames the failure of a statement this session stopped
@@ -939,7 +939,9 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		if err != nil {
 			return true, s.extendedError(err)
 		}
-		s.be.Send(&pgproto3.ParseComplete{})
+		if err := s.sendMsg(&pgproto3.ParseComplete{}); err != nil {
+			return true, err
+		}
 	case *pgproto3.Bind:
 		err := s.runQuery(ctx, func(qctx context.Context) error {
 			return s.exec.Bind(qctx, m.DestinationPortal, m.PreparedStatement, m.ParameterFormatCodes, m.Parameters, m.ResultFormatCodes)
@@ -947,7 +949,9 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		if err != nil {
 			return true, s.extendedError(err)
 		}
-		s.be.Send(&pgproto3.BindComplete{})
+		if err := s.sendMsg(&pgproto3.BindComplete{}); err != nil {
+			return true, err
+		}
 	case *pgproto3.Describe:
 		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Describe(qctx, DescribeKind(m.ObjectType), m.Name, w) })
 		if err != nil {
@@ -962,7 +966,9 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		if err := s.exec.Close(ctx, DescribeKind(m.ObjectType), m.Name); err != nil {
 			return true, s.extendedError(err)
 		}
-		s.be.Send(&pgproto3.CloseComplete{})
+		if err := s.sendMsg(&pgproto3.CloseComplete{}); err != nil {
+			return true, err
+		}
 	case *pgproto3.Flush:
 		// Flush must produce the answers to what has been staged, not only
 		// push bytes already written: a pipelined client sends Execute
@@ -1006,7 +1012,9 @@ func (s *session) simpleQuery(ctx context.Context, sql string, w *resultWriter) 
 		s.reportError(Errorf(CodeSyntaxError, "%v", err))
 		return s.readyForQuery()
 	case len(stmts) == 0:
-		s.be.Send(&pgproto3.EmptyQueryResponse{})
+		if err := s.sendMsg(&pgproto3.EmptyQueryResponse{}); err != nil {
+			return err
+		}
 		return s.readyForQuery()
 	case len(stmts) > 1:
 		return s.simpleQueryBatch(ctx, stmts, w)
