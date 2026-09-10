@@ -443,7 +443,7 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 		if exists {
 			sql = "ALTER ROLE " + pgx.Identifier{r.Name}.Sanitize() + " " + RoleOptionsSQL(r)
 		}
-		if _, err := conn.Exec(ctx, sql); err != nil {
+		if err := execRole(ctx, conn, sql); err != nil {
 			return fmt.Errorf("role %s: %w", r.Name, err)
 		}
 	}
@@ -467,7 +467,7 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 		if m.Admin {
 			sql += " WITH ADMIN OPTION"
 		}
-		if _, err := conn.Exec(ctx, sql); err != nil {
+		if err := execRole(ctx, conn, sql); err != nil {
 			return fmt.Errorf("membership %s in %s: %w", m.Member, m.Role, err)
 		}
 	}
@@ -487,7 +487,7 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 			sql += " IN DATABASE " + pgx.Identifier{s.Database}.Sanitize()
 		}
 		sql += " SET " + pgx.Identifier{s.Name}.Sanitize() + " TO " + quoteLiteral(s.Value)
-		if _, err := conn.Exec(ctx, sql); err != nil {
+		if err := execRole(ctx, conn, sql); err != nil {
 			return fmt.Errorf("setting %s of %s: %w", s.Name, s.Role, err)
 		}
 	}
@@ -967,3 +967,47 @@ func (c poolShardConn) Close(ctx context.Context) error {
 	c.Release()
 	return nil
 }
+
+// concurrentUpdate reports PostgreSQL refusing a catalog write because
+// another backend changed the same row first: XX000 "tuple concurrently
+// updated". It is not a serialization failure the caller is told to retry,
+// so nothing retries it on its own.
+func concurrentUpdate(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "XX000" &&
+		strings.Contains(pgErr.Message, "tuple concurrently updated")
+}
+
+// execRole runs one role statement, retrying a concurrent-update collision
+// on that ROLE alone.
+//
+// Role and grant materialization is the one place pgshard writes an object
+// a HUMAN is also entitled to write, so the collision happens whenever an
+// administrator runs ALTER ROLE during a repair pass, or two controllers
+// overlap during a leadership handover. Losing that race failed the whole
+// pass, which then retried EVERY role for one collision.
+//
+// Retried here rather than around the pass for that reason: a genuinely
+// wedged role must not block all the others.
+func execRole(ctx context.Context, conn ShardConn, sql string) error {
+	var err error
+	for attempt := range roleCollisionRetries {
+		if _, err = conn.Exec(ctx, sql); err == nil || !concurrentUpdate(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * roleCollisionBackoff):
+		}
+	}
+	return err
+}
+
+// roleCollisionRetries and roleCollisionBackoff bound the wait: a few short
+// attempts cover a concurrent writer, and a role that keeps losing is a
+// real failure rather than a race.
+const (
+	roleCollisionRetries = 4
+	roleCollisionBackoff = 20 * time.Millisecond
+)
