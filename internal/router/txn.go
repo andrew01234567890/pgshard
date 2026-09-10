@@ -626,6 +626,11 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		return err
 	}
 	crashpoint.Hit("after_decision")
+	// The outcome is durable now, so a client cancel must stop reaching the
+	// participants: interrupting COMMIT PREPARED leaves those rows prepared
+	// until the resolver finishes them, and the client has already been
+	// told COMMIT.
+	e.decided.Store(true)
 	e.r.metrics.TwoPCCommits.Inc()
 	commitPrepared := func(p *txnPart) error {
 		return e.runOn(ctx, p, "COMMIT PREPARED "+quoteLiteral(gid), discardWriter{})
@@ -668,6 +673,7 @@ func heartbeatUntilDecided(ctx context.Context, log DecisionLog, gid string) {
 
 // finishTxn marks the multi-shard transaction over on the current stream.
 func (e *Executor) finishTxn(tag string) {
+	e.decided.Store(false)
 	e.forgetCancelTargets()
 	e.tx = pgwire.TxIdle
 	e.txnOnBackend, e.txnPreFence = false, false
