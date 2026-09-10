@@ -430,6 +430,57 @@ func TestRewriteRefusesDependentColumnOnPostgres(t *testing.T) {
 // UPDATE of the whole table, which is the opposite of what an online rewrite
 // is for: unbounded WAL, row locks held for the length of the rewrite, and a
 // cancellation that has to roll all of it back.
+// TestRewriteBackfillOverAUUIDPrimaryKey: the backfill cursor only has to be
+// ORDERABLE, and orderable is not aggregatable. Reporting each batch's last
+// key with max() failed with 42883 "function max(uuid) does not exist" on a
+// uuid primary key -- which is the key type the sharding guide recommends,
+// so the recommended key was the one that could not be rewritten online.
+func TestRewriteBackfillOverAUUIDPrimaryKey(t *testing.T) {
+	parallelPG(t)
+	pool, a, store := rewritePGFixture(t)
+	ctx := context.Background()
+	mustExecSQL(t, pool, `CREATE TABLE events (id uuid NOT NULL PRIMARY KEY, amount text NOT NULL DEFAULT '0')`)
+	mustExecSQL(t, pool, `ALTER TABLE events OWNER TO appowner`)
+	mustExecSQL(t, pool, `INSERT INTO events (id, amount) SELECT uuidv7(), g::text FROM generate_series(1, `+fmt.Sprint(rewriteRows)+`) g`)
+
+	m := catalog.DDLMigration{ID: "10000000-0000-0000-0000-0000000000c2", Database: "postgres",
+		Statement: "alter table events alter column amount type bigint using amount::bigint",
+		Kind:      "ALTER TABLE", Strategy: catalog.StrategyRewrite, Scope: "all", State: catalog.MigrationQueued,
+		Meta: catalog.MigrationMeta{RunAs: "appowner", Rewrite: &catalog.RewriteChange{Schema: "public", Table: "events",
+			Column: "amount", NewType: "bigint", Using: "amount::bigint", BatchSize: 100}}}
+	store.migrations = []catalog.DDLMigration{m}
+
+	if _, err := a.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := store.get(t, m.ID)
+	if got.State != catalog.MigrationComplete {
+		t.Fatalf("state %s: %s", got.State, got.Error)
+	}
+	var typ string
+	if err := pool.QueryRow(ctx, `SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a
+		WHERE a.attrelid = 'public.events'::regclass AND a.attname = 'amount'`).Scan(&typ); err != nil {
+		t.Fatal(err)
+	}
+	if typ != "bigint" {
+		t.Fatalf("column type %q after the rewrite, want bigint", typ)
+	}
+	// Every row must have carried its value, and the backfill must still
+	// have been batched -- a cursor that silently stopped advancing would
+	// finish by the final whole-table pass and hide the regression.
+	var wrong int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE amount::text <> ''`).Scan(&wrong); err != nil {
+		t.Fatal(err)
+	}
+	var versions int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM (SELECT DISTINCT xmin::text FROM events) v`).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions < 2 {
+		t.Fatalf("every row shares one transaction id: the backfill ran as a single unbounded UPDATE of all %d rows", rewriteRows)
+	}
+}
+
 func TestRewriteBackfillBatchesWithoutASinglePrimaryKey(t *testing.T) {
 	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
