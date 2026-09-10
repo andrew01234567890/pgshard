@@ -50,12 +50,17 @@ type Instance struct {
 	// carrying it went to Failed with a raw pgBackRest error. One agent owns
 	// one stanza, so waiting here is the whole of it.
 	repoGate chan struct{}
+	// boot is what this member can say about building its data directory
+	// while it is doing it, which is the only thing that keeps a clone
+	// longer than the startup probe's budget from being killed and started
+	// again from nothing.
+	boot *bootstrapProgress
 }
 
 // NewInstance wires an Instance from its parts.
 func NewInstance(cfg *Config, sup *Supervisor, epoch *EpochStore, log *slog.Logger) *Instance {
 	in := &Instance{cfg: cfg, sup: sup, epoch: epoch, log: log, cloneRetry: 5 * time.Second,
-		repoGate: make(chan struct{}, 1)}
+		repoGate: make(chan struct{}, 1), boot: newBootstrapProgress(cfg.PGData)}
 	in.rewindFn = in.pgRewind
 	in.recloneFn = in.baseBackup
 	in.repoCloneFn = in.repoClone
@@ -66,6 +71,17 @@ func NewInstance(cfg *Config, sup *Supervisor, epoch *EpochStore, log *slog.Logg
 	sup.Env = append(sup.Env, "PGPASSFILE="+in.pgpassPath())
 	return in
 }
+
+// BootstrapState reports whether this member is still building its data
+// directory, whether that work has stalled, and what it is doing. It is
+// what the startup and liveness probes answer with while there is no
+// PostgreSQL to answer for.
+func (in *Instance) BootstrapState() (active, stalled bool, what string) {
+	return in.boot.state()
+}
+
+// WatchBootstrap samples the data directory until the bootstrap ends.
+func (in *Instance) WatchBootstrap(ctx context.Context) { in.boot.watch(ctx) }
 
 // IsEmpty reports whether PGDATA has no cluster in it.
 func (in *Instance) IsEmpty() (bool, error) {
@@ -100,6 +116,7 @@ func (in *Instance) IsStandby() (bool, error) {
 // and renders the configuration; it is a no-op on an existing cluster
 // except for re-rendering configuration.
 func (in *Instance) Bootstrap(ctx context.Context) error {
+	defer in.boot.finish()
 	if err := in.writePgpass(); err != nil {
 		return err
 	}
@@ -124,19 +141,23 @@ func (in *Instance) Bootstrap(ctx context.Context) error {
 	}
 	switch {
 	case empty && in.cfg.Role == RolePrimary && in.cfg.Restore != nil:
+		in.boot.begin("restoring from the repository")
 		if err := in.restoreFn(ctx); err != nil {
 			return err
 		}
 	case empty && in.cfg.Role == RolePrimary:
+		in.boot.begin("initdb")
 		if err := in.initdb(ctx); err != nil {
 			return err
 		}
 	case empty && in.cfg.Role == RoleStandby:
+		in.boot.begin("cloning from the primary")
 		if err := in.retryClone(ctx); err != nil {
 			return err
 		}
 	case !empty && in.cfg.Role == RoleStandby && !standby:
 		in.log.Info("data directory belongs to a former primary; rejoining as a standby")
+		in.boot.begin("rejoining as a standby")
 		if err := in.waitSourceFn(ctx, in.cfg.PrimaryConninfo); err != nil {
 			return err
 		}
