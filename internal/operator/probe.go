@@ -213,9 +213,20 @@ func (PgxProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, er
 	var st StandbyState
 	err := withProbeConn(ctx, dsn, func(conn *pgxpool.Conn) error {
 		var lsn *int64
+		// GREATEST of received and replayed, not received alone.
+		// pg_last_wal_receive_lsn() is NULL until the walreceiver has
+		// started, so a standby that has just restarted reported NULL --
+		// read here as ZERO, which ranks it BELOW every member that is
+		// behind it. A standby holding the last synchronously acknowledged
+		// commits could therefore lose the election and then be rewound to
+		// the winner, discarding those commits. Replay position survives the
+		// restart, so it is the floor when the receiver has not reconnected.
 		err := conn.QueryRow(ctx, `SELECT pg_is_in_recovery(),
 			EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming'),
-			CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_flush_lsn() END - '0/0'::pg_lsn`).
+			CASE WHEN pg_is_in_recovery()
+			     THEN GREATEST(coalesce(pg_last_wal_receive_lsn(), '0/0'::pg_lsn),
+			                   coalesce(pg_last_wal_replay_lsn(), '0/0'::pg_lsn))
+			     ELSE pg_current_wal_flush_lsn() END - '0/0'::pg_lsn`).
 			Scan(&st.InRecovery, &st.Streaming, &lsn)
 		if err != nil {
 			return err
