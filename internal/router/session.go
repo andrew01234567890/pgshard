@@ -1759,9 +1759,16 @@ func (e *Executor) sync(ctx context.Context) error {
 				return err
 			}
 		}
+		// A BEGIN earlier in this same batch opens the transaction the
+		// write belongs to, even though it has not run yet, so the walk
+		// tracks it rather than reading e.tx alone.
+		inTxn := e.tx != pgwire.TxIdle
 		for _, item := range executed {
+			if item.class.Txn == plan.TxnBegin {
+				inTxn = true
+			}
 			if item.class.Write {
-				if err := e.noteWrite(ctx); err != nil {
+				if err := e.noteWriteIn(ctx, inTxn); err != nil {
 					e.staged = e.staged[:e.stagedMark]
 					return err
 				}
