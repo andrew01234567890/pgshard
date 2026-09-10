@@ -333,9 +333,10 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		return status.Errorf(codes.FailedPrecondition, "shard set %q has no serving shards", set)
 	}
 	gen := s.Topology.Generation()
+	fingerprint := s.Topology.Fingerprint(set)
 	send := lockedSender(srv.Send)
-	if pg := start.GetPosition().GetShardMapGeneration(); pg != 0 && pg != gen {
-		m := &merger{shards: shards, topo: s.Topology, generation: pg, opts: opts, send: send}
+	if stale(start.GetPosition(), gen, fingerprint) {
+		m := &merger{shards: shards, topo: s.Topology, set: set, generation: start.GetPosition().GetShardMapGeneration(), opts: opts, send: send}
 		return m.resharded()
 	}
 	startPos := positionFrom(start.GetPosition())
@@ -400,11 +401,27 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 	live := newEmitted(shards, startPos)
 	defer s.registerLive(def.Name, live)()
 	m := &merger{shards: shards, inputs: inputs, ready: ready, acks: acks, acker: ackers.request, send: send,
-		topo: s.Topology, generation: gen, opts: opts, position: startPos, copying: copying, emitted: live}
+		topo: s.Topology, set: set, generation: gen, fingerprint: fingerprint, opts: opts, position: startPos, copying: copying, emitted: live}
 	err = m.run(ctx)
 	cancel()
 	wg.Wait()
 	return err
+}
+
+// stale reports whether a saved position was taken on a shard set that no
+// longer serves.
+//
+// A position stamped with a fingerprint answers this exactly: rows moved,
+// or they did not. One from a server that stamped none can only be compared
+// on the generation, which is what it was compared on before -- so an older
+// consumer keeps the behaviour it had rather than being told its position
+// is fine when nothing knows whether it is.
+func stale(pos *pgshardv1.VPosition, gen, fingerprint uint64) bool {
+	if pf := pos.GetShardSetFingerprint(); pf != 0 {
+		return pf != fingerprint
+	}
+	pg := pos.GetShardMapGeneration()
+	return pg != 0 && pg != gen
 }
 
 func lockedSender(send func(*pgshardv1.VEvent) error) func(*pgshardv1.VEvent) error {

@@ -2,8 +2,10 @@ package vstream
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -24,6 +26,12 @@ type Topology interface {
 	// that omits one means.
 	ServingSet() string
 	Generation() uint64
+	// Fingerprint identifies the serving shard set: which shards serve it
+	// and which key ranges they own. It changes only when rows move, which
+	// is what a stream and a saved position actually depend on -- the
+	// generation counts every catalog change, including ones that move
+	// nothing.
+	Fingerprint(set string) uint64
 	Epoch(sh router.Shard) uint64
 	Client(sh router.Shard) (pgshardv1.PoolerClient, error)
 }
@@ -50,6 +58,39 @@ func (t SnapshotTopology) Shards(set string) []router.Shard {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// Fingerprint hashes the serving shards of set and the ranges they own.
+//
+// A shard that appears, disappears or gives up part of its range moves
+// rows, and a position taken before that cannot be resumed after it. A
+// generation bump that leaves all three alone -- a shard set declared
+// before its cutover, a table placement published -- moves nothing.
+func (t SnapshotTopology) Fingerprint(set string) uint64 {
+	s := t.Snapshot()
+	if s == nil {
+		return 0
+	}
+	ranges := append([]snapshot.Range(nil), s.ShardSets[set]...)
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].ShardID < ranges[j].ShardID })
+	h := fnv.New64a()
+	var buf [8]byte
+	write := func(v uint64) {
+		binary.BigEndian.PutUint64(buf[:], v)
+		_, _ = h.Write(buf[:])
+	}
+	_, _ = h.Write([]byte(set))
+	for _, r := range ranges {
+		write(uint64(uint32(r.ShardID)))
+		write(uint64(r.Start))
+		write(uint64(r.End))
+	}
+	// A set with no ranges at all must not hash to zero, which means "no
+	// fingerprint was stamped" everywhere else.
+	if v := h.Sum64(); v != 0 {
+		return v
+	}
+	return 1
 }
 
 // ServingSet answers from the snapshot, the same source the planner and

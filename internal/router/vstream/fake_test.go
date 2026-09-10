@@ -214,6 +214,20 @@ type fakeTopology struct {
 	// serving is what an omitted shard set resolves to; empty means the
 	// default set, which is what a cluster that never resharded reports.
 	serving string
+	// fingerprint is the identity of the serving shard set. A test that
+	// bumps only gen is saying the catalog changed without moving rows.
+	fingerprint uint64
+}
+
+func (t *fakeTopology) Fingerprint(string) uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.fingerprint == 0 {
+		// A topology that says nothing about its set still has one, and it
+		// is the same one for the life of the fake.
+		return 1
+	}
+	return t.fingerprint
 }
 
 func (t *fakeTopology) ServingSet() string {
@@ -262,7 +276,22 @@ func (t *fakeTopology) promote(sh router.Shard, p *fakePooler) {
 	t.poolers[sh] = p
 }
 
+// reshard moves rows: the shard set is a different one afterwards, which
+// is what ends a stream.
 func (t *fakeTopology) reshard() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.gen++
+	if t.fingerprint == 0 {
+		t.fingerprint = 1
+	}
+	t.fingerprint++
+}
+
+// bumpGeneration is a catalog change that moves no rows -- a shard set
+// declared before its cutover, a table placement published. The counter
+// advances and the serving shards are the ones they were.
+func (t *fakeTopology) bumpGeneration() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.gen++

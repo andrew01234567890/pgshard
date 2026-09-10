@@ -49,9 +49,13 @@ type merger struct {
 	acker      func(router.Shard, uint64)
 	send       func(*pgshardv1.VEvent) error
 	topo       Topology
+	set        string
 	generation uint64
-	opts       options
-	now        func() time.Time
+	// fingerprint is the serving shard set this stream was opened on. The
+	// generation above is only a cheap gate for consulting it.
+	fingerprint uint64
+	opts        options
+	now         func() time.Time
 
 	position map[router.Shard]uint64
 	// emitted mirrors position for the unary Ack path, which runs on
@@ -88,6 +92,7 @@ func (m *merger) vector() *pgshardv1.VPosition {
 		m.posShard = map[router.Shard]*pgshardv1.VPosition_Shard{}
 	}
 	m.pos.ShardMapGeneration = m.generation
+	m.pos.ShardSetFingerprint = m.fingerprint
 	m.pos.Shards = m.pos.Shards[:0]
 	m.pos.CopyState = m.pos.CopyState[:0]
 	for _, sh := range m.shards {
@@ -124,8 +129,18 @@ func (m *merger) run(ctx context.Context) error {
 	heartbeat := time.NewTimer(m.opts.heartbeat)
 	defer heartbeat.Stop()
 	for {
-		if m.topo.Generation() != m.generation {
-			return m.resharded()
+		if gen := m.topo.Generation(); gen != m.generation {
+			// The generation counts every catalog change, and most of them
+			// move no rows: a shard set declared days before its cutover, a
+			// table placement published. Ending the stream on the counter
+			// ended it on all of those, and the consumer's saved position
+			// -- stamped with the old count -- was then refused for ever,
+			// so the restart it was told to do could not succeed either.
+			// What invalidates a stream is the shard set changing under it.
+			if fp := m.topo.Fingerprint(m.set); fp != m.fingerprint {
+				return m.resharded()
+			}
+			m.generation = gen
 		}
 		m.drainAcks()
 		m.fill()

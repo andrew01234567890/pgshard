@@ -177,6 +177,19 @@ message VPosition {
   uint64 shard_map_generation = 2;
   // Shards still in their initial copy.
   repeated VCopyState copy_state = 3;
+  // Identity of the serving shard set this position was taken in: the
+  // shards and the key ranges they own.
+  //
+  // The generation above counts every catalog change, including ones that
+  // move no rows -- a new shard set declared days before its cutover, a
+  // table placement published. Ending a stream on the counter ended it on
+  // all of those, and the position the consumer had saved was then refused
+  // for ever because it carried the old count. What actually invalidates a
+  // position is the shard set changing under it, which is what this says.
+  //
+  // Zero means a position from a server that did not stamp one; those fall
+  // back to the generation.
+  uint64 shard_set_fingerprint = 4;
 }
 
 // VStreamRequest is the start of a stream or an ack.
