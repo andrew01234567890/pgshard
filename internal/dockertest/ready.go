@@ -144,11 +144,19 @@ func waitReady(id string, connect Connector, probe dockerProbes, idle, limit tim
 		}
 		switch {
 		case time.Since(lastProgress) > idle:
-			return mappingOr(probe, id, fmt.Errorf("the container logged nothing for %s and never accepted a connection (%s in total); last error %w\n%s\ncontainer log:\n%s",
-				idle, time.Since(start).Round(time.Second), err, ports(probe, id), probe.log(id)))
+			// The ports are probed ONCE and the same answer decides both
+			// what the message says and whether this is retryable.
+			// Probing again to classify asked docker a second question a
+			// moment later, and the container is being torn down around
+			// it: the message said the mapping had failed while the
+			// classification saw something else, and no retry ever fired.
+			mapped := ports(probe, id)
+			return mappingOr(mapped, fmt.Errorf("the container logged nothing for %s and never accepted a connection (%s in total); last error %w\n%s\ncontainer log:\n%s",
+				idle, time.Since(start).Round(time.Second), err, mapped, probe.log(id)))
 		case time.Since(start) > limit:
-			return mappingOr(probe, id, fmt.Errorf("the container did not accept a connection within %s, though it was still logging; last error %w\n%s\ncontainer log:\n%s",
-				limit, err, ports(probe, id), probe.log(id)))
+			mapped := ports(probe, id)
+			return mappingOr(mapped, fmt.Errorf("the container did not accept a connection within %s, though it was still logging; last error %w\n%s\ncontainer log:\n%s",
+				limit, err, mapped, probe.log(id)))
 		}
 		time.Sleep(connectEvery)
 	}
@@ -157,8 +165,8 @@ func waitReady(id string, connect Connector, probe dockerProbes, idle, limit tim
 // mappingOr marks err as ErrPortMapping when the ports probe says the host
 // side never came up. The message is unchanged either way -- what changes
 // is whether a caller may start another container instead of giving up.
-func mappingOr(probe dockerProbes, id string, err error) error {
-	if strings.Contains(ports(probe, id), noHostListener) {
+func mappingOr(mapped string, err error) error {
+	if strings.Contains(mapped, noHostListener) {
 		return fmt.Errorf("%w\n%w", ErrPortMapping, err)
 	}
 	return err

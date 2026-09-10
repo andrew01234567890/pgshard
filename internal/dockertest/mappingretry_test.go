@@ -40,6 +40,26 @@ func TestAFailedMappingIsToldApartFromAFailedContainer(t *testing.T) {
 		t.Fatalf("a server that is reachable and not answering was marked retryable: %v", err)
 	}
 
+	// The answer that decides retryability must be the SAME answer the
+	// message reported. Probing again to classify asked docker a second
+	// question a moment later, while the container was being torn down
+	// around it -- so the message said the mapping had failed, the
+	// classification saw something else, and no retry fired. Seen in a real
+	// run: three "NOTHING is listening" failures and no retry attempted.
+	once := probes(true, "running", steady("no progress at all"))
+	calls := 0
+	once.ports = func(string) string {
+		calls++
+		if calls == 1 {
+			return "published ports:\n  5432/tcp -> 127.0.0.1:1  ->  " + noHostListener
+		}
+		return "published ports: none (docker port said \"\")"
+	}
+	err = waitReady("c", refused, once, 20*time.Millisecond, time.Minute)
+	if !errors.Is(err, ErrPortMapping) {
+		t.Fatalf("the failure was classified from a second probe rather than the one it reported: %v", err)
+	}
+
 	// A container that stopped is its own error, whatever the ports say:
 	// it will stop again.
 	stopped := probes(false, "exited exit=1", steady("x"))
