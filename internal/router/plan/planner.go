@@ -68,7 +68,7 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 		return sess.unsharded(), nil
 	}
 	pl := &Plan{Generation: sess.generation(), home: sess.HomeShard, set: sess.shardSet(), snap: sess.Snapshot}
-	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
+	if err := classify(raw.GetStmt(), &pl.Class, sess.localOnly()); err != nil {
 		return refusalErr(err)
 	}
 	if rw := readWriteRewrite(raw.GetStmt()); rw != "" {
@@ -142,6 +142,16 @@ func (s Session) shardSet() string {
 	return s.Snapshot.ServingShardSet()
 }
 
+// localOnly reports whether every object of this database lives on its home
+// shard, so a statement about one has exactly one place to run and needs no
+// fan-out to get there.
+func (s Session) localOnly() bool {
+	if s.Snapshot == nil {
+		return false
+	}
+	return s.Snapshot.Databases[s.Database].LocalOnly
+}
+
 func (s Session) unsharded() Plan {
 	return Plan{Kind: Unsharded, Shards: []int32{s.HomeShard}, Generation: s.generation(), Class: StmtClass{Write: true}}
 }
@@ -150,7 +160,12 @@ func (s Session) session() Plan { return Plan{Kind: SessionLocal, Generation: s.
 
 // classify picks up the session-level facts the executor tracks and the
 // refusals that do not depend on the catalog.
-func classify(node *pgquerypb.Node, c *StmtClass) error {
+// local says the database keeps everything on one shard, which is what
+// makes an unlogged relation the client's own business again: the
+// durability floor pgshard enforces is about a write that a failover would
+// lose, and a database declared local is one PostgreSQL, where PostgreSQL's
+// own rules for UNLOGGED apply.
+func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 	switch n := node.GetNode().(type) {
 	case *pgquerypb.Node_UpdateStmt:
 		// pg_catalog.pg_settings is an updatable view whose rule rewrites the
@@ -176,7 +191,9 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 		case "t":
 			return notYet("temporary tables are not supported through the router", "")
 		case "u":
-			return notDurable("CREATE UNLOGGED TABLE")
+			if !local {
+				return notDurable("CREATE UNLOGGED TABLE")
+			}
 		}
 	case *pgquerypb.Node_CreateTableAsStmt:
 		// The same node carries CREATE MATERIALIZED VIEW and SELECT INTO.
@@ -188,14 +205,18 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 		case "t":
 			return notYet("temporary tables are not supported through the router", "")
 		case "u":
-			return notDurable(form)
+			if !local {
+				return notDurable(form)
+			}
 		}
 	case *pgquerypb.Node_CreateSeqStmt:
 		switch n.CreateSeqStmt.GetSequence().GetRelpersistence() {
 		case "t":
 			return notYet("temporary sequences are not supported through the router", "")
 		case "u":
-			return notDurable("CREATE UNLOGGED SEQUENCE")
+			if !local {
+				return notDurable("CREATE UNLOGGED SEQUENCE")
+			}
 		}
 	case *pgquerypb.Node_TransactionStmt:
 		t := n.TransactionStmt
@@ -954,6 +975,14 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		w.plan.Shards = nil
 		return nil
 	}
+	// A local database has one shard, so "the planner does not know how to
+	// spread this" is not a question about it: CREATE FUNCTION, CREATE
+	// TRIGGER, COMMENT and CREATE EVENT TRIGGER all run there as they would
+	// on any PostgreSQL. The refusal below is about there being more than
+	// one place to run a statement, not about the statement.
+	if w.sess.localOnly() {
+		return w.homeStatement()
+	}
 	// Fail closed: a statement shape the planner does not recognise could
 	// write, and routing it to the home shard would run it on one shard
 	// silently. Everything the router supports is listed above.
@@ -1384,6 +1413,12 @@ func (w *walker) nestedStatement(node *pgquerypb.Node) error {
 	case *pgquerypb.Node_SelectStmt:
 		return w.selectStmt(n.SelectStmt)
 	case *pgquerypb.Node_InsertStmt, *pgquerypb.Node_UpdateStmt, *pgquerypb.Node_DeleteStmt:
+		// One shard, one statement, one PostgreSQL: a writable CTE in a
+		// local database needs nothing the planner would have to work out.
+		// What it cannot do is span shards, and there are none to span.
+		if w.sess.localOnly() {
+			return w.homeStatement()
+		}
 		return notYet("data-modifying statements in WITH are not available yet", "run the modification as its own statement")
 	}
 	return nil
