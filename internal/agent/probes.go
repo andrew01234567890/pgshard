@@ -120,6 +120,14 @@ func (p *Probes) readyz(w http.ResponseWriter, r *http.Request) {
 
 // Ready implements /readyz.
 func (p *Probes) Ready(ctx context.Context) error {
+	// A member building its data directory is never ready, whatever
+	// PostgreSQL says. A restore starts PostgreSQL to replay and promote,
+	// so there is a window in the middle of a bootstrap where it accepts
+	// writes and the member is still nowhere near serving: without this,
+	// readiness answers yes for that window and a Service sends it traffic.
+	if active, _, what := p.bootstrap(); active {
+		return fmt.Errorf("still %s", what)
+	}
 	primary, err := p.Health.IsPrimary()
 	if err != nil {
 		return fmt.Errorf("reading the instance role: %w", err)

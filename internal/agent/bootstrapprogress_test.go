@@ -55,6 +55,15 @@ func TestACloneLongerThanTheProbeBudgetIsNotKilled(t *testing.T) {
 		t.Fatal("a stalled bootstrap is not alive either; nothing else will restart it")
 	}
 
+	// A member building its data directory is never READY, whatever
+	// PostgreSQL says while it does it: a restore starts PostgreSQL to
+	// replay and promote, so there is a window mid-bootstrap where it
+	// accepts writes and the member is still nowhere near serving.
+	b.begin("restoring from the repository")
+	if p.Ready(ctx) == nil {
+		t.Fatal("a member still restoring reported itself ready; a Service would send it traffic")
+	}
+
 	// And once it finishes, the probes answer about PostgreSQL again.
 	b.finish()
 	if active, _, _ := b.state(); active {
