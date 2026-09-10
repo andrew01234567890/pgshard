@@ -141,12 +141,36 @@ func TestPgrollAgainstALocalDatabase(t *testing.T) {
 		t.Fatalf("the dual-write trigger did not fill the old column: %q", old)
 	}
 
+	// A migration that is rolled back instead: the new column and the
+	// version schema it added go, and the old version keeps serving. Same
+	// machinery as complete, in the other direction, and it is the path a
+	// failed migration takes on its own.
+	rb := dir + "/02_rollback_me.json"
+	if err := os.WriteFile(rb, []byte(`{
+	  "operations": [
+	    {"add_column": {"table": "people", "up": "'x'",
+	      "column": {"name": "scratch", "type": "text", "nullable": true}}}
+	  ]
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	run("complete")
 	var n int
 	if err := conn.QueryRow(ctx, `SELECT count(*) FROM people WHERE name IS NOT NULL`).Scan(&n); err != nil {
 		t.Fatalf("after complete: %v", err)
 	}
 	if n != 3 {
-		t.Fatalf("after complete %d rows have the new column, want 3", n)
+		t.Fatalf("after complete %d rows carry the migrated column, want 3", n)
 	}
+
+	run("start", rb)
+	run("rollback")
+	var rolled int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_name = 'people' AND column_name = 'scratch'`).Scan(&rolled); err != nil {
+		t.Fatal(err)
+	}
+	if rolled != 0 {
+		t.Fatalf("the rolled-back column is still on the table")
+	}
+
 }
