@@ -467,6 +467,25 @@ func (e *Executor) endTxn(ctx context.Context, commit bool, w pgwire.ResultWrite
 			return err
 		}
 		e.finishTxn(final.tag)
+		if commit {
+			// Every "other" here read and did not write -- there is at
+			// most one writer on this path, and it is `final`. Its
+			// ROLLBACK failing changes nothing about the outcome: it has
+			// nothing to roll back, and the pooler resets the backend when
+			// it takes it back.
+			//
+			// Returning it did change something, and it was the worst
+			// thing this router can do. The COMMIT has already succeeded
+			// and its tag is already on the wire, so the error arrives
+			// AFTER the client was told the transaction committed -- and
+			// nameFenceInTxn rewrites a fence refusal into 40001 "retry
+			// the transaction". A client that does as it is told applies
+			// the write twice.
+			//
+			// twoPhaseCommit has always done this correctly: it rolls the
+			// readers back and consults firstError(writers) alone.
+			return nil
+		}
 		return firstError(others)
 	}
 	return e.twoPhaseCommit(ctx, writers, readers, w)
