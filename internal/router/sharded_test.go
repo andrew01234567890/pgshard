@@ -311,7 +311,10 @@ func TestStartupSearchPathIsAppliedOnTheBackend(t *testing.T) {
 		}
 		return v
 	}
-	if got := setting(); got != `"audit", "public"` {
+	// Unquoted, because that is what PostgreSQL itself reports: set_config
+	// stores the string verbatim, so quoting elements that need no quotes
+	// made current_setting differ through pgshard from a direct connection.
+	if got := setting(); got != `audit, public` {
 		t.Fatalf("backend search_path = %q, want the startup path the planner routes with", got)
 	}
 	if _, err := conn.Exec(ctx, "set search_path = public"); err != nil {
@@ -323,7 +326,7 @@ func TestStartupSearchPathIsAppliedOnTheBackend(t *testing.T) {
 	if _, err := conn.Exec(ctx, "reset search_path"); err != nil {
 		t.Fatal(err)
 	}
-	if got := setting(); got != `"audit", "public"` {
+	if got := setting(); got != `audit, public` {
 		t.Fatalf("backend search_path after RESET = %q, want the startup path back", got)
 	}
 }
@@ -710,7 +713,7 @@ func TestPipelinedResetRestoresTheStartupSearchPathInTheSameSync(t *testing.T) {
 	if err := br.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got != `"audit", "public"` {
+	if got != `audit, public` {
 		t.Fatalf("statement pipelined behind RESET ran with search_path = %q, want the startup path the planner routed with", got)
 	}
 }
