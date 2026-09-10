@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 
@@ -98,6 +99,26 @@ var processMockSecret = func() []byte {
 	return b
 }()
 
+// mockSCRAMVerifier is the doomed verifier a missing or unusable role gets.
+//
+// It derives NOTHING. Building it with BuildSCRAMVerifier ran a full
+// 4096-round PBKDF2 -- 522107 ns/op against ParseSCRAMVerifier's 326 -- and
+// then threw the result away by zeroing StoredKey. So the exchange that
+// exists to hide whether a role exists announced it on the clock instead:
+// a missing role cost half a millisecond of CPU, a present one a few HMACs.
+//
+// PostgreSQL's mock does exactly what this does: a deterministic salt, keys
+// left zero, and the server's configured iteration count
+// (auth-scram.c:mock_scram_secret).
+func mockSCRAMVerifier(salt []byte) *SCRAMVerifier {
+	return &SCRAMVerifier{
+		Iterations: DefaultSCRAMIterations,
+		Salt:       salt,
+		StoredKey:  make([]byte, sha256.Size),
+		ServerKey:  make([]byte, sha256.Size),
+	}
+}
+
 // mockSalt derives a stable, user-specific salt for the mock exchange.
 func (a SCRAMAuthenticator) mockSalt(user string) []byte {
 	secret := a.MockSecret
@@ -149,11 +170,7 @@ func (a SCRAMAuthenticator) Authenticate(ctx context.Context, startup map[string
 		// from a wrong password, as PostgreSQL does with a mock verifier:
 		// the salt is deterministic per user so repeated probes cannot tell
 		// a mock exchange from a real one.
-		verifier, err = BuildSCRAMVerifier(user, a.mockSalt(user), DefaultSCRAMIterations)
-		if err != nil {
-			return nil, err
-		}
-		verifier.StoredKey = make([]byte, len(verifier.StoredKey))
+		verifier = mockSCRAMVerifier(a.mockSalt(user))
 	}
 	srv := newSCRAMServer(verifier)
 	serverFirst, err := srv.handleClientFirst(initial.Data)
