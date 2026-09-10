@@ -46,6 +46,16 @@ type MigrationMeta struct {
 	// RunAs is the role the statement runs as on every shard (SET ROLE), so
 	// ownership and privilege checks are the client's.
 	RunAs string `json:"run_as,omitempty"`
+	// SearchPath is the client's search_path, rendered as PostgreSQL
+	// reports it, so an unqualified name in the statement resolves on each
+	// shard to what it named on the router. Without it the statement was
+	// applied under the DDL role's default path: a client that set
+	// search_path and created an unqualified table got that table in
+	// public, silently, and then could not find it.
+	//
+	// Empty means the client never set one, and the applier leaves the
+	// session default alone.
+	SearchPath string `json:"search_path,omitempty"`
 	// Role, RoleOp ("create", "alter", "drop") and Verifier mirror role DDL
 	// into pgshard.roles.
 	Role     string `json:"role,omitempty"`

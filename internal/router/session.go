@@ -287,12 +287,30 @@ func resetsSearchPath(g gucEntry) bool {
 // string sees a different value through pgshard than off it. pgroll's
 // dual-write triggers compare it exactly, to decide which column a write
 // belongs to, so the quotes sent writes to the wrong column.
-func searchPathSQL(path []string) string {
+// recordedSearchPath renders the session's path the way a migration has to
+// carry it, and empty when the session is on the default: a migration that
+// names no path leaves the applier's own default alone, and a client that
+// never set one has no opinion to record.
+func (e *Executor) recordedSearchPath() string {
+	path := e.searchPath()
+	if slices.Equal(path, plan.DefaultSearchPath) {
+		return ""
+	}
+	return searchPathValue(path)
+}
+
+// searchPathValue is the value half of searchPathSQL: each element quoted
+// as PostgreSQL quotes it, joined the way PostgreSQL reports them.
+func searchPathValue(path []string) string {
 	quoted := make([]string, len(path))
 	for i, s := range path {
 		quoted[i] = quoteSearchPathElement(s)
 	}
-	value := strings.Join(quoted, ", ")
+	return strings.Join(quoted, ", ")
+}
+
+func searchPathSQL(path []string) string {
+	value := searchPathValue(path)
 	return "SELECT set_config('search_path', '" + strings.ReplaceAll(value, "'", "''") + "', false)"
 }
 

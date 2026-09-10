@@ -774,6 +774,15 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 			return nil, err
 		}
 	}
+	// After SET ROLE, because "$user" in a path resolves to the role that
+	// is current when the path is USED, and the client's path meant the
+	// client's role.
+	if m.Meta.SearchPath != "" {
+		if _, err := conn.Exec(ctx, "SET search_path = "+quoteLiteral(m.Meta.SearchPath)); err != nil {
+			_ = conn.Close(context.WithoutCancel(ctx))
+			return nil, err
+		}
+	}
 	return conn, nil
 }
 
@@ -1099,6 +1108,9 @@ func (a *Applier) catalogLocals(m *catalog.DDLMigration, key string) []string {
 	out := []string{"SET LOCAL lock_timeout = " + quoteLiteral(fmt.Sprint(timeout.Milliseconds())+"ms")}
 	if m.Meta.RunAs != "" {
 		out = append(out, "SET LOCAL ROLE "+pgx.Identifier{m.Meta.RunAs}.Sanitize())
+	}
+	if m.Meta.SearchPath != "" {
+		out = append(out, "SET LOCAL search_path = "+quoteLiteral(m.Meta.SearchPath))
 	}
 	return out
 }
