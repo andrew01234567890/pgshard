@@ -175,6 +175,23 @@ func (l *Lease) markAcquired() {
 	l.acquired = l.now()
 }
 
+// markReleased forgets when the lease was acquired, so Stale stops reporting
+// a lease this member no longer holds.
+//
+// Without it, acquired kept its old value after a release and Stale went
+// true once the duration passed -- for ever. The liveness probe only
+// consults Stale for a member that still READS as a primary, and a demote
+// is exactly that window: standby.signal is not written until the end of
+// Follow, so a member being demoted, rewound or recloned still looks like a
+// primary while it works. It was then killed for holding a stale lease it
+// had deliberately given up, and a reclone that had already cleared the
+// data directory started again from nothing.
+func (l *Lease) markReleased() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.acquired = time.Time{}
+}
+
 // Stale reports whether the lease has not been renewed within its duration.
 // The self-fence on losing a lease runs inside Hold's goroutine, so a process
 // that is frozen or wedged never reaches it and keeps its PostgreSQL child
@@ -229,6 +246,9 @@ func (l *Lease) Release(ctx context.Context) error {
 	}
 	cur.Spec.HolderIdentity = ptr.To("")
 	_, err = l.client.Update(ctx, cur, metav1.UpdateOptions{})
+	if err == nil {
+		l.markReleased()
+	}
 	return err
 }
 

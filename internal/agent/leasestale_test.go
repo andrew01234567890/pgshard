@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 // TestLiveFailsOnAStaleLease guards the case the self-fence cannot cover. A
@@ -54,5 +57,52 @@ func TestLeaseStaleUsesTheLeaseDuration(t *testing.T) {
 	now = now.Add(time.Second)
 	if !l.Stale() {
 		t.Fatal("past the duration with no renewal the lease is stale")
+	}
+}
+
+// TestAReleasedLeaseStopsBeingStale.
+//
+// Release cleared the Kubernetes holder but never reset the acquired time,
+// so Stale went true once the duration passed -- for ever, on a member that
+// had deliberately GIVEN UP the lease.
+//
+// The liveness probe only consults Stale for a member that still READS as a
+// primary, and a demote is exactly that window: standby.signal is not
+// written until the end of Follow, so a member being demoted, rewound or
+// recloned still looks like a primary while it works. It was then killed
+// for holding a lease it no longer held -- and a reclone that had already
+// cleared the data directory started again from nothing.
+//
+// Driven through Release rather than the helper it calls: the reset is only
+// worth anything if the release path performs it.
+func TestAReleasedLeaseStopsBeingStale(t *testing.T) {
+	cs := fake.NewClientset()
+	l := NewLeaseWithClient(cs.CoordinationV1().Leases("ns"), leaseCfg("pod-a"), slog.New(slog.DiscardHandler))
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	if err := l.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(l.duration + time.Second)
+	if !l.Stale() {
+		t.Fatal("the premise of this test is a lease that has gone stale")
+	}
+
+	if err := l.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if l.Stale() {
+		t.Fatal("a lease this member gave up is still reported stale; liveness kills it mid-demote for holding nothing")
+	}
+
+	// Taking it again starts the clock afresh rather than inheriting the
+	// old one.
+	if err := l.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if l.Stale() {
+		t.Fatal("a reacquired lease is fresh")
 	}
 }
