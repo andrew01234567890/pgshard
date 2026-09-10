@@ -118,8 +118,15 @@ func TestFencedShardInsideTransactionIs40001(t *testing.T) {
 	if sqlstate(err) != "40001" || time.Since(start) > 500*time.Millisecond {
 		t.Fatalf("in-transaction statement during fence: %v after %s", err, time.Since(start))
 	}
-	if conn.PgConn().TxStatus() != 'I' {
-		t.Fatalf("the aborted transaction must be gone, status %c", conn.PgConn().TxStatus())
+	// 'E', not 'I'. The transaction is over on the server -- the backend
+	// went with the failover -- but the CLIENT still has one open, and
+	// telling it Idle is telling it the transaction ended cleanly. It would
+	// then send COMMIT, get a COMMIT tag from a fresh backend that has
+	// never heard of the transaction, and believe its writes landed. This
+	// is what PostgreSQL answers after a failed statement in a transaction
+	// block, and it is what the client has to see to do the right thing.
+	if conn.PgConn().TxStatus() != 'E' {
+		t.Fatalf("a killed transaction reports %c; the client will commit a transaction that is not there", conn.PgConn().TxStatus())
 	}
 	h.setSnap(serving)
 	if _, err := conn.Exec(ctx, "rollback"); err != nil {
