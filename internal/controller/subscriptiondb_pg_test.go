@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // TestASubscriptionOfAnotherDatabaseIsNotMistakenForOurs.
@@ -70,6 +72,70 @@ func TestASubscriptionOfAnotherDatabaseIsNotMistakenForOurs(t *testing.T) {
 	}
 	if scoped != 0 {
 		t.Fatalf("d2 counted %d subscriptions of its own named %s; it has none", scoped, name)
+	}
+}
+
+// TestDroppingSubscriptionsOnlyTouchesThisDatabase: the same shared-catalogue
+// trap as above, at the other end of the workflow. dropSubscriptionsLike
+// listed every database's identically named subscriptions, and a subscription
+// can only be dropped from the database it belongs to -- so the second row
+// failed 42704. Complete and Unwind retry every pass, so on a cluster with
+// two user databases they never finished: the reverse subscriptions were
+// never released and the retired shard set was never freed.
+func TestDroppingSubscriptionsOnlyTouchesThisDatabase(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgresWith(t, "-c wal_level=logical")
+	conn := connect(t, dsn)
+	for _, stmt := range []string{`CREATE DATABASE d1`, `CREATE DATABASE d2`} {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inDB := func(database string) string {
+		t.Helper()
+		ci, err := ConnInfo(dsn, database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ci
+	}
+	name := SubscriptionName(5, 1, 0)
+	subscribe := func(c *pgx.Conn, db string) {
+		t.Helper()
+		if _, err := c.Exec(ctx, `CREATE PUBLICATION p FOR ALL TABLES`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, `CREATE SUBSCRIPTION `+QuoteIdent(name)+
+			` CONNECTION 'host=/tmp user=postgres dbname=`+db+`' PUBLICATION p WITH (connect = false, slot_name = NONE)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d1 := connect(t, inDB("d1"))
+	subscribe(d1, "d1")
+	d2 := connect(t, inDB("d2"))
+	subscribe(d2, "d2")
+
+	// The drop runs from d2, exactly as a Complete or Unwind pass does once
+	// it has dialled that database.
+	if err := dropSubscriptionsLike(ctx, pgxShardConn{d2}, strings.ReplaceAll(name, "_", "\\_")); err != nil {
+		t.Fatalf("dropping d2's own subscriptions failed because it reached for d1's: %v", err)
+	}
+
+	count := func(c *pgx.Conn) int {
+		t.Helper()
+		var n int
+		if err := c.QueryRow(ctx, `SELECT count(*) FROM pg_subscription WHERE subname = $1
+			 AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())`, name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count(d2); n != 0 {
+		t.Fatalf("d2 still has %d subscriptions named %s", n, name)
+	}
+	if n := count(d1); n != 1 {
+		t.Fatalf("d1 has %d subscriptions named %s: the drop reached into another database", n, name)
 	}
 }
 

@@ -1296,7 +1296,16 @@ func dropSubscriptions(ctx context.Context, conn ShardConn, gen int64, t int32) 
 }
 
 func dropSubscriptionsLike(ctx context.Context, conn ShardConn, pattern string) error {
-	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription WHERE subname LIKE $1`, pattern)
+	// subdbid, for the reason subscribeOn already carries: pg_subscription
+	// is SHARED, so from one database this listed the identically named
+	// subscriptions of every other one. A subscription can only be dropped
+	// from the database it belongs to, so the second row failed 42704 --
+	// and the callers retry every pass, so Complete and Unwind never
+	// finished on a cluster with two user databases. Every caller already
+	// loops over the databases and dials each, so scoping to the current
+	// one drops exactly what that pass is responsible for.
+	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription
+		 WHERE subname LIKE $1 AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())`, pattern)
 	if err != nil {
 		return err
 	}
