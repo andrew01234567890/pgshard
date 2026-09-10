@@ -63,6 +63,12 @@ type ClusterReconciler struct {
 	// PodFenceTimeout bounds the wait for the old primary's Pod to go
 	// before a successor is promoted; zero means DefaultPodFenceTimeout.
 	PodFenceTimeout time.Duration
+	// OnPrimaryFenced runs after a failover has stopped the old primary and
+	// before it re-reads member positions. It exists so a test can move a
+	// standby in exactly that window, which is the window the re-read
+	// exists for and the only place a stale sample can be observed. Nil in
+	// production.
+	OnPrimaryFenced func()
 	// SwitchoverCatchUp bounds how long a planned switchover waits for its
 	// target to draw level with the furthest-ahead standby; zero means
 	// DefaultSwitchoverCatchUp.

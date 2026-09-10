@@ -593,6 +593,41 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 		log.Info("cannot fence the old primary; not promoting", "old", old, "err", err)
 		return state, errors.Join(fmt.Errorf("fencing %s: %w", old, err), r.releaseLease(ctx, c, g))
 	}
+	if r.OnPrimaryFenced != nil {
+		r.OnPrimaryFenced()
+	}
+	// The candidate was chosen from positions sampled BEFORE the old primary
+	// was stopped, and the comment above says why it might still have been
+	// writable then. A standby that was briefly disconnected during the
+	// sample -- so counted as gone -- can reconnect and acknowledge another
+	// synchronous commit while fencePod is landing, and promoting the
+	// earlier winner loses it.
+	//
+	// Positions are final once the old primary is stopped: nothing can
+	// advance further. So re-read them here and confirm the choice. If the
+	// leader changed, abandon this attempt rather than promoting on a stale
+	// sample -- nothing has been published yet, so the next pass decides
+	// with everything settled, and giving up an attempt is always safer
+	// than promoting the wrong member.
+	after, err := r.quiesce(ctx, c, g, old, members, password)
+	if err != nil {
+		log.Info("cannot re-read positions after fencing; not promoting", "err", err)
+		return state, errors.Join(err, r.releaseLease(ctx, c, g))
+	}
+	for i := range after {
+		after[i].Listed = after[i].Name != old
+	}
+	confirmed, err := chooseCandidate(after, old, preferred, minSyncStandbys(c))
+	if err != nil {
+		log.Info("no candidate once the old primary was stopped; releasing the fence", "views", fmt.Sprintf("%+v", after))
+		return state, errors.Join(err, r.releaseLease(ctx, c, g))
+	}
+	if confirmed != candidate {
+		log.Info("the leading member changed once the old primary was stopped; not promoting on the earlier sample",
+			"chosen", candidate, "leads_now", confirmed)
+		return state, errors.Join(fmt.Errorf("failover candidate changed after fencing %s: %s now leads %s", old, confirmed, candidate),
+			r.releaseLease(ctx, c, g))
+	}
 	epoch := nextEpoch(state.epoch, candEpoch)
 	if err := r.publishFence(ctx, c, g, old, candidate, epoch, password); err != nil {
 		return state, err

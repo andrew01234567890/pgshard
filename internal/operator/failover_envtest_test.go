@@ -193,6 +193,62 @@ func TestFailoverPromotesHighestFlushedReachableStandby(t *testing.T) {
 	}
 }
 
+// TestAStandbyThatAdvancesWhileTheFenceLandsIsNotPassedOver.
+//
+// The winner used to be chosen from positions sampled BEFORE the old primary
+// was stopped -- and failover's own comment says the old primary may still
+// be alive and writable then, because an agent it cannot reach is counted as
+// gone. So a standby briefly disconnected during the sample can reconnect,
+// acknowledge another synchronous commit while fencePod is landing, and
+// still be passed over. Promoting the earlier winner then rewinds it and
+// discards that commit.
+//
+// Positions are final once the old primary is stopped, so they are re-read
+// and the choice confirmed. If the leader changed, the attempt is abandoned:
+// nothing has been published yet, so the next pass decides with everything
+// settled, and giving up an attempt is always safer than promoting the wrong
+// member.
+func TestAStandbyThatAdvancesWhileTheFenceLandsIsNotPassedOver(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "advance")
+	deletePod(t, "advance-shard-0-0")
+	fa.set(podIP(1, 0), AgentStatus{}, errors.New("gone"))
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 500}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 10}
+	fp.err = errors.New("no primary")
+
+	// Member 2 catches up and passes member 1 in exactly the window the
+	// re-read exists for: after the old primary is stopped, before the
+	// positions are read again.
+	r.OnPrimaryFenced = func() {
+		fp.mu.Lock()
+		fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 900}
+		fp.mu.Unlock()
+	}
+	// The pass abandons rather than promoting on the stale sample. Nothing
+	// has been published, so this is the safe direction: the error names
+	// what changed instead of silently promoting the wrong member.
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "default", Name: c.Name}})
+	if err == nil {
+		t.Fatal("the failover promoted on a sample taken before the old primary was stopped")
+	}
+	if !strings.Contains(err.Error(), "candidate changed after fencing") {
+		t.Fatalf("abandoned for the wrong reason: %v", err)
+	}
+	for _, p := range fa.promotes {
+		if strings.HasSuffix(p, "advance-shard-0-1") {
+			t.Fatalf("promoted the member that led the stale sample: %v", fa.promotes)
+		}
+	}
+
+	// With the positions settled, the next pass promotes the member that
+	// actually leads -- the guard must not wedge the failover.
+	r.OnPrimaryFenced = nil
+	reconcile(t, r, c)
+	if len(fa.promotes) != 1 || !strings.HasSuffix(fa.promotes[0], "advance-shard-0-2") {
+		t.Fatalf("the member holding the newest WAL must be promoted once positions settle, got %v", fa.promotes)
+	}
+}
+
 func TestFailoverWithoutCandidateRecreatesThePrimary(t *testing.T) {
 	r, fp, fa, c := healthyCluster(t, "nocand")
 	deletePod(t, "nocand-shard-0-0")
