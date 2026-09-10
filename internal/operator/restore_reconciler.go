@@ -413,15 +413,23 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	case rs.Status.Phase == pgshardv1alpha1.RestorePhaseRecovered && rs.Status.Reconciliation != nil:
 		msg = fmt.Sprintf("cluster %s recovered to the barrier and unfenced: %d committed, %d rolled back", c.Name, rs.Status.Reconciliation.Committed, rs.Status.Reconciliation.RolledBack)
 	}
-	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: boolCondition(inProgress),
-		Reason: rs.Status.Phase, Message: msg, ObservedGeneration: rs.Generation})
-	if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
-		return ctrl.Result{}, err
-	}
+	// Clearing comes BEFORE the phase is written, because Reconcile returns
+	// immediately for a Recovered restore. Clearing afterwards meant one
+	// failed patch -- or a crash in the gap -- left the restore-source
+	// annotation on the cluster with nothing that would ever retry it, and
+	// a later primary bootstrap with an empty PGDATA acts on that
+	// annotation: it would restore the ORIGINAL source backup over the
+	// cluster that has been running since. Clearing is idempotent, so
+	// doing it first costs nothing when the patch below then fails.
 	if rs.Status.Phase == pgshardv1alpha1.RestorePhaseRecovered {
 		if err := r.clearRestoreSource(ctx, c); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: boolCondition(inProgress),
+		Reason: rs.Status.Phase, Message: msg, ObservedGeneration: rs.Generation})
+	if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
+		return ctrl.Result{}, err
 	}
 	if reconcileErr != nil {
 		return ctrl.Result{}, reconcileErr
