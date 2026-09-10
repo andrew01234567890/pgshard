@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -40,6 +41,7 @@ func LoadServing(ctx context.Context, db Beginner) (*Snapshot, error) {
 		Serving:         map[ShardKey]Serving{},
 		Databases:       map[string]catalog.Database{},
 		Tables:          map[TableKey]Placement{},
+		Views:           map[TableKey]View{},
 		Sequences:       map[string]bool{},
 		ScalarFunctions: map[FunctionKey]bool{},
 	}
@@ -79,6 +81,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		Serving:         map[ShardKey]Serving{},
 		Databases:       map[string]catalog.Database{},
 		Tables:          map[TableKey]Placement{},
+		Views:           map[TableKey]View{},
 		Sequences:       map[string]bool{},
 		ScalarFunctions: map[FunctionKey]bool{},
 	}
@@ -164,6 +167,9 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		if t.Placement == "unsharded" {
 			s.Tables[key] = Placement{Placement: t.Placement, Generation: t.DesiredGeneration}
 		}
+	}
+	if err := loadViews(ctx, tx, s); err != nil {
+		return nil, fmt.Errorf("snapshot: views: %w", err)
 	}
 	// A table that is a reference table only because its database defaults
 	// to reference placement has no row in pgshard.tables, so the loop
@@ -313,4 +319,33 @@ func shardKeyType(ts catalog.TableStatus) string {
 		return ""
 	}
 	return *ts.ShardKeyType
+}
+
+// loadViews reads pgshard.views. A view with no entry is an undeclared
+// relation to the planner, and an undeclared relation falls to the database
+// default placement -- which for a view over a sharded table is one shard's
+// rows and no error. Opaque views are loaded too, precisely so the planner
+// can tell "a view it cannot route" from "a table it has never heard of".
+func loadViews(ctx context.Context, q catalog.Querier, s *Snapshot) error {
+	rows, err := q.Query(ctx, `SELECT database, schema_name, view_name, base_schema, base_name, shape, columns::text FROM pgshard.views`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var db, schema, name, baseSchema, baseName, shape, cols string
+		if err := rows.Scan(&db, &schema, &name, &baseSchema, &baseName, &shape, &cols); err != nil {
+			return err
+		}
+		v := View{Simple: shape == catalog.ViewSimple}
+		if v.Simple {
+			v.Base = TableKey{Database: db, SchemaName: baseSchema, TableName: baseName}
+			if err := json.Unmarshal([]byte(cols), &v.Columns); err != nil {
+				// A column map that cannot be read is not a map to route by.
+				v.Simple, v.Columns = false, nil
+			}
+		}
+		s.Views[TableKey{Database: db, SchemaName: schema, TableName: name}] = v
+	}
+	return rows.Err()
 }
