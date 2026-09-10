@@ -634,6 +634,24 @@ func (e *Executor) referenceTarget() Shard {
 	if len(ids) == 0 {
 		return e.Home()
 	}
+	// Inside a transaction, stay where the transaction already is. A
+	// reference table is on EVERY shard, so reading it from the pinned one
+	// is the same answer -- and choosing by session id instead forced a
+	// shard switch for no gain: under REPEATABLE READ or SERIALIZABLE that
+	// is refused outright with "cannot span shards", and under READ
+	// COMMITTED it is a needless park, Reserve, SET LOCAL lock_timeout and
+	// a hidden-writer probe at COMMIT.
+	//
+	// Only when the current shard really is one of this set's: a session
+	// pinned elsewhere, or to a set that has moved, falls back to the
+	// spread below.
+	if e.tx != pgwire.TxIdle && e.shard.Set == set {
+		for _, id := range ids {
+			if id == e.shard.ID {
+				return e.shard
+			}
+		}
+	}
 	return Shard{Set: set, ID: ids[e.info.ID%uint64(len(ids))]}
 }
 
