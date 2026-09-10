@@ -147,6 +147,12 @@ type Executor struct {
 	// land on whatever that backend is running by the time it arrives.
 	cancelSent atomic.Bool
 	cancelFor  context.Context
+	// decided is set once a two-phase COMMIT has been recorded durably.
+	// Past that point nothing is safe to cancel: the outcome is settled,
+	// and cancelling a COMMIT PREPARED only leaves the rows prepared on
+	// that participant until the resolver's next pass -- during which the
+	// client, which has been told COMMIT, cannot read its own writes there.
+	decided atomic.Bool
 
 	// cancelMu guards cancelTo, the poolers a cancel must reach: the streams
 	// this statement has run on. It is the only executor state another
@@ -2236,6 +2242,12 @@ func (e *Executor) beginStatement(ctx context.Context) {
 }
 
 func (e *Executor) cancelBackend(ctx context.Context) {
+	// A cancel that arrives after the commit decision has nothing left to
+	// act on. Sending it anyway interrupts COMMIT PREPARED on a participant
+	// whose outcome is already durable.
+	if e.decided.Load() {
+		return
+	}
 	if !e.cancelSent.CompareAndSwap(false, true) {
 		return
 	}
