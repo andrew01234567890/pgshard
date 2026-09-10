@@ -59,6 +59,9 @@ type Migration struct {
 	// Roles is the desired-state delta of a role, membership, grant or
 	// setting statement.
 	Roles *catalog.RoleChanges
+	// View is what a CREATE VIEW projects, so the applier can record it in
+	// pgshard.views and a router can route the view.
+	View *catalog.ViewChange
 	// Database and DatabaseOp mirror CREATE/DROP DATABASE into
 	// pgshard.databases.
 	Database   string
@@ -553,6 +556,12 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 		if objs := d.GetObjects(); len(objs) == 1 {
 			if rv := qualifiedName(objs[0]); rv != nil {
 				m.Object = relationRef(rv, objectAbsent)
+				// A dropped view must lose its routing row, or the planner
+				// keeps routing a relation that is gone -- and a later
+				// table of the same name would inherit the view's mapping.
+				if d.GetRemoveType() == pgquerypb.ObjectType_OBJECT_VIEW {
+					m.View = &catalog.ViewChange{Schema: rv.GetSchemaname(), Name: rv.GetRelname(), Drop: true}
+				}
 			}
 		}
 		if d.GetRemoveType() == pgquerypb.ObjectType_OBJECT_INDEX && !d.GetConcurrent() && len(d.GetObjects()) == 1 && d.GetBehavior() != pgquerypb.DropBehavior_DROP_CASCADE {
@@ -668,7 +677,9 @@ func (w *walker) createView(v *pgquerypb.ViewStmt) error {
 				"query the table directly, or declare the view's base table unsharded or reference")
 		}
 	}
-	return w.migration(Migration{Kind: "CREATE VIEW", Scope: scope, Object: relationRef(v.GetView(), objectPresent)})
+	m := Migration{Kind: "CREATE VIEW", Scope: scope, Object: relationRef(v.GetView(), objectPresent)}
+	m.View = viewChange(v, inner.rels)
+	return w.migration(m)
 }
 
 func (w *walker) reindex(s *pgquerypb.ReindexStmt) error {
@@ -977,4 +988,58 @@ func (w *walker) vacuum(v *pgquerypb.VacuumStmt) error {
 		}
 	}
 	return nil
+}
+
+// viewChange records what a CREATE VIEW projects, so a router can route the
+// view rather than mistaking it for an undeclared table.
+//
+// Only the shape a versioned-schema migration tool produces is recognised as
+// routable: ONE base relation and a target list of plain column references.
+// Anything else -- a join, an aggregate, a subquery, an expression, DISTINCT,
+// GROUP BY, a set operation -- is recorded as opaque, which routes nowhere.
+// Recording it at all still matters: without a row the relation looks like an
+// undeclared TABLE and falls to the database default placement, which is the
+// silent partial answer this whole area exists to stop.
+func viewChange(v *pgquerypb.ViewStmt, rels []*rel) *catalog.ViewChange {
+	c := &catalog.ViewChange{
+		Schema: v.GetView().GetSchemaname(), Name: v.GetView().GetRelname(),
+		Shape: catalog.ViewOpaque,
+	}
+	sel := v.GetQuery().GetSelectStmt()
+	if sel == nil || len(rels) != 1 || sel.GetDistinctClause() != nil || sel.GetGroupClause() != nil ||
+		sel.GetHavingClause() != nil || sel.GetWithClause() != nil || sel.GetLarg() != nil || sel.GetRarg() != nil ||
+		len(sel.GetFromClause()) != 1 || sel.GetFromClause()[0].GetRangeVar() == nil {
+		return c
+	}
+	cols := map[string]string{}
+	for _, t := range sel.GetTargetList() {
+		res := t.GetResTarget()
+		ref := res.GetVal().GetColumnRef()
+		if ref == nil {
+			return c // an expression: not a projection this can map
+		}
+		fields := ref.GetFields()
+		last := fields[len(fields)-1]
+		if last.GetAStar() != nil {
+			// SELECT * is a projection, but its column list is decided by
+			// the base table at creation time and pgshard does not have it
+			// here. Opaque until the applier can report the resolved list.
+			return c
+		}
+		base := last.GetString_().GetSval()
+		if base == "" {
+			return c
+		}
+		out := res.GetName()
+		if out == "" {
+			out = base
+		}
+		cols[out] = base
+	}
+	if len(cols) == 0 {
+		return c
+	}
+	c.Shape, c.Columns = catalog.ViewSimple, cols
+	c.BaseSchema, c.BaseName = rels[0].schema, rels[0].name
+	return c
 }

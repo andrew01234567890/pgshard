@@ -168,6 +168,7 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 			Verifier:      m.Verifier,
 			ClearVerifier: m.ClearVerifier,
 			Roles:         m.Roles,
+			View:          m.View,
 			Database:      m.Database, DatabaseOp: m.DatabaseOp, Steps: migrationSteps(m.Steps), Rewrite: m.Rewrite}}
 	id, err := e.r.cfg.Migrations.Enqueue(ctx, req)
 	if err != nil {

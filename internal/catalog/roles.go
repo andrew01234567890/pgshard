@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -468,3 +469,33 @@ func CheckRoleSetting(name string) error {
 // controller applies memberships on every group as a superuser, so a
 // membership naming a superuser role hands that superuser out.
 var ErrProtectedRole = errors.New("a superuser role may not be granted through the desired state")
+
+// ViewMirrorStatements records what a completed CREATE or DROP VIEW means
+// for routing. A view with no row here is indistinguishable from an
+// undeclared TABLE, and an undeclared relation falls to the database default
+// placement -- which for a view over a sharded table is one shard's rows and
+// no error.
+func ViewMirrorStatements(database string, meta MigrationMeta) []Statement {
+	v := meta.View
+	if v == nil || v.Name == "" {
+		return nil
+	}
+	schema := v.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	if v.Drop {
+		return []Statement{{`DELETE FROM pgshard.views WHERE database = $1 AND schema_name = $2 AND view_name = $3`,
+			[]any{database, schema, v.Name}}}
+	}
+	cols, err := json.Marshal(v.Columns)
+	if err != nil || v.Columns == nil {
+		cols = []byte("{}")
+	}
+	return []Statement{{`INSERT INTO pgshard.views (database, schema_name, view_name, base_schema, base_name, shape, columns)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+		ON CONFLICT (database, schema_name, view_name) DO UPDATE SET
+		base_schema = EXCLUDED.base_schema, base_name = EXCLUDED.base_name,
+		shape = EXCLUDED.shape, columns = EXCLUDED.columns, updated_at = now()`,
+		[]any{database, schema, v.Name, v.BaseSchema, v.BaseName, v.Shape, string(cols)}}}
+}

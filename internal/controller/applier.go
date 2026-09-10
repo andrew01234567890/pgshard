@@ -1225,6 +1225,7 @@ func mirrorStatements(m catalog.DDLMigration) []catalog.Statement {
 	case "drop":
 		stmts = append(stmts, catalog.Statement{SQL: `DELETE FROM pgshard.databases WHERE name = $1`, Args: []any{meta.Database}})
 	}
+	stmts = append(stmts, catalog.ViewMirrorStatements(m.Database, meta)...)
 	return stmts
 }
 

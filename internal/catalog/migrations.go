@@ -65,6 +65,9 @@ type MigrationMeta struct {
 	// Roles carries the desired-state delta of role, membership, grant and
 	// setting statements.
 	Roles *RoleChanges `json:"roles,omitempty"`
+	// View records what a CREATE VIEW projects, so a router can route the
+	// view instead of mistaking it for an undeclared table.
+	View *ViewChange `json:"view,omitempty"`
 	// Steps is the ordered plan of a "multistep" migration; the applier
 	// runs them per shard, each under its own lock_timeout retry.
 	Steps []MigrationStep `json:"steps,omitempty"`
@@ -535,3 +538,30 @@ func SaveMigrationMeta(ctx context.Context, db RowQuerier, id string, term int64
 	}
 	return termHeld(term, rows.CommandTag().RowsAffected())
 }
+
+// ViewChange is what one CREATE or DROP VIEW records in pgshard.views.
+type ViewChange struct {
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	// Drop records a removal; the fields below are then unused.
+	Drop bool `json:"drop,omitempty"`
+	// BaseSchema and BaseName are the single relation a simple view
+	// projects. Empty for an opaque one.
+	BaseSchema string `json:"base_schema,omitempty"`
+	BaseName   string `json:"base_name,omitempty"`
+	// Shape is "simple" -- one base relation and direct column projections,
+	// so Columns is complete and the view can be routed -- or "opaque",
+	// which is recorded only so the router knows the relation is a view and
+	// refuses it rather than falling back to a default placement.
+	Shape string `json:"shape,omitempty"`
+	// Columns maps each output column to the base column behind it. This is
+	// what lets the planner see a shard key the view exposes under another
+	// name.
+	Columns map[string]string `json:"columns,omitempty"`
+}
+
+// ViewShape values.
+const (
+	ViewSimple = "simple"
+	ViewOpaque = "opaque"
+)
