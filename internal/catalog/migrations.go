@@ -51,6 +51,13 @@ type MigrationMeta struct {
 	Role     string `json:"role,omitempty"`
 	RoleOp   string `json:"role_op,omitempty"`
 	Verifier string `json:"verifier,omitempty"`
+	// ClearVerifier distinguishes PASSWORD NULL -- which REVOKES the
+	// password -- from a statement with no PASSWORD clause at all, which
+	// must leave it alone. Both produce an empty Verifier, and treating
+	// them alike left the revoked password working: the router terminates
+	// SCRAM against the catalog verifier, so it kept accepting a password
+	// the administrator had just removed, and said the removal succeeded.
+	ClearVerifier bool `json:"clear_verifier,omitempty"`
 	// Database and DatabaseOp mirror CREATE/DROP DATABASE into
 	// pgshard.databases.
 	Database   string `json:"database,omitempty"`

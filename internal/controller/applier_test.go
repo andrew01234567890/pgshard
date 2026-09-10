@@ -1001,7 +1001,9 @@ func TestApplierMirrorsRolesAndDatabases(t *testing.T) {
 	got := strings.Join(f.store.execs, "\n")
 	for _, want := range []string{
 		"INSERT INTO pgshard.roles (rolname, verifier, login, createdb, createrole, inherit, connection_limit, valid_until) VALUES ($1, nullif($2, ''), coalesce($3, true),",
-		"[r SCRAM-SHA-256$x <nil> <nil> <nil> <nil> <nil> <nil>]",
+		// The trailing false is ClearVerifier: an ALTER that did not say
+		// PASSWORD NULL must not clear the stored verifier.
+		"[r SCRAM-SHA-256$x <nil> <nil> <nil> <nil> <nil> <nil> false]",
 		"INSERT INTO pgshard.databases (name) VALUES ($1) ON CONFLICT (name) DO NOTHING [d]",
 		"DELETE FROM pgshard.databases WHERE name = $1 [d]",
 		"DELETE FROM pgshard.roles WHERE rolname = $1 [r]",
