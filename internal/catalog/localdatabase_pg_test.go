@@ -75,17 +75,21 @@ func TestALocalDatabaseAndADistributedTableCannotBothBeDeclared(t *testing.T) {
 	// be able to decide on its own; it has to wait for a.
 	done := make(chan error, 1)
 	go func() {
-		tb, err := b.Begin(ctx)
-		if err != nil {
-			done <- err
-			return
-		}
-		defer func() { _ = tb.Rollback(ctx) }()
-		if _, err := tb.Exec(ctx, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('racy', 'public', 'orders', 'sharded', 'tenant_id')`); err != nil {
-			done <- err
-			return
-		}
-		done <- tb.Commit(ctx)
+		// The result is sent LAST, after the deferred rollback has run.
+		// Sending it from inside would let the test return -- and its
+		// cleanup close this connection -- while the rollback was still
+		// using it.
+		done <- func() error {
+			tb, err := b.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tb.Rollback(ctx) }()
+			if _, err := tb.Exec(ctx, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('racy', 'public', 'orders', 'sharded', 'tenant_id')`); err != nil {
+				return err
+			}
+			return tb.Commit(ctx)
+		}()
 	}()
 
 	select {
