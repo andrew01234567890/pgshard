@@ -261,7 +261,7 @@ func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
 		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
 		stmts: map[string]prepared{}, portals: map[string]string{},
 	}
-	e.startupSearchPath = startupSearchPath(info.Params["options"])
+	e.startupSearchPath = startupPath(info.Params)
 	return e
 }
 
@@ -372,38 +372,68 @@ func startupSearchPath(options string) []string {
 		if !ok || !strings.EqualFold(strings.TrimSpace(name), "search_path") {
 			continue
 		}
-		path = []string{}
-		for _, part := range strings.Split(value, ",") {
-			part = strings.TrimSpace(part)
-			// An UNQUOTED element is downcased, a quoted one is not,
-			// because that is what the backend does with this value.
-			//
-			// A startup option stores the string raw, and PostgreSQL splits
-			// it with SplitIdentifierString when it resolves a name, which
-			// downcases every unquoted element. Keeping the case here made
-			// the planner look up "MySchema" while the backend searched
-			// myschema: the planner found nothing, fell through to the
-			// database default, and sent a sharded table's statement to the
-			// home shard -- where the table also exists, so the answer was
-			// the home shard's rows and no error.
-			//
-			// Measured: PGOPTIONS="-c search_path=MySchema" gives
-			// current_setting 'MySchema' and current_schemas '{myschema}'.
-			//
-			// NOT true of `SET search_path = 'MySchema'`, which PostgreSQL
-			// stores already quoted and resolves with its case intact -- the
-			// planner's own SET parsing matches that and is left alone.
-			if quoted := strings.HasPrefix(part, `"`) && strings.HasSuffix(part, `"`) && len(part) >= 2; quoted {
-				part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
-			} else {
-				part = downcaseIdentifier(part)
-			}
-			if part != "" {
-				path = append(path, part)
-			}
+		path = splitSearchPathValue(value)
+	}
+	return path
+}
+
+// splitSearchPathValue splits one search_path VALUE into its elements, the
+// way the backend does when it resolves a name.
+func splitSearchPathValue(value string) []string {
+	path := []string{}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		// An UNQUOTED element is downcased, a quoted one is not,
+		// because that is what the backend does with this value.
+		//
+		// A startup option stores the string raw, and PostgreSQL splits
+		// it with SplitIdentifierString when it resolves a name, which
+		// downcases every unquoted element. Keeping the case here made
+		// the planner look up "MySchema" while the backend searched
+		// myschema: the planner found nothing, fell through to the
+		// database default, and sent a sharded table's statement to the
+		// home shard -- where the table also exists, so the answer was
+		// the home shard's rows and no error.
+		//
+		// Measured: PGOPTIONS="-c search_path=MySchema" gives
+		// current_setting 'MySchema' and current_schemas '{myschema}'.
+		//
+		// NOT true of `SET search_path = 'MySchema'`, which PostgreSQL
+		// stores already quoted and resolves with its case intact -- the
+		// planner's own SET parsing matches that and is left alone.
+		if quoted := strings.HasPrefix(part, `"`) && strings.HasSuffix(part, `"`) && len(part) >= 2; quoted {
+			part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+		} else {
+			part = downcaseIdentifier(part)
+		}
+		if part != "" {
+			path = append(path, part)
 		}
 	}
 	return path
+}
+
+// startupPath reads the session's startup search_path. A client may send it
+// two ways and pgshard has to honour both: inside "options" as -c
+// search_path=..., and as a startup PARAMETER of its own, which the protocol
+// allows for any user-settable GUC and which Go drivers send for connection
+// keys they do not recognise -- pgroll connects that way.
+//
+// Reading only "options" did not merely lose it for planning: nothing
+// forwards a bare startup parameter to the backend either, so the setting
+// was dropped entirely and the session silently ran under the default path.
+// Unqualified names then resolved in the wrong schema, and for a sharded
+// table that means the home shard's rows rather than an error.
+//
+// A parameter of its own wins over "options": it is the unambiguous form,
+// and a client that sends both is asking for the more specific one.
+func startupPath(params map[string]string) []string {
+	if v, ok := params["search_path"]; ok {
+		if path := splitSearchPathValue(v); len(path) > 0 {
+			return path
+		}
+	}
+	return startupSearchPath(params["options"])
 }
 
 // downcaseIdentifier lowercases an unquoted identifier the way PostgreSQL
