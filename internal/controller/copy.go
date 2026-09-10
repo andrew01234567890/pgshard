@@ -358,15 +358,86 @@ func (c *Copier) save(ctx context.Context, wf *copyWorkflow, stage, message stri
 }
 
 func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error {
+	// The replication objects go with the workflow. A failed workflow is
+	// NEVER revisited -- list() selects pending, running and cancelling, and
+	// CancelWorkflow accepts only pending or paused -- so a slot left on a
+	// serving source is left for good. Once the targets are torn down it
+	// goes inactive and pins WAL on a PRIMARY until pg_wal fills the disk,
+	// which is a shard outage caused by a failed copy nobody was watching.
+	//
+	// Placer.fail already reasons this way for the table-placement
+	// workflow; the copier never got it.
+	//
+	// Best effort, and its failures are RECORDED rather than returned: a
+	// source that cannot be reached must not stop the workflow being marked
+	// failed, or the next pass tries again and the workflow never ends.
+	status := map[string]any{"stage": "failed", "copy": wf.copy, "message": cause.Error()}
+	if err := c.dropForwardReplication(ctx, wf); err != nil {
+		status["leaked"] = err.Error()
+		c.logger().Warn("failed reshard left replication objects behind; they pin WAL on the source until dropped",
+			"workflow", wf.id, "err", err)
+	}
 	if err := ownedExec(ctx, c.Pool, wf.owner,
 		`UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now()
 		 WHERE id = $1::uuid AND ($5::text IS NULL OR (owner = $5 AND state = $6))`,
-		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": "failed", "copy": wf.copy, "message": cause.Error()}),
+		wf.id, StateFailed, cause.Error(), mustJSON(status),
 		nullIfEmpty(wf.owner), wf.fence); err != nil {
 		return err
 	}
 	wf.fence = StateFailed
 	return nil
+}
+
+// dropForwardReplication removes the subscriptions, slots and publications a
+// copy created, on the source set it actually built them on. Unreachable
+// shards are collected rather than aborting: what can be dropped should be.
+func (c *Copier) dropForwardReplication(ctx context.Context, wf *copyWorkflow) error {
+	srcSet, srcIDs, err := c.pinSource(ctx, wf)
+	if err != nil {
+		return err
+	}
+	dbs, err := c.databases(ctx)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, db := range dbs {
+		for _, t := range wf.ids {
+			conn, err := c.Shards.DialDatabase(ctx, wf.set, t, db.name)
+			if err != nil {
+				// A target that is already gone took its subscriptions with
+				// it; the slots on the SOURCE are what matter here.
+				continue
+			}
+			if err := dropSubscriptions(ctx, conn, wf.gen, t); err != nil {
+				errs = append(errs, fmt.Errorf("target %d subscriptions in %s: %w", t, db.name, err))
+			}
+			_ = conn.Close(ctx)
+		}
+	}
+	for _, s := range srcIDs {
+		conn, err := c.Shards.Dial(ctx, srcSet, s)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("source %d: %w", s, err))
+			continue
+		}
+		if err := dropSlots(ctx, conn, wf.gen); err != nil {
+			errs = append(errs, fmt.Errorf("source %d slots: %w", s, err))
+		}
+		_ = conn.Close(ctx)
+		for _, db := range dbs {
+			conn, err := c.Shards.DialDatabase(ctx, srcSet, s, db.name)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("source %d in %s: %w", s, db.name, err))
+				continue
+			}
+			if err := dropPublications(ctx, conn, wf.gen); err != nil {
+				errs = append(errs, fmt.Errorf("source %d publications in %s: %w", s, db.name, err))
+			}
+			_ = conn.Close(ctx)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // sources are the shards of the serving set the copy reads from.
