@@ -272,13 +272,82 @@ func resetsSearchPath(g gucEntry) bool {
 }
 
 // searchPathSQL renders the statement that applies path on a backend.
+//
+// Elements are quoted only where PostgreSQL would quote them. set_config
+// stores the string VERBATIM -- check_search_path validates the syntax and
+// nothing canonicalises it -- so quoting every element unconditionally made
+// current_setting('search_path') report `"public_02_x"` where a direct
+// PostgreSQL connection reports `public_02_x`. Anything comparing that
+// string sees a different value through pgshard than off it. pgroll's
+// dual-write triggers compare it exactly, to decide which column a write
+// belongs to, so the quotes sent writes to the wrong column.
 func searchPathSQL(path []string) string {
 	quoted := make([]string, len(path))
 	for i, s := range path {
-		quoted[i] = `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+		quoted[i] = quoteSearchPathElement(s)
 	}
 	value := strings.Join(quoted, ", ")
 	return "SELECT set_config('search_path', '" + strings.ReplaceAll(value, "'", "''") + "', false)"
+}
+
+// quoteSearchPathElement quotes one search_path element the way PostgreSQL's
+// quote_identifier does: bare when it is a valid unquoted identifier, quoted
+// otherwise. "$user" is quoted by this rule, which is what PostgreSQL itself
+// reports for the default path.
+func quoteSearchPathElement(s string) string {
+	if isBareIdentifier(s) {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// isBareIdentifier reports whether s needs no quoting, by PostgreSQL's rule
+// in quote_identifier: [a-z_][a-z0-9_]* and not a keyword. Note that '$' is
+// legal in an identifier but quote_identifier still quotes it -- checked
+// against a live server, which reports "a$b_1" with quotes -- so it is not
+// accepted here either.
+func isBareIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c == '_':
+		case i > 0 && c >= '0' && c <= '9':
+		default:
+			return false
+		}
+	}
+	return !quotedKeywords[s]
+}
+
+// quotedKeywords are the keywords PostgreSQL quotes in an identifier
+// position. Only the ones plausible as a schema name are listed: quoting one
+// that did not need it is harmless for correctness here -- it round-trips --
+// while failing to quote a reserved word would produce invalid SQL.
+var quotedKeywords = map[string]bool{
+	"all": true, "analyse": true, "analyze": true, "and": true, "any": true,
+	"array": true, "as": true, "asc": true, "authorization": true, "between": true,
+	"binary": true, "both": true, "case": true, "cast": true, "check": true,
+	"collate": true, "column": true, "constraint": true, "create": true,
+	"cross": true, "current_date": true, "current_role": true, "current_time": true,
+	"current_timestamp": true, "current_user": true, "default": true,
+	"deferrable": true, "desc": true, "distinct": true, "do": true, "else": true,
+	"end": true, "except": true, "false": true, "for": true, "foreign": true,
+	"freeze": true, "from": true, "full": true, "grant": true, "group": true,
+	"having": true, "ilike": true, "in": true, "initially": true, "inner": true,
+	"intersect": true, "into": true, "is": true, "isnull": true, "join": true,
+	"leading": true, "left": true, "like": true, "limit": true, "localtime": true,
+	"localtimestamp": true, "natural": true, "not": true, "notnull": true,
+	"null": true, "offset": true, "on": true, "only": true, "or": true,
+	"order": true, "outer": true, "overlaps": true, "placing": true,
+	"primary": true, "references": true, "returning": true, "right": true,
+	"select": true, "session_user": true, "similar": true, "some": true,
+	"symmetric": true, "table": true, "then": true, "to": true, "trailing": true,
+	"true": true, "union": true, "unique": true, "user": true, "using": true,
+	"variadic": true, "verbose": true, "when": true, "where": true, "window": true,
+	"with": true,
 }
 
 // startupSearchPath extracts search_path from a startup "options" parameter

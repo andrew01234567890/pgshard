@@ -492,7 +492,7 @@ func TestScatterAppliesTheSessionSearchPath(t *testing.T) {
 	if _, err := conn.Exec(ctx, "select * from events"); err != nil {
 		t.Fatal(err)
 	}
-	pathApplied(`"audit", "public"`)
+	pathApplied(`audit, public`)
 
 	if _, err := conn.Exec(ctx, "set search_path = audit"); err != nil {
 		t.Fatal(err)
@@ -500,7 +500,7 @@ func TestScatterAppliesTheSessionSearchPath(t *testing.T) {
 	if _, err := conn.Exec(ctx, "select * from events"); err != nil {
 		t.Fatal(err)
 	}
-	pathApplied(`"audit"`)
+	pathApplied(`audit`)
 
 	if _, err := conn.Exec(ctx, "reset search_path"); err != nil {
 		t.Fatal(err)
@@ -508,7 +508,7 @@ func TestScatterAppliesTheSessionSearchPath(t *testing.T) {
 	if _, err := conn.Exec(ctx, "select * from events"); err != nil {
 		t.Fatal(err)
 	}
-	pathApplied(`"audit", "public"`)
+	pathApplied(`audit, public`)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
