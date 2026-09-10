@@ -20,14 +20,42 @@ refused). Untyped key literals that look numeric must be cast
 (`'1'::int8`); drivers that prepare-and-describe (pgx, JDBC) carry the type
 automatically.
 
-**Scatter reads.** A read-only `SELECT` over one sharded table with no key
-predicate fans out to every shard and merges the streams: plain scans,
-`ORDER BY` (streaming merge; text keys need an explicit `COLLATE "C"`),
-`LIMIT`/`OFFSET` (pushed down), `count`/`sum`/`min`/`max` without
-`GROUP BY`, and `GROUP BY`/`DISTINCT` that include the shard key. Anything
-else multi-shard — joins, subqueries, CTEs, window functions, `avg()`,
-set operations, `FOR UPDATE` — is refused with `0A000` and a message naming
-the rule. Scatter `UPDATE`/`DELETE` without a key predicate is refused.
+**Scatter reads.** A read-only `SELECT` with no key predicate fans out to
+every shard and merges the streams: plain scans, `ORDER BY` (streaming
+merge; text keys need an explicit `COLLATE "C"`), `LIMIT`/`OFFSET` (pushed
+down), `count`/`sum`/`min`/`max` without `GROUP BY`, and `GROUP BY`/
+`DISTINCT` that include the shard key. Anything else multi-shard —
+subqueries, CTEs, window functions, `avg()`, set operations, `FOR UPDATE` —
+is refused with `0A000` and a message naming the rule. Scatter
+`UPDATE`/`DELETE` without a key predicate is refused.
+
+**Colocated joins.** More than one table may take part in a scatter,
+provided every row a join could match is already on the shard that holds
+it. That is the case when each sharded table is joined to the others **on
+its shard key**, and when a reference table is joined to anything — every
+shard has the whole copy. So this fans out and is answered correctly:
+
+```sql
+SELECT o.id, l.sku
+FROM orders o JOIN order_lines l ON l.customer_id = o.customer_id
+JOIN regions r ON r.id = o.region_id;
+```
+
+while joining two sharded tables on anything but their shard key is refused
+(`cross-shard join is not available yet`) rather than answered from the
+rows that happen to share a shard. Joining a sharded table to an unsharded
+one is refused for the same reason: the unsharded table is on the home
+shard alone.
+
+A keyed statement is under the same rule, and it is worth being precise
+about it: pinning *one* side is not enough. `WHERE o.customer_id = $1`
+alone still leaves `order_lines` unpinned, so a join to it on anything but
+the shard key is refused. Give every sharded table its own key —
+`WHERE o.customer_id = $1 AND l.customer_id = $1` — and the whole statement
+runs on that one shard, joined however you like.
+
+The full rule, including how the key must be written, is in
+[router.md](../router.md#routing).
 
 **Reference tables.** `INSERT`/`UPDATE`/`DELETE` on a reference table run
 the same statement on every shard inside one two-phase transaction, so
