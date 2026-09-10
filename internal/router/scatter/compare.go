@@ -168,6 +168,14 @@ func decoderFor(fam family, oid uint32, format int16) decoder {
 	switch fam {
 	case famInt:
 		if bin {
+			// OID is unsigned, and a real installation does cross the
+			// signed boundary -- OIDs wrap through the whole 32-bit
+			// unsigned range. Read through int32 they come back negative
+			// and sort before every small value, so an ascending merge
+			// puts them first and LIMIT returns the wrong row.
+			if oid == oidOid {
+				return decodeOidBinary
+			}
 			return decodeIntBinary
 		}
 		return decodeIntText
@@ -230,6 +238,13 @@ func decodeIntBinary(v []byte) (value, error) {
 		return value{i: int64(binary.BigEndian.Uint64(v))}, nil
 	}
 	return value{}, badValue("binary integer", v)
+}
+
+func decodeOidBinary(v []byte) (value, error) {
+	if len(v) != 4 {
+		return value{}, badValue("binary oid", v)
+	}
+	return value{i: int64(binary.BigEndian.Uint32(v))}, nil
 }
 
 func decodeFloatText(v []byte) (value, error) {
