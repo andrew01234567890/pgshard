@@ -498,6 +498,74 @@ func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
 	}
 }
 
+// TestACoordinatorDecidingDuringTheScanDoesNotSplitTheTransaction: the
+// resolver scans for prepared transactions once per pass and then walks the
+// decisions. A coordinator that was still preparing participants during that
+// scan, and records its commit before the decision is reached, leaves a
+// holder list from before the transaction was complete. Committing only what
+// that list names and then DELETING the decision leaves the later
+// participants prepared with nothing to resolve them -- the orphan sweep
+// reads a prepared transaction with no decision as abandoned and rolls it
+// back. One shard commits and the other does not, which is the one thing 2PC
+// exists to prevent.
+func TestACoordinatorDecidingDuringTheScanDoesNotSplitTheTransaction(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+
+	// The coordinator has prepared shard 0 and stalled long enough to look
+	// dead. Only shard 0 holds it when the scan runs.
+	f.prepare(0, "pgshard-split-1", "both-or-neither")
+	f.decide("pgshard-split-1", "preparing", 10*time.Minute, 0, 1)
+	shards, err := f.res.listShards(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holders, scanErrs := f.res.scanPrepared(ctx, shards)
+	if len(scanErrs) != 0 {
+		t.Fatalf("scan errors %v", scanErrs)
+	}
+
+	// It was not dead. It prepares the second participant and records the
+	// commit, both after the scan.
+	f.prepare(1, "pgshard-split-1", "both-or-neither")
+	mustExecPool(t, f.pool, `UPDATE pgshard.xact_decisions SET state = 'commit', decided_at = now() WHERE gid = 'pgshard-split-1'`)
+
+	// Keeping the decision is reported as "left in doubt" -- Resolve counts
+	// it unresolved and tries again next pass, which is the safe direction.
+	var out Outcome
+	err = f.res.resolveDecision(ctx, decision{GID: "pgshard-split-1", State: "preparing", Participants: []int32{0, 1}, AgeSeconds: 600}, holders, true, &out)
+	if err == nil {
+		t.Fatal("the pass finished a decision whose participant scan predates the decision")
+	}
+	if !strings.Contains(err.Error(), "keeping the decision") {
+		t.Fatalf("left in doubt for the wrong reason: %v", err)
+	}
+
+	// The decision must survive: it is the only thing that can tell the
+	// next pass that shard 1 has to COMMIT rather than be swept away.
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-split-1:commit" {
+		t.Fatalf("decisions %v: the decision was deleted while a participant still held the transaction", got)
+	}
+
+	// The next pass sees both holders and finishes the transaction whole.
+	out = Outcome{}
+	if _, err := f.res.Resolve(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, sh := range []int{0, 1} {
+		if got := f.values(sh); strings.Join(got, ",") != "both-or-neither" {
+			t.Fatalf("shard %d committed %v: the transaction was split", sh, got)
+		}
+		if got := f.prepared(sh); len(got) != 0 {
+			t.Fatalf("shard %d still prepared %v", sh, got)
+		}
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decisions left %v once every participant was finished", got)
+	}
+}
+
 func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
 	parallelPG(t)
 	f := newResolverFixture(t)
