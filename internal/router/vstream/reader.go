@@ -558,7 +558,23 @@ func (a *assembler) addOne(ev *pgshardv1.ChangeEvent) (*unit, error) {
 	case *pgshardv1.ChangeEvent_Message_:
 		msg := &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Message_{Message: &pgshardv1.VEvent_Message{Shard: sh, Prefix: e.Message.GetPrefix(), Content: e.Message.GetContent(), Transactional: e.Message.GetTransactional()}}}
 		if !e.Message.GetTransactional() {
-			return &unit{shard: a.shard, events: []*pgshardv1.VEvent{msg}, rels: [][]*relMeta{nil}, xids: []uint32{0}}, nil
+			// Carries its WAL position, so a reconnect does not deliver it
+			// twice. A non-transactional message is emitted immediately
+			// rather than at a commit, so it used to arrive with no
+			// position at all -- and the reader's dedupe tests position,
+			// which meant every failover or pooler blip replayed every one
+			// of them since the slot's confirmed LSN. Consumers using them
+			// as DDL markers acted on the same marker again.
+			u := &unit{shard: a.shard, events: []*pgshardv1.VEvent{msg}, rels: [][]*relMeta{nil}, xids: []uint32{0}}
+			// Only a KNOWN position is deduped. Treating an absent LSN as
+			// zero would make it compare "already delivered" and drop the
+			// message outright, which is worse than the duplicate this is
+			// fixing: delivering twice is recoverable, silently dropping a
+			// DDL marker is not.
+			if lsn := ev.GetLsn(); lsn > 0 {
+				u.endLSN, u.position = lsn, true
+			}
+			return u, nil
 		}
 		a.append(a.target(), msg, ev.GetXid())
 	case *pgshardv1.ChangeEvent_Keepalive_:
