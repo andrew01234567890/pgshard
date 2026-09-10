@@ -491,6 +491,16 @@ func (e *Executor) Home() Shard {
 	return e.home
 }
 
+// localOnly reports whether the session's database keeps every object on
+// its home shard, so there is one PostgreSQL to be consistent with.
+func (e *Executor) localOnly() bool {
+	if e.catalogSession() {
+		return false
+	}
+	snap := e.r.cfg.Snapshot()
+	return snap != nil && snap.Databases[e.info.Database].LocalOnly
+}
+
 // catalogSession reports whether the session fronts the catalog database,
 // whose plans never depend on the shard map.
 func (e *Executor) catalogSession() bool { return e.home.Set == CatalogShardSet }
@@ -775,6 +785,17 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 // EndImplicit's COMMIT, so neither refuses itself.
 func (e *Executor) refuseTxnControlInBatch(class StmtClass) error {
 	if !e.implicitTx || class.Txn == plan.TxnNone {
+		return nil
+	}
+	// A local database is one PostgreSQL and the batch is pinned to it, so
+	// the client's own BEGIN adopts the transaction this executor opened
+	// and its COMMIT ends it -- which is what the harm above was about: a
+	// COMMIT committing a transaction the client did not open. Here it did.
+	//
+	// One difference from PostgreSQL remains and is not worth machinery:
+	// statements AFTER a COMMIT in the same batch each commit on their own
+	// rather than sharing a second implicit transaction.
+	if e.localOnly() {
 		return nil
 	}
 	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,

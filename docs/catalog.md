@@ -42,7 +42,31 @@ statement a trigger sends `NOTIFY pgshard_desired` with payload
 | `name` | Logical database name (primary key). |
 | `default_placement` | `unsharded`, `sharded` or `reference`; placement of tables not listed in `pgshard.tables`. |
 | `home_shard` | Shard that holds unsharded tables. |
+| `local_only` | Every object lives on `home_shard`, and DDL runs on the client's own connection instead of fanning out. See below. |
 | `created_at`, `updated_at` | Timestamps. |
+
+#### Local databases
+
+`local_only` says a database has one shard and nothing to keep in agreement.
+Its DDL is not recorded as a migration and is not applied by the controller:
+the router sends it to the home shard on the connection the client is already
+using, inside the client's own transaction, and PostgreSQL rolls it back with
+everything else if the transaction does not commit.
+
+That is what lets a migration tool which keeps its state in the database it
+migrates -- pgroll, sqitch, atlas, flyway -- run unmodified. Their state
+tables, functions, triggers, comments and event triggers, and the transactions
+they wrap all of it in, are ordinary PostgreSQL again.
+
+A local database cannot hold a sharded or reference table, and the catalog
+refuses the combination from either side: declaring one in a local database,
+or declaring a database local while it holds one. Its `default_placement` must
+be `unsharded`.
+
+The declaration is explicit rather than inferred from "has no sharded tables
+yet", because inferring it would change what DDL means the moment somebody
+declared a sharded table, and leave everything that ran before that point
+unrecorded.
 
 ### `pgshard.tables`
 

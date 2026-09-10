@@ -109,7 +109,27 @@ const (
 )
 
 // migration finishes the plan as a Migration.
+// homeStatement runs the statement on the home shard, on the connection the
+// client is already using. A local database's DDL takes this path instead of
+// the migration queue: there is one shard to change, so the change is a
+// plain statement in the client's own transaction, and PostgreSQL rolls it
+// back with everything else if the transaction does not commit.
+//
+// Nothing is recorded in pgshard.migrations. That log exists to converge a
+// fan-out and to say which shard is behind, and neither question exists
+// here. New shards get these objects the way they get every other physical
+// object, from the schema dump the copy takes.
+func (w *walker) homeStatement() error {
+	w.plan.Kind, w.plan.Shards, w.plan.Migration = Unsharded, []int32{w.sess.HomeShard}, nil
+	return nil
+}
+
 func (w *walker) migration(m Migration) error {
+	// Every DDL the planner recognises arrives here, so this is where a
+	// local database stops being a fan-out.
+	if w.sess.localOnly() {
+		return w.homeStatement()
+	}
 	if m.Strategy == "" {
 		m.Strategy = StrategyDirect
 	}
@@ -235,6 +255,15 @@ func (w *walker) createIndex(s *pgquerypb.IndexStmt) error {
 }
 
 func (w *walker) alterTable(a *pgquerypb.AlterTableStmt) error {
+	// A local database is one PostgreSQL, so an ALTER TABLE on it is one
+	// ALTER TABLE. Everything below this line -- the placement checks, the
+	// scope, the online-rewrite and stepped-constraint plans, and the
+	// refusals that come with them -- exists to keep several shards in
+	// agreement about a table. A rewrite here takes the lock PostgreSQL
+	// takes and is over when PostgreSQL says it is.
+	if w.sess.localOnly() {
+		return w.homeStatement()
+	}
 	switch a.GetObjtype() {
 	case pgquerypb.ObjectType_OBJECT_TABLE:
 	case pgquerypb.ObjectType_OBJECT_INDEX:
@@ -491,13 +520,26 @@ func (w *walker) rename(s *pgquerypb.RenameStmt) error {
 		}
 		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRelationType()), Scope: scope})
 	}
-	return refuseUnfannable("ALTER " + objectWord(s.GetRenameType()) + " RENAME")
+	return w.unfannable("ALTER " + objectWord(s.GetRenameType()) + " RENAME")
+}
+
+// unfannable turns a statement over an object pgshard did not create into
+// either a refusal or a plain home-shard statement, depending on whether
+// the database has anywhere else the object could be.
+func (w *walker) unfannable(what string) error {
+	if w.sess.localOnly() {
+		return w.homeStatement()
+	}
+	return refuseUnfannable(what)
 }
 
 // refuseUnfannable turns down a statement over an object that exists in
 // every group, because a database does, and that pgshard cannot fan out
 // because it never created it. Sending it to the home shard alone left
 // every other shard holding the old object, silently.
+//
+// A local database has no other shard to be left behind, so this refusal
+// does not apply to one -- see walker.unfannable.
 func refuseUnfannable(what string) error {
 	return notYet(what+" is not available through the router",
 		"pgshard does not manage these objects: the matching CREATE is refused too, so change it on each group the way it was created")
@@ -622,7 +664,7 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 	// object: CREATE FUNCTION, CREATE AGGREGATE and CREATE EXTENSION are
 	// all refused here. It is dropped the way it was created, on each
 	// group.
-	return refuseUnfannable(kind)
+	return w.unfannable(kind)
 }
 
 // dropOnRelation drops an object that belongs to a table -- a trigger, a
@@ -962,7 +1004,7 @@ func (w *walker) alterObject(kind string, objType pgquerypb.ObjectType, rv *pgqu
 	// kind is written for the table case ("ALTER TABLE OWNER"), so a
 	// refusal built from it would name a table in a statement about a
 	// function. The object type is what the user typed.
-	return refuseUnfannable("ALTER " + objectWord(objType) + " " + strings.TrimPrefix(kind, "ALTER TABLE "))
+	return w.unfannable("ALTER " + objectWord(objType) + " " + strings.TrimPrefix(kind, "ALTER TABLE "))
 }
 
 // vacuumFull reports whether a VACUUM statement carries the FULL option.
