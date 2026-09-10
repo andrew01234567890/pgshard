@@ -48,6 +48,21 @@ type TableKey struct {
 	TableName  string
 }
 
+// View is one row of pgshard.views: what a view projects, so the planner can
+// route the view by its base table's placement instead of guessing.
+type View struct {
+	// Base is the single relation a simple view projects; zero for opaque.
+	Base TableKey
+	// Simple reports that Columns is a complete map of this view's output
+	// columns to Base's, so the view can be routed. Opaque views are
+	// recorded too, and refused.
+	Simple bool
+	// Columns maps each output column to the base column behind it. This is
+	// what lets a shard key the view exposes under another name still be
+	// recognised in a predicate.
+	Columns map[string]string
+}
+
 // Placement is the effective placement of a table.
 type Placement struct {
 	Placement  string
@@ -158,6 +173,13 @@ type Snapshot struct {
 	Serving   map[ShardKey]Serving
 	Databases map[string]catalog.Database
 	Tables    map[TableKey]Placement
+	// Views are the routable views of pgshard.views, keyed the same way as
+	// Tables. A view with no entry here is an undeclared relation and falls
+	// to the database default placement, which for a view over a sharded
+	// table is one shard's rows and no error -- so an entry, even an opaque
+	// one, is what lets the router tell a view from a table it has never
+	// heard of.
+	Views map[TableKey]View
 	// Sequences names the rows of pgshard.sequences, the global sequences
 	// the router answers nextval() for.
 	Sequences map[string]bool
