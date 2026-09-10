@@ -85,6 +85,26 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		Sequences:       map[string]bool{},
 		ScalarFunctions: map[FunctionKey]bool{},
 	}
+	// Refuse a catalog migrated by a NEWER binary than this one, here rather
+	// than only in Migrate. CheckCompatible existed for exactly this and had
+	// one caller -- Migrate -- which only the operator's probe and the
+	// router's dev bootstrap reach. So a router, pooler or controller still
+	// on the previous release read a catalog the operator had already
+	// migrated and failed somewhere deep in a query with a raw "column does
+	// not exist", naming neither the version gap nor the component that
+	// opened it.
+	//
+	// That window is not rare: the operator migrates the catalog and THEN
+	// rolls the components, so every upgrade has one.
+	//
+	// Refusing here is safe. A failed load leaves the watcher's current
+	// snapshot in place, so a component keeps serving what it already had
+	// rather than crash-looping through the roll that would fix it -- and
+	// if it can never reload, MaxAge fails it closed rather than letting it
+	// serve a stale view for ever.
+	if err := catalog.CheckCompatible(ctx, tx, nil); err != nil {
+		return nil, fmt.Errorf("snapshot: %w", err)
+	}
 	if s.ShardMapGeneration, s.DesiredGeneration, err = catalog.Generations(ctx, tx); err != nil {
 		return nil, fmt.Errorf("snapshot: generations: %w", err)
 	}
