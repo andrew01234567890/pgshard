@@ -33,7 +33,7 @@ func TestASQLReshardIsNotUndoneByAnUnchangedSpec(t *testing.T) {
 	def, _ := fp.shardSet(catalog.DefaultShardSet)
 	fp.mu.Lock()
 	fp.shardSets = []ShardSetInfo{{Name: "g2", Generation: 2, State: catalog.ShardSetServing,
-		Ranges: splitAt(def.Ranges[0], 0), PGMajor: def.PGMajor}}
+		Ranges: splitInHalf(def.Ranges[0]), PGMajor: def.PGMajor}}
 	fp.mu.Unlock()
 	reconcile(t, r, c)
 	get(t, c.Name, c)
@@ -80,6 +80,59 @@ func TestASQLReshardIsNotUndoneByAnUnchangedSpec(t *testing.T) {
 	}
 }
 
+// TestAnOperatorThatNeverRecordedAppliedShardsDoesNotReverseReshard covers
+// the cluster the guard was written for and did not cover: appliedShards is
+// unset, because the operator running before this upgrade did not have the
+// field. The catalog has moved and spec.shards has not, and treating an
+// absent record as "no request has been applied yet" read that as a fresh
+// request and resharded backwards on the first pass after the upgrade.
+func TestAnOperatorThatNeverRecordedAppliedShardsDoesNotReverseReshard(t *testing.T) {
+	r, fp, c := setup(t, "noapplied")
+	t.Cleanup(func() { deleteServicesOf(t, c) })
+	c.Spec.Shards = ptr.To(1)
+	if err := k8sClient.Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	bringUp(t, r, fp, c)
+
+	// What an operator upgrade leaves behind: a reconciled cluster whose
+	// status predates appliedShards. A nil field alone is not enough to
+	// refuse on -- a cluster created WITHOUT spec.shards never records one
+	// either, and the first spec.shards it is given is a real request -- so
+	// the catalog below is moved to a later generation, which is what says
+	// something other than this operator resharded it.
+	get(t, c.Name, c)
+	c.Status.AppliedShards = nil
+	if err := k8sClient.Status().Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	get(t, c.Name, c)
+	if c.Status.AppliedShards != nil {
+		t.Fatalf("the premise of this test is an unset field: %+v", c.Status.AppliedShards)
+	}
+
+	def, _ := fp.shardSet(catalog.DefaultShardSet)
+	fp.mu.Lock()
+	fp.shardSets = []ShardSetInfo{{Name: "g2", Generation: 2, State: catalog.ShardSetServing,
+		Ranges: splitInHalf(def.Ranges[0]), PGMajor: def.PGMajor}}
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+
+	for _, s := range allSets(fp) {
+		if s.State == catalog.ShardSetDesired {
+			t.Fatalf("an unset appliedShards resharded back toward spec.shards: %+v", s)
+		}
+	}
+	cond := condition(t, c.Name, pgshardv1alpha1.ConditionResharding)
+	if cond.Reason != "ShardCountConflict" {
+		t.Fatalf("the disagreement must be surfaced, not acted on: %+v", cond)
+	}
+	get(t, c.Name, c)
+	if c.Status.AppliedShards == nil || *c.Status.AppliedShards != 1 {
+		t.Fatalf("refusing must record what it refused, or every pass refuses afresh: %v", derefInt(c.Status.AppliedShards))
+	}
+}
+
 // TestChangingSpecShardsStillReshardsAfterASQLReshard keeps the spec a way
 // to reshard: it stops being obeyed only while it has not changed.
 func TestChangingSpecShardsStillReshardsAfterASQLReshard(t *testing.T) {
@@ -93,7 +146,7 @@ func TestChangingSpecShardsStillReshardsAfterASQLReshard(t *testing.T) {
 	def, _ := fp.shardSet(catalog.DefaultShardSet)
 	fp.mu.Lock()
 	fp.shardSets = []ShardSetInfo{{Name: "g2", Generation: 2, State: catalog.ShardSetServing,
-		Ranges: splitAt(def.Ranges[0], 0), PGMajor: def.PGMajor}}
+		Ranges: splitInHalf(def.Ranges[0]), PGMajor: def.PGMajor}}
 	fp.mu.Unlock()
 	reconcile(t, r, c)
 

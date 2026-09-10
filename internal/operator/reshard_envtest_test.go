@@ -194,7 +194,7 @@ func TestReshardAdoptsCatalogEditedShardSet(t *testing.T) {
 	def, _ := fp.shardSet(catalog.DefaultShardSet)
 	split := def.Ranges
 	fp.mu.Lock()
-	fp.shardSets = append(fp.shardSets, ShardSetInfo{Name: "g2", Generation: 2, State: catalog.ShardSetDesired, Ranges: splitAt(split[0], 0)})
+	fp.shardSets = append(fp.shardSets, ShardSetInfo{Name: "g2", Generation: 2, State: catalog.ShardSetDesired, Ranges: splitInHalf(split[0])})
 	fp.mu.Unlock()
 	reconcile(t, r, c)
 	var rec pgshardv1alpha1.PgShardReshard
@@ -231,8 +231,10 @@ func TestReshardAdoptsCatalogEditedShardSet(t *testing.T) {
 	}
 }
 
-func splitAt(r placement.Range, at int64) placement.RangeSet {
-	return placement.RangeSet{{Start: r.Start, End: at - 1}, {Start: at, End: r.End}}
+// splitInHalf splits one range at zero, which is the midpoint of the whole
+// int8 keyspace and so the split a 1 -> 2 reshard produces.
+func splitInHalf(r placement.Range) placement.RangeSet {
+	return placement.RangeSet{{Start: r.Start, End: -1}, {Start: 0, End: r.End}}
 }
 
 func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
