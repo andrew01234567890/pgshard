@@ -545,6 +545,15 @@ type ViewChange struct {
 	Name   string `json:"name"`
 	// Drop records a removal; the fields below are then unused.
 	Drop bool `json:"drop,omitempty"`
+	// DropSchema drops every view row of Schema instead of the one named,
+	// which is what DROP SCHEMA means: the views in it went with it, and a
+	// routing row that outlives its view routes a relation that is gone --
+	// then hands its column map to whatever is next created under that
+	// name.
+	DropSchema bool `json:"drop_schema,omitempty"`
+	// DropBase drops the view rows whose base is BaseSchema.BaseName,
+	// which is what DROP TABLE ... CASCADE means for the views over it.
+	DropBase bool `json:"drop_base,omitempty"`
 	// BaseSchema and BaseName are the single relation a simple view
 	// projects. Empty for an opaque one.
 	BaseSchema string `json:"base_schema,omitempty"`

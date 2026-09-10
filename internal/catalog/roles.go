@@ -477,12 +477,30 @@ var ErrProtectedRole = errors.New("a superuser role may not be granted through t
 // no error.
 func ViewMirrorStatements(database string, meta MigrationMeta) []Statement {
 	v := meta.View
-	if v == nil || v.Name == "" {
+	if v == nil {
 		return nil
 	}
 	schema := v.Schema
 	if schema == "" {
 		schema = "public"
+	}
+	// A whole schema, and the views over a dropped table, are named by what
+	// they belonged to rather than one by one: the statement never listed
+	// them, and neither does the catalog have to.
+	if v.DropSchema {
+		return []Statement{{`DELETE FROM pgshard.views WHERE database = $1 AND schema_name = $2`,
+			[]any{database, schema}}}
+	}
+	if v.DropBase {
+		base := v.BaseSchema
+		if base == "" {
+			base = "public"
+		}
+		return []Statement{{`DELETE FROM pgshard.views WHERE database = $1 AND base_schema = $2 AND base_name = $3`,
+			[]any{database, base, v.BaseName}}}
+	}
+	if v.Name == "" {
+		return nil
 	}
 	if v.Drop {
 		return []Statement{{`DELETE FROM pgshard.views WHERE database = $1 AND schema_name = $2 AND view_name = $3`,
