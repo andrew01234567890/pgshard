@@ -164,8 +164,19 @@ func TestRouterOps(t *testing.T) {
 		if _, err := txConn.Exec(ctx, "select 1"); sqlstate(err) != "40001" {
 			t.Fatalf("statement inside a transaction during a fence: %v", err)
 		}
-		if txConn.PgConn().TxStatus() != 'I' {
-			t.Fatalf("session must be idle after a failover error, status %c", txConn.PgConn().TxStatus())
+		// 'E', not 'I'. The transaction is over on the server -- the
+		// backend went with the fence -- but the CLIENT still has one
+		// open, and telling it Idle is telling it the transaction ended
+		// cleanly. It would then send COMMIT, get a COMMIT tag from a
+		// fresh backend that never heard of the transaction, and believe
+		// the insert above landed. PostgreSQL answers 'E' after a failed
+		// statement in a transaction block for the same reason.
+		if txConn.PgConn().TxStatus() != 'E' {
+			t.Fatalf("a killed transaction reports %c; the client will commit a transaction that is not there", txConn.PgConn().TxStatus())
+		}
+		// And ending it is what returns the session to use.
+		if _, err := txConn.Exec(ctx, "rollback"); err != nil {
+			t.Fatalf("rollback after a killed transaction: %v", err)
 		}
 
 		go func() {
