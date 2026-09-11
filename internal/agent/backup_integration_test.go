@@ -17,7 +17,7 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
-// MinIO deleted the minio/minio repository from Docker Hub, so the pull
+// MinIO deleted both minio/minio and minio/mc from Docker Hub, so the pull
 // fails outright rather than rate-limiting: "pull access denied ...
 // repository does not exist". quay.io is MinIO's own registry and carries
 // the same release tags.
