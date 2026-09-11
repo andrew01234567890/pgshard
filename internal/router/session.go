@@ -863,6 +863,16 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if err := checkFanoutMode(pl.Class); err != nil {
 		return err
 	}
+	// The failed-transaction checks come before the fan-out ceiling on
+	// purpose. A session whose transaction was killed needs to be told
+	// that -- 25P02, end the transaction -- rather than that its query is
+	// too wide, which is true but not the thing standing in its way.
+	if handled, err := e.endFailedTxn(pl.Class, w); handled {
+		return e.afterBatch(ctx, err)
+	}
+	if err := e.refuseInFailedTransaction(pl.Class); err != nil {
+		return e.afterBatch(ctx, err)
+	}
 	if err := e.checkFanout(pl); err != nil {
 		return e.afterBatch(ctx, err)
 	}
@@ -1031,6 +1041,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 		switch decideFailover(true, inTxn, false, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 		case failoverFailTxn:
 			e.dropStream()
+			e.failTxn()
 			return e.afterBatch(ctx, failoverInTxnError())
 		case failoverRefuse:
 			return e.afterBatch(ctx, e.bufferFull())
@@ -1056,6 +1067,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 	switch decideFailover(isFailover(err), inTxn, cw.wrote, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 	case failoverFailTxn:
 		e.dropStream()
+		e.failTxn()
 		err = failoverInTxnError()
 	case failoverRefuse:
 		err = e.bufferFull()
@@ -1125,6 +1137,50 @@ func (e *Executor) dropStream() {
 	// awaitRelease orders the next openStream behind it.
 	e.releaseOn(client)
 	e.tx = pgwire.TxIdle
+}
+
+// failTxn puts the session into PostgreSQL's failed-transaction state after
+// a transaction was killed under it.
+//
+// dropStream leaves the session Idle, because that is what it is: there is
+// no backend and no transaction. But the CLIENT still has one open, and
+// telling it Idle is telling it the transaction ended cleanly. An
+// application that retries the failed statement -- a statement-level 40001
+// retry loop is the normal thing to write -- then sends COMMIT, which runs
+// on a fresh backend as a no-op and answers with a COMMIT tag. pgx and JDBC
+// both report success, and the work done before the failover is gone.
+//
+// PostgreSQL answers 'E' and 25P02 for every statement until the
+// transaction is ended, which is what this makes the router do.
+// It is called only where decideFailover answered failoverFailTxn, which
+// it does only when a transaction is open (failover.go:88-93), so there is
+// no second condition to check here.
+func (e *Executor) failTxn() { e.tx = pgwire.TxFailed }
+
+// endFailedTxn ends a transaction that was killed under the client, without
+// touching a shard: there is nothing left of it to end. COMMIT answers
+// ROLLBACK, as PostgreSQL does for a commit in a failed transaction.
+func (e *Executor) endFailedTxn(class StmtClass, w pgwire.ResultWriter) (bool, error) {
+	if e.tx != pgwire.TxFailed || e.conn != nil {
+		return false, nil
+	}
+	if class.Txn != plan.TxnCommit && class.Txn != plan.TxnRollback {
+		return false, nil
+	}
+	e.finishTxn("ROLLBACK")
+	return true, w.CommandComplete("ROLLBACK")
+}
+
+// refuseInFailedTransaction answers what PostgreSQL answers while a
+// transaction is in the failed state: nothing runs until it is ended.
+func (e *Executor) refuseInFailedTransaction(class StmtClass) error {
+	if e.tx != pgwire.TxFailed || e.conn != nil {
+		return nil
+	}
+	if class.Txn == plan.TxnCommit || class.Txn == plan.TxnRollback {
+		return nil
+	}
+	return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
 }
 
 // releaseOn releases the session on the pooler that holds the current
