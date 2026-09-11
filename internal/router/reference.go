@@ -175,12 +175,13 @@ func unnamedBatch(sql string, oids []uint32, batch []*pgshardv1.ExecuteRequest) 
 	return append(reqs, syncReq())
 }
 
-// nextvalBatch answers an extended batch whose statement is a nextval()
-// over a global sequence; such a statement must be alone in its batch.
-func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, parsed []string, w pgwire.ResultWriter) (bool, error) {
-	name := ""
-	other := false
-	binary := false
+// routerAnswers finds the one statement of an extended batch that the
+// router answers itself, and reports whether the batch holds anything else.
+//
+// Anything else is a refusal rather than a split, because the rest of the
+// batch needs a backend and this statement never reaches one: interleaving
+// the two would reorder the replies.
+func (e *Executor) routerAnswers(batch []*pgshardv1.ExecuteRequest, parsed []string, wanted func(plan.Plan) bool) (pl plan.Plan, binary, other, found bool) {
 	stmtOf := func(portal string) string { return e.portals[portal] }
 	for _, req := range batch {
 		var stmt string
@@ -202,13 +203,43 @@ func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteR
 		}
 		st, ok := e.stmts[stmt]
 		switch {
-		case ok && st.plan.NextVal != "":
-			name = st.plan.NextVal
+		case ok && wanted(st.plan):
+			pl, found = st.plan, true
 		default:
 			other = true
 		}
 	}
-	if name == "" {
+	return pl, binary, other, found
+}
+
+// answerBatch replays an extended batch against an answer the router makes
+// itself: Describe reports the row shape, Execute produces the rows.
+func answerBatch(batch []*pgshardv1.ExecuteRequest, answer func(describe, execute bool) error, w pgwire.ResultWriter) error {
+	for _, req := range batch {
+		switch r := req.Message.(type) {
+		case *pgshardv1.ExecuteRequest_Describe:
+			if r.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
+				if err := w.ParameterDescription(nil); err != nil {
+					return err
+				}
+			}
+			if err := answer(true, false); err != nil {
+				return err
+			}
+		case *pgshardv1.ExecuteRequest_Execute:
+			if err := answer(false, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// nextvalBatch answers an extended batch whose statement is a nextval()
+// over a global sequence; such a statement must be alone in its batch.
+func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, parsed []string, w pgwire.ResultWriter) (bool, error) {
+	pl, binary, other, found := e.routerAnswers(batch, parsed, func(pl plan.Plan) bool { return pl.NextVal != "" })
+	if !found {
 		return false, nil
 	}
 	if other {
@@ -216,24 +247,26 @@ func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteR
 		err.Hint = "send a Sync before and after it"
 		return true, err
 	}
-	for _, req := range batch {
-		switch r := req.Message.(type) {
-		case *pgshardv1.ExecuteRequest_Describe:
-			if r.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
-				if err := w.ParameterDescription(nil); err != nil {
-					return true, err
-				}
-			}
-			if err := e.answerNextval(ctx, name, true, false, binary, w); err != nil {
-				return true, err
-			}
-		case *pgshardv1.ExecuteRequest_Execute:
-			if err := e.answerNextval(ctx, name, false, true, binary, w); err != nil {
-				return true, err
-			}
-		}
+	return true, answerBatch(batch, func(describe, execute bool) error {
+		return e.answerNextval(ctx, pl.NextVal, describe, execute, binary, w)
+	}, w)
+}
+
+// explainBatch answers an extended batch whose statement is
+// EXPLAIN (PGSHARD) ...; such a statement must be alone in its batch.
+func (e *Executor) explainBatch(batch []*pgshardv1.ExecuteRequest, parsed []string, w pgwire.ResultWriter) (bool, error) {
+	pl, _, other, found := e.routerAnswers(batch, parsed, func(pl plan.Plan) bool { return pl.Explain != nil })
+	if !found {
+		return false, nil
 	}
-	return true, nil
+	if other {
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "EXPLAIN (%s) must be the only statement of its batch", plan.ExplainOption)
+		err.Hint = "send a Sync before and after it"
+		return true, err
+	}
+	return true, answerBatch(batch, func(describe, execute bool) error {
+		return e.answerExplain(pl.Explain, describe, execute, w)
+	}, w)
 }
 
 // answerNextval serves `SELECT nextval('seq')` from the router's block of
@@ -264,6 +297,31 @@ func noSequenceAllocator() error {
 	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "global sequences are not available: the router has no sequence allocator")
 	err.Hint = "start the router with a catalog connection that may call pgshard.allocate_sequence_block"
 	return err
+}
+
+// answerExplain returns the router's own plan as rows, the way PostgreSQL
+// returns EXPLAIN output: one text column, one row per line.
+//
+// The router answers it without visiting a shard, because the routing
+// decision is the router's and a shard knows nothing about it. The
+// statement being explained is NOT run.
+func (e *Executor) answerExplain(lines []string, describe, execute bool, w pgwire.ResultWriter) error {
+	if describe {
+		if err := w.RowDescription([]pgproto3.FieldDescription{
+			{Name: []byte("PGSHARD PLAN"), DataTypeOID: 25, DataTypeSize: -1, TypeModifier: -1},
+		}); err != nil {
+			return err
+		}
+	}
+	if !execute {
+		return nil
+	}
+	for _, l := range lines {
+		if err := w.DataRow([][]byte{[]byte(l)}); err != nil {
+			return err
+		}
+	}
+	return w.CommandComplete("EXPLAIN")
 }
 
 func nextvalField(binary bool) pgproto3.FieldDescription {

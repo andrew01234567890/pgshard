@@ -67,6 +67,11 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 	if !ok {
 		return sess.unsharded(), nil
 	}
+	// Before every gate below: EXPLAIN (pgshard) runs nothing, so nothing
+	// it names needs refusing here -- the refusal is what it renders.
+	if e := raw.GetStmt().GetExplainStmt(); e != nil && explainsRouting(e) {
+		return p.explainRouting(ctx, sess, parseVersion(res.Tree), e)
+	}
 	pl := &Plan{Generation: sess.generation(), home: sess.HomeShard, set: sess.shardSet(), snap: sess.Snapshot}
 	if err := classify(raw.GetStmt(), &pl.Class, sess.localOnly()); err != nil {
 		return refusalErr(err)

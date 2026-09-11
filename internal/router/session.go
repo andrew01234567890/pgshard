@@ -860,6 +860,9 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if err := e.refuseTxnControlInBatch(pl.Class); err != nil {
 		return err
 	}
+	if pl.Explain != nil {
+		return e.afterBatch(ctx, e.answerExplain(pl.Explain, true, true, w))
+	}
 	if err := checkFanoutMode(pl.Class); err != nil {
 		return err
 	}
@@ -1715,6 +1718,10 @@ func (e *Executor) sync(ctx context.Context) error {
 		scatterPlan = nil
 	}
 	if handled, err := e.nextvalBatch(ctx, batch, parsed, w); handled {
+		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+		return e.afterBatch(ctx, err)
+	}
+	if handled, err := e.explainBatch(batch, parsed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, err)
 	}

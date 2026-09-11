@@ -134,6 +134,12 @@ type Plan struct {
 	// NextVal names the global sequence a `SELECT nextval('...')` reads;
 	// the router answers it without visiting a shard (Kind SessionLocal).
 	NextVal string
+	// Explain is the rendered router plan of EXPLAIN (PGSHARD) ..., which
+	// the router answers itself. A user otherwise has no way to see the
+	// routing decision at all: a plain EXPLAIN is planned and sent to a
+	// shard, so it returns that shard's PostgreSQL plan and says nothing
+	// about which shards were chosen or why.
+	Explain []string
 	// Migration describes a DDL/DCL statement of Kind MigrationKind.
 	Migration *Migration
 	// Rewritten, when set, is the statement text the shards run instead of
