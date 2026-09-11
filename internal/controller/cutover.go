@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -515,23 +514,42 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		}
 		wf.cutover.Positions = pos
 	case StepCatchUp:
+		// Every forward subscription has reached the recorded positions,
+		// and that is the whole step.
+		//
+		// It used to demand, on top of that, that re-reading the sources
+		// gave back the SAME positions -- "the sources stood still through
+		// a whole catch-up" -- against a router that had not seen the
+		// fence and wrote anyway. But the positions are
+		// pg_current_wal_lsn, which a checkpoint or an autovacuum moves
+		// with no user write behind it: measured on an idle PostgreSQL 18
+		// with no writes at all, the position moved across one
+		// five-second sample and stood still across the next. So the step
+		// was a coin flip against background WAL rather than a statement
+		// about writers. It failed a cutover roughly one CI run in eleven
+		// with "sources advanced past the recorded positions", and a real
+		// upgrade sat retrying it indefinitely. StepFlip learned the same
+		// thing about the same question and stopped asking it.
+		//
+		// Dropping it is what makes the step terminate: the recorded
+		// positions are fixed, so the targets have a boundary that does
+		// not run away from them, and the sources are free to keep
+		// writing while they reach it.
+		//
+		// Nothing is lost by not asking. A write that lands after the
+		// positions were read is still carried by the forward
+		// subscriptions, which stay enabled until StepSwap -- and StepSwap
+		// pauses the sources, drains the writers already open, re-reads
+		// the positions and re-checks them before it disables anything.
+		// That is where a straggler is caught, and it is the only place
+		// the sources can be made to stand still without failing the
+		// writes of clients the fence deliberately let through.
 		ok, why, err := ops.CaughtUp(ctx, wf.cutover.Positions)
 		if err != nil {
 			return false, err
 		}
 		if !ok {
 			return true, retryf("%s", why)
-		}
-		// A router that had not seen the fence yet may have written after
-		// the positions were read; the switch only proceeds once the
-		// sources stood still through a whole catch-up.
-		pos, err := ops.Positions(ctx)
-		if err != nil {
-			return false, err
-		}
-		if !maps.Equal(pos, wf.cutover.Positions) {
-			wf.cutover.Positions = pos
-			return true, retryf("sources advanced past the recorded positions")
 		}
 	case StepVerify:
 		report, err := ops.Verify(ctx)
@@ -547,12 +565,24 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			// target holding exactly one batch more than the sources
 			// predicted. That is a race in the measurement, not a target
 			// that disagrees with its source, and it must not abandon a
-			// switch -- the positions say which it was.
+			// switch.
+			//
+			// Asking whether the positions MOVED does not tell those
+			// apart: background WAL moves them with nothing behind it, so
+			// every mismatch read as a measurement race and a real one
+			// could never be reported at all. Ask instead whether the
+			// targets have caught up to where the sources are NOW -- if
+			// they have and the digests still disagree, the disagreement
+			// is real.
 			pos, perr := ops.Positions(ctx)
 			if perr != nil {
 				return false, perr
 			}
-			if !maps.Equal(pos, wf.cutover.Positions) {
+			settled, _, perr := ops.CaughtUp(ctx, pos)
+			if perr != nil {
+				return false, perr
+			}
+			if !settled {
 				wf.cutover.Positions = pos
 				return true, retryf("sources advanced while verifying (%s)", strings.Join(report.Mismatches, "; "))
 			}

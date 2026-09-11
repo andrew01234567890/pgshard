@@ -49,8 +49,18 @@ type fakeOps struct {
 	journaled       map[string]int
 	lsn             int64
 	advance         int64
-	paused          bool
-	pauses          int
+	// backgroundAdvance moves the source's WAL position for reasons no
+	// fence can stop -- a checkpoint, an autovacuum, a standby snapshot.
+	// Measured on an idle PostgreSQL 18 with no writes at all, so a fake
+	// whose fenced source stands perfectly still is not a model of one.
+	backgroundAdvance int64
+	// unapplied is WAL the targets have not taken yet. Ordinary writes do
+	// not leave any -- the forward subscriptions are live and keep up --
+	// but a write landing during a check does, which is what makes the
+	// target look ahead of the source position that was read before it.
+	unapplied int64
+	paused    bool
+	pauses    int
 	// caughtUpUntil, when set, makes CaughtUp report behind from that call
 	// onwards, so a test can park the run at a chosen check.
 	caughtUpUntil int
@@ -102,6 +112,10 @@ func (f *fakeOps) Positions(context.Context) (map[string]int64, error) {
 	if !f.paused {
 		f.lsn += f.advance
 	}
+	// Background WAL moves the source's position without leaving anything
+	// to apply: it decodes to nothing, so the walsender carries every slot
+	// over it on a keepalive.
+	f.lsn += f.backgroundAdvance
 	return map[string]int64{"0": f.lsn}, f.step(StepPositions)
 }
 
@@ -115,11 +129,20 @@ func (f *fakeOps) DrainSources(context.Context) error {
 	return nil
 }
 func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, string, error) {
-	if pos["0"] != f.lsn {
-		return false, "", fmt.Errorf("caught-up check against stale position %d, current %d", pos["0"], f.lsn)
+	// A slot may be at or past the asked-for position -- it advances over
+	// WAL that decodes to nothing -- so only a position from the future is
+	// a caller mistake.
+	if pos["0"] > f.lsn {
+		return false, "", fmt.Errorf("caught-up check against a position %d ahead of the source at %d", pos["0"], f.lsn)
 	}
 	f.caughtUpCalls++
 	if f.caughtUpUntil > 0 && f.caughtUpCalls > f.caughtUpUntil {
+		return false, "lagging", f.step(StepCatchUp)
+	}
+	// Asked once, the targets get there: the next check finds them level.
+	behind := f.unapplied > 0
+	f.unapplied = 0
+	if behind {
 		return false, "lagging", f.step(StepCatchUp)
 	}
 	return f.caughtUp, "lagging", f.step(StepCatchUp)
@@ -129,6 +152,7 @@ func (f *fakeOps) Verify(context.Context) (VerifyReport, error) {
 	// read first and the target second, so a write in between is already
 	// applied on the target when it is read.
 	f.lsn += f.verifyAdvance
+	f.unapplied += f.verifyAdvance
 	return f.verify, f.step(StepVerify)
 }
 func (f *fakeOps) Sequences(context.Context) (string, error) {
@@ -235,7 +259,7 @@ func (h *cutoverHarness) runUntil(t *testing.T, stage string) {
 func TestCutoverHappyPath(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitched)
-	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepSequences, StepReverse, StepJournal,
+	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepSequences, StepReverse, StepJournal,
 		StepPositions, StepCatchUp, StepFlip,
 		"pause_sources", "drain_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
@@ -260,20 +284,44 @@ func TestCutoverHappyPath(t *testing.T) {
 	}
 }
 
-func TestCutoverWaitsUntilSourcesStandStill(t *testing.T) {
+// TestCutoverConvergesWhileBackgroundWALMoves is PGS-784. A checkpoint, an
+// autovacuum or a standby snapshot moves pg_current_wal_lsn with no user
+// write behind it -- measured on an idle PostgreSQL 18 with no writes at
+// all -- and no fence can stop any of them. catch_up used to demand the
+// position be identical across a catch-up, which made it a coin flip
+// against that background: it lost about one CI cutover in eleven with
+// "sources advanced past the recorded positions", and a real upgrade sat
+// retrying it indefinitely.
+func TestCutoverConvergesWhileBackgroundWALMoves(t *testing.T) {
 	h := newCutoverHarness(t)
-	h.ops.advance = 10
+	h.ops.backgroundAdvance = 7
 	h.runUntil(t, StageSwitching)
-	for i := 0; i < 3; i++ {
-		h.pass(t)
-		if h.wf.cutover.Step != StepCatchUp {
-			t.Fatalf("pass %d: step %s, want catch_up while the sources move", i, h.wf.cutover.Step)
-		}
-	}
-	h.ops.advance = 0
 	h.runUntil(t, StageSwitched)
-	if h.wf.cutover.Positions["0"] != h.ops.lsn {
-		t.Fatalf("positions %v, source at %d", h.wf.cutover.Positions, h.ops.lsn)
+	for _, a := range h.wf.cutover.Aborts {
+		t.Errorf("background WAL must not abort a switch: %s", a)
+	}
+	if h.ops.lsn == 0 {
+		t.Fatal("the fixture stopped exercising the property: the source never moved")
+	}
+}
+
+// TestCutoverConvergesWhileTheSourcesKeepWriting: the recorded positions are
+// a FIXED boundary, so a source that keeps writing cannot run away from the
+// targets. Making the sources stand still first is not an option before the
+// journal -- default_transaction_read_only there fails the writes of the
+// clients the fence deliberately let through, seen as 25006 in
+// TestReshardCutoverUnderLoad. StepSwap is where the sources are stopped,
+// after the flip, and it re-reads and re-checks the positions there.
+func TestCutoverConvergesWhileTheSourcesKeepWriting(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.advance = 1000
+	h.runUntil(t, StageSwitching)
+	h.runUntil(t, StageSwitched)
+	for _, a := range h.wf.cutover.Aborts {
+		t.Errorf("a writing source must not abort a switch: %s", a)
+	}
+	if h.wf.cutover.Positions["0"] > h.ops.lsn {
+		t.Fatalf("positions %v ahead of the source at %d", h.wf.cutover.Positions, h.ops.lsn)
 	}
 }
 
