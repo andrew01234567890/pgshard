@@ -235,6 +235,34 @@ func (n *node) status() *pgshardv1.StatusResponse {
 	return st
 }
 
+// waitRPC waits until the agent's gRPC server answers.
+//
+// /readyz is not a proxy for it. The agent serves its probes long before
+// its gRPC server -- run.go starts the HTTP listener before Bootstrap and
+// grpcSrv.Serve only at the end of startup -- so a test that waits for
+// readiness and then makes an RPC is racing that gap. It loses rarely and
+// intermittently, which is how it read as a flake: "error reading server
+// preface: connection reset by peer" from a listener that exists and is
+// not serving yet.
+//
+// Waiting for the thing about to be used, rather than for a different
+// thing that usually happens first.
+func (n *node) waitRPC(timeout time.Duration) {
+	n.t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, last = n.grpc.Status(ctx, &pgshardv1.StatusRequest{})
+		cancel()
+		if last == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	n.t.Fatalf("%s: the agent's gRPC server did not answer within %s (last: %v)\n%s", n.name, timeout, last, n.logs())
+}
+
 func (n *node) waitStandbyCaughtUp(primary *node, timeout time.Duration) {
 	n.t.Helper()
 	target := primary.psql("SELECT pg_current_wal_lsn()")
@@ -265,6 +293,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	p := h.start("s0-0", RolePrimary, "s0-1", peersOf("s0-1"))
 	p.waitHTTP("/startz", 200, 90*time.Second)
 	p.waitHTTP("/readyz", 200, 60*time.Second)
+	p.waitRPC(30 * time.Second)
 	if got := p.psql("SHOW wal_level"); got != "logical" {
 		t.Fatalf("wal_level=%s", got)
 	}
@@ -298,6 +327,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	s := h.start("s0-1", RoleStandby, "s0-0", peersOf("s0-0"))
 	s.waitHTTP("/startz", 200, 120*time.Second)
 	s.waitHTTP("/readyz", 200, 60*time.Second)
+	s.waitRPC(30 * time.Second)
 	s.waitStandbyCaughtUp(p, 30*time.Second)
 	if got := s.psql("SELECT note FROM t WHERE id = 1"); got != "first" {
 		t.Fatalf("standby did not replicate: %q", got)
