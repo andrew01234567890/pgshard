@@ -150,3 +150,50 @@ func TestExplainPgshardDistinguishesTheRoutingsThatNameNoShard(t *testing.T) {
 		t.Errorf("a parameterised key is routed at Bind, got:\n%s", deferred)
 	}
 }
+
+// A reference write runs on every shard in one two-phase commit and never
+// reaches the merge. Rendering its unused merge spec reported "refused at
+// execution" for a statement that runs perfectly well, which is worse than
+// saying nothing: the feature exists to be believed.
+func TestExplainPgshardDoesNotCallAReferenceWriteRefused(t *testing.T) {
+	for _, sql := range []string{
+		"explain (pgshard) insert into regions (id, name) values (1, 'x')",
+		"explain (pgshard) update regions set name = 'y' where id = 1",
+		"explain (pgshard) delete from regions where id = 1",
+	} {
+		out := explain(t, sql)
+		if strings.Contains(out, "refused") {
+			t.Errorf("%s: the statement runs; got:\n%s", sql, out)
+		}
+		if !strings.Contains(out, "every shard in one two-phase commit") {
+			t.Errorf("%s: want the write described, got:\n%s", sql, out)
+		}
+	}
+}
+
+// SessionLocal is not router-local. SET, EXECUTE and DECLARE are forwarded
+// to whichever shard the session is on; only nextval() over a global
+// sequence and this EXPLAIN are answered without one.
+func TestExplainPgshardSeparatesForwardedFromRouterAnswered(t *testing.T) {
+	forwarded := explain(t, "explain (pgshard) execute somestatement")
+	if !strings.Contains(forwarded, "the shard this session is on") {
+		t.Errorf("EXECUTE is forwarded, got:\n%s", forwarded)
+	}
+	answered := explain(t, "explain (pgshard) select nextval('invoice_numbers')")
+	if !strings.Contains(answered, "the router answers this itself") {
+		t.Errorf("a global nextval never reaches a shard, got:\n%s", answered)
+	}
+}
+
+// PostgreSQL's defGetBoolean takes 0 and 1 and rejects every other number.
+// Recognising (pgshard 2) here would answer a statement PostgreSQL would
+// have rejected, in our own dialect.
+func TestExplainPgshardIntegerOptionIsZeroOrOne(t *testing.T) {
+	p, err := New().Plan(context.Background(), session(fixture(t)), "explain (pgshard 2) select * from orders where tenant_id = 1")
+	if err != nil {
+		t.Fatalf("it is the shard's rejection to raise: %v", err)
+	}
+	if p.Explain != nil {
+		t.Errorf("2 is not a boolean: %v", p.Explain)
+	}
+}

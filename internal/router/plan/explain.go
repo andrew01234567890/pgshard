@@ -48,7 +48,10 @@ func optionIsOn(d *pgquerypb.DefElem) bool {
 	case arg.GetString_() != nil:
 		return isTrueWord(arg.GetString_().GetSval())
 	case arg.GetInteger() != nil:
-		return arg.GetInteger().GetIval() != 0
+		// 1 and nothing else: defGetBoolean rejects any other number, and
+		// leaving the option unrecognised here sends the statement to a
+		// shard, where PostgreSQL raises that rejection itself.
+		return arg.GetInteger().GetIval() == 1
 	case arg.GetBoolean() != nil:
 		return arg.GetBoolean().GetBoolval()
 	}
@@ -123,10 +126,17 @@ func renderPlan(p *Plan, err error) []string {
 	for _, t := range p.Tables {
 		out = append(out, fmt.Sprintf("  Table:  %s.%s", t.SchemaName, t.TableName))
 	}
+	switch {
+	// A reference write never reaches the merge: it runs on every shard
+	// inside one two-phase commit, and the lowest shard's rows and tag are
+	// the ones the client sees. Its merge spec would report a refusal the
+	// executor does not consult.
+	case p.Kind == Reference && p.Class.Write && len(p.Shards) > 1:
+		out = append(out, "  Write:  applied on every shard in one two-phase commit")
 	// Only where the merge is reached: every read carries a merge spec,
 	// and describing one on a plan that runs on a single shard says the
 	// router combines results it never receives.
-	if len(p.Shards) > 1 || p.Kind == Scatter {
+	case len(p.Shards) > 1 || p.Kind == Scatter:
 		m, merr := p.MultiShard()
 		switch {
 		case merr != nil:
@@ -147,8 +157,12 @@ func shardsLabel(p *Plan) string {
 		return "decided at Bind, from the parameter that carries the shard key"
 	case p.Kind == Reference && len(p.Shards) == 0:
 		return "one serving shard, chosen at execution: the table is the same on every shard"
-	case len(p.Shards) == 0:
+	case len(p.Shards) == 0 && (p.NextVal != "" || p.Explain != nil):
 		return "none: the router answers this itself"
+	case len(p.Shards) == 0:
+		// SessionLocal is not router-local: SET, EXECUTE and DECLARE are
+		// forwarded to whichever shard the session is already on.
+		return "the shard this session is on; the statement is forwarded there"
 	}
 	ids := make([]string, len(p.Shards))
 	for i, s := range p.Shards {
