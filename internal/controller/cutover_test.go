@@ -54,13 +54,8 @@ type fakeOps struct {
 	// Measured on an idle PostgreSQL 18 with no writes at all, so a fake
 	// whose fenced source stands perfectly still is not a model of one.
 	backgroundAdvance int64
-	// unapplied is WAL the targets have not taken yet. Ordinary writes do
-	// not leave any -- the forward subscriptions are live and keep up --
-	// but a write landing during a check does, which is what makes the
-	// target look ahead of the source position that was read before it.
-	unapplied int64
-	paused    bool
-	pauses    int
+	paused            bool
+	pauses            int
 	// caughtUpUntil, when set, makes CaughtUp report behind from that call
 	// onwards, so a test can park the run at a chosen check.
 	caughtUpUntil int
@@ -139,21 +134,25 @@ func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, strin
 	if f.caughtUpUntil > 0 && f.caughtUpCalls > f.caughtUpUntil {
 		return false, "lagging", f.step(StepCatchUp)
 	}
-	// Asked once, the targets get there: the next check finds them level.
-	behind := f.unapplied > 0
-	f.unapplied = 0
-	if behind {
-		return false, "lagging", f.step(StepCatchUp)
-	}
 	return f.caughtUp, "lagging", f.step(StepCatchUp)
 }
 func (f *fakeOps) Verify(context.Context) (VerifyReport, error) {
 	// A source that moves while the digests are being taken: the source is
 	// read first and the target second, so a write in between is already
-	// applied on the target when it is read.
+	// applied on the target when it is read -- which is why the target
+	// looks AHEAD, and why asking whether the targets have caught up says
+	// yes about a race.
+	//
+	// The numbers such a mismatch reports describe one instant, so they are
+	// different every time it is asked. A target that genuinely disagrees
+	// reports the same count, sum and xor every time, and that is the only
+	// thing telling the two apart.
 	f.lsn += f.verifyAdvance
-	f.unapplied += f.verifyAdvance
-	return f.verify, f.step(StepVerify)
+	report := f.verify
+	if f.verifyAdvance > 0 && len(report.Mismatches) > 0 {
+		report.Mismatches = []string{fmt.Sprintf("%s (at %d)", report.Mismatches[0], f.lsn)}
+	}
+	return report, f.step(StepVerify)
 }
 func (f *fakeOps) Sequences(context.Context) (string, error) {
 	return f.seqFP, f.step(StepSequences)
@@ -396,7 +395,12 @@ func TestCutoverVerifyMismatchAbortsBeforeJournal(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.ops.verify = VerifyReport{Mismatches: []string{"app.orders/0: count 10 vs 9"}}
 	h.runUntil(t, StageSwitching)
-	_, err := h.c.cutover(context.Background(), h.wf, h.ops)
+	// The first mismatch is asked again rather than believed: only the same
+	// digests twice are a disagreement rather than a measurement race.
+	var err error
+	for i := 0; i < 5 && !isFatal(err); i++ {
+		_, err = h.c.cutover(context.Background(), h.wf, h.ops)
+	}
 	if !isFatal(err) || !strings.Contains(err.Error(), "verification failed") {
 		t.Fatalf("err %v", err)
 	}
@@ -413,8 +417,9 @@ func TestCutoverVerifyMismatchAbortsBeforeJournal(t *testing.T) {
 // already applied on the target and makes it look ahead of its source. CI
 // saw exactly that -- a target holding one batch more than the sources
 // predicted. That is a race in the measurement, not a target that disagrees
-// with its source, and it must not abandon the switch: the positions say
-// which it was.
+// with its source, and it must not abandon the switch. What tells the two
+// apart is asking the digests again: a race reported one instant and reports
+// different numbers next time, while a real disagreement repeats exactly.
 func TestCutoverVerifyRetriesWhileTheSourceMoves(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.ops.verify = VerifyReport{Mismatches: []string{"app.ledger on g2/1: 1740 rows, sources predict 1730"}}

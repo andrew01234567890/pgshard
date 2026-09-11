@@ -518,31 +518,22 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// and that is the whole step.
 		//
 		// It used to demand, on top of that, that re-reading the sources
-		// gave back the SAME positions -- "the sources stood still through
-		// a whole catch-up" -- against a router that had not seen the
-		// fence and wrote anyway. But the positions are
-		// pg_current_wal_lsn, which a checkpoint or an autovacuum moves
-		// with no user write behind it: measured on an idle PostgreSQL 18
-		// with no writes at all, the position moved across one
-		// five-second sample and stood still across the next. So the step
-		// was a coin flip against background WAL rather than a statement
-		// about writers. It failed a cutover roughly one CI run in eleven
-		// with "sources advanced past the recorded positions", and a real
-		// upgrade sat retrying it indefinitely. StepFlip learned the same
+		// gave back the SAME positions. But those are pg_current_wal_lsn,
+		// which a checkpoint or an autovacuum moves with no user write
+		// behind it -- measured on an idle PostgreSQL 18 with no writes at
+		// all -- so the step was a coin flip against background WAL, and
+		// it lost about one cutover in eleven. StepFlip learned the same
 		// thing about the same question and stopped asking it.
 		//
-		// Dropping it is what makes the step terminate: the recorded
-		// positions are fixed, so the targets have a boundary that does
-		// not run away from them, and the sources are free to keep
-		// writing while they reach it.
-		//
-		// Nothing is lost by not asking. A write that lands after the
-		// positions were read is still carried by the forward
-		// subscriptions, which stay enabled until StepSwap -- and StepSwap
-		// pauses the sources, drains the writers already open, re-reads
-		// the positions and re-checks them before it disables anything.
-		// That is where a straggler is caught, and it is the only place
-		// the sources can be made to stand still without failing the
+		// Not asking is what makes the step terminate: the recorded
+		// positions are a FIXED boundary, so a source that keeps writing
+		// cannot run away from the targets. And nothing is lost by it. A
+		// write landing after the positions were read is still carried by
+		// the forward subscriptions, which stay enabled until StepSwap --
+		// and StepSwap pauses the sources, drains the writers already
+		// open, re-reads the positions and re-checks them before it
+		// disables anything. That is where a straggler is caught, and it
+		// is the only place the sources can be stopped without failing the
 		// writes of clients the fence deliberately let through.
 		ok, why, err := ops.CaughtUp(ctx, wf.cutover.Positions)
 		if err != nil {
@@ -556,6 +547,7 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		if err != nil {
 			return false, err
 		}
+		previous := wf.cutover.Verify
 		wf.cutover.Verify = &report
 		if len(report.Mismatches) > 0 {
 			// A source that moved while the digests were being taken makes
@@ -567,26 +559,23 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			// that disagrees with its source, and it must not abandon a
 			// switch.
 			//
-			// Asking whether the positions MOVED does not tell those
-			// apart: background WAL moves them with nothing behind it, so
-			// every mismatch read as a measurement race and a real one
-			// could never be reported at all. Ask instead whether the
-			// targets have caught up to where the sources are NOW -- if
-			// they have and the digests still disagree, the disagreement
-			// is real.
-			pos, perr := ops.Positions(ctx)
-			if perr != nil {
-				return false, perr
+			// Neither of the two questions about POSITIONS tells those
+			// apart. "Did they move" is answered yes by background WAL
+			// with nothing behind it, so every mismatch read as a race and
+			// a real one could never be reported. "Have the targets caught
+			// up to where the sources are now" is answered yes in exactly
+			// the racing case -- the write is already applied, which is
+			// why the target looked ahead -- so it calls the race real.
+			//
+			// Ask the digests again instead. A race is gone or different
+			// next pass, because the numbers it produced described one
+			// instant; a target that genuinely disagrees produces the same
+			// count, sum and xor every time.
+			if previous == nil || !slices.Equal(previous.Mismatches, report.Mismatches) {
+				return true, retryf("digests disagree, asking again to tell a moving source from a real disagreement (%s)",
+					strings.Join(report.Mismatches, "; "))
 			}
-			settled, _, perr := ops.CaughtUp(ctx, pos)
-			if perr != nil {
-				return false, perr
-			}
-			if !settled {
-				wf.cutover.Positions = pos
-				return true, retryf("sources advanced while verifying (%s)", strings.Join(report.Mismatches, "; "))
-			}
-			return false, fatal("verification failed: %s", strings.Join(report.Mismatches, "; "))
+			return false, fatal("verification failed, the same digests twice: %s", strings.Join(report.Mismatches, "; "))
 		}
 	case StepSequences:
 		fp, err := ops.Sequences(ctx)

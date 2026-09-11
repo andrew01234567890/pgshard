@@ -281,8 +281,20 @@ idempotent, so a controller crash anywhere repeats at most one step:
    flip, and why it re-reads and re-checks the positions there.
 6. `verify` — per table, range and target: `count(*)`, `sum(h)` and
    `bit_xor(h)` where `h = hashtextextended(row::text, 0)`, under the source
-   position vs the target. A mismatch aborts the switch (fence released,
-   workflow `failed`) before anything irreversible.
+   position vs the target. A mismatch is asked again before it is believed:
+   only the same digests twice abort the switch (fence released, workflow
+   `failed`), and that happens before anything irreversible.
+
+   Once, because a mismatch is usually the measurement racing rather than a
+   target that disagrees — the source is read first and the target second,
+   so a write landing between the two is already applied on the target and
+   makes it look ahead. Neither question about WAL positions tells those
+   apart: "did they move" is answered yes by background WAL with nothing
+   behind it, and "have the targets caught up" is answered yes in exactly
+   the racing case, because the write is already applied. The digests
+   themselves do: a race describes one instant and reports different
+   numbers next pass, while a target that genuinely disagrees reports the
+   same count, sum and xor every time.
 
    Two combinations rather than one because a sum is commutative and
    additive: any two rows swapped for two others of the same total pass a
