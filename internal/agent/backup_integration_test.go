@@ -17,7 +17,11 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
-const minioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+// MinIO deleted both minio/minio and minio/mc from Docker Hub, so the pull
+// fails outright rather than rate-limiting: "pull access denied ...
+// repository does not exist". quay.io is MinIO's own registry and carries
+// the same release tags.
+const minioImage = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
 
 // startMinIO runs MinIO on the harness network with the pgshard bucket and
 // returns the agent's backup settings for stanza against it.
