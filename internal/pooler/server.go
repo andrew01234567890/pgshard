@@ -598,7 +598,15 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	}
 	if _, ok := req.Message.(*pgshardv1.ExecuteRequest_Cancel); ok {
 		if b := r.backend(); b != nil {
-			if err := b.cancel(ctx, r.srv.cfg.Dialer); err != nil {
+			// This one arrives on the session's own stream, so the session
+			// is right here; the check is that the BACKEND is still its
+			// own, which a cancel racing the end of a statement can lose.
+			still := func() bool {
+				r.srv.mu.Lock()
+				defer r.srv.mu.Unlock()
+				return r.se.b == b && !b.released
+			}
+			if err := b.cancel(ctx, r.srv.cfg.Dialer, still); err != nil {
 				r.srv.cfg.Logger.Warn("cancel failed", "session", r.se.id, "err", err)
 			}
 		}
@@ -1050,7 +1058,15 @@ func (s *Server) Cancel(ctx context.Context, req *pgshardv1.CancelRequest) (*pgs
 	b := se.b
 	s.mu.Unlock()
 	if b != nil {
-		if err := b.cancel(ctx, s.cfg.Dialer); err != nil {
+		// Still this session's backend, asked again once the cancellation
+		// connection is up: by then the statement may have finished and
+		// the backend been handed to somebody else.
+		still := func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return se.b == b && !b.released
+		}
+		if err := b.cancel(ctx, s.cfg.Dialer, still); err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
 	}
