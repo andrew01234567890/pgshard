@@ -353,7 +353,23 @@ func (b *Backend) runSimpleQuery(sql string) error {
 }
 
 // cancel sends a CancelRequest for this backend over a fresh connection.
-func (b *Backend) cancel(ctx context.Context, d Dialer) error {
+// cancel sends PostgreSQL a CancelRequest for this backend.
+//
+// still is consulted AFTER the connection is up and before anything is
+// sent, and returning false abandons the cancel. A backend is shared: once
+// the statement the cancel was fired for has finished, the pooler resets
+// the backend and hands it to another session, and a cancel that arrives
+// then interrupts THAT session's statement instead. The router fires
+// cancels on client cancellation and on timeouts, which are exactly the
+// moments a statement is about to end, so the window is not a rare one.
+//
+// What this closes is the dial: a TCP connect, and a TLS handshake with
+// it, between reading the backend and sending anything to it. What remains
+// is the single write below, which cannot be made atomic with the
+// handover without holding the pooler's lock across a socket write --
+// which would stall every session on this pooler if the write blocked.
+// PostgreSQL's own cancellation is best-effort for the same reason.
+func (b *Backend) cancel(ctx context.Context, d Dialer, still func() bool) error {
 	conn, err := d.dial(ctx)
 	if err != nil {
 		return err
@@ -362,6 +378,9 @@ func (b *Backend) cancel(ctx context.Context, d Dialer) error {
 	buf, err := (&pgproto3.CancelRequest{ProcessID: b.pid, SecretKey: b.secret}).Encode(nil)
 	if err != nil {
 		return err
+	}
+	if still != nil && !still() {
+		return nil
 	}
 	if _, err := conn.Write(buf); err != nil {
 		return err
