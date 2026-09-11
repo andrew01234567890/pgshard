@@ -870,9 +870,22 @@ type VPosition struct {
 	Shards             []*VPosition_Shard     `protobuf:"bytes,1,rep,name=shards,proto3" json:"shards,omitempty"`
 	ShardMapGeneration uint64                 `protobuf:"varint,2,opt,name=shard_map_generation,json=shardMapGeneration,proto3" json:"shard_map_generation,omitempty"`
 	// Shards still in their initial copy.
-	CopyState     []*VCopyState `protobuf:"bytes,3,rep,name=copy_state,json=copyState,proto3" json:"copy_state,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	CopyState []*VCopyState `protobuf:"bytes,3,rep,name=copy_state,json=copyState,proto3" json:"copy_state,omitempty"`
+	// Identity of the serving shard set this position was taken in: the
+	// shards and the key ranges they own.
+	//
+	// The generation above counts every catalog change, including ones that
+	// move no rows -- a new shard set declared days before its cutover, a
+	// table placement published. Ending a stream on the counter ended it on
+	// all of those, and the position the consumer had saved was then refused
+	// for ever because it carried the old count. What actually invalidates a
+	// position is the shard set changing under it, which is what this says.
+	//
+	// Zero means a position from a server that did not stamp one; those fall
+	// back to the generation.
+	ShardSetFingerprint uint64 `protobuf:"varint,4,opt,name=shard_set_fingerprint,json=shardSetFingerprint,proto3" json:"shard_set_fingerprint,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *VPosition) Reset() {
@@ -924,6 +937,13 @@ func (x *VPosition) GetCopyState() []*VCopyState {
 		return x.CopyState
 	}
 	return nil
+}
+
+func (x *VPosition) GetShardSetFingerprint() uint64 {
+	if x != nil {
+		return x.ShardSetFingerprint
+	}
+	return 0
 }
 
 // VStreamRequest is the start of a stream or an ack.
@@ -2895,12 +2915,13 @@ const file_pgshard_v1_vstream_proto_rawDesc = "" +
 	"\x05state\x18\x04 \x01(\tR\x05state\x12-\n" +
 	"\x05slots\x18\x05 \x03(\v2\x17.pgshard.v1.VStreamSlotR\x05slots\"I\n" +
 	"\x14ListVStreamsResponse\x121\n" +
-	"\astreams\x18\x01 \x03(\v2\x17.pgshard.v1.VStreamInfoR\astreams\"\xf0\x01\n" +
+	"\astreams\x18\x01 \x03(\v2\x17.pgshard.v1.VStreamInfoR\astreams\"\xa4\x02\n" +
 	"\tVPosition\x123\n" +
 	"\x06shards\x18\x01 \x03(\v2\x1b.pgshard.v1.VPosition.ShardR\x06shards\x120\n" +
 	"\x14shard_map_generation\x18\x02 \x01(\x04R\x12shardMapGeneration\x125\n" +
 	"\n" +
-	"copy_state\x18\x03 \x03(\v2\x16.pgshard.v1.VCopyStateR\tcopyState\x1aE\n" +
+	"copy_state\x18\x03 \x03(\v2\x16.pgshard.v1.VCopyStateR\tcopyState\x122\n" +
+	"\x15shard_set_fingerprint\x18\x04 \x01(\x04R\x13shardSetFingerprint\x1aE\n" +
 	"\x05Shard\x12*\n" +
 	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
 	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\"\x8b\x02\n" +
