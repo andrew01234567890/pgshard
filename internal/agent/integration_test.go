@@ -418,6 +418,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	docker(t, "restart", p.container)
 	p.connect()
 	p.waitHTTP("/readyz", 200, 120*time.Second)
+	// A restart reopens the same window as a start: the probes answer
+	// before grpcSrv.Serve does.
+	p.waitRPC(30 * time.Second)
 	if st := p.status(); st.GetEpoch() != 1 || st.GetRole() != pgshardv1.StatusResponse_ROLE_STANDBY {
 		t.Fatalf("status after restart: %v", st)
 	}
