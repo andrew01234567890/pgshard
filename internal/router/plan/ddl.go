@@ -929,12 +929,7 @@ func (w *walker) hashPassword(raw *pgquerypb.RawStmt, options []*pgquerypb.Node)
 	return v.String(), stmt, false, nil
 }
 
-func (w *walker) parseVersion() int32 {
-	if pr, ok := w.tree.(*pgquerypb.ParseResult); ok {
-		return pr.GetVersion()
-	}
-	return 0
-}
+func (w *walker) parseVersion() int32 { return parseVersion(w.tree) }
 
 func rewritePassword(node *pgquerypb.Node, verifier string) {
 	var options []*pgquerypb.Node

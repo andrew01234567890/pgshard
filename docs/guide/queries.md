@@ -65,6 +65,29 @@ a write are refused: they would produce different rows per shard. Compute
 volatile values in the client and pass them as parameters, and keep
 reference-table column defaults constant.
 
+**Seeing the routing decision.** `EXPLAIN (PGSHARD) <statement>` returns the
+router's own plan: which shards the statement reaches, its fan-out class, the
+tables it routed on, and what the router does with the shards' rows. The
+statement is not run, and it never leaves the router.
+
+```
+=> EXPLAIN (PGSHARD) SELECT * FROM orders ORDER BY id LIMIT 10;
+                            PGSHARD PLAN
+ ----------------------------------------------------------------
+ Route [Scatter]
+   Shards: 0, 1, 2, 3
+   Fanout: scatter
+   Table:  public.orders
+   Merge:  the shards' rows are merged in ORDER BY order; LIMIT 10 applied at the router
+```
+
+A refusal is rendered as the plan rather than raised, so you can see why a
+statement would be refused without the refusal ending your transaction --
+including the statements `pgshard.fanout` below would reject. A plain
+`EXPLAIN` still means what PostgreSQL means by it: it is routed like any
+other statement and comes back with one shard's plan. The option takes no
+others (`ANALYZE` would promise a run that does not happen).
+
 **Catching an accidental scatter.** `SET pgshard.fanout = 'single'` refuses
 any statement that would route to more than one shard, and `'multi'` allows a
 bounded set (an `IN` list) but still refuses a scatter. The default,
