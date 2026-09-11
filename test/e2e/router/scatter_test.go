@@ -524,7 +524,6 @@ func (s *scatterStack) canceledCount(tb testing.TB) int {
 	return total
 }
 
-
 // floatSkewFirstID fences the rows loadFloatSkew adds off from the corpus.
 const floatSkewFirstID = "1000000"
 
