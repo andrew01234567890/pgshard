@@ -860,6 +860,12 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if err := e.refuseTxnControlInBatch(pl.Class); err != nil {
 		return err
 	}
+	if err := checkFanoutMode(pl.Class); err != nil {
+		return err
+	}
+	if err := e.checkFanout(pl); err != nil {
+		return e.afterBatch(ctx, err)
+	}
 	if pl.Kind == plan.MigrationKind {
 		return e.afterBatch(ctx, e.runMigration(ctx, pl, w))
 	}
@@ -1181,6 +1187,9 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 	if err == nil {
 		err = checkTransactionMode(pl.Class)
 	}
+	if err == nil {
+		err = checkFanoutMode(pl.Class)
+	}
 	if err != nil {
 		e.failBatch()
 		return err
@@ -1212,6 +1221,13 @@ func multiShard(pl plan.Plan) bool {
 // aimBatch records the shard a resolved plan needs; one batch may only
 // target one shard, or carry one multi-shard statement.
 func (e *Executor) aimBatch(pl plan.Plan, stmt string) error {
+	// The one place an extended-protocol statement's destinations are
+	// final: parse comes here for a plan that needs no parameters, and
+	// aimBound comes here after Bind has resolved the keys of one that
+	// does. So the ceiling is checked on a plan that knows its shards.
+	if err := e.checkFanout(pl); err != nil {
+		return err
+	}
 	if multiShard(pl) {
 		if _, err := pl.MultiShard(); err != nil && !isReferenceWrite(pl) {
 			return err

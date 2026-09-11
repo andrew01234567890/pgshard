@@ -65,6 +65,21 @@ a write are refused: they would produce different rows per shard. Compute
 volatile values in the client and pass them as parameters, and keep
 reference-table column defaults constant.
 
+**Catching an accidental scatter.** `SET pgshard.fanout = 'single'` refuses
+any statement that would route to more than one shard, and `'multi'` allows a
+bounded set (an `IN` list) but still refuses a scatter. The default,
+`'scatter'`, refuses nothing. The refusal names both shapes:
+
+```
+ERROR:  the statement's fan-out (scatter) exceeds pgshard.fanout (single)
+HINT:   add a shard key predicate, or raise pgshard.fanout for this session
+```
+
+Set it in tests and CI to catch a query that lost its shard-key predicate
+before it reaches production, or on a request path that should always be
+keyed. DDL is exempt, and so is the fan-out that maintains a reference
+table -- a reference write reaches every shard by definition.
+
 **Refused session features.** `LISTEN`/`NOTIFY`, `WITH HOLD` cursors and
 temporary tables are refused (`0A000`). Session `SET` and named prepared
 statements work and are replayed across backend changes; the usual

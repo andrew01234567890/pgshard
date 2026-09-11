@@ -458,6 +458,10 @@ func setsProtectedValue(kind pgquerypb.VariableSetKind) bool {
 var clientGUCs = map[string]bool{
 	"pgshard.ddl_async":        true,
 	"pgshard.transaction_mode": true,
+	// fanout only ever NARROWS what the session may run, and raising it
+	// back to scatter restores the default. A client cannot exempt itself
+	// from anything with it, which is the test this list applies.
+	"pgshard.fanout": true,
 }
 
 func refuseProtectedGUC(name string) error {

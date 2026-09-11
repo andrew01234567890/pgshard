@@ -363,3 +363,51 @@ func refusal(err error, hint string) (Plan, error) {
 }
 
 func refusalErr(err error) (Plan, error) { return Plan{Kind: Refuse, Err: err}, err }
+
+// Fanout levels, in widening order. They name how broadly a plan routes,
+// which is what a session can put a ceiling on.
+const (
+	// FanoutSingle is one shard: a keyed statement, or an unsharded table
+	// on its home shard.
+	FanoutSingle = "single"
+	// FanoutMulti is a bounded set named by the statement itself -- an IN
+	// list resolves to the shards holding those values and no others.
+	FanoutMulti = "multi"
+	// FanoutScatter is every shard of the set.
+	FanoutScatter = "scatter"
+	// FanoutExempt is a plan the ceiling does not apply to: session-local
+	// statements, DDL, and the fan-out that maintains a reference table.
+	// A reference write reaches every shard by definition, and refusing it
+	// for being wide would refuse the table's whole purpose.
+	FanoutExempt = ""
+)
+
+// Fanout names how broadly this plan routes.
+func (p Plan) Fanout() string {
+	switch p.Kind {
+	case SessionLocal, MigrationKind, Refuse, Reference:
+		return FanoutExempt
+	case Scatter:
+		return FanoutScatter
+	case In:
+		if len(p.Shards) <= 1 {
+			return FanoutSingle
+		}
+		return FanoutMulti
+	}
+	if len(p.Shards) > 1 {
+		return FanoutMulti
+	}
+	return FanoutSingle
+}
+
+// FanoutExceeds reports whether a plan's fan-out is wider than the ceiling.
+func FanoutExceeds(fanout, ceiling string) bool {
+	rank := map[string]int{FanoutSingle: 1, FanoutMulti: 2, FanoutScatter: 3}
+	f, ok := rank[fanout]
+	if !ok {
+		return false
+	}
+	c, ok := rank[ceiling]
+	return ok && f > c
+}
