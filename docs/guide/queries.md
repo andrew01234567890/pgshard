@@ -29,6 +29,24 @@ subqueries, CTEs, window functions, `avg()`, set operations, `FOR UPDATE` —
 is refused with `0A000` and a message naming the rule. Scatter
 `UPDATE`/`DELETE` without a key predicate is refused.
 
+**`sum()` over `float8` is order-dependent.** A scatter sums each shard's
+rows and then adds the per-shard totals, which is a different association
+from one pass over all the rows. Floating-point addition is not
+associative, so the two answers can differ in their low bits -- the same
+caveat PostgreSQL documents for `sum(double precision)` on one node, where
+the answer already depends on the order the planner happens to read rows
+in. Measured here on one large value and four hundred small ones spread
+across shards:
+
+```
+sum(price) on one PostgreSQL   1e+16
+through pgshard                1.00000000000004e+16
+```
+
+`count`, `min` and `max` are unaffected, and so is `sum()` over `numeric`
+and the integer types, which is exact. Use `numeric` for anything being
+reconciled against a total computed another way.
+
 **Colocated joins.** More than one table may take part in a scatter,
 provided every row a join could match is already on the shard that holds
 it. That is the case when each sharded table is joined to the others **on
