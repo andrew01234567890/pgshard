@@ -634,6 +634,30 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 			r.srv.cfg.Pool.Discard(b)
 			return r.refuse(&pgshardv1.Error{Sqlstate: "57P03", Message: "pooler is draining"})
 		}
+		// The fence was evaluated on a view read BEFORE the acquire, and
+		// the acquire waits -- up to AcquireTimeout, five seconds by
+		// default. The epoch can be bumped, the generation can move and the
+		// member can stop serving in that window, and the statement would
+		// then be written to the socket regardless.
+		//
+		// The correlation runs the wrong way, which is what makes it worth
+		// re-checking rather than accepting: backends are scarcest, so the
+		// wait is longest, exactly during a failover or a cutover flip --
+		// the moments the fence exists for.
+		//
+		// Only after a wait. A request that took a backend immediately was
+		// gated on a view no older than itself.
+		view = r.srv.cfg.Source.View()
+		for _, gate := range []func() *pgshardv1.Error{
+			func() *pgshardv1.Error { return member(view) },
+			func() *pgshardv1.Error { return serving(view) },
+			func() *pgshardv1.Error { return fence(view, req.Generation) },
+			func() *pgshardv1.Error { return fenceMigrating(view, req) },
+		} {
+			if e := gate(); e != nil {
+				return r.refuse(e)
+			}
+		}
 	}
 	// Everything past here reads or writes the backend socket, and none of
 	// those calls take a context. The router giving up -- a cancel, a
