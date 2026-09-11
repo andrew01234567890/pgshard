@@ -99,3 +99,25 @@ func TestAJournalThatCannotBeReadStillEndsTheStream(t *testing.T) {
 	}
 	t.Fatal("a journal the catalog could not answer for stopped the event reaching the consumer at all")
 }
+
+// TestAJournalRefusesAShardIdItCannotHold.
+//
+// The target shard ids arrive as JSON object keys and are parsed back into
+// int32. strconv.Atoi returns an int, and narrowing that to int32
+// TRUNCATES rather than failing: 4294967296 becomes 0, and the consumer is
+// pointed at a shard the journal never named. A shard id is an identity,
+// so the parse has to refuse what it cannot hold.
+func TestAJournalRefusesAShardIdItCannotHold(t *testing.T) {
+	for _, key := range []string{"4294967296", "-4294967297", "99999999999999999999", "seven"} {
+		if _, err := parseJournalTargets("j1", map[string]uint64{key: 42}); err == nil {
+			t.Fatalf("target shard %q was accepted; it does not fit an int32 and would arrive as something else", key)
+		}
+	}
+	got, err := parseJournalTargets("j1", map[string]uint64{"3": 42, "-1": 7})
+	if err != nil {
+		t.Fatalf("ordinary shard ids: %v", err)
+	}
+	if got[3] != 42 || got[-1] != 7 {
+		t.Fatalf("targets %v", got)
+	}
+}

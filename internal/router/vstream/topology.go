@@ -181,15 +181,31 @@ func (c PGCatalog) Journal(ctx context.Context, set string) (Journal, bool, erro
 	if err != nil {
 		return Journal{}, false, err
 	}
-	j := Journal{ID: id, Targets: make(map[int32]uint64, len(targets))}
-	for k, lsn := range targets {
-		shard, cerr := strconv.Atoi(k)
-		if cerr != nil {
-			return Journal{}, false, fmt.Errorf("vstream: journal %s has a non-numeric target shard %q", id, k)
-		}
-		j.Targets[int32(shard)] = lsn
+	t, perr := parseJournalTargets(id, targets)
+	if perr != nil {
+		return Journal{}, false, perr
 	}
-	return j, true, nil
+	return Journal{ID: id, Targets: t}, true, nil
+}
+
+// parseJournalTargets turns the journal's JSON object keys back into shard
+// ids.
+//
+// ParseInt with a bit size, not Atoi: Atoi returns an int, and narrowing
+// that to int32 TRUNCATES rather than failing. A target shard id of
+// 4294967296 would arrive as 0, and the consumer would be pointed at a
+// shard the journal never named. A shard id is an identity; there is no
+// rounding it.
+func parseJournalTargets(id string, targets map[string]uint64) (map[int32]uint64, error) {
+	out := make(map[int32]uint64, len(targets))
+	for k, lsn := range targets {
+		shard, err := strconv.ParseInt(k, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("vstream: journal %s has an unusable target shard %q: %w", id, k, err)
+		}
+		out[int32(shard)] = lsn
+	}
+	return out, nil
 }
 
 // List implements Catalog.
