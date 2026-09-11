@@ -5,10 +5,12 @@ package router
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -278,6 +280,11 @@ type corpusQuery struct {
 	ordered bool
 }
 
+// Every query here is compared to one node's answer EXACTLY, so none of
+// them may aggregate a float8: sum() over float8 is order-dependent (see
+// loadFloatSkew), and adding such a case would fail for a reason that is
+// arithmetic rather than routing. min/max over float8 are order-independent
+// and are here.
 var scatterCorpus = []corpusQuery{
 	{`select tenant_id, id, amount, price, qty, name, ts, d, ok, u from events`, false},
 	{`select id, name from events where qty > 50`, false},
@@ -421,6 +428,37 @@ func TestRouterScatterDifferential(t *testing.T) {
 		}
 	}
 
+	// Last, because it adds rows: a float8 sum is not associative, so the
+	// scatter's answer is allowed to differ from one node's in its low
+	// bits, and the corpus above must not be asked to hold otherwise.
+	t.Run("float_sum_is_order_dependent", func(t *testing.T) {
+		s.loadFloatSkew(t)
+		const q = `select sum(price) from events where id >= ` + floatSkewFirstID
+		// One node adds the rows in one pass; without this it may add them
+		// in per-worker partials instead, which is the very thing being
+		// contrasted. On its own connection, so the setting cannot reach a
+		// later comparison against the oracle and quietly change it.
+		single := s.appConn(t, s.oracleDSN)
+		if _, err := single.Exec(ctx, "set max_parallel_workers_per_gather = 0"); err != nil {
+			t.Fatal(err)
+		}
+		want, got := resultOf(t, single, q, pgx.QueryExecModeSimpleProtocol), resultOf(t, conn, q, pgx.QueryExecModeSimpleProtocol)
+		if len(want) != 1 || len(got) != 1 {
+			t.Fatalf("want one row each, got %v and %v", want, got)
+		}
+		// The rows are placed so the association differs: the large value
+		// is alone on its shard, and every small value is on another, so
+		// the partials add the small ones together first and one node adds
+		// each of them into the large one, where they vanish.
+		if got[0] == want[0] {
+			t.Fatalf("the fixture no longer exercises the property: both said %s", got[0])
+		}
+		if !withinRelative(t, got[0], want[0], 1e-9) {
+			t.Fatalf("the difference is larger than rounding explains: router %s, one node %s", got[0], want[0])
+		}
+		t.Logf("sum(float8): router %s, one node %s -- documented in docs/guide/queries.md", got[0], want[0])
+	})
+
 	t.Run("cancel_reaches_every_shard", func(t *testing.T) {
 		before := s.canceledCount(t)
 		go func() {
@@ -486,6 +524,73 @@ func (s *scatterStack) canceledCount(tb testing.TB) int {
 		total += strings.Count(string(out), "canceling statement due to user request")
 	}
 	return total
+}
+
+// floatSkewFirstID fences the rows loadFloatSkew adds off from the corpus.
+const floatSkewFirstID = "1000000"
+
+// loadFloatSkew adds rows whose float8 sum depends on the order it is taken
+// in: one large value alone on its shard, and many small ones on the others,
+// each too small to change the large one on its own.
+//
+// PGS-783: floating-point addition is not associative, so summing per shard
+// and adding the partials is a different association from one pass over the
+// rows. Every sharded database has this; the fixture exists so the corpus
+// above is never quietly written to assume otherwise.
+func (s *scatterStack) loadFloatSkew(tb testing.TB) {
+	tb.Helper()
+	cols := []string{"tenant_id", "id", "price"}
+	byShard := make([][][]any, len(s.shardDSNs))
+	var all [][]any
+	id, _ := strconv.Atoi(floatSkewFirstID)
+	// The large value first, so one node's single pass adds every small
+	// value into it and loses each of them to rounding.
+	big := s.shardOf(tb, 0)
+	row := []any{int64(0), id, 1e16}
+	all, byShard[big] = append(all, row), append(byShard[big], row)
+	added := 0
+	for tenant := int64(0); added < 400; tenant++ {
+		sh := s.shardOf(tb, tenant)
+		if sh == big {
+			continue
+		}
+		id++
+		added++
+		small := []any{tenant, id, 1.0}
+		all, byShard[sh] = append(all, small), append(byShard[sh], small)
+	}
+	load := func(dsn string, rows [][]any) {
+		if len(rows) == 0 {
+			return
+		}
+		if _, err := s.appConn(tb, dsn).CopyFrom(context.Background(), pgx.Identifier{"events"}, cols, pgx.CopyFromRows(rows)); err != nil {
+			tb.Fatalf("load float skew into %s: %v", dsn, err)
+		}
+	}
+	load(s.oracleDSN, all)
+	for i, rows := range byShard {
+		load(s.shardDSNs[i], rows)
+	}
+}
+
+// withinRelative reports whether two finite float8 values differ by no more
+// than rel of the larger. NaN and an infinity answer false, which is the
+// right answer for a sum that was supposed to be finite.
+func withinRelative(tb testing.TB, got, want string, rel float64) bool {
+	tb.Helper()
+	g, err := strconv.ParseFloat(got, 64)
+	if err != nil {
+		tb.Fatalf("router returned %q, which is not a float8: %v", got, err)
+	}
+	w, err := strconv.ParseFloat(want, 64)
+	if err != nil {
+		tb.Fatalf("one node returned %q, which is not a float8: %v", want, err)
+	}
+	scale := math.Max(math.Abs(g), math.Abs(w))
+	if scale == 0 {
+		return g == w
+	}
+	return math.Abs(g-w)/scale <= rel
 }
 
 func firstDiff(a, b []string) string {
