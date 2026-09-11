@@ -260,11 +260,41 @@ idempotent, so a controller crash anywhere repeats at most one step:
    source in a short transaction under `lock_timeout`.
 4. `positions` — `pg_current_wal_lsn()` per source, kept in the record.
 5. `catch_up` — every forward subscription's `latest_end_lsn` reaches its
-   source position.
+   source position, and that is the whole step.
+
+   It used to demand, on top of that, that re-reading the sources gave
+   back the *same* positions. But `pg_current_wal_lsn()` is moved by a
+   checkpoint or an autovacuum with no user write behind it — measured on
+   an idle PostgreSQL 18 with no writes at all, it moved across one
+   five-second sample and stood still across the next — so the step was a
+   coin flip against background WAL rather than a statement about writers.
+   It failed about one CI cutover in eleven with "sources advanced past
+   the recorded positions", and a real upgrade sat retrying it
+   indefinitely.
+
+   Dropping it is what makes the step terminate: the recorded positions
+   are a *fixed* boundary, so a source that keeps writing cannot run away
+   from the targets. Making the sources stand still first is not an option
+   here — `default_transaction_read_only` before the journal fails the
+   writes of the clients the fence deliberately lets finish, with `25006`
+   — which is why `swap_replication` is where they are stopped, after the
+   flip, and why it re-reads and re-checks the positions there.
 6. `verify` — per table, range and target: `count(*)`, `sum(h)` and
    `bit_xor(h)` where `h = hashtextextended(row::text, 0)`, under the source
-   position vs the target. A mismatch aborts the switch (fence released,
-   workflow `failed`) before anything irreversible.
+   position vs the target. A mismatch is asked again before it is believed:
+   only the same digests twice abort the switch (fence released, workflow
+   `failed`), and that happens before anything irreversible.
+
+   Once, because a mismatch is usually the measurement racing rather than a
+   target that disagrees — the source is read first and the target second,
+   so a write landing between the two is already applied on the target and
+   makes it look ahead. Neither question about WAL positions tells those
+   apart: "did they move" is answered yes by background WAL with nothing
+   behind it, and "have the targets caught up" is answered yes in exactly
+   the racing case, because the write is already applied. The digests
+   themselves do: a race describes one instant and reports different
+   numbers next pass, while a target that genuinely disagrees reports the
+   same count, sum and xor every time.
 
    Two combinations rather than one because a sum is commutative and
    additive: any two rows swapped for two others of the same total pass a

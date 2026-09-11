@@ -49,8 +49,13 @@ type fakeOps struct {
 	journaled       map[string]int
 	lsn             int64
 	advance         int64
-	paused          bool
-	pauses          int
+	// backgroundAdvance moves the source's WAL position for reasons no
+	// fence can stop -- a checkpoint, an autovacuum, a standby snapshot.
+	// Measured on an idle PostgreSQL 18 with no writes at all, so a fake
+	// whose fenced source stands perfectly still is not a model of one.
+	backgroundAdvance int64
+	paused            bool
+	pauses            int
 	// caughtUpUntil, when set, makes CaughtUp report behind from that call
 	// onwards, so a test can park the run at a chosen check.
 	caughtUpUntil int
@@ -102,6 +107,10 @@ func (f *fakeOps) Positions(context.Context) (map[string]int64, error) {
 	if !f.paused {
 		f.lsn += f.advance
 	}
+	// Background WAL moves the source's position without leaving anything
+	// to apply: it decodes to nothing, so the walsender carries every slot
+	// over it on a keepalive.
+	f.lsn += f.backgroundAdvance
 	return map[string]int64{"0": f.lsn}, f.step(StepPositions)
 }
 
@@ -115,8 +124,11 @@ func (f *fakeOps) DrainSources(context.Context) error {
 	return nil
 }
 func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, string, error) {
-	if pos["0"] != f.lsn {
-		return false, "", fmt.Errorf("caught-up check against stale position %d, current %d", pos["0"], f.lsn)
+	// A slot may be at or past the asked-for position -- it advances over
+	// WAL that decodes to nothing -- so only a position from the future is
+	// a caller mistake.
+	if pos["0"] > f.lsn {
+		return false, "", fmt.Errorf("caught-up check against a position %d ahead of the source at %d", pos["0"], f.lsn)
 	}
 	f.caughtUpCalls++
 	if f.caughtUpUntil > 0 && f.caughtUpCalls > f.caughtUpUntil {
@@ -127,9 +139,20 @@ func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, strin
 func (f *fakeOps) Verify(context.Context) (VerifyReport, error) {
 	// A source that moves while the digests are being taken: the source is
 	// read first and the target second, so a write in between is already
-	// applied on the target when it is read.
+	// applied on the target when it is read -- which is why the target
+	// looks AHEAD, and why asking whether the targets have caught up says
+	// yes about a race.
+	//
+	// The numbers such a mismatch reports describe one instant, so they are
+	// different every time it is asked. A target that genuinely disagrees
+	// reports the same count, sum and xor every time, and that is the only
+	// thing telling the two apart.
 	f.lsn += f.verifyAdvance
-	return f.verify, f.step(StepVerify)
+	report := f.verify
+	if f.verifyAdvance > 0 && len(report.Mismatches) > 0 {
+		report.Mismatches = []string{fmt.Sprintf("%s (at %d)", report.Mismatches[0], f.lsn)}
+	}
+	return report, f.step(StepVerify)
 }
 func (f *fakeOps) Sequences(context.Context) (string, error) {
 	return f.seqFP, f.step(StepSequences)
@@ -235,7 +258,7 @@ func (h *cutoverHarness) runUntil(t *testing.T, stage string) {
 func TestCutoverHappyPath(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitched)
-	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepSequences, StepReverse, StepJournal,
+	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepSequences, StepReverse, StepJournal,
 		StepPositions, StepCatchUp, StepFlip,
 		"pause_sources", "drain_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
@@ -260,20 +283,44 @@ func TestCutoverHappyPath(t *testing.T) {
 	}
 }
 
-func TestCutoverWaitsUntilSourcesStandStill(t *testing.T) {
+// TestCutoverConvergesWhileBackgroundWALMoves is PGS-784. A checkpoint, an
+// autovacuum or a standby snapshot moves pg_current_wal_lsn with no user
+// write behind it -- measured on an idle PostgreSQL 18 with no writes at
+// all -- and no fence can stop any of them. catch_up used to demand the
+// position be identical across a catch-up, which made it a coin flip
+// against that background: it lost about one CI cutover in eleven with
+// "sources advanced past the recorded positions", and a real upgrade sat
+// retrying it indefinitely.
+func TestCutoverConvergesWhileBackgroundWALMoves(t *testing.T) {
 	h := newCutoverHarness(t)
-	h.ops.advance = 10
+	h.ops.backgroundAdvance = 7
 	h.runUntil(t, StageSwitching)
-	for i := 0; i < 3; i++ {
-		h.pass(t)
-		if h.wf.cutover.Step != StepCatchUp {
-			t.Fatalf("pass %d: step %s, want catch_up while the sources move", i, h.wf.cutover.Step)
-		}
-	}
-	h.ops.advance = 0
 	h.runUntil(t, StageSwitched)
-	if h.wf.cutover.Positions["0"] != h.ops.lsn {
-		t.Fatalf("positions %v, source at %d", h.wf.cutover.Positions, h.ops.lsn)
+	for _, a := range h.wf.cutover.Aborts {
+		t.Errorf("background WAL must not abort a switch: %s", a)
+	}
+	if h.ops.lsn == 0 {
+		t.Fatal("the fixture stopped exercising the property: the source never moved")
+	}
+}
+
+// TestCutoverConvergesWhileTheSourcesKeepWriting: the recorded positions are
+// a FIXED boundary, so a source that keeps writing cannot run away from the
+// targets. Making the sources stand still first is not an option before the
+// journal -- default_transaction_read_only there fails the writes of the
+// clients the fence deliberately let through, seen as 25006 in
+// TestReshardCutoverUnderLoad. StepSwap is where the sources are stopped,
+// after the flip, and it re-reads and re-checks the positions there.
+func TestCutoverConvergesWhileTheSourcesKeepWriting(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.advance = 1000
+	h.runUntil(t, StageSwitching)
+	h.runUntil(t, StageSwitched)
+	for _, a := range h.wf.cutover.Aborts {
+		t.Errorf("a writing source must not abort a switch: %s", a)
+	}
+	if h.wf.cutover.Positions["0"] > h.ops.lsn {
+		t.Fatalf("positions %v ahead of the source at %d", h.wf.cutover.Positions, h.ops.lsn)
 	}
 }
 
@@ -348,7 +395,12 @@ func TestCutoverVerifyMismatchAbortsBeforeJournal(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.ops.verify = VerifyReport{Mismatches: []string{"app.orders/0: count 10 vs 9"}}
 	h.runUntil(t, StageSwitching)
-	_, err := h.c.cutover(context.Background(), h.wf, h.ops)
+	// The first mismatch is asked again rather than believed: only the same
+	// digests twice are a disagreement rather than a measurement race.
+	var err error
+	for i := 0; i < 5 && !isFatal(err); i++ {
+		_, err = h.c.cutover(context.Background(), h.wf, h.ops)
+	}
 	if !isFatal(err) || !strings.Contains(err.Error(), "verification failed") {
 		t.Fatalf("err %v", err)
 	}
@@ -365,8 +417,9 @@ func TestCutoverVerifyMismatchAbortsBeforeJournal(t *testing.T) {
 // already applied on the target and makes it look ahead of its source. CI
 // saw exactly that -- a target holding one batch more than the sources
 // predicted. That is a race in the measurement, not a target that disagrees
-// with its source, and it must not abandon the switch: the positions say
-// which it was.
+// with its source, and it must not abandon the switch. What tells the two
+// apart is asking the digests again: a race reported one instant and reports
+// different numbers next time, while a real disagreement repeats exactly.
 func TestCutoverVerifyRetriesWhileTheSourceMoves(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.ops.verify = VerifyReport{Mismatches: []string{"app.ledger on g2/1: 1740 rows, sources predict 1730"}}

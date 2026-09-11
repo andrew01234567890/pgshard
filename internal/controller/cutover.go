@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -515,6 +514,27 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		}
 		wf.cutover.Positions = pos
 	case StepCatchUp:
+		// Every forward subscription has reached the recorded positions,
+		// and that is the whole step.
+		//
+		// It used to demand, on top of that, that re-reading the sources
+		// gave back the SAME positions. But those are pg_current_wal_lsn,
+		// which a checkpoint or an autovacuum moves with no user write
+		// behind it -- measured on an idle PostgreSQL 18 with no writes at
+		// all -- so the step was a coin flip against background WAL, and
+		// it lost about one cutover in eleven. StepFlip learned the same
+		// thing about the same question and stopped asking it.
+		//
+		// Not asking is what makes the step terminate: the recorded
+		// positions are a FIXED boundary, so a source that keeps writing
+		// cannot run away from the targets. And nothing is lost by it. A
+		// write landing after the positions were read is still carried by
+		// the forward subscriptions, which stay enabled until StepSwap --
+		// and StepSwap pauses the sources, drains the writers already
+		// open, re-reads the positions and re-checks them before it
+		// disables anything. That is where a straggler is caught, and it
+		// is the only place the sources can be stopped without failing the
+		// writes of clients the fence deliberately let through.
 		ok, why, err := ops.CaughtUp(ctx, wf.cutover.Positions)
 		if err != nil {
 			return false, err
@@ -522,22 +542,12 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		if !ok {
 			return true, retryf("%s", why)
 		}
-		// A router that had not seen the fence yet may have written after
-		// the positions were read; the switch only proceeds once the
-		// sources stood still through a whole catch-up.
-		pos, err := ops.Positions(ctx)
-		if err != nil {
-			return false, err
-		}
-		if !maps.Equal(pos, wf.cutover.Positions) {
-			wf.cutover.Positions = pos
-			return true, retryf("sources advanced past the recorded positions")
-		}
 	case StepVerify:
 		report, err := ops.Verify(ctx)
 		if err != nil {
 			return false, err
 		}
+		previous := wf.cutover.Verify
 		wf.cutover.Verify = &report
 		if len(report.Mismatches) > 0 {
 			// A source that moved while the digests were being taken makes
@@ -547,16 +557,25 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			// target holding exactly one batch more than the sources
 			// predicted. That is a race in the measurement, not a target
 			// that disagrees with its source, and it must not abandon a
-			// switch -- the positions say which it was.
-			pos, perr := ops.Positions(ctx)
-			if perr != nil {
-				return false, perr
+			// switch.
+			//
+			// Neither of the two questions about POSITIONS tells those
+			// apart. "Did they move" is answered yes by background WAL
+			// with nothing behind it, so every mismatch read as a race and
+			// a real one could never be reported. "Have the targets caught
+			// up to where the sources are now" is answered yes in exactly
+			// the racing case -- the write is already applied, which is
+			// why the target looked ahead -- so it calls the race real.
+			//
+			// Ask the digests again instead. A race is gone or different
+			// next pass, because the numbers it produced described one
+			// instant; a target that genuinely disagrees produces the same
+			// count, sum and xor every time.
+			if previous == nil || !slices.Equal(previous.Mismatches, report.Mismatches) {
+				return true, retryf("digests disagree, asking again to tell a moving source from a real disagreement (%s)",
+					strings.Join(report.Mismatches, "; "))
 			}
-			if !maps.Equal(pos, wf.cutover.Positions) {
-				wf.cutover.Positions = pos
-				return true, retryf("sources advanced while verifying (%s)", strings.Join(report.Mismatches, "; "))
-			}
-			return false, fatal("verification failed: %s", strings.Join(report.Mismatches, "; "))
+			return false, fatal("verification failed, the same digests twice: %s", strings.Join(report.Mismatches, "; "))
 		}
 	case StepSequences:
 		fp, err := ops.Sequences(ctx)
