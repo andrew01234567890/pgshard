@@ -883,6 +883,10 @@ func (emptyCatalog) Lookup(context.Context, string) (catalog.Stream, error) {
 	return catalog.Stream{}, ErrUnknownStream
 }
 
+func (emptyCatalog) Journal(context.Context, string) (Journal, bool, error) {
+	return Journal{}, false, nil
+}
+
 func (emptyCatalog) List(context.Context) ([]catalog.Stream, []catalog.StreamStatus, error) {
 	return nil, nil, nil
 }
