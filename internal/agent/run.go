@@ -51,10 +51,73 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		log.Warn("primary lease disabled: no kube API configured (lease.enabled=false)")
 	}
 
+	fatal := func(err error) { cancel(err) }
+	var rollback startupRollback
+	defer rollback.run()
+
+	// The probes answer BEFORE the data directory is built, not after.
+	// Bootstrap can take an hour on a large shard -- a clone, a rejoin, a
+	// restore from the repository -- and with nothing listening the startup
+	// probe failed for all of it, ran out of budget, and the kubelet killed
+	// the container. The restart cleared the data directory and copied
+	// again, and was killed again: a permanent failure that got worse as
+	// the data grew. What the probes say while this runs is in
+	// Probes.Bootstrapping.
+	reg := metrics.NewRegistry("agent")
+	am := metrics.NewAgent(reg,
+		func() float64 {
+			if primary, err := inst.IsPrimary(); err == nil && primary {
+				return 1
+			}
+			return 0
+		},
+		func() float64 {
+			if primary, err := inst.IsPrimary(); err != nil || primary {
+				return 0
+			}
+			lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			lag, err := inst.ReplayLagBytes(lctx)
+			if err != nil {
+				return -1
+			}
+			return float64(lag)
+		})
+	probes := &Probes{Health: inst, MaxLagBytes: cfg.MaxLagBytes, Peers: cfg.PeerFailsafeURLs,
+		IsolationGrace: time.Duration(cfg.IsolationGrace), Bootstrapping: inst.BootstrapState,
+		Fenced: func() {
+			am.FenceEvents.Inc()
+			fatal(errors.New("primary isolated: self-fencing"))
+		}}
+	if lease != nil {
+		probes.KubeReachable = lease.Reachable
+		probes.LeaseStale = lease.Stale
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/", probes.Handler())
+	mux.Handle("/metrics", metrics.Handler(reg))
+	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	httpLn, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return err
+	}
+	rollback.push(func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutCancel()
+		_ = httpSrv.Shutdown(shutCtx)
+	})
+	go func() {
+		if err := httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fatal(err)
+		}
+	}()
+
+	go inst.WatchBootstrap(ctx)
+
 	if err := inst.Bootstrap(ctx); err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
-	fatal := func(err error) { cancel(err) }
+	go pollMetrics(ctx, inst, am)
 	sup.OnUnexpectedExit = fatal
 	srv := NewServer(inst, epoch, lease, log, fatal)
 	srv.bgCtx = ctx
@@ -80,8 +143,6 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	// returned with PostgreSQL serving, HTTP answering and the lease
 	// renewing: the caller exits, and the lease is left to expire on its
 	// own, during which nothing else may promote.
-	var rollback startupRollback
-	defer rollback.run()
 
 	if !standby && lease != nil {
 		if err := lease.Acquire(ctx); err != nil {
@@ -113,56 +174,6 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	// reserved -- and on a quiet cluster nothing else makes it. See
 	// needsStandbySnapshot for what this does and does not rescue.
 	go srv.runStandbySnapshots(ctx, standbySnapshotEvery)
-
-	reg := metrics.NewRegistry("agent")
-	am := metrics.NewAgent(reg,
-		func() float64 {
-			if primary, err := inst.IsPrimary(); err == nil && primary {
-				return 1
-			}
-			return 0
-		},
-		func() float64 {
-			if primary, err := inst.IsPrimary(); err != nil || primary {
-				return 0
-			}
-			lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			lag, err := inst.ReplayLagBytes(lctx)
-			if err != nil {
-				return -1
-			}
-			return float64(lag)
-		})
-	go pollMetrics(ctx, inst, am)
-	probes := &Probes{Health: inst, MaxLagBytes: cfg.MaxLagBytes, Peers: cfg.PeerFailsafeURLs,
-		IsolationGrace: time.Duration(cfg.IsolationGrace),
-		Fenced: func() {
-			am.FenceEvents.Inc()
-			fatal(errors.New("primary isolated: self-fencing"))
-		}}
-	if lease != nil {
-		probes.KubeReachable = lease.Reachable
-		probes.LeaseStale = lease.Stale
-	}
-	mux := http.NewServeMux()
-	mux.Handle("/", probes.Handler())
-	mux.Handle("/metrics", metrics.Handler(reg))
-	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	httpLn, err := net.Listen("tcp", cfg.HTTPAddr)
-	if err != nil {
-		return err
-	}
-	rollback.push(func() {
-		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutCancel()
-		_ = httpSrv.Shutdown(shutCtx)
-	})
-	go func() {
-		if err := httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fatal(err)
-		}
-	}()
 
 	// Both tokens, re-read on every call so a rotated Secret is honoured
 	// without an agent restart.

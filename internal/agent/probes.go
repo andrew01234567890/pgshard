@@ -48,6 +48,17 @@ type Probes struct {
 	// single slow probe under load must not take the primary down. Zero
 	// means DefaultIsolationGrace.
 	IsolationGrace time.Duration
+	// Bootstrapping reports whether the data directory is still being
+	// built, whether that work has stalled, and what it is doing. Nil when
+	// the caller does not track it.
+	//
+	// A member cloning 100 GB has no PostgreSQL to answer for, and the
+	// kubelet has no "in progress": the startup probe failed for as long as
+	// the copy took, ran out of budget, and the container was killed and
+	// restarted from an empty directory -- for ever. A bootstrap that is
+	// getting somewhere is therefore started and alive; one that has
+	// stopped getting anywhere is neither.
+	Bootstrapping func() (active, stalled bool, what string)
 	// now is the clock; nil means time.Now.
 	now func() time.Time
 
@@ -70,7 +81,35 @@ func (p *Probes) Handler() http.Handler {
 func (p *Probes) startz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	respond(w, p.Health.Started(ctx))
+	respond(w, p.Start(ctx))
+}
+
+// Start implements /startz. A member still building its data directory is
+// starting up, which is what it says for as long as that work is getting
+// somewhere.
+func (p *Probes) Start(ctx context.Context) error {
+	if active, stalled, what := p.bootstrap(); active {
+		return stalledError(stalled, what)
+	}
+	return p.Health.Started(ctx)
+}
+
+func (p *Probes) bootstrap() (active, stalled bool, what string) {
+	if p.Bootstrapping == nil {
+		return false, false, ""
+	}
+	return p.Bootstrapping()
+}
+
+// stalledError is nil while the work is getting somewhere. A bootstrap that
+// has stopped growing the data directory is the one case worth a restart,
+// and saying so is the whole difference between a probe that reports and a
+// probe that guesses.
+func stalledError(stalled bool, what string) error {
+	if !stalled {
+		return nil
+	}
+	return fmt.Errorf("%s has made no progress for %s", what, StallWindow)
 }
 
 func (p *Probes) readyz(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +120,14 @@ func (p *Probes) readyz(w http.ResponseWriter, r *http.Request) {
 
 // Ready implements /readyz.
 func (p *Probes) Ready(ctx context.Context) error {
+	// A member building its data directory is never ready, whatever
+	// PostgreSQL says. A restore starts PostgreSQL to replay and promote,
+	// so there is a window in the middle of a bootstrap where it accepts
+	// writes and the member is still nowhere near serving: without this,
+	// readiness answers yes for that window and a Service sends it traffic.
+	if active, _, what := p.bootstrap(); active {
+		return fmt.Errorf("still %s", what)
+	}
 	primary, err := p.Health.IsPrimary()
 	if err != nil {
 		return fmt.Errorf("reading the instance role: %w", err)
@@ -137,6 +184,12 @@ func (p *Probes) isolatedLongEnough(isolated bool) bool {
 // the kube API answers or, without it, when at least one peer's /failsafe
 // answers; a primary that reaches nothing is isolated.
 func (p *Probes) Live(ctx context.Context) error {
+	// Before the role is read: a member building its data directory has no
+	// role to read, and the checks below would treat that as a primary
+	// whose data directory is already wrong.
+	if active, stalled, what := p.bootstrap(); active {
+		return stalledError(stalled, what)
+	}
 	// A member whose role cannot be read is treated as a primary here: the
 	// checks below are what stop an isolated primary from staying alive,
 	// and skipping them on an unreadable role would skip exactly the case
