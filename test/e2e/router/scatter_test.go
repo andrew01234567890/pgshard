@@ -436,11 +436,13 @@ func TestRouterScatterDifferential(t *testing.T) {
 		const q = `select sum(price) from events where id >= ` + floatSkewFirstID
 		// One node adds the rows in one pass; without this it may add them
 		// in per-worker partials instead, which is the very thing being
-		// contrasted.
-		if _, err := oracle.Exec(ctx, "set max_parallel_workers_per_gather = 0"); err != nil {
+		// contrasted. On its own connection, so the setting cannot reach a
+		// later comparison against the oracle and quietly change it.
+		single := s.appConn(t, s.oracleDSN)
+		if _, err := single.Exec(ctx, "set max_parallel_workers_per_gather = 0"); err != nil {
 			t.Fatal(err)
 		}
-		want, got := resultOf(t, oracle, q, pgx.QueryExecModeSimpleProtocol), resultOf(t, conn, q, pgx.QueryExecModeSimpleProtocol)
+		want, got := resultOf(t, single, q, pgx.QueryExecModeSimpleProtocol), resultOf(t, conn, q, pgx.QueryExecModeSimpleProtocol)
 		if len(want) != 1 || len(got) != 1 {
 			t.Fatalf("want one row each, got %v and %v", want, got)
 		}
@@ -571,9 +573,9 @@ func (s *scatterStack) loadFloatSkew(tb testing.TB) {
 	}
 }
 
-// withinRelative reports whether two rendered float8 values differ by no
-// more than rel of the larger, which is what rounding can explain and a
-// wrong answer cannot.
+// withinRelative reports whether two finite float8 values differ by no more
+// than rel of the larger. NaN and an infinity answer false, which is the
+// right answer for a sum that was supposed to be finite.
 func withinRelative(tb testing.TB, got, want string, rel float64) bool {
 	tb.Helper()
 	g, err := strconv.ParseFloat(got, 64)

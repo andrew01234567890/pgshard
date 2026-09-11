@@ -32,11 +32,12 @@ is refused with `0A000` and a message naming the rule. Scatter
 **`sum()` over `float8` is order-dependent.** A scatter sums each shard's
 rows and then adds the per-shard totals, which is a different association
 from one pass over all the rows. Floating-point addition is not
-associative, so the two answers can differ in their low bits -- the same
-caveat PostgreSQL documents for `sum(double precision)` on one node, where
-the answer already depends on the order the planner happens to read rows
-in. Measured here on one large value and four hundred small ones spread
-across shards:
+associative, so the two answers can differ in their low bits. The same is
+already true on one PostgreSQL, where the answer depends on the order the
+planner happens to read rows in and on whether it aggregates in parallel;
+sharding makes a difference that was incidental into one that is
+structural. Measured here on one large value and four hundred small ones
+spread across shards:
 
 ```
 sum(price) on one PostgreSQL   1e+16
