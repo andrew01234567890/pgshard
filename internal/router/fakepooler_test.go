@@ -67,7 +67,11 @@ type fakePooler struct {
 	// currently prepared on the shard.
 	maxPrepared string
 	failPrepare bool
-	prepared    []string
+	// failRollback makes ROLLBACK fail, which is what a shard behind a
+	// stale-generation fence does: it refuses every message, ROLLBACK
+	// included.
+	failRollback bool
+	prepared     []string
 	// gate, when set, holds every Reserve until several shards are
 	// reserving at once.
 	gate *reserveGate
@@ -628,6 +632,9 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		return true, s.complete(tag)
 	case q == "rollback":
 		b.tx, b.xidAssigned = 'I', false
+		if s.f.failRollback {
+			return true, s.errorf("55000", "rollback refused by the fake shard")
+		}
 		return true, s.complete("ROLLBACK")
 	case strings.HasPrefix(q, "savepoint "):
 		return true, s.complete("SAVEPOINT")
