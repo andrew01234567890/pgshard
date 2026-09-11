@@ -40,6 +40,11 @@ func (c *peekConn) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, err
 		c.last = &peekRows{lsn: c.rows.lsn, data: c.rows.data}
 		return c.last, nil
 	}
+	// The WAL end catch-up reads BEFORE each peek, so its advance can never
+	// pass a commit the peek did not see. It comes back as text.
+	if strings.Contains(sql, "SELECT pg_current_wal_lsn()::text") {
+		return &textRows{v: "0/1"}, nil
+	}
 	// Whatever else catch-up asks this connection is the slot lag, which
 	// this test does not reach unless the bound failed to trip.
 	return &lagRows{}, nil

@@ -1652,6 +1652,23 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 	dec := NewDecoder()
 	applied := 0
 	for round := 0; ; round++ {
+		// The WAL end is read BEFORE the peek, and it is what an empty peek
+		// advances to. Reading it afterwards let a transaction commit
+		// between the two statements and then be skipped: the peek saw
+		// nothing, and the advance moved the slot past a commit nobody had
+		// decoded, so those rows never reached the shadow table.
+		//
+		// Taken first it is a bound the peek has already covered -- the
+		// peek reads to the end of WAL as it stands when it runs, which is
+		// at or past this -- so advancing to it can skip nothing.
+		uptoRows, err := conn.Query(ctx, `SELECT pg_current_wal_lsn()::text`)
+		if err != nil {
+			return 0, applied, err
+		}
+		upto, err := pgx.CollectExactlyOneRow(uptoRows, pgx.RowTo[string])
+		if err != nil {
+			return 0, applied, err
+		}
 		rows, err := conn.Query(ctx, `SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication_names', $3)`,
 			wf.slotName(s), peekChanges, wf.publicationName())
 		if err != nil {
@@ -1746,10 +1763,13 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 				return 0, applied, err
 			}
 		case msgCount == 0:
-			// Nothing decodes between the slot and the end of WAL: a
-			// transaction that commits later is decoded in full from its
-			// start, so the slot may follow the WAL end.
-			if _, err := conn.Exec(ctx, `SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())`, wf.slotName(s)); err != nil {
+			// Nothing decodes between the slot and the WAL end recorded
+			// BEFORE this peek, so the slot may follow it. A transaction
+			// still in progress is decoded in full from its start when it
+			// commits, which is why an open one does not hold this back --
+			// but one that COMMITTED while the peek ran is past the bound
+			// and is left for the next round, rather than skipped.
+			if _, err := conn.Exec(ctx, `SELECT pg_replication_slot_advance($1, $2::pg_lsn)`, wf.slotName(s), upto); err != nil {
 				return 0, applied, err
 			}
 		default:
