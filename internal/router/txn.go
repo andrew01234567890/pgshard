@@ -281,7 +281,20 @@ func checkTransactionMode(class StmtClass) error {
 // writes. The second writable shard of a transaction escalates it to
 // two-phase commit, or is refused in single mode.
 func (e *Executor) noteWrite(ctx context.Context) error {
-	if e.tx == pgwire.TxIdle || e.wroteHere {
+	return e.noteWriteIn(ctx, e.tx != pgwire.TxIdle)
+}
+
+// noteWriteIn is noteWrite for a caller that knows a transaction is open
+// even though e.tx does not say so yet. A batch carrying BEGIN and a write
+// in one Sync is exactly that: the BEGIN has not run when the batch is
+// classified, so e.tx is still Idle and the write went unrecorded -- the
+// second writable shard was then admitted in single mode and refused only
+// at COMMIT, checkPreparedCapacity ran at COMMIT instead of when the write
+// was admitted, and txnWrote() reported false for a transaction that wrote.
+// Only the hidden-writer probe kept that correct, and a backstop is not
+// where this belongs.
+func (e *Executor) noteWriteIn(ctx context.Context, inTxn bool) error {
+	if !inTxn || e.wroteHere {
 		return nil
 	}
 	var writers []*txnPart
