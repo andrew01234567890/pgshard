@@ -24,6 +24,13 @@ const (
 	// shard is handled: "twopc" (default) escalates to two-phase commit,
 	// "single" refuses the second writable shard.
 	TransactionModeGUC = "pgshard.transaction_mode"
+	// FanoutGUC caps how broadly one statement may route. A query that
+	// loses its shard-key predicate -- a refactor, an ORM change, a new
+	// WHERE clause -- silently becomes a fan-out to every shard, and is
+	// discovered in production as load. Setting a ceiling makes it a
+	// refusal instead, which is what a test suite or a request path that
+	// should always be keyed wants.
+	FanoutGUC = "pgshard.fanout"
 
 	txnModeTwoPC  = "twopc"
 	txnModeSingle = "single"
@@ -202,6 +209,57 @@ func gucValueOf(sql string) string {
 		return ""
 	}
 	return strings.Trim(strings.TrimSpace(s[i+1:]), "'\"")
+}
+
+// fanoutCeiling is the session's effective pgshard.fanout. The default is
+// scatter, which refuses nothing.
+func (e *Executor) fanoutCeiling() string {
+	ceiling := plan.FanoutScatter
+	for _, list := range [][]gucEntry{e.gucs, e.staged} {
+		for _, g := range list {
+			if g.name == FanoutGUC {
+				if v := gucValueOf(g.sql); v != "" {
+					ceiling = v
+				}
+			}
+		}
+	}
+	return ceiling
+}
+
+// checkFanout refuses a statement that routes more broadly than the session
+// allows. DDL and the fan-out that maintains a reference table are exempt:
+// a reference write reaches every shard by definition.
+func (e *Executor) checkFanout(pl plan.Plan) error {
+	ceiling := e.fanoutCeiling()
+	if ceiling == plan.FanoutScatter {
+		return nil
+	}
+	fanout := pl.Fanout()
+	if !plan.FanoutExceeds(fanout, ceiling) {
+		return nil
+	}
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
+		"the statement's fan-out (%s) exceeds %s (%s)", fanout, FanoutGUC, ceiling)
+	err.Hint = "add a shard key predicate, or raise " + FanoutGUC + " for this session"
+	return err
+}
+
+// checkFanoutMode validates a SET of pgshard.fanout before it reaches a
+// backend, which would accept any placeholder value.
+func checkFanoutMode(class StmtClass) error {
+	if !class.SetGUC || class.GUCName != FanoutGUC {
+		return nil
+	}
+	switch strings.ToLower(class.GUCValue) {
+	// Empty is a RESET, which restores the default and cannot widen
+	// anything beyond it.
+	case "", plan.FanoutSingle, plan.FanoutMulti, plan.FanoutScatter:
+		return nil
+	}
+	err := pgwire.Errorf(codeInvalidParamVal, "invalid value for parameter %q: %q", FanoutGUC, class.GUCValue)
+	err.Hint = "valid values are single, multi and scatter"
+	return err
 }
 
 // checkTransactionMode validates a SET of pgshard.transaction_mode before
