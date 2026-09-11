@@ -121,8 +121,13 @@ func TestReserveAndRelease(t *testing.T) {
 	roundTrip(t, stream, queryReq("s", "set x = 1", gen(7, 3), identity("alice")))
 	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), nil))
 	const releaseBudget = 200 * time.Millisecond
-	shortCtx, cancel := context.WithTimeout(ctx, releaseBudget)
+	// start BEFORE the deadline is created, because the deadline's own
+	// clock starts there. Taking it afterwards measures a shorter interval
+	// than the one that fires, so the elapsed floor below could be missed
+	// by exactly the scheduling gap between the two lines -- seen in CI at
+	// 199.749ms against a 200ms budget, a failure with nothing wrong.
 	start := time.Now()
+	shortCtx, cancel := context.WithTimeout(ctx, releaseBudget)
 	_, err = h.client.Release(shortCtx, &pgshardv1.ReleaseRequest{SessionId: "s"})
 	waited := time.Since(start)
 	cancel()
