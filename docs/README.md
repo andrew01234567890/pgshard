@@ -79,6 +79,7 @@ replaced by a later record rather than edited.
 | [0013](adr/0013-crd-api-group.md) | `pgshard.io` as the CRD API group |
 | [0014](adr/0014-postgresql-18-and-19.md) | Targeting PostgreSQL 18 and 19, and nothing older |
 | [0015](adr/0015-one-identity-per-component.md) | One identity per component, and no shared root credential |
+| [0016](adr/0016-properties-we-do-not-trade-away.md) | Four properties that are not to be traded away |
 
 Component references are design-plus-behaviour documents; where one
 disagrees with the code, the code and its tests are authoritative, and the
