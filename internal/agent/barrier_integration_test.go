@@ -43,7 +43,7 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	}
 	p := h.start("s0-0", RolePrimary, "s0-0", nil)
 	p.waitHTTP("/startz", 200, 90*time.Second)
-	p.waitHTTP("/readyz", 200, 60*time.Second)
+	p.waitServing(60 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	waitInfo := func(cond func(*pgshardv1.RestoreInfoResponse) bool, what string) {
