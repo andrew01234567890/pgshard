@@ -112,8 +112,13 @@ func TestCatchUpAppliesMoreOperationsASecondWhenItCoalescesThem(t *testing.T) {
 	//
 	// It stays an assertion where it can be trusted and a report where it
 	// cannot: a ratio that fails half the time on every PR gets worked
-	// around, which is worse than no guard at all. The nightly perf job is
-	// where a real regression has to be caught. See PGS-763.
+	// around, which is worse than no guard at all.
+	//
+	// Where a real regression is caught is BenchmarkCatchUpApplyPerRow and
+	// BenchmarkCatchUpApplyCoalesced, run nightly by .github/workflows/
+	// perf.yml on one runner and compared with benchstat, which reads a
+	// change in the trend rather than a threshold calibrated for the worst
+	// runner anyone has. See PGS-763.
 	switch ratio := coalesced / perRow; {
 	case ratio >= 1.5:
 	case sharedRunner():

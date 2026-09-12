@@ -27,13 +27,13 @@ const (
 	pgImage19 = "ghcr.io/andrew01234567890/pgshard-postgres:19"
 )
 
-func startPostgres(t *testing.T) string {
+func startPostgres(t testing.TB) string {
 	t.Helper()
 	return startPostgresWith(t)
 }
 
 // startPostgresWith starts PostgreSQL with extra server options.
-func startPostgresWith(t *testing.T, opts ...string) string {
+func startPostgresWith(t testing.TB, opts ...string) string {
 	t.Helper()
 	return startPostgresImage(t, pgImage, nil, opts...)
 }
@@ -50,7 +50,7 @@ func parallelPG(t *testing.T) {
 
 // startPostgresImage starts image with extra docker run arguments and
 // server options and returns the host-side DSN.
-func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ...string) string {
+func startPostgresImage(t testing.TB, image string, dockerArgs []string, opts ...string) string {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		dockertest.Unavailable(t, "docker unavailable; skipping controller integration tests")
@@ -96,7 +96,7 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 	return dsn
 }
 
-func connect(t *testing.T, dsn string) *pgx.Conn {
+func connect(t testing.TB, dsn string) *pgx.Conn {
 	t.Helper()
 	conn, err := pgx.Connect(context.Background(), dsn)
 	if err != nil {
@@ -106,7 +106,7 @@ func connect(t *testing.T, dsn string) *pgx.Conn {
 	return conn
 }
 
-func mustExec(t *testing.T, conn *pgx.Conn, sql string, args ...any) {
+func mustExec(t testing.TB, conn *pgx.Conn, sql string, args ...any) {
 	t.Helper()
 	if _, err := conn.Exec(context.Background(), sql, args...); err != nil {
 		t.Fatalf("%s: %v", sql, err)

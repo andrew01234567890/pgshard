@@ -71,6 +71,19 @@ jobs:
           go test -run '^$' -bench . -benchmem -count 10 ./test/perf/... | tee bench.txt
           { echo '## Nightly benchmarks'; echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+      # The catch-up applier's coalescing, which the PR gate cannot measure:
+      # these benchmarks need a PostgreSQL, so hack/perf/benchstat.sh does
+      # not list internal/controller and a ratio asserted in the blocking
+      # suite was unreproducible on a shared runner (PGS-763). Nightly, on
+      # one runner, trending, and non-gating is where it belongs.
+      - name: Catch-up applier throughput
+        continue-on-error: true
+        run: |
+          PGSHARD_REQUIRE_DOCKER=1 go test -run '^$' -bench BenchmarkCatchUpApply \
+            -benchmem -count 6 -timeout 20m ./internal/controller/ | tee applier.txt
+          { echo '## Catch-up applier throughput (per-row vs coalesced)'; echo '```'
+            cat applier.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
   # Pooling parity: PgBouncer vs pgshard router+pooler vs direct on one
   # unsharded PostgreSQL 18 backend. Baseline collection only - does not gate.
   parity:
