@@ -1,6 +1,7 @@
 package copysplit
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -111,7 +112,7 @@ func TestAShortRowIsAnError(t *testing.T) {
 	// The key column itself is missing.
 	s := New(2, 3)
 	s.Write([]byte("a\tb\n"))
-	if _, _, err := s.Next(); err != ErrShortRow {
+	if _, _, err := s.Next(); !errors.Is(err, ErrShortRow) {
 		t.Fatalf("missing key column: err %v, want ErrShortRow", err)
 	}
 	// And the case the first check does not catch: the key is there, but
@@ -119,7 +120,7 @@ func TestAShortRowIsAnError(t *testing.T) {
 	// whole COPY after the router had already fanned other rows out.
 	s = New(0, 3)
 	s.Write([]byte("a\tb\n"))
-	if _, _, err := s.Next(); err != ErrShortRow {
+	if _, _, err := s.Next(); !errors.Is(err, ErrShortRow) {
 		t.Fatalf("short row with a readable key: err %v, want ErrShortRow", err)
 	}
 }
