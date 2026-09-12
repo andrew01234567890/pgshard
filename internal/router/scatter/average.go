@@ -21,6 +21,10 @@ type average struct {
 	sumAt  int
 	cntAt  int
 	sumOID uint32
+	// cntFormat is the count column's own format. Mixed client result
+	// formats pad the hidden column with the client's LAST format, which
+	// need not be the format of the avg column beside it.
+	cntFormat int16
 	// numeric is false for a float average, which PostgreSQL answers in
 	// float8 and divides as floats.
 	numeric bool
@@ -56,7 +60,7 @@ func newAverage(a plan.Agg, cols []Column) (accumulator, error) {
 		return nil, err
 	}
 	return &average{sum: sum, count: count, sumAt: a.Col, cntAt: a.Count, sumOID: col.TypeOID,
-		numeric: fam != famFloat, format: col.Format}, nil
+		cntFormat: cols[a.Count].Format, numeric: fam != famFloat, format: col.Format}, nil
 }
 
 func (a *average) add(row [][]byte) error {
@@ -79,7 +83,7 @@ func (a *average) result() ([]byte, error) {
 	if sum == nil || cnt == nil {
 		return nil, nil
 	}
-	n, err := decoderFor(famInt, oidInt8, a.format)(cnt)
+	n, err := decoderFor(famInt, oidInt8, a.cntFormat)(cnt)
 	if err != nil {
 		return nil, err
 	}

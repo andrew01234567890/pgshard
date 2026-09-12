@@ -404,7 +404,16 @@ func (b *mergeBuilder) splitAverages() error {
 		if b.spec.Aggregates[i].Func != AggAvg {
 			continue
 		}
-		fc := m.GetTargetList()[i].GetResTarget().GetVal().GetFuncCall()
+		rt := m.GetTargetList()[i].GetResTarget()
+		// PostgreSQL names an unaliased column after its function, so the
+		// shard would call this one "sum" and the client would be told its
+		// avg() came back as a sum. Name it here rather than rewriting the
+		// description later: the shard then reports the name itself, and an
+		// alias the client did write still wins.
+		if rt.GetName() == "" {
+			rt.Name = "avg"
+		}
+		fc := rt.GetVal().GetFuncCall()
 		count := proto.Clone(fc).(*pgquerypb.FuncCall)
 		count.Funcname = []*pgquerypb.Node{strNode("pg_catalog"), strNode("count")}
 		fc.Funcname = []*pgquerypb.Node{strNode("pg_catalog"), strNode("sum")}

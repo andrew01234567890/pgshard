@@ -24,7 +24,7 @@ func mergeSpec(t *testing.T, sql string) *Merge {
 // a sum and a count, and the division happens once, over the totals.
 func TestAvgIsSplitIntoASumAndACount(t *testing.T) {
 	m := mergeSpec(t, "select avg(qty) from orders")
-	if m.ShardSQL != "SELECT pg_catalog.sum(qty), pg_catalog.count(qty) FROM orders" {
+	if m.ShardSQL != "SELECT pg_catalog.sum(qty) AS avg, pg_catalog.count(qty) FROM orders" {
 		t.Fatalf("shard SQL %q", m.ShardSQL)
 	}
 	if len(m.Aggregates) != 1 || m.Aggregates[0] != (Agg{Func: AggAvg, Col: 0, Count: 1}) {
@@ -41,7 +41,7 @@ func TestAvgIsSplitIntoASumAndACount(t *testing.T) {
 // asked for keeps the position it asked for it in.
 func TestAvgKeepsTheClientColumnPositions(t *testing.T) {
 	m := mergeSpec(t, "select count(*), avg(amount), sum(qty) from orders")
-	if m.ShardSQL != "SELECT count(*), pg_catalog.sum(amount), sum(qty), pg_catalog.count(amount) FROM orders" {
+	if m.ShardSQL != "SELECT count(*), pg_catalog.sum(amount) AS avg, sum(qty), pg_catalog.count(amount) FROM orders" {
 		t.Fatalf("shard SQL %q", m.ShardSQL)
 	}
 	want := []Agg{{Func: AggCount, Col: 0, Count: -1}, {Func: AggAvg, Col: 1, Count: 3}, {Func: AggSum, Col: 2, Count: -1}}
@@ -60,7 +60,7 @@ func TestAvgKeepsTheClientColumnPositions(t *testing.T) {
 
 func TestTwoAveragesEachGetTheirOwnCount(t *testing.T) {
 	m := mergeSpec(t, "select avg(qty), avg(amount) from orders")
-	if m.ShardSQL != "SELECT pg_catalog.sum(qty), pg_catalog.sum(amount), pg_catalog.count(qty), pg_catalog.count(amount) FROM orders" {
+	if m.ShardSQL != "SELECT pg_catalog.sum(qty) AS avg, pg_catalog.sum(amount) AS avg, pg_catalog.count(qty), pg_catalog.count(amount) FROM orders" {
 		t.Fatalf("shard SQL %q", m.ShardSQL)
 	}
 	if m.Aggregates[0].Count == m.Aggregates[1].Count {
@@ -87,5 +87,18 @@ func TestAvgKeepsTheAggregateRefusals(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.msg) {
 			t.Errorf("%s: %v, want %q", c.sql, err, c.msg)
 		}
+	}
+}
+
+// PostgreSQL names an unaliased column after its function, so a shard asked
+// for sum(x) would call the column "sum" and the client would be told its
+// average came back as a sum. The shard query names it instead, which also
+// leaves an alias the client wrote alone.
+func TestAvgNamesTheShardColumnForTheClient(t *testing.T) {
+	if m := mergeSpec(t, "select avg(qty) from orders"); !strings.Contains(m.ShardSQL, "sum(qty) AS avg") {
+		t.Errorf("shard SQL %q must name the column avg", m.ShardSQL)
+	}
+	if m := mergeSpec(t, "select avg(qty) as mean from orders"); !strings.Contains(m.ShardSQL, "sum(qty) AS mean") {
+		t.Errorf("shard SQL %q must keep the client's alias", m.ShardSQL)
 	}
 }

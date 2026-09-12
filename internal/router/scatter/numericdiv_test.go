@@ -1,8 +1,11 @@
 package scatter
 
 import (
+	"encoding/binary"
 	"math/big"
 	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
 func ratOf(t *testing.T, s string) *big.Rat {
@@ -118,5 +121,30 @@ func TestWeightAndFirstDigit(t *testing.T) {
 		if w != c.weight || f != c.first {
 			t.Errorf("%s: weight %d first %d, want %d %d", c.in, w, f, c.weight, c.first)
 		}
+	}
+}
+
+// TestAverageReadsTheCountInItsOwnFormat: a client can ask for different
+// result formats per column, and shardResultFormats pads the hidden count
+// with the client's LAST format -- which need not be the format of the avg
+// column beside it. Decoding the count in the sum's format then reads
+// binary as text, or text as binary.
+func TestAverageReadsTheCountInItsOwnFormat(t *testing.T) {
+	cols := []Column{{TypeOID: oidInt8, Format: FormatText}, {TypeOID: oidInt8, Format: FormatBinary}}
+	acc, err := newAccumulator(plan.Agg{Func: plan.AggAvg, Col: 0, Count: 1}, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binCount := make([]byte, 8)
+	binary.BigEndian.PutUint64(binCount, 4)
+	if err := acc.add([][]byte{[]byte("10"), binCount}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	got, err := acc.result()
+	if err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if string(got) != "2.5000000000000000" {
+		t.Errorf("avg = %q, want 2.5000000000000000", got)
 	}
 }
