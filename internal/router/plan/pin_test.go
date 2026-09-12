@@ -123,3 +123,25 @@ func TestParseShardPin(t *testing.T) {
 		}
 	}
 }
+
+// A reference write belongs on every shard, in one transaction: ADR 16
+// makes that atomicity a property pgshard does not trade away. Pinning
+// would write exactly one copy, and a join answered locally on any shard
+// would then return a different answer depending on where it ran, with
+// nothing reporting it.
+func TestAPinnedSessionRefusesAReferenceWrite(t *testing.T) {
+	for _, sql := range []string{
+		"insert into regions (id, name) values (7, 'eu')",
+		"update regions set name = 'eu' where id = 7",
+		"delete from regions where id = 7",
+	} {
+		_, err := pinnedPlan(t, 1, sql)
+		if err == nil || !strings.Contains(err.Error(), "reference table cannot run while") {
+			t.Errorf("%s: %v, want the reference-write refusal", sql, err)
+		}
+	}
+	// Reading one is fine: that is what a pinned session is for.
+	if _, err := pinnedPlan(t, 1, "select * from regions"); err != nil {
+		t.Errorf("a pinned reference READ is the point of the setting: %v", err)
+	}
+}

@@ -14,6 +14,14 @@ func (e *Executor) pinnedShard() *int32 {
 	var pin *int32
 	for _, list := range [][]gucEntry{e.gucs, e.staged} {
 		for _, g := range list {
+			// RESET ALL is recorded with no name. applyStaged already drops
+			// every GUC when it applies one, so a pin does not survive it
+			// between batches -- but inside a batch the staged SET is still
+			// in this list and would otherwise still be read.
+			if g.name == "" {
+				pin = nil
+				continue
+			}
 			if g.name != plan.ShardGUC {
 				continue
 			}

@@ -55,6 +55,16 @@ func (p *Plan) pinned(shard int32, ids []int32) error {
 		return notYet("a schema change cannot run while "+ShardGUC+" targets one shard: DDL runs across the cluster",
 			"RESET "+ShardGUC+", or use another session without it, to run the change cluster-wide")
 	}
+	// A reference write fans out to every shard by definition, and ADR 16
+	// makes that atomicity a property we do not trade away: the copies of a
+	// reference table cannot be allowed to diverge, because a join answered
+	// locally on any shard would then return a different answer depending
+	// on where it ran, and nothing would report it. Pinning one would write
+	// exactly one copy.
+	if p.Kind == Reference && p.Class.Write {
+		return notYet("a write to a reference table cannot run while "+ShardGUC+" targets one shard: it belongs on every shard, in one transaction",
+			"RESET "+ShardGUC+" to write it everywhere, or read from the pinned shard instead")
+	}
 	if !containsShard(ids, shard) {
 		e := pgwire.Errorf(codeInvalidParamVal, "%s names shard %d, which is not serving in this shard set", ShardGUC, shard)
 		e.Hint = "read the serving shards from pgshard.shard_ranges"

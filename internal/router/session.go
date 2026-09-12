@@ -1522,6 +1522,14 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 			return err
 		}
 		if st.class.SetGUC {
+			// Again here, not only at Parse. A named statement can be
+			// prepared while the session is idle and executed after BEGIN,
+			// and the pin must not change under a transaction whichever
+			// message carried it.
+			if err := e.checkShardPin(st.class); err != nil {
+				e.failBatch()
+				return err
+			}
 			g := gucEntry{name: st.class.GUCName, sql: st.sql, value: st.class.GUCValue, searchPath: st.class.SearchPath}
 			e.staged = append(e.staged, g)
 			defer e.injectSearchPath(g)

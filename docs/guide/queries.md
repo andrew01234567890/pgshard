@@ -144,9 +144,12 @@ While it is set, `SELECT`/`INSERT`/`UPDATE`/`DELETE` go to that shard;
 session and transaction control (`SET`, `SHOW`, `BEGIN`, `COMMIT`) take
 their ordinary path, so the pin can always be RESET. Two things are
 refused outright: **DDL**, because a schema change runs across the cluster
-rather than on one shard, and **`nextval()` over a global sequence**,
-because the router answers that itself and cannot also forward the
-statement to a shard.
+rather than on one shard, **`nextval()` over a global sequence**, because
+the router answers that itself and cannot also forward the statement to a
+shard, and a **write to a reference table**, which belongs on every shard
+in one transaction — pinning it would write exactly one copy and the
+others would silently disagree. Reading a reference table from the pinned
+shard is fine, and is usually the point.
 
 **Catching an accidental scatter.** `SET pgshard.fanout = 'single'` refuses
 any statement that would route to more than one shard, and `'multi'` allows a

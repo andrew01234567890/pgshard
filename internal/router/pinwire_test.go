@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
 func hintOf(err error) string {
@@ -124,4 +126,69 @@ func TestAPinnedSessionReachesOneShard(t *testing.T) {
 func newShardedHarnessAdmin(t testing.TB) *shardedHarness {
 	t.Helper()
 	return newShardedHarnessWith(t, Config{CatalogAccess: admins{"app"}})
+}
+
+// The in-transaction rule has to hold whichever message carries the SET. A
+// named statement can be prepared while the session is idle and executed
+// after BEGIN, which checks at Parse alone would have let through.
+func TestAPinCannotChangeInsideATransactionByAPreparedStatement(t *testing.T) {
+	h := newShardedHarnessAdmin(t)
+	conn := h.connect(t, h.dsn())
+	ctx := context.Background()
+	if _, err := conn.Prepare(ctx, "pin", "set pgshard.shard = '1'"); err != nil {
+		t.Fatalf("preparing it while idle is allowed: %v", err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, "pin")
+	if err == nil || !strings.Contains(err.Error(), "cannot be changed inside a transaction") {
+		t.Fatalf("want the in-transaction refusal at Execute, got %v", err)
+	}
+}
+
+// RESET ALL gives the session its settings back, and the pin is one of
+// them. Between batches applyStaged already drops every GUC when it applies
+// one, so the pin does not survive there. The window that needs guarding is
+// INSIDE a batch, where the staged SET is still in the list the pin is read
+// from and applyStaged has not run yet.
+func TestResetAllClearsAStagedPin(t *testing.T) {
+	e := &Executor{
+		gucs:   []gucEntry{{name: "search_path", sql: "set search_path = public"}},
+		staged: []gucEntry{{name: plan.ShardGUC, sql: "set pgshard.shard = '2'"}, {name: ""}},
+	}
+	if got := e.pinnedShard(); got != nil {
+		t.Errorf("pinned to %d after a staged RESET ALL", *got)
+	}
+	// Without the RESET ALL the same staged SET does pin, so the test is
+	// about the reset and not about the list being read at all.
+	e.staged = e.staged[:1]
+	if got := e.pinnedShard(); got == nil || *got != 2 {
+		t.Fatalf("a staged pin must be read: %v", got)
+	}
+}
+
+// SET x = 2 and SET x = '2' are the same setting. Reading only the quoted
+// form left the value empty, which the value check then skipped.
+func TestAnUnquotedPinIsReadAndChecked(t *testing.T) {
+	h := newShardedHarnessAdmin(t)
+	conn := h.connect(t, h.dsn())
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, "set pgshard.shard = 2"); err != nil {
+		t.Fatalf("an unquoted shard id is a shard id: %v", err)
+	}
+	_, _ = conn.Exec(ctx, "select * from orders", pgx.QueryExecModeSimpleProtocol)
+	for i := range h.poolers {
+		if ran := h.ranOn(i, "select * from orders"); ran != (i == 2) {
+			t.Errorf("shard %d ran=%v; the unquoted pin did not take effect", i, ran)
+		}
+	}
+	// And an unquoted value that is not a shard id is still refused.
+	h2 := newShardedHarnessAdmin(t)
+	c2 := h2.connect(t, h2.dsn())
+	if _, err := c2.Exec(ctx, "set pgshard.shard = -1"); err == nil {
+		t.Error("a negative shard id was accepted")
+	}
 }

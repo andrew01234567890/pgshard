@@ -325,6 +325,9 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 		}
 		r.adminAccess[name] = true
 	}
+	if err := admins.Err(); err != nil {
+		return nil, fmt.Errorf("snapshot: admin access: %w", err)
+	}
 	return r, access.Err()
 }
 
