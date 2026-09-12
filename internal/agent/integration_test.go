@@ -235,6 +235,21 @@ func (n *node) status() *pgshardv1.StatusResponse {
 	return st
 }
 
+// waitServing waits for everything a test uses after starting an agent:
+// the probes AND the gRPC server behind them.
+//
+// Every agent-start site should call this rather than waitHTTP alone. The
+// two are not the same wait, and which sites remembered the second one was
+// how this bug kept coming back: it was fixed in this file and left in
+// barrier_integration_test.go and backup_integration_test.go, where it
+// went on failing as "connection reset by peer" on a dependency bump that
+// had nothing to do with it.
+func (n *node) waitServing(timeout time.Duration) {
+	n.t.Helper()
+	n.waitHTTP("/readyz", 200, timeout)
+	n.waitRPC(timeout)
+}
+
 // waitRPC waits until the agent's gRPC server answers.
 //
 // /readyz is not a proxy for it. The agent serves its probes long before
@@ -292,8 +307,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	}
 	p := h.start("s0-0", RolePrimary, "s0-1", peersOf("s0-1"))
 	p.waitHTTP("/startz", 200, 90*time.Second)
-	p.waitHTTP("/readyz", 200, 60*time.Second)
-	p.waitRPC(30 * time.Second)
+	p.waitServing(60 * time.Second)
 	if got := p.psql("SHOW wal_level"); got != "logical" {
 		t.Fatalf("wal_level=%s", got)
 	}
@@ -326,8 +340,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 
 	s := h.start("s0-1", RoleStandby, "s0-0", peersOf("s0-0"))
 	s.waitHTTP("/startz", 200, 120*time.Second)
-	s.waitHTTP("/readyz", 200, 60*time.Second)
-	s.waitRPC(30 * time.Second)
+	s.waitServing(60 * time.Second)
 	s.waitStandbyCaughtUp(p, 30*time.Second)
 	if got := s.psql("SELECT note FROM t WHERE id = 1"); got != "first" {
 		t.Fatalf("standby did not replicate: %q", got)
@@ -402,7 +415,8 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if strings.Contains(p.logs(), "pg_rewind failed") {
 		t.Fatalf("demote fell back to reclone; expected rewind\n%s", p.logs())
 	}
-	p.waitHTTP("/readyz", 200, 90*time.Second)
+	// p.status() below is an RPC, and the agent restarted to rewind.
+	p.waitServing(90 * time.Second)
 	p.waitStandbyCaughtUp(s, 60*time.Second)
 	if got := p.psql("SELECT string_agg(note, ',' ORDER BY id) FROM t"); got != "first,after-promote" {
 		t.Fatalf("rewound standby content: %q", got)
@@ -417,10 +431,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	t.Log("epoch survives an agent restart")
 	docker(t, "restart", p.container)
 	p.connect()
-	p.waitHTTP("/readyz", 200, 120*time.Second)
 	// A restart reopens the same window as a start: the probes answer
 	// before grpcSrv.Serve does.
-	p.waitRPC(30 * time.Second)
+	p.waitServing(120 * time.Second)
 	if st := p.status(); st.GetEpoch() != 1 || st.GetRole() != pgshardv1.StatusResponse_ROLE_STANDBY {
 		t.Fatalf("status after restart: %v", st)
 	}

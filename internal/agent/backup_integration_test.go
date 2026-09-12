@@ -86,7 +86,7 @@ func (h *harness) restoreFrom(member string, spec map[string]any) *node {
 	n := h.start(member, RolePrimary, member, nil)
 	h.extra = saved
 	n.waitHTTP("/startz", 200, 4*time.Minute)
-	n.waitHTTP("/readyz", 200, 60*time.Second)
+	n.waitServing(60 * time.Second)
 	if got := n.psql("SELECT pg_is_in_recovery()"); got != "f" {
 		t.Fatalf("%s still in recovery\n%s", member, n.logs())
 	}
@@ -122,7 +122,7 @@ func TestBackupIntegration(t *testing.T) {
 	}
 	p := h.start("s0-0", RolePrimary, "s0-1", peersOf("s0-1"))
 	p.waitHTTP("/startz", 200, 90*time.Second)
-	p.waitHTTP("/readyz", 200, 60*time.Second)
+	p.waitServing(60 * time.Second)
 	if got := p.psql("SHOW archive_mode"); got != "on" {
 		t.Fatalf("archive_mode=%s", got)
 	}
@@ -212,7 +212,7 @@ func TestBackupIntegration(t *testing.T) {
 	if !strings.Contains(s.logs(), "recloning from the repository") {
 		t.Fatalf("standby did not restore from the repository:\n%s", s.logs())
 	}
-	s.waitHTTP("/readyz", 200, 120*time.Second)
+	s.waitServing(120 * time.Second)
 	waitCount(t, s, "b", 6500)
 	if got := s.psql("SELECT pg_is_in_recovery()"); got != "t" {
 		t.Fatalf("recloned standby in recovery = %s", got)
