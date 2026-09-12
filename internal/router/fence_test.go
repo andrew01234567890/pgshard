@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
@@ -408,22 +410,35 @@ func TestWriteFenceRefusesAShardTheTransactionHasNotReached(t *testing.T) {
 // the pause lifts, and the client sees latency rather than an error it
 // could not have avoided.
 func TestAReadOnlyRefusalOfAnUntouchedTransactionIsRetried(t *testing.T) {
-	h := newTxnHarness(t)
-	ctx := context.Background()
-	a, _ := h.twoTenants(t)
-	h.poolers[h.shardOf(t, a)].script("insert into orders (tenant_id, id) values ($1, 1)", script{
-		err: "cannot execute INSERT in a read-only transaction", code: "25006", once: true})
+	// Every mode a client can send this in. A client that DESCRIBES before
+	// it executes used to lose the retry, because the description counted
+	// as output the statement had already produced -- so the retry worked
+	// for whichever protocol shape the test happened to use and silently
+	// did not for the others.
+	for _, mode := range []pgx.QueryExecMode{
+		pgx.QueryExecModeCacheStatement,
+		pgx.QueryExecModeCacheDescribe,
+		pgx.QueryExecModeDescribeExec,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			h := newTxnHarness(t)
+			ctx := context.Background()
+			a, _ := h.twoTenants(t)
+			h.poolers[h.shardOf(t, a)].script("insert into orders (tenant_id, id) values ($1, 1)", script{
+				err: "cannot execute INSERT in a read-only transaction", code: "25006", once: true})
 
-	conn := h.connect(t, h.dsn())
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
-		t.Fatalf("the retry did not happen: %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+			conn := h.connect(t, h.dsn())
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", mode, a); err != nil {
+				t.Fatalf("the retry did not happen: %v", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

@@ -255,11 +255,24 @@ func (c *countingWriter) CommandComplete(t string) error {
 	return c.w.CommandComplete(t)
 }
 func (c *countingWriter) EmptyQueryResponse() error { c.wrote = true; return c.w.EmptyQueryResponse() }
+
+// ParameterDescription and NoData describe the STATEMENT, not a result:
+// the parameter types it takes, and that it returns no columns. They do not
+// count as output for the same reason ParameterStatus does not -- a
+// statement retried after them has still told the client nothing about its
+// outcome, and the answer does not change because the transaction was
+// rolled back and opened again.
+//
+// Counting them silently switched the write-pause retry off for any client
+// that describes before it executes. That was already true here for pgx's
+// cache-describe mode, and pgx 5.11 makes describing the common path, so
+// the retry -- which exists so a client sees latency instead of a 25006 it
+// could not have avoided -- would have stopped working for most clients
+// without a single test noticing.
 func (c *countingWriter) ParameterDescription(o []uint32) error {
-	c.wrote = true
 	return c.w.ParameterDescription(o)
 }
-func (c *countingWriter) NoData() error          { c.wrote = true; return c.w.NoData() }
+func (c *countingWriter) NoData() error          { return c.w.NoData() }
 func (c *countingWriter) PortalSuspended() error { c.wrote = true; return c.w.PortalSuspended() }
 func (c *countingWriter) Notice(n *pgproto3.NoticeResponse) error {
 	c.wrote = true
