@@ -21,7 +21,7 @@ func TestAnAckIsNotClampedToThePositionItsStreamAskedFor(t *testing.T) {
 	const claimed = 1 << 40
 	h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain", Position: &pgshardv1.VPosition{
 		ShardMapGeneration: 7, Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: claimed}}}})
-	waitFor(t, func() bool { return len(h.pool[0].startLSNs()) == 1 })
+	waitFor(t, func() bool { return h.server.liveStream("plain") != nil })
 
 	if _, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{
 		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: claimed}}}}); err != nil {
@@ -56,5 +56,68 @@ func TestASecondStreamCannotRaiseTheFirstsClamp(t *testing.T) {
 	}
 	if a := h.pool[0].ackedLSNs(); len(a) != 1 || a[0] != 2000 {
 		t.Fatalf("ack = %v, want exactly the 2000 delivered to the stream holding the name", a)
+	}
+}
+
+// The in-stream ack was clamped to the merger's position vector, which also
+// starts at the caller's claim, so the same inflated position confirmed the
+// slot one RPC over from the unary path this fixes. Nothing below the router
+// clamps it: the pooler seeds its own delivered mark from the LSN the router
+// asked to start at.
+func TestAnInStreamAckIsNotClampedToTheClaimEither(t *testing.T) {
+	h := newHarness(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const claimed = 1 << 40
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain", Position: &pgshardv1.VPosition{
+		ShardMapGeneration: 7, Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: claimed}}}})
+	waitFor(t, func() bool { return h.server.liveStream("plain") != nil })
+
+	if err := st.Send(&pgshardv1.VStreamRequest{Request: &pgshardv1.VStreamRequest_Ack{Ack: &pgshardv1.VPosition{
+		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: claimed}}}}}); err != nil {
+		t.Fatalf("in-stream ack: %v", err)
+	}
+	select {
+	case <-h.pool[0].ackWake:
+		t.Fatalf("the pooler was acked at %v for a stream that has delivered nothing", h.pool[0].ackedLSNs())
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// A second stream for a name does not take it from the first, but it does
+// inherit it: when a consumer reconnects, the stream it left behind has not
+// always noticed the connection is gone, and dropping the newcomer's
+// registration outright left the name with no entry at all once the old
+// stream finally died -- every unary ack from the live consumer refused
+// with "not open on this router", which was false.
+func TestTheNameIsInheritedWhenTheStreamHoldingItEnds(t *testing.T) {
+	h := newHarness(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	firstCtx, endFirst := context.WithCancel(ctx)
+	first := h.open(firstCtx, &pgshardv1.VStreamRequest_Start{Stream: "plain"})
+	h.pool[0].feed("plain", batch(0, evRelation(16384, "t", "id")))
+	h.pool[0].feed("plain", txn(16384, 7, 1000, 2000, "1"))
+	recvN(t, first, 4, 5*time.Second)
+
+	second := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain"})
+	held := h.server.liveStream("plain")
+	waitFor(t, func() bool { return len(h.pool[0].startLSNs()) == 2 })
+
+	endFirst()
+	waitFor(t, func() bool {
+		e := h.server.liveStream("plain")
+		return e != nil && e != held
+	})
+	h.pool[0].feed("plain", batch(0, evRelation(16384, "t", "id")))
+	h.pool[0].feed("plain", txn(16384, 8, 3000, 4000, "2"))
+	recvN(t, second, 4, 5*time.Second)
+
+	if _, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{
+		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 1 << 40}}}}); err != nil {
+		t.Fatalf("unary ack after the first stream ended: %v", err)
+	}
+	if a := h.pool[0].ackedLSNs(); len(a) != 1 || a[0] != 4000 {
+		t.Fatalf("ack = %v, want the 4000 the stream that inherited the name delivered", a)
 	}
 }

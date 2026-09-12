@@ -56,9 +56,9 @@ type Server struct {
 	// live holds the emitted position of each open stream, so a unary Ack
 	// can be clamped to what a consumer was actually sent. The pooler
 	// admits one reader per slot, so a name is expected to have at most
-	// one; registerLive does not rely on that.
+	// one open stream; registerLive does not rely on that.
 	mu   sync.Mutex
-	live map[string]*emitted
+	live map[string][]*emitted
 }
 
 // emitted is what one open stream has delivered, per shard. The merger
@@ -94,7 +94,12 @@ func (e *emitted) advance(sh router.Shard, lsn uint64) {
 	}
 }
 
+// at is nil-safe: a merger without one has delivered nothing an ack can be
+// held to, which is what a false second return says.
 func (e *emitted) at(sh router.Shard) (uint64, bool) {
+	if e == nil {
+		return 0, false
+	}
 	v, ok := e.pos[sh]
 	if !ok {
 		return 0, false
@@ -105,35 +110,45 @@ func (e *emitted) at(sh router.Shard) (uint64, bool) {
 // registerLive publishes an open stream's emitted position and returns the
 // function that withdraws it.
 //
-// A name already live is not replaced: the two streams have delivered
-// different things, and letting the newer one take the name would measure
-// the older stream's acks against a delivery they had nothing to do with.
+// Registrations for one name queue in the order they opened rather than
+// overwriting each other, and liveStream answers with the oldest still
+// open. The entry is what a unary Ack is checked against, and two streams
+// of the same name have delivered different things: letting a newcomer take
+// the name would measure the older stream's acks against a delivery they
+// had nothing to do with. Dropping the newcomer instead is no better --
+// when a consumer reconnects, the old stream has not always noticed the
+// connection is gone, and the new one would go on serving a name whose
+// entry vanished with the stream that finally died.
 func (s *Server) registerLive(name string, e *emitted) func() {
 	s.mu.Lock()
 	if s.live == nil {
-		s.live = map[string]*emitted{}
+		s.live = map[string][]*emitted{}
 	}
-	_, taken := s.live[name]
-	if !taken {
-		s.live[name] = e
-	}
+	s.live[name] = append(s.live[name], e)
 	s.mu.Unlock()
 	return func() {
-		if taken {
-			return
-		}
 		s.mu.Lock()
-		if s.live[name] == e {
+		defer s.mu.Unlock()
+		q := s.live[name]
+		for i, x := range q {
+			if x == e {
+				s.live[name] = append(q[:i:i], q[i+1:]...)
+				break
+			}
+		}
+		if len(s.live[name]) == 0 {
 			delete(s.live, name)
 		}
-		s.mu.Unlock()
 	}
 }
 
 func (s *Server) liveStream(name string) *emitted {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.live[name]
+	if q := s.live[name]; len(q) > 0 {
+		return q[0]
+	}
+	return nil
 }
 
 func (s *Server) logger() *slog.Logger {
