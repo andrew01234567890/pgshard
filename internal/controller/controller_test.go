@@ -62,26 +62,36 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 	}
 	// Docker picks the host port: choosing one here and binding it a moment
 	// later races every other test starting a container in the same window.
-	args := append([]string{"run", "-d", "--rm", "-p", "127.0.0.1::5432"}, dockerArgs...)
-	args = append(args, "--entrypoint", "sh", image, "-ec",
-		`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
-		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*' `+strings.Join(opts, " "))
-	out, err := exec.Command("docker", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker run: %v: %s", err, out)
-	}
-	id := strings.TrimSpace(string(out))
-	t.Cleanup(func() {
-		_ = exec.Command("docker", "rm", "-f", id).Run()
-	})
-	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", dockertest.HostPort(t, id, "5432"))
-	dockertest.WaitReady(t, id, func(ctx context.Context) error {
-		conn, err := pgx.Connect(ctx, dsn)
+	//
+	// That is not enough on its own. This package still loses containers to
+	// a published port with nothing listening on the host -- five tests in
+	// one run, a different five in the next, each passing alone -- so the
+	// mapping fails even when nothing raced for the port. Waiting cannot
+	// fix that, and the wait is ninety seconds: another container is the
+	// only recovery.
+	var dsn string
+	dockertest.StartAndWait(t, 3, func() (string, dockertest.Connector) {
+		args := append([]string{"run", "-d", "--rm", "-p", "127.0.0.1::5432"}, dockerArgs...)
+		args = append(args, "--entrypoint", "sh", image, "-ec",
+			`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
+			 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
+			 exec postgres -D /tmp/pgdata -c listen_addresses='*' `+strings.Join(opts, " "))
+		out, err := exec.Command("docker", args...).CombinedOutput()
 		if err != nil {
-			return err
+			t.Fatalf("docker run: %v: %s", err, out)
 		}
-		return conn.Close(context.Background())
+		id := strings.TrimSpace(string(out))
+		t.Cleanup(func() {
+			_ = exec.Command("docker", "rm", "-f", id).Run()
+		})
+		dsn = fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", dockertest.HostPort(t, id, "5432"))
+		return id, func(ctx context.Context) error {
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				return err
+			}
+			return conn.Close(context.Background())
+		}
 	})
 	return dsn
 }

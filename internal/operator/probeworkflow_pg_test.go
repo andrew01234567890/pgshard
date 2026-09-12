@@ -97,32 +97,28 @@ func startProbePostgresWith(t *testing.T, opts ...string) string {
 	}
 	// The server options arrive as positional arguments after the script's
 	// own $0, which is why "sh" is there.
-	args := append([]string{"run", "-d", "--rm", "-p", "127.0.0.1::5432",
-		"--entrypoint", "sh", image, "-ec",
-		`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
-		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 echo "host replication all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*' "$@"`, "sh"}, opts...)
-	out, err := exec.Command("docker", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker run: %v: %s", err, out)
-	}
-	id := strings.TrimSpace(string(out))
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
-
-	pout, err := exec.Command("docker", "port", id, "5432/tcp").Output()
-	if err != nil {
-		t.Fatalf("docker port: %v", err)
-	}
-	hostPort := strings.TrimSpace(strings.SplitN(string(pout), "\n", 2)[0])
-	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", hostPort)
-
-	dockertest.WaitReady(t, id, func(ctx context.Context) error {
-		conn, err := pgx.Connect(ctx, dsn)
+	var dsn string
+	dockertest.StartAndWait(t, 3, func() (string, dockertest.Connector) {
+		args := append([]string{"run", "-d", "--rm", "-p", "127.0.0.1::5432",
+			"--entrypoint", "sh", image, "-ec",
+			`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
+			 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
+			 echo "host replication all all trust" >> /tmp/pgdata/pg_hba.conf &&
+			 exec postgres -D /tmp/pgdata -c listen_addresses='*' "$@"`, "sh"}, opts...)
+		out, err := exec.Command("docker", args...).CombinedOutput()
 		if err != nil {
-			return err
+			t.Fatalf("docker run: %v: %s", err, out)
 		}
-		return conn.Close(context.Background())
+		id := strings.TrimSpace(string(out))
+		t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
+		dsn = fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", dockertest.HostPort(t, id, "5432"))
+		return id, func(ctx context.Context) error {
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				return err
+			}
+			return conn.Close(context.Background())
+		}
 	})
 	return dsn
 }
