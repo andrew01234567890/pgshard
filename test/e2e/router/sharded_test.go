@@ -220,7 +220,7 @@ func TestRouterShardedRouting(t *testing.T) {
 	t.Run("refusals", func(t *testing.T) {
 		for _, c := range []struct{ sql, msg string }{
 			{"select * from orders for update", "multi-shard SELECT with FOR UPDATE/SHARE is not available yet"},
-			{"select avg(id) from orders", "multi-shard avg() is not available yet"},
+			{"select avg(id::real) from orders", "multi-shard avg() over a real column is not available yet"},
 			{"insert into orders values (1, 2)", "insert requires the shard key"},
 			{"update orders set tenant_id = 1 where tenant_id = 2", "shard key is immutable"},
 			{"delete from orders", "scatter DELETE without a shard key predicate is not available yet"},

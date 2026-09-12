@@ -500,7 +500,10 @@ func TestRouterScatterDifferential(t *testing.T) {
 	t.Run("refusals", func(t *testing.T) {
 		for _, c := range []struct{ sql, msg string }{
 			{`select id, name from events order by name`, `multi-shard ORDER BY on a text column needs an explicit COLLATE "C"`},
-			{`select avg(price) from events`, "multi-shard avg() over a real column is not available yet"},
+			// price is float8, so it has to be cast: the refusal is about
+			// real, where PostgreSQL accumulates avg() in double precision
+			// and sum() in real, so a per-shard sum is already rounded.
+			{`select avg(price::real) from events`, "multi-shard avg() over a real column is not available yet"},
 			{`select max(name) from events`, "multi-shard min()/max() over a text column is not available yet"},
 			{`select id from events order by id limit $1`, "multi-shard LIMIT must be an integer constant"},
 			{`select ok, count(*) from events group by ok`, "multi-shard GROUP BY without the shard key"},
