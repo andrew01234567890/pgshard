@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // slotDialer serves the pg_replication_slots flush query of one shard from
@@ -63,7 +64,12 @@ func (r *slotRows) Scan(dest ...any) error {
 }
 func (r *slotRows) Values() ([]any, error) { return []any{r.names[r.i-1], r.vals[r.i-1]}, nil }
 func (r *slotRows) RawValues() [][]byte    { return nil }
-func (r *slotRows) Conn() *pgx.Conn        { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *slotRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+func (r *slotRows) Conn() *pgx.Conn      { return nil }
 
 // testCutover carries TWO databases, because the slots are per-database and
 // a fixture with one cannot tell a per-database expectation from a

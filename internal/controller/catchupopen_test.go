@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // peekRows is the two-column result of pg_logical_slot_peek_binary_changes.
@@ -28,7 +29,12 @@ func (r *peekRows) Scan(dest ...any) error {
 }
 func (r *peekRows) Values() ([]any, error) { return nil, nil }
 func (r *peekRows) RawValues() [][]byte    { return nil }
-func (r *peekRows) Conn() *pgx.Conn        { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *peekRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+func (r *peekRows) Conn() *pgx.Conn      { return nil }
 
 type peekConn struct {
 	rows *peekRows
@@ -53,14 +59,19 @@ func (c *peekConn) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, err
 // lagRows is the one-row bigint of slotLag.
 type lagRows struct{ i int }
 
-func (r *lagRows) Close()                                                    {}
-func (r *lagRows) Err() error                                                { return nil }
-func (r *lagRows) CommandTag() pgconn.CommandTag                             { return pgconn.CommandTag{} }
-func (r *lagRows) FieldDescriptions() []pgconn.FieldDescription              { return nil }
-func (r *lagRows) Next() bool                                                { r.i++; return r.i <= 1 }
-func (r *lagRows) Scan(dest ...any) error                                    { *(dest[0].(*int64)) = 0; return nil }
-func (r *lagRows) Values() ([]any, error)                                    { return nil, nil }
-func (r *lagRows) RawValues() [][]byte                                       { return nil }
+func (r *lagRows) Close()                                       {}
+func (r *lagRows) Err() error                                   { return nil }
+func (r *lagRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *lagRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *lagRows) Next() bool                                   { r.i++; return r.i <= 1 }
+func (r *lagRows) Scan(dest ...any) error                       { *(dest[0].(*int64)) = 0; return nil }
+func (r *lagRows) Values() ([]any, error)                       { return nil, nil }
+func (r *lagRows) RawValues() [][]byte                          { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *lagRows) TypeMap() *pgtype.Map                                      { return pgtype.NewMap() }
 func (r *lagRows) Conn() *pgx.Conn                                           { return nil }
 func (c *peekConn) Exec(context.Context, string, ...any) (CommandTag, error) { return nil, nil }
 func (c *peekConn) Close(context.Context) error                              { return nil }

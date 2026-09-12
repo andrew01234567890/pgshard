@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 
@@ -27,8 +28,13 @@ type fakeRows struct {
 	i    int
 }
 
-func (r *fakeRows) Close()                                       {}
-func (r *fakeRows) Err() error                                   { return nil }
+func (r *fakeRows) Close()     {}
+func (r *fakeRows) Err() error { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and the shared default map is
+// the honest answer: these rows carry text the caller reads directly.
+func (r *fakeRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 func (r *fakeRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *fakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *fakeRows) Next() bool                                   { r.i++; return r.i <= len(r.rows) }
@@ -50,8 +56,13 @@ type nameRows struct {
 	i    int
 }
 
-func (r *nameRows) Close()                                       {}
-func (r *nameRows) Err() error                                   { return nil }
+func (r *nameRows) Close()     {}
+func (r *nameRows) Err() error { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and the shared default map is
+// the honest answer: these rows carry text the caller reads directly.
+func (r *nameRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 func (r *nameRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *nameRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *nameRows) Next() bool                                   { r.i++; return r.i <= len(r.rows) }
