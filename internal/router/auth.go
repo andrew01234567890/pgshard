@@ -178,6 +178,15 @@ func (c *RoleCache) MayUseCatalog(user string) bool {
 	return cur.roles.MayUseCatalog(user)
 }
 
+// MayAdminister reports whether the role holds pgshard_admin.
+func (c *RoleCache) MayAdminister(user string) bool {
+	cur := c.cur.Load()
+	if cur == nil {
+		return false
+	}
+	return cur.roles.MayAdminister(user)
+}
+
 // Refresh reloads the roles from the catalog.
 func (c *RoleCache) Refresh(ctx context.Context) error {
 	c.mu.Lock()

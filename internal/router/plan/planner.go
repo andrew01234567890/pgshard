@@ -122,6 +122,15 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 		return out, nil
 	}
 	pl.Class.Write = pl.Kind != SessionLocal && (w.stmt != "SELECT" || w.locking)
+	if sess.PinnedShard != nil {
+		// Last, so the pin overrides a routing decision that is already
+		// complete rather than one half-made: the refusals the ordinary
+		// walk raises still apply, and a statement it refused stays
+		// refused.
+		if err := pl.pinned(*sess.PinnedShard, sess.servingShards()); err != nil {
+			return refusalErr(err)
+		}
+	}
 	if pl.merge != nil && raw.GetStmt().GetSelectStmt() == nil {
 		pl.merge, pl.mergeErr = nil, notYet("only a plain SELECT can run on multiple shards", "filter on one shard key value")
 		if pl.Kind == Scatter {
@@ -140,6 +149,16 @@ func (s Session) generation() int64 {
 
 // shardSet is the shard set plans locate keys in: the serving set of the
 // snapshot, or DefaultShardSet without one.
+// servingShards is the shard ids of the session's set, which is what a pin
+// is checked against: naming a shard that is not serving is a mistake worth
+// an error rather than a statement sent nowhere.
+func (s Session) servingShards() []int32 {
+	if s.Snapshot == nil {
+		return nil
+	}
+	return s.Snapshot.ShardIDs(s.shardSet())
+}
+
 func (s Session) shardSet() string {
 	if s.Snapshot == nil {
 		return DefaultShardSet
@@ -467,6 +486,10 @@ var clientGUCs = map[string]bool{
 	// back to scatter restores the default. A client cannot exempt itself
 	// from anything with it, which is the test this list applies.
 	"pgshard.fanout": true,
+	// shard is the one setting here that WIDENS what a session can reach,
+	// so unlike the others it is admitted to the list and then refused at
+	// the router unless the session holds pgshard_admin.
+	ShardGUC: true,
 }
 
 func refuseProtectedGUC(name string) error {
