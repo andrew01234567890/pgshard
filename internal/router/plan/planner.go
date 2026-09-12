@@ -940,8 +940,15 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		if err != nil {
 			return err
 		}
+		if r.kind == placeSharded && !n.CopyStmt.GetIsFrom() {
+			return notYet("COPY TO from a sharded table is not available yet",
+				"read it with SELECT, or filter on one shard key value")
+		}
+		if r.kind == placeSharded {
+			return w.copyIn(n.CopyStmt, r)
+		}
 		if r.kind != placeUnsharded {
-			return notYet("COPY on sharded and reference tables is not available yet", "COPY through the router works for unsharded tables only")
+			return notYet("COPY on a reference table is not available yet", "COPY through the router works for unsharded and sharded tables")
 		}
 		return w.unshardedOnly()
 	case *pgquerypb.Node_CreateStmt:
