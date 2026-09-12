@@ -23,11 +23,25 @@ automatically.
 **Scatter reads.** A read-only `SELECT` with no key predicate fans out to
 every shard and merges the streams: plain scans, `ORDER BY` (streaming
 merge; text keys need an explicit `COLLATE "C"`), `LIMIT`/`OFFSET` (pushed
-down), `count`/`sum`/`min`/`max` without `GROUP BY`, and `GROUP BY`/
+down), `count`/`sum`/`avg`/`min`/`max` without `GROUP BY`, and `GROUP BY`/
 `DISTINCT` that include the shard key. Anything else multi-shard —
-subqueries, CTEs, window functions, `avg()`, set operations, `FOR UPDATE` —
+subqueries, CTEs, window functions, set operations, `FOR UPDATE` —
 is refused with `0A000` and a message naming the rule. Scatter
 `UPDATE`/`DELETE` without a key predicate is refused.
+
+**`avg()` is computed from a sum and a count.** An average of averages is
+not the average — a shard holding one row and a shard holding a thousand
+would count equally — so each shard is asked for `sum(x)` and `count(x)`
+and the division happens once, at the router, over the totals. The count is
+a column you never see. The division follows PostgreSQL's own rule for the
+scale of a numeric quotient, so `avg()` over integers and `numeric` gives
+the same text a single node gives.
+
+`avg()` over `real` is refused: PostgreSQL accumulates `avg(real)` in
+double precision while its `sum(real)` accumulates in `real`, so a sum
+taken per shard has already been rounded and dividing it would not be the
+same number. Cast to double precision (`avg(x::float8)`), which is
+order-dependent in the low bits for the reason below.
 
 **`sum()` over `float8` is order-dependent.** A scatter sums each shard's
 rows and then adds the per-shard totals, which is a different association

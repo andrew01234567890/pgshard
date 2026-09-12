@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"google.golang.org/protobuf/proto"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -598,7 +599,7 @@ func (e *Executor) mergeScatter(parts []*participant, m *plan.Merge, out scatter
 		return pgwire.Errorf(pgwire.CodeInternalError, "router: %d hidden sort columns but the shard row has %d", m.Hidden, len(fields))
 	}
 	if out.describe {
-		if err := w.RowDescription(fieldDescriptions(fields[:len(fields)-m.Hidden])); err != nil {
+		if err := w.RowDescription(fieldDescriptions(describeMerged(fields[:len(fields)-m.Hidden], m))); err != nil {
 			return err
 		}
 	}
@@ -645,6 +646,45 @@ func (e *Executor) relayPrelude(msgs []*pgshardv1.ExecuteResponse, w pgwire.Resu
 	}
 	return nil
 }
+
+// describeMerged corrects the shard's description of the columns the router
+// does not return as the shard computed them.
+//
+// avg() is the only one: the shard was asked for sum(x), so it describes an
+// int8 for an int2 or int4 column, while the router divides and answers a
+// numeric under that description. A client reading the description -- which
+// is every client -- then parses a numeric as an int8 and fails, or asks for
+// binary int8 and is handed twelve bytes of numeric.
+func describeMerged(fields []*pgshardv1.FieldDescription, m *plan.Merge) []*pgshardv1.FieldDescription {
+	out := fields
+	for _, a := range m.Aggregates {
+		if a.Func != plan.AggAvg || a.Col >= len(fields) {
+			continue
+		}
+		switch fields[a.Col].GetTypeOid() {
+		case oidInt2, oidInt4, oidInt8, numericOID:
+		default:
+			// avg(float8) is a float8 and the shard already said so.
+			continue
+		}
+		if len(out) > 0 && &out[0] == &fields[0] {
+			out = append([]*pgshardv1.FieldDescription(nil), fields...)
+		}
+		f := proto.Clone(fields[a.Col]).(*pgshardv1.FieldDescription)
+		f.TypeOid, f.TypeSize, f.TypeModifier = numericOID, -1, -1
+		out[a.Col] = f
+	}
+	return out
+}
+
+// The exact-numeric type OIDs avg() can be asked for, and numeric, which is
+// what PostgreSQL's avg() returns for every one of them.
+const (
+	oidInt2    = 21
+	oidInt4    = 23
+	oidInt8    = 20
+	numericOID = 1700
+)
 
 func sameDescription(a, b *participant, rewriting string) error {
 	if b.rowDesc == nil {

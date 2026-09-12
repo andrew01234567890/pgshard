@@ -354,7 +354,6 @@ func TestScatterRefusalsThroughTheWire(t *testing.T) {
 	ctx := context.Background()
 	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
 	cases := []struct{ sql, msg string }{
-		{"select avg(id) from orders", "multi-shard avg() is not available yet"},
 		{"select * from orders limit $1", "multi-shard LIMIT must be an integer constant"},
 		{"select id from orders group by id", "multi-shard GROUP BY without the shard key is not available yet"},
 		{"explain select * from orders", "only a plain SELECT can run on multiple shards"},

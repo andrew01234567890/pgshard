@@ -159,13 +159,16 @@ func mergeOrdered(keys []plan.SortKey, cols []Column, hidden int, sources []Sour
 }
 
 // combineAggregates folds the one row every shard returns into one row.
-func combineAggregates(aggs []plan.AggFunc, cols []Column, sources []Source, out *limiter) error {
-	if len(aggs) != len(cols) {
+func combineAggregates(aggs []plan.Agg, cols []Column, sources []Source, out *limiter) error {
+	if len(aggs) > len(cols) {
 		return pgwire.Errorf(pgwire.CodeInternalError, "router: %d aggregates planned but the shard row has %d columns", len(aggs), len(cols))
 	}
 	accs := make([]accumulator, len(aggs))
 	for i, a := range aggs {
-		acc, err := newAccumulator(a, cols[i])
+		if a.Col < 0 || a.Col >= len(cols) || a.Count >= len(cols) {
+			return pgwire.Errorf(pgwire.CodeInternalError, "router: aggregate %d reads column %d/%d of a %d-column shard row", i, a.Col, a.Count, len(cols))
+		}
+		acc, err := newAccumulator(a, cols)
 		if err != nil {
 			return err
 		}
@@ -179,11 +182,11 @@ func combineAggregates(aggs []plan.AggFunc, cols []Column, sources []Source, out
 		if !ok {
 			return pgwire.Errorf(pgwire.CodeInternalError, "router: a shard returned no row for an aggregate query")
 		}
-		if len(row) != len(accs) {
-			return pgwire.Errorf(pgwire.CodeInternalError, "router: shard row has %d columns, expected %d", len(row), len(accs))
+		if len(row) != len(cols) {
+			return pgwire.Errorf(pgwire.CodeInternalError, "router: shard row has %d columns, expected %d", len(row), len(cols))
 		}
-		for i, v := range row {
-			if err := accs[i].add(v); err != nil {
+		for _, acc := range accs {
+			if err := acc.add(row); err != nil {
 				return err
 			}
 		}
@@ -193,7 +196,9 @@ func combineAggregates(aggs []plan.AggFunc, cols []Column, sources []Source, out
 			return pgwire.Errorf(pgwire.CodeInternalError, "router: a shard returned more than one row for an aggregate query")
 		}
 	}
-	row := make([][]byte, len(accs))
+	// Full shard width, because the limiter strips the trailing columns the
+	// client never asked for -- the counts avg() needed.
+	row := make([][]byte, len(cols))
 	for i, acc := range accs {
 		v, err := acc.result()
 		if err != nil {
@@ -205,13 +210,40 @@ func combineAggregates(aggs []plan.AggFunc, cols []Column, sources []Source, out
 }
 
 // accumulator folds per-shard aggregate values; NULL inputs are skipped and
-// the result is NULL when every input was.
+// the result is NULL when every input was. It is handed the whole shard row
+// because avg() reads two of its columns.
 type accumulator interface {
+	add(row [][]byte) error
+	result() ([]byte, error)
+}
+
+// oneCol adapts an accumulator that folds a single column.
+type oneCol struct {
+	col int
+	acc valueAccumulator
+}
+
+func (a *oneCol) add(row [][]byte) error  { return a.acc.add(row[a.col]) }
+func (a *oneCol) result() ([]byte, error) { return a.acc.result() }
+
+// valueAccumulator folds one column's values.
+type valueAccumulator interface {
 	add(v []byte) error
 	result() ([]byte, error)
 }
 
-func newAccumulator(fn plan.AggFunc, col Column) (accumulator, error) {
+func newAccumulator(a plan.Agg, cols []Column) (accumulator, error) {
+	if a.Func == plan.AggAvg {
+		return newAverage(a, cols)
+	}
+	acc, err := newValueAccumulator(a.Func, cols[a.Col])
+	if err != nil {
+		return nil, err
+	}
+	return &oneCol{col: a.Col, acc: acc}, nil
+}
+
+func newValueAccumulator(fn plan.AggFunc, col Column) (valueAccumulator, error) {
 	fam := familyOf(col.TypeOID)
 	switch fn {
 	case plan.AggCount:

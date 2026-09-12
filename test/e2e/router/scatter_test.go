@@ -328,6 +328,20 @@ var scatterCorpus = []corpusQuery{
 	{`select min(id), max(id), min(qty), max(qty) from events`, true},
 	{`select min(ts), max(ts), min(d), max(d) from events`, true},
 	{`select min(price), max(price), min(d), max(d) from events`, true},
+	// PGS-774: avg() is the aggregate applications reach for after count,
+	// and the router has to divide exactly as PostgreSQL does -- a numeric's
+	// text is its scale, so a right answer at the wrong scale is a wrong
+	// answer here. int2, int4 and numeric between them cover the two
+	// numerator types the division sees (sum(int2) and sum(int4) come back
+	// as int8, sum(numeric) as numeric).
+	{`select avg(qty) from events`, true},
+	{`select avg(id) from events`, true},
+	{`select avg(amount) from events`, true},
+	{`select avg(qty), avg(amount), count(*) from events`, true},
+	{`select avg(qty) from events where qty > 1000`, true},
+	{`select avg(qty) from events where tenant_id in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)`, true},
+	// Every row NULL for the column: PostgreSQL answers NULL, not zero.
+	{`select avg(qty) from events where qty is null`, true},
 	{`select count(*) from events where qty > 1000`, true},
 	{`select sum(amount), max(amount) from events where qty > 1000`, true},
 	{`select count(*), sum(qty) from events where tenant_id in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)`, true},
@@ -486,7 +500,10 @@ func TestRouterScatterDifferential(t *testing.T) {
 	t.Run("refusals", func(t *testing.T) {
 		for _, c := range []struct{ sql, msg string }{
 			{`select id, name from events order by name`, `multi-shard ORDER BY on a text column needs an explicit COLLATE "C"`},
-			{`select avg(qty) from events`, "multi-shard avg() is not available yet"},
+			// price is float8, so it has to be cast: the refusal is about
+			// real, where PostgreSQL accumulates avg() in double precision
+			// and sum() in real, so a per-shard sum is already rounded.
+			{`select avg(price::real) from events`, "multi-shard avg() over a real column is not available yet"},
 			{`select max(name) from events`, "multi-shard min()/max() over a text column is not available yet"},
 			{`select id from events order by id limit $1`, "multi-shard LIMIT must be an integer constant"},
 			{`select ok, count(*) from events group by ok`, "multi-shard GROUP BY without the shard key"},

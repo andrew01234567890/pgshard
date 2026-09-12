@@ -110,14 +110,14 @@ func TestMergeSpecLimitPushdownArithmetic(t *testing.T) {
 
 func TestMergeSpecAggregatesAndShardLocalShapes(t *testing.T) {
 	m := mergeOf(t, "select count(*), count(id), sum(amount), min(id), max(created_at) from orders")
-	if want := []AggFunc{AggCount, AggCount, AggSum, AggMin, AggMax}; fmt.Sprint(m.Aggregates) != fmt.Sprint(want) {
+	if want := aggsOf(AggCount, AggCount, AggSum, AggMin, AggMax); fmt.Sprint(m.Aggregates) != fmt.Sprint(want) {
 		t.Fatalf("aggregates %v, want %v", m.Aggregates, want)
 	}
 	if m.ShardSQL != "" || len(m.OrderBy) != 0 {
 		t.Fatalf("aggregate query must go to shards unchanged: %+v", m)
 	}
 	m = mergeOf(t, "select pg_catalog.sum(id) from orders")
-	if fmt.Sprint(m.Aggregates) != fmt.Sprint([]AggFunc{AggSum}) {
+	if fmt.Sprint(m.Aggregates) != fmt.Sprint(aggsOf(AggSum)) {
 		t.Fatalf("schema-qualified aggregate: %v", m.Aggregates)
 	}
 	// Shard-local shapes are concatenated with no aggregate combination.
@@ -140,7 +140,6 @@ func TestMergeSpecAggregatesAndShardLocalShapes(t *testing.T) {
 
 func TestMergeSpecRefusals(t *testing.T) {
 	cases := []struct{ sql, msg string }{
-		{"select avg(id) from orders", "multi-shard avg() is not available yet"},
 		{"select count(*) + 1 from orders", "multi-shard aggregates must be top-level"},
 		{"select id, count(*) from orders", "multi-shard aggregates must be top-level"},
 		{"select sum(id) filter (where id > 1) from orders", "multi-shard aggregates with DISTINCT, FILTER, ORDER BY or OVER"},
@@ -204,11 +203,11 @@ func TestMergeSpecOnMultiShardInPlans(t *testing.T) {
 	if keys(m) != "0:asc:last" || m.Limit != 2 || !strings.HasSuffix(m.ShardSQL, "ORDER BY id LIMIT 2") {
 		t.Fatalf("In-plan merge %+v", m)
 	}
-	pl, err = New().Plan(context.Background(), session(snap), "select avg(id) from orders where tenant_id in (1, 2, 3, 4, 5, 6, 7, 8)")
+	pl, err = New().Plan(context.Background(), session(snap), "select string_agg(status, ',') from orders where tenant_id in (1, 2, 3, 4, 5, 6, 7, 8)")
 	if err != nil {
 		t.Fatalf("an unmergeable In plan is still a plan (it may resolve to one shard): %v", err)
 	}
-	if _, err := pl.MultiShard(); err == nil || !strings.Contains(err.Error(), "avg()") {
+	if _, err := pl.MultiShard(); err == nil || !strings.Contains(err.Error(), "string_agg()") {
 		t.Fatalf("In-plan refusal: %v", err)
 	}
 	pl, err = New().Plan(context.Background(), session(snap), "select id from orders where tenant_id = 1")
@@ -353,4 +352,13 @@ func TestAnUncheckedShardKeyStillScatters(t *testing.T) {
 		!strings.Contains(err.Error(), "cross-shard join is not available yet") {
 		t.Errorf("a join on a non-key column: %v", err)
 	}
+}
+
+// aggsOf builds the Aggregates a query of single-column aggregates produces.
+func aggsOf(fns ...AggFunc) []Agg {
+	out := make([]Agg, len(fns))
+	for i, f := range fns {
+		out[i] = Agg{Func: f, Col: i, Count: -1}
+	}
+	return out
 }
