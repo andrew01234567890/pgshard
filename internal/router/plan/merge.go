@@ -27,9 +27,11 @@ type Merge struct {
 	// Limit and Offset are applied at the router; -1 means absent.
 	Limit  int64
 	Offset int64
-	// Aggregates, when set, has one entry per result column: every shard
-	// returns exactly one row and the router combines them into one.
-	Aggregates []AggFunc
+	// Aggregates, when set, has one entry per CLIENT result column: every
+	// shard returns exactly one row and the router combines them into one.
+	// The shard row can be wider, because avg() asks for a count the client
+	// never sees; those extra columns are counted in Hidden.
+	Aggregates []Agg
 }
 
 // SortKey is one ORDER BY key over the shard rows.
@@ -58,6 +60,20 @@ func (k SortKey) Index(width, hidden int) int {
 	return k.Column
 }
 
+// Agg is one client result column of an aggregate query, and which columns
+// of the shard row produce it.
+type Agg struct {
+	Func AggFunc
+	// Col is the shard-row column carrying the value to combine.
+	Col int
+	// Count is the shard-row column carrying count(x) for AggAvg, and -1
+	// for every other aggregate. avg() is the only one the shards cannot
+	// answer on their own: an average of averages is not the average, so
+	// each shard returns a sum and a count and the division happens once,
+	// at the router, over the totals.
+	Count int
+}
+
 // AggFunc is a distributive aggregate the router combines across shards.
 type AggFunc int
 
@@ -70,9 +86,11 @@ const (
 	AggMin
 	// AggMax keeps the largest per-shard maximum.
 	AggMax
+	// AggAvg divides a combined sum by a combined count.
+	AggAvg
 )
 
-var aggNames = map[string]AggFunc{"count": AggCount, "sum": AggSum, "min": AggMin, "max": AggMax}
+var aggNames = map[string]AggFunc{"count": AggCount, "sum": AggSum, "min": AggMin, "max": AggMax, "avg": AggAvg}
 
 // MultiShard reports how the executor may run the plan on several shards:
 // the merge specification, or the refusal explaining why it cannot.
@@ -340,7 +358,7 @@ func (b *mergeBuilder) aggregates() error {
 		fn := aggNames[strings.ToLower(names[len(names)-1])]
 		if len(names) != 1 || fn == 0 {
 			return notYet("multi-shard "+strings.ToLower(names[len(names)-1])+"() is not available yet",
-				"only count, sum, min and max combine across shards; avg(x) can be computed from sum(x) and count(x)")
+				"only count, sum, avg, min and max combine across shards")
 		}
 		if fc.GetAggDistinct() || fc.GetAggFilter() != nil || len(fc.GetAggOrder()) > 0 || fc.GetOver() != nil || fc.GetAggWithinGroup() {
 			return notYet("multi-shard aggregates with DISTINCT, FILTER, ORDER BY or OVER are not available yet", "")
@@ -353,9 +371,55 @@ func (b *mergeBuilder) aggregates() error {
 				return notYet("nested aggregates cannot run on multiple shards", "")
 			}
 		}
-		b.spec.Aggregates = append(b.spec.Aggregates, fn)
+		b.spec.Aggregates = append(b.spec.Aggregates, Agg{Func: fn, Col: len(b.spec.Aggregates), Count: -1})
 	}
+	return b.splitAverages()
+}
+
+// splitAverages rewrites every avg(x) in the shard query into sum(x), and
+// appends a count(x) for it after the client's own columns.
+//
+// An average of averages is not the average -- a shard holding one row and
+// a shard holding a thousand would count equally -- so the division cannot
+// happen on the shards. Each shard returns the two totals the division
+// needs instead, and the router divides once, over the whole set.
+//
+// The counts go at the END of the target list so the client's columns keep
+// their positions, and are declared Hidden, which is the same mechanism a
+// merge sort already uses for a key it had to add: the shard row is wider
+// than the row the client is sent.
+func (b *mergeBuilder) splitAverages() error {
+	avgs := 0
+	for _, a := range b.spec.Aggregates {
+		if a.Func == AggAvg {
+			avgs++
+		}
+	}
+	if avgs == 0 {
+		return nil
+	}
+	m := b.mutable()
+	width := len(m.GetTargetList())
+	for i := range b.spec.Aggregates {
+		if b.spec.Aggregates[i].Func != AggAvg {
+			continue
+		}
+		fc := m.GetTargetList()[i].GetResTarget().GetVal().GetFuncCall()
+		count := proto.Clone(fc).(*pgquerypb.FuncCall)
+		count.Funcname = []*pgquerypb.Node{strNode("pg_catalog"), strNode("count")}
+		fc.Funcname = []*pgquerypb.Node{strNode("pg_catalog"), strNode("sum")}
+		m.TargetList = append(m.TargetList, &pgquerypb.Node{Node: &pgquerypb.Node_ResTarget{
+			ResTarget: &pgquerypb.ResTarget{Val: &pgquerypb.Node{Node: &pgquerypb.Node_FuncCall{FuncCall: count}}},
+		}})
+		b.spec.Aggregates[i].Count = width
+		width++
+	}
+	b.spec.Hidden = avgs
 	return nil
+}
+
+func strNode(s string) *pgquerypb.Node {
+	return &pgquerypb.Node{Node: &pgquerypb.Node_String_{String_: &pgquerypb.String{Sval: s}}}
 }
 
 func (b *mergeBuilder) limits() (limit, offset int64, err error) {

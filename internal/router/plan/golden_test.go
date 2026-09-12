@@ -305,7 +305,6 @@ func golden() []want {
 		{sql: "explain select * from orders", kind: Refuse, msg: "only a plain SELECT can run on multiple shards"},
 		{sql: "select count(*) from orders", kind: Scatter, shards: "all"},
 		{sql: "select max(id) from orders", kind: Scatter, shards: "all"},
-		{sql: "select avg(id) from orders", kind: Refuse, msg: "multi-shard avg() is not available yet"},
 		{sql: "select count(*) + 1 from orders", kind: Refuse, msg: "multi-shard aggregates must be top-level"},
 		{sql: "select count(distinct id) from orders", kind: Refuse, msg: "multi-shard aggregates with DISTINCT, FILTER, ORDER BY or OVER are not available yet"},
 		{sql: "select id from orders group by id", kind: Refuse, msg: "multi-shard GROUP BY without the shard key is not available yet"},

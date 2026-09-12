@@ -291,7 +291,7 @@ func TestMergeReportsSourceErrorsAndWidthMismatch(t *testing.T) {
 }
 
 func TestCombineAggregates(t *testing.T) {
-	spec := &plan.Merge{Aggregates: []plan.AggFunc{plan.AggCount, plan.AggSum, plan.AggSum, plan.AggSum, plan.AggMin, plan.AggMax}, Limit: -1, Offset: -1}
+	spec := &plan.Merge{Aggregates: []plan.Agg{{Func: plan.AggCount, Count: -1}, {Func: plan.AggSum, Col: 1, Count: -1}, {Func: plan.AggSum, Col: 2, Count: -1}, {Func: plan.AggSum, Col: 3, Count: -1}, {Func: plan.AggMin, Col: 4, Count: -1}, {Func: plan.AggMax, Col: 5, Count: -1}}, Limit: -1, Offset: -1}
 	oids := []uint32{oidInt8, oidInt8, oidNumeric, oidFloat8, oidInt4, oidDate}
 	got, n, err := collect(t, spec, oids, sources(
 		[][][]byte{row("2", "10", "1.50", "0.5", "7", "2024-01-01")},
@@ -305,31 +305,31 @@ func TestCombineAggregates(t *testing.T) {
 		t.Fatalf("combined %v (%d), want %s", got, n, want)
 	}
 	// All-NULL inputs stay NULL; count of nothing is 0.
-	got, _, err = collect(t, &plan.Merge{Aggregates: []plan.AggFunc{plan.AggCount, plan.AggMax}, Limit: -1, Offset: -1}, []uint32{oidInt8, oidInt4},
+	got, _, err = collect(t, &plan.Merge{Aggregates: aggs(plan.AggCount, plan.AggMax), Limit: -1, Offset: -1}, []uint32{oidInt8, oidInt4},
 		sources([][][]byte{row("0", "NULL")}, [][][]byte{row("0", "NULL")}))
 	if err != nil || got[0] != "0|NULL" {
 		t.Fatalf("all-NULL: %v %v", got, err)
 	}
 	// LIMIT/OFFSET apply to the single combined row.
-	got, _, err = collect(t, &plan.Merge{Aggregates: []plan.AggFunc{plan.AggCount}, Limit: -1, Offset: 1}, []uint32{oidInt8}, sources([][][]byte{row("1")}))
+	got, _, err = collect(t, &plan.Merge{Aggregates: aggs(plan.AggCount), Limit: -1, Offset: 1}, []uint32{oidInt8}, sources([][][]byte{row("1")}))
 	if err != nil || len(got) != 0 {
 		t.Fatalf("offset past the aggregate row: %v %v", got, err)
 	}
 	// Text min/max and sums over unsupported types are refused.
-	_, _, err = collect(t, &plan.Merge{Aggregates: []plan.AggFunc{plan.AggMax}, Limit: -1, Offset: -1}, []uint32{oidText}, sources([][][]byte{row("a")}))
+	_, _, err = collect(t, &plan.Merge{Aggregates: aggs(plan.AggMax), Limit: -1, Offset: -1}, []uint32{oidText}, sources([][][]byte{row("a")}))
 	if sqlstate(err) != pgwire.CodeFeatureNotSupported {
 		t.Fatalf("text max must be refused: %v", err)
 	}
-	_, _, err = collect(t, &plan.Merge{Aggregates: []plan.AggFunc{plan.AggSum}, Limit: -1, Offset: -1}, []uint32{1186}, sources([][][]byte{row("1 day")}))
+	_, _, err = collect(t, &plan.Merge{Aggregates: aggs(plan.AggSum), Limit: -1, Offset: -1}, []uint32{1186}, sources([][][]byte{row("1 day")}))
 	if sqlstate(err) != pgwire.CodeFeatureNotSupported {
 		t.Fatalf("interval sum must be refused: %v", err)
 	}
 	// A shard returning no row or two rows is a protocol error.
-	_, _, err = collect(t, &plan.Merge{Aggregates: []plan.AggFunc{plan.AggCount}, Limit: -1, Offset: -1}, []uint32{oidInt8}, sources([][][]byte{}))
+	_, _, err = collect(t, &plan.Merge{Aggregates: aggs(plan.AggCount), Limit: -1, Offset: -1}, []uint32{oidInt8}, sources([][][]byte{}))
 	if err == nil {
 		t.Fatal("missing aggregate row must be an error")
 	}
-	_, _, err = collect(t, &plan.Merge{Aggregates: []plan.AggFunc{plan.AggCount}, Limit: -1, Offset: -1}, []uint32{oidInt8}, sources(rows("1", "2")))
+	_, _, err = collect(t, &plan.Merge{Aggregates: aggs(plan.AggCount), Limit: -1, Offset: -1}, []uint32{oidInt8}, sources(rows("1", "2")))
 	if err == nil {
 		t.Fatal("two aggregate rows must be an error")
 	}
@@ -445,7 +445,7 @@ func TestBinaryFormatComparatorsAndAggregates(t *testing.T) {
 		t.Fatalf("date text decodes to day %d, want 2", d.i)
 	}
 	// Aggregates in binary format produce binary results.
-	spec := &plan.Merge{Aggregates: []plan.AggFunc{plan.AggCount, plan.AggSum, plan.AggSum, plan.AggMax}, Limit: -1, Offset: -1}
+	spec := &plan.Merge{Aggregates: aggs(plan.AggCount, plan.AggSum, plan.AggSum, plan.AggMax), Limit: -1, Offset: -1}
 	cols := []Column{{oidInt8, FormatBinary}, {oidNumeric, FormatBinary}, {oidFloat8, FormatBinary}, {oidTimestampTZ, FormatBinary}}
 	var got [][]byte
 	_, err := Merge(spec, cols, sources(
@@ -466,7 +466,7 @@ func TestBinaryFormatComparatorsAndAggregates(t *testing.T) {
 		t.Fatalf("binary numeric sum %s e%d, want 3750 e-3 (3.750)", n.Int, n.Exp)
 	}
 	// An int8 overflow of the combined count is 22003.
-	_, err = Merge(&plan.Merge{Aggregates: []plan.AggFunc{plan.AggCount}, Limit: -1, Offset: -1}, []Column{{oidInt8, FormatText}},
+	_, err = Merge(&plan.Merge{Aggregates: aggs(plan.AggCount), Limit: -1, Offset: -1}, []Column{{oidInt8, FormatText}},
 		sources(rows("9223372036854775807"), rows("1")), func([][]byte) error { return nil })
 	if sqlstate(err) != "22003" {
 		t.Fatalf("overflow: %v", err)
@@ -566,4 +566,14 @@ func BenchmarkOrderedMerge(b *testing.B) {
 			b.Fatalf("merged %d: %v", n, err)
 		}
 	}
+}
+
+// aggs builds one Agg per shard column, in order, for the aggregates that
+// read a single column.
+func aggs(fns ...plan.AggFunc) []plan.Agg {
+	out := make([]plan.Agg, len(fns))
+	for i, f := range fns {
+		out[i] = plan.Agg{Func: f, Col: i, Count: -1}
+	}
+	return out
 }
