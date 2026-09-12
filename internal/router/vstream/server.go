@@ -55,7 +55,8 @@ type Server struct {
 
 	// live holds the emitted position of each open stream, so a unary Ack
 	// can be clamped to what a consumer was actually sent. The pooler
-	// allows one reader per slot, so one stream name has at most one.
+	// admits one reader per slot, so a name is expected to have at most
+	// one; registerLive does not rely on that.
 	mu   sync.Mutex
 	live map[string]*emitted
 }
@@ -67,12 +68,17 @@ type emitted struct {
 	pos map[router.Shard]*atomic.Uint64
 }
 
-func newEmitted(shards []router.Shard, start map[router.Shard]uint64) *emitted {
+// newEmitted starts every shard at zero, whatever position the caller
+// claimed to be resuming from. Seeding the clamp from that claim made it
+// agree with the consumer instead of checking it: nothing has been
+// delivered yet, so an ack has nothing it can be held to.
+//
+// The cost is that a resuming consumer's first ack does nothing until the
+// stream delivers something. That is the safe direction.
+func newEmitted(shards []router.Shard) *emitted {
 	e := &emitted{pos: make(map[router.Shard]*atomic.Uint64, len(shards))}
 	for _, sh := range shards {
-		v := &atomic.Uint64{}
-		v.Store(start[sh])
-		e.pos[sh] = v
+		e.pos[sh] = &atomic.Uint64{}
 	}
 	return e
 }
@@ -98,14 +104,24 @@ func (e *emitted) at(sh router.Shard) (uint64, bool) {
 
 // registerLive publishes an open stream's emitted position and returns the
 // function that withdraws it.
+//
+// A name already live is not replaced: the two streams have delivered
+// different things, and letting the newer one take the name would measure
+// the older stream's acks against a delivery they had nothing to do with.
 func (s *Server) registerLive(name string, e *emitted) func() {
 	s.mu.Lock()
 	if s.live == nil {
 		s.live = map[string]*emitted{}
 	}
-	s.live[name] = e
+	_, taken := s.live[name]
+	if !taken {
+		s.live[name] = e
+	}
 	s.mu.Unlock()
 	return func() {
+		if taken {
+			return
+		}
 		s.mu.Lock()
 		if s.live[name] == e {
 			delete(s.live, name)
@@ -401,7 +417,7 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 			}
 		}
 	}()
-	live := newEmitted(shards, startPos)
+	live := newEmitted(shards)
 	defer s.registerLive(def.Name, live)()
 	m := &merger{shards: shards, inputs: inputs, ready: ready, acks: acks, acker: ackers.request, send: send,
 		topo: s.Topology, set: set, generation: gen, fingerprint: fingerprint, opts: opts, position: startPos, copying: copying, emitted: live,
