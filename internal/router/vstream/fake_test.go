@@ -297,7 +297,22 @@ func (t *fakeTopology) bumpGeneration() {
 	t.gen++
 }
 
-type fakeCatalog struct{ streams map[string]catalog.Stream }
+type fakeCatalog struct {
+	streams map[string]catalog.Stream
+	// journal is what the cutover recorded for the set, if anything.
+	journal    *Journal
+	journalErr error
+}
+
+func (c fakeCatalog) Journal(context.Context, string) (Journal, bool, error) {
+	if c.journalErr != nil {
+		return Journal{}, false, c.journalErr
+	}
+	if c.journal == nil {
+		return Journal{}, false, nil
+	}
+	return *c.journal, true, nil
+}
 
 func (c fakeCatalog) Lookup(_ context.Context, name string) (catalog.Stream, error) {
 	st, ok := c.streams[name]

@@ -54,8 +54,14 @@ type merger struct {
 	// fingerprint is the serving shard set this stream was opened on. The
 	// generation above is only a cheap gate for consulting it.
 	fingerprint uint64
-	opts        options
-	now         func() time.Time
+	// journal reads where the stream continues after a cutover; nil when
+	// the server has no catalog to ask.
+	journal func(set string) (Journal, bool, error)
+	// logJournalErr reports a journal that could not be read. The stream
+	// still ends; what is lost is the position, not the event.
+	logJournalErr func(error)
+	opts          options
+	now           func() time.Time
 
 	position map[router.Shard]uint64
 	// emitted mirrors position for the unary Ack path, which runs on
@@ -197,10 +203,42 @@ func (m *merger) resharded() error {
 		for _, sh := range m.shards {
 			j.Participants = append(j.Participants, shardRef(sh))
 		}
+		// Where the stream continues, which is the whole point of a
+		// journal event. The cutover writes the id and the per-target LSNs
+		// in the same transaction as the flip, so they are the positions
+		// the sources stopped at; without them a consumer opens the new
+		// set with no position and never receives what was replicated to
+		// the targets between its last vgtid and the flip.
+		//
+		// A journal that cannot be read does not turn this into an error:
+		// the stream is ending either way, and a Journal event that says
+		// less is better than one that does not arrive.
+		if m.journal != nil {
+			if jr, ok, err := m.journal(m.set); err != nil {
+				m.logJournalErr(err)
+			} else if ok {
+				j.JournalId = jr.ID
+				for _, sh := range sortedTargets(jr.Targets) {
+					j.Targets = append(j.Targets, &pgshardv1.VEvent_Journal_Target{
+						Shard: shardRef(router.Shard{Set: m.set, ID: sh}), Lsn: jr.Targets[sh]})
+				}
+			}
+		}
 		return m.send(&pgshardv1.VEvent{Event: &pgshardv1.VEvent_Journal_{Journal: j}})
 	}
 	return m.send(&pgshardv1.VEvent{Event: &pgshardv1.VEvent_Error_{Error: &pgshardv1.VEvent_Error{Code: pgshardv1.VEvent_Error_CODE_RESHARDED,
 		Message: "shard map generation changed; restart the stream"}}})
+}
+
+// sortedTargets orders a journal's target shards, so the event a consumer
+// receives does not depend on a map's iteration order.
+func sortedTargets(targets map[int32]uint64) []int32 {
+	out := make([]int32, 0, len(targets))
+	for sh := range targets {
+		out = append(out, sh)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (m *merger) drainAcks() {

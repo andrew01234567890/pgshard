@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -128,6 +129,20 @@ func (t SnapshotTopology) Client(sh router.Shard) (pgshardv1.PoolerClient, error
 type Catalog interface {
 	Lookup(ctx context.Context, name string) (catalog.Stream, error)
 	List(ctx context.Context) ([]catalog.Stream, []catalog.StreamStatus, error)
+	// Journal returns the resharding journal row a stream needs in order
+	// to follow a cutover: the id of the event and, per target shard, the
+	// LSN to resume from on it. A set with no journal row -- a generation
+	// that moved for some other reason -- returns ok false.
+	Journal(ctx context.Context, set string) (Journal, bool, error)
+}
+
+// Journal is what the cutover recorded about where a stream continues.
+type Journal struct {
+	ID string
+	// Targets maps a target shard id to the LSN it is caught up to. The
+	// cutover writes these in the same transaction as the flip, so they
+	// are the positions the sources stopped at.
+	Targets map[int32]uint64
 }
 
 // ErrUnknownStream is returned by Lookup for a stream that does not exist.
@@ -149,6 +164,48 @@ func (c PGCatalog) Lookup(ctx context.Context, name string) (catalog.Stream, err
 		return catalog.Stream{}, fmt.Errorf("%w: %q", ErrUnknownStream, name)
 	}
 	return st, err
+}
+
+// Journal implements Catalog.
+//
+// The newest row for the set: a set that has been resharded more than once
+// has one row per cutover, and a stream ending now continues from the last.
+func (c PGCatalog) Journal(ctx context.Context, set string) (Journal, bool, error) {
+	var id string
+	var targets map[string]uint64
+	err := c.Pool.QueryRow(ctx, `SELECT id::text, targets FROM pgshard.resharding_journal
+		WHERE shard_set = $1 ORDER BY created_at DESC, id DESC LIMIT 1`, set).Scan(&id, &targets)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Journal{}, false, nil
+	}
+	if err != nil {
+		return Journal{}, false, err
+	}
+	t, perr := parseJournalTargets(id, targets)
+	if perr != nil {
+		return Journal{}, false, perr
+	}
+	return Journal{ID: id, Targets: t}, true, nil
+}
+
+// parseJournalTargets turns the journal's JSON object keys back into shard
+// ids.
+//
+// ParseInt with a bit size, not Atoi: Atoi returns an int, and narrowing
+// that to int32 TRUNCATES rather than failing. A target shard id of
+// 4294967296 would arrive as 0, and the consumer would be pointed at a
+// shard the journal never named. A shard id is an identity; there is no
+// rounding it.
+func parseJournalTargets(id string, targets map[string]uint64) (map[int32]uint64, error) {
+	out := make(map[int32]uint64, len(targets))
+	for k, lsn := range targets {
+		shard, err := strconv.ParseInt(k, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("vstream: journal %s has an unusable target shard %q: %w", id, k, err)
+		}
+		out[int32(shard)] = lsn
+	}
+	return out, nil
 }
 
 // List implements Catalog.
