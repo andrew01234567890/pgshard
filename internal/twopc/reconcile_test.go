@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestDecide(t *testing.T) {
@@ -96,8 +97,13 @@ type fakeRows struct {
 	i    int
 }
 
-func (r *fakeRows) Close()                                       {}
-func (r *fakeRows) Err() error                                   { return nil }
+func (r *fakeRows) Close()     {}
+func (r *fakeRows) Err() error { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and the shared default map is
+// the honest answer: these rows carry text the caller reads directly.
+func (r *fakeRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 func (r *fakeRows) CommandTag() (t pgconn.CommandTag)            { return }
 func (r *fakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *fakeRows) RawValues() [][]byte                          { return nil }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // TestAnEmptyPeekCannotAdvancePastACommitItDidNotSee.
@@ -116,7 +117,12 @@ func (r *textRows) Next() bool                                   { r.i++; return
 func (r *textRows) Scan(dest ...any) error                       { *(dest[0].(*string)) = r.v; return nil }
 func (r *textRows) Values() ([]any, error)                       { return []any{r.v}, nil }
 func (r *textRows) RawValues() [][]byte                          { return nil }
-func (r *textRows) Conn() *pgx.Conn                              { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *textRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+func (r *textRows) Conn() *pgx.Conn      { return nil }
 
 // TestTheAdvanceUsesTheBoundReadBeforeThePeek asserts the WIRING, not just
 // the SQL shapes above: the value handed to pg_replication_slot_advance must

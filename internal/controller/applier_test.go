@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
@@ -474,7 +475,12 @@ func (r *maxRows) Scan(dest ...any) error {
 }
 func (r *maxRows) Values() ([]any, error) { return []any{r.val}, nil }
 func (r *maxRows) RawValues() [][]byte    { return nil }
-func (r *maxRows) Conn() *pgx.Conn        { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *maxRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+func (r *maxRows) Conn() *pgx.Conn      { return nil }
 
 func (c *fakeConn) Close(context.Context) error { return nil }
 
@@ -516,7 +522,12 @@ func (r *boolRows) Scan(dest ...any) error {
 }
 func (r *boolRows) Values() ([]any, error) { return []any{r.vals[r.i-1]}, nil }
 func (r *boolRows) RawValues() [][]byte    { return nil }
-func (r *boolRows) Conn() *pgx.Conn        { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *boolRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+func (r *boolRows) Conn() *pgx.Conn      { return nil }
 
 func (c *fakeConn) log(what string) {
 	c.f.mu.Lock()
@@ -545,7 +556,12 @@ func (r *stringRows) Scan(dest ...any) error {
 }
 func (r *stringRows) Values() ([]any, error) { return []any{r.vals[r.i-1]}, nil }
 func (r *stringRows) RawValues() [][]byte    { return nil }
-func (r *stringRows) Conn() *pgx.Conn        { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *stringRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+func (r *stringRows) Conn() *pgx.Conn      { return nil }
 
 // intRows is a one-column pgx.Rows of ints.
 type intRows struct {
@@ -553,8 +569,13 @@ type intRows struct {
 	i    int
 }
 
-func (r *intRows) Close()                                       {}
-func (r *intRows) Err() error                                   { return nil }
+func (r *intRows) Close()     {}
+func (r *intRows) Err() error { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and the shared default map is
+// the honest answer: these rows carry text the caller reads directly.
+func (r *intRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 func (r *intRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *intRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *intRows) Next() bool                                   { r.i++; return r.i <= len(r.vals) }
@@ -585,7 +606,12 @@ func (r *factsRows) Scan(dest ...any) error {
 }
 func (r *factsRows) Values() ([]any, error) { return []any{r.def, r.notNull}, nil }
 func (r *factsRows) RawValues() [][]byte    { return nil }
-func (r *factsRows) Conn() *pgx.Conn        { return nil }
+
+// TypeMap is pgx 5.11's addition to the Rows interface. A fake that
+// decodes nothing still has to answer it, and a default map is the
+// honest answer: these rows carry values the caller reads directly.
+func (r *factsRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+func (r *factsRows) Conn() *pgx.Conn      { return nil }
 
 func pgErr(code, msg string) error {
 	return &pgconn.PgError{Severity: "ERROR", Code: code, Message: msg}
