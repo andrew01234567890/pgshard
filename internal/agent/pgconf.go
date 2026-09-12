@@ -59,6 +59,14 @@ func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 		}
 		set[k] = quote(v)
 	}
+	// Applied only where nothing else said anything: a floor, not an
+	// override. pgtune derives a better value from the disk size and it
+	// arrives above as a parameter, which wins.
+	for k, v := range defaultSettings {
+		if _, have := set[k]; !have {
+			set[k] = quote(v)
+		}
+	}
 	keys := make([]string, 0, len(set))
 	for k := range set {
 		keys = append(keys, k)
@@ -72,6 +80,30 @@ func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 	fmt.Fprintf(&b, "include_if_exists = %s\n", quote(overrideConf))
 	fmt.Fprintf(&b, "include_if_exists = %s\n", quote(slotsConf))
 	return b.String()
+}
+
+// defaultSettings are applied when neither the agent nor the operator named
+// them. They are a floor for settings whose ABSENCE is unsafe, not tuning.
+//
+// pgtune derives max_slot_wal_keep_size from the disk size, but Tuning
+// returns nothing at all when spec.resources names no memory -- "without a
+// budget nothing can be derived and the agent's fixed configuration stands
+// alone". So an unbudgeted cluster got PostgreSQL's default of -1, unlimited
+// retention, and a slot left for a member that no longer exists pinned WAL
+// on a PRIMARY until pg_wal filled the disk. A failover that leaves a slot
+// behind is enough; nothing else has to go wrong.
+//
+// It is not owned, because a derived value is better than this one wherever
+// there is a disk size to derive it from. The same reasoning as the
+// replication-worker settings above, which are owned because replication
+// correctness must not depend on the memory budget -- disk safety must not
+// either.
+//
+// idle_replication_slot_timeout is deliberately NOT here: it invalidates an
+// inactive slot, and a change stream registered before its consumer starts
+// is inactive by design. See PGS-715.
+var defaultSettings = map[string]string{
+	"max_slot_wal_keep_size": "20GB",
 }
 
 // OwnedSettings lists the postgresql.conf names the agent fixes itself; a
