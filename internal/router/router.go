@@ -92,6 +92,10 @@ type RoleLimiter interface {
 // the catalog server.
 type CatalogAccessCheck interface {
 	MayUseCatalog(role string) bool
+	// MayAdminister is the stronger of the two: pgshard_admin rather than
+	// pgshard_reader. Reading the control plane and acting on the cluster
+	// are different privileges.
+	MayAdminister(role string) bool
 }
 
 // CancelForwarder delivers a cancel key to the router instances it may

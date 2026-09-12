@@ -37,9 +37,12 @@ const (
 	// for the controller to apply on every target shard; Plan.Migration
 	// says how.
 	MigrationKind
+	// Pinned is a statement an operator targeted at one shard with
+	// SET pgshard.shard, whatever the shard map would have said.
+	Pinned
 )
 
-var kindNames = [...]string{"Unsharded", "EqualUnique", "In", "Scatter", "Reference", "Refuse", "SessionLocal", "Migration"}
+var kindNames = [...]string{"Unsharded", "EqualUnique", "In", "Scatter", "Reference", "Refuse", "SessionLocal", "Migration", "Pinned"}
 
 func (k Kind) String() string {
 	if int(k) < len(kindNames) {
@@ -175,6 +178,13 @@ type Session struct {
 	// in; nil means DefaultSearchPath.
 	SearchPath []string
 	Snapshot   *snapshot.Snapshot
+	// PinnedShard is the shard an operator targeted with
+	// SET pgshard.shard, or nil for ordinary routing. It is an operational
+	// tool: it exists so that looking at one shard does not require a
+	// credential that reaches a shard with none of the router's refusals
+	// in front of it, which is the credential the router exists to avoid
+	// handing out.
+	PinnedShard *int32
 }
 
 // DefaultSearchPath is what a backend runs with when nothing set one, and

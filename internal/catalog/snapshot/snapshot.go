@@ -499,6 +499,11 @@ type Roles struct {
 	// catalogAccess is the roles the catalog server itself says hold a
 	// control-plane role.
 	catalogAccess map[string]bool
+	// adminAccess is the subset of those that hold pgshard_admin rather
+	// than only pgshard_reader. Reading the control plane and acting on
+	// the cluster are different privileges, and pinning a session to one
+	// shard is the second.
+	adminAccess map[string]bool
 }
 
 // MayUseCatalog reports whether the role holds pgshard_admin or
@@ -506,6 +511,14 @@ type Roles struct {
 // or by being a superuser.
 func (r *Roles) MayUseCatalog(role string) bool {
 	return r != nil && r.catalogAccess[role]
+}
+
+// MayAdminister reports whether the role holds pgshard_admin -- directly,
+// through another role, or by being a superuser. pgshard_reader is not
+// enough: a reader may read the control plane, and an administrator may act
+// on the cluster.
+func (r *Roles) MayAdminister(role string) bool {
+	return r != nil && r.adminAccess[role]
 }
 
 // Verifier returns the SCRAM verifier of a role, if any.
@@ -523,11 +536,22 @@ func NewRoles(creds map[string]RoleCred) *Roles {
 // NewRolesWithCatalogAccess is NewRoles plus the roles that may open a
 // session on the catalog database.
 func NewRolesWithCatalogAccess(creds map[string]RoleCred, catalogAccess []string) *Roles {
-	r := &Roles{verifiers: map[string]RoleCred{}, catalogAccess: map[string]bool{}}
+	return NewRolesWithAccess(creds, catalogAccess, nil)
+}
+
+// NewRolesWithAccess is NewRolesWithCatalogAccess plus the roles that hold
+// pgshard_admin. Every administrator may also open a catalog session, so
+// admins are added to both.
+func NewRolesWithAccess(creds map[string]RoleCred, catalogAccess, admins []string) *Roles {
+	r := &Roles{verifiers: map[string]RoleCred{}, catalogAccess: map[string]bool{}, adminAccess: map[string]bool{}}
 	for name, c := range creds {
 		r.verifiers[name] = c
 	}
 	for _, name := range catalogAccess {
+		r.catalogAccess[name] = true
+	}
+	for _, name := range admins {
+		r.adminAccess[name] = true
 		r.catalogAccess[name] = true
 	}
 	return r

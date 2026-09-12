@@ -275,7 +275,7 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 		return nil, fmt.Errorf("snapshot: roles: %w", err)
 	}
 	defer rows.Close()
-	r := &Roles{verifiers: map[string]RoleCred{}, catalogAccess: map[string]bool{}}
+	r := &Roles{verifiers: map[string]RoleCred{}, catalogAccess: map[string]bool{}, adminAccess: map[string]bool{}}
 	for rows.Next() {
 		var name string
 		var cred RoleCred
@@ -307,6 +307,26 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 			return nil, err
 		}
 		r.catalogAccess[name] = true
+	}
+	// Who may ACT on the cluster, asked the same way and for the same
+	// reasons, but of pgshard_admin alone: a reader may look at the
+	// control plane, and only an administrator may pin a session to one
+	// shard or anything else that reaches past the router's routing.
+	admins, err := q.Query(ctx, `SELECT r.rolname FROM pgshard.roles r JOIN pg_roles pr ON pr.rolname = r.rolname
+		WHERE pg_has_role(pr.oid, 'pgshard_admin'::regrole, 'USAGE')`)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: admin access: %w", err)
+	}
+	defer admins.Close()
+	for admins.Next() {
+		var name string
+		if err := admins.Scan(&name); err != nil {
+			return nil, err
+		}
+		r.adminAccess[name] = true
+	}
+	if err := admins.Err(); err != nil {
+		return nil, fmt.Errorf("snapshot: admin access: %w", err)
 	}
 	return r, access.Err()
 }

@@ -16,6 +16,10 @@ func (c controlPlane) MayUseCatalog(role string) bool {
 	return snapshot.NewRolesWithCatalogAccess(nil, c).MayUseCatalog(role)
 }
 
+// MayAdminister: this fake's roles are all catalog readers and none is an
+// administrator, which is what the tests here are about.
+func (c controlPlane) MayAdminister(string) bool { return false }
+
 // Every role pgshard knows is materialized on the catalog group with LOGIN
 // and its verifier, so routing dbname=pgshard by name alone handed an
 // ordinary application credential a session on the control-plane server.

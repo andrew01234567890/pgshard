@@ -121,6 +121,36 @@ including the statements `pgshard.fanout` below would reject. A plain
 other statement and comes back with one shard's plan. The option takes no
 others (`ANALYZE` would promise a run that does not happen).
 
+**Targeting one shard.** An operator can send reads and writes to a named
+shard, whatever the shard map says:
+
+```sql
+SET pgshard.shard = '2';
+SELECT * FROM orders WHERE id = 4242;   -- shard 2, and only shard 2
+RESET pgshard.shard;
+```
+
+It exists so that looking at one shard does not need a credential that
+reaches a shard with none of the router's refusals in front of it — which
+is the credential the router exists to avoid handing out.
+
+It is an **operator's** setting and needs membership of `pgshard_admin`:
+a session that can pin its own shard can read rows the map would have
+routed it away from, so anyone else is refused with `42501`. It also
+cannot change inside a transaction — statements already sent cannot be
+re-routed — and it cannot be set to a shard that is not serving.
+
+While it is set, `SELECT`/`INSERT`/`UPDATE`/`DELETE` go to that shard;
+session and transaction control (`SET`, `SHOW`, `BEGIN`, `COMMIT`) take
+their ordinary path, so the pin can always be RESET. Two things are
+refused outright: **DDL**, because a schema change runs across the cluster
+rather than on one shard, **`nextval()` over a global sequence**, because
+the router answers that itself and cannot also forward the statement to a
+shard, and a **write to a reference table**, which belongs on every shard
+in one transaction — pinning it would write exactly one copy and the
+others would silently disagree. Reading a reference table from the pinned
+shard is fine, and is usually the point.
+
 **Catching an accidental scatter.** `SET pgshard.fanout = 'single'` refuses
 any statement that would route to more than one shard, and `'multi'` allows a
 bounded set (an `IN` list) but still refuses a scatter. The default,

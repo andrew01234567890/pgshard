@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -122,6 +123,15 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 		return out, nil
 	}
 	pl.Class.Write = pl.Kind != SessionLocal && (w.stmt != "SELECT" || w.locking)
+	if sess.PinnedShard != nil {
+		// Last, so the pin overrides a routing decision that is already
+		// complete rather than one half-made: the refusals the ordinary
+		// walk raises still apply, and a statement it refused stays
+		// refused.
+		if err := pl.pinned(*sess.PinnedShard, sess.servingShards()); err != nil {
+			return refusalErr(err)
+		}
+	}
 	if pl.merge != nil && raw.GetStmt().GetSelectStmt() == nil {
 		pl.merge, pl.mergeErr = nil, notYet("only a plain SELECT can run on multiple shards", "filter on one shard key value")
 		if pl.Kind == Scatter {
@@ -140,6 +150,16 @@ func (s Session) generation() int64 {
 
 // shardSet is the shard set plans locate keys in: the serving set of the
 // snapshot, or DefaultShardSet without one.
+// servingShards is the shard ids of the session's set, which is what a pin
+// is checked against: naming a shard that is not serving is a mistake worth
+// an error rather than a statement sent nowhere.
+func (s Session) servingShards() []int32 {
+	if s.Snapshot == nil {
+		return nil
+	}
+	return s.Snapshot.ShardIDs(s.shardSet())
+}
+
 func (s Session) shardSet() string {
 	if s.Snapshot == nil {
 		return DefaultShardSet
@@ -275,7 +295,7 @@ func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 			pgquerypb.VariableSetKind_VAR_SET_CURRENT, pgquerypb.VariableSetKind_VAR_RESET:
 			c.SetGUC, c.GUCName = true, strings.ToLower(s.GetName())
 			if args := s.GetArgs(); len(args) == 1 {
-				c.GUCValue = args[0].GetAConst().GetSval().GetSval()
+				c.GUCValue = constText(args[0].GetAConst())
 			}
 			if c.GUCName == "search_path" {
 				if s.GetKind() == pgquerypb.VariableSetKind_VAR_SET_CURRENT {
@@ -467,6 +487,30 @@ var clientGUCs = map[string]bool{
 	// back to scatter restores the default. A client cannot exempt itself
 	// from anything with it, which is the test this list applies.
 	"pgshard.fanout": true,
+	// shard is the one setting here that WIDENS what a session can reach,
+	// so unlike the others it is admitted to the list and then refused at
+	// the router unless the session holds pgshard_admin.
+	ShardGUC: true,
+}
+
+// constText renders a SET's single argument, whether it was written quoted
+// or not: SET x = '2' and SET x = 2 are the same setting, and reading only
+// the quoted form left the value empty for the other -- which a check on
+// the value then skipped.
+func constText(c *pgquerypb.A_Const) string {
+	switch {
+	case c == nil:
+		return ""
+	case c.GetSval() != nil:
+		return c.GetSval().GetSval()
+	case c.GetIval() != nil:
+		return strconv.FormatInt(int64(c.GetIval().GetIval()), 10)
+	case c.GetFval() != nil:
+		return c.GetFval().GetFval()
+	case c.GetBoolval() != nil:
+		return strconv.FormatBool(c.GetBoolval().GetBoolval())
+	}
+	return ""
 }
 
 func refuseProtectedGUC(name string) error {
