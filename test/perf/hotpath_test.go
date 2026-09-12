@@ -607,3 +607,66 @@ func BenchmarkGRPCPoolerHopSocket(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkPlannerLiteralVarying is PGS-773's measurement: the same
+// statement with a different literal each time, which is what an
+// application on the simple query protocol sends. The parse cache is keyed
+// on the statement TEXT, so every one of these is a miss -- a full grammar
+// parse and a full plan.
+func BenchmarkPlannerLiteralVarying(b *testing.B) {
+	p := plan.New()
+	sess := plan.Session{Database: "app", HomeShard: 0, Snapshot: benchSnapshot(b)}
+	ctx := context.Background()
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		pl, err := p.Plan(ctx, sess, fmt.Sprintf("SELECT * FROM orders WHERE tenant_id = %d", i))
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkPlan = pl
+	}
+}
+
+// BenchmarkPlannerLiteralRepeated is the same statement with the SAME
+// literal, which hits the cache. The gap between this and
+// BenchmarkPlannerLiteralVarying is what normalising a literal to a
+// parameter before the lookup would be worth.
+func BenchmarkPlannerLiteralRepeated(b *testing.B) {
+	p := plan.New()
+	sess := plan.Session{Database: "app", HomeShard: 0, Snapshot: benchSnapshot(b)}
+	ctx := context.Background()
+	if _, err := p.Plan(ctx, sess, "SELECT * FROM orders WHERE tenant_id = 1"); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		pl, err := p.Plan(ctx, sess, "SELECT * FROM orders WHERE tenant_id = 1")
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkPlan = pl
+	}
+}
+
+// BenchmarkStatementFingerprint is PGS-773's enabler measured on its own.
+// libpg_query's fingerprint is literal-insensitive by construction -- it
+// hashes the statement SHAPE, so "tenant_id = 12", "tenant_id = 13" and
+// "tenant_id = $1" all give one value -- and it costs a fraction of a
+// parse. Keying a plan cache on it is what would let a literal-varying
+// workload share a plan.
+func BenchmarkStatementFingerprint(b *testing.B) {
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		f, err := pgparser.Fingerprint(fmt.Sprintf("SELECT * FROM orders WHERE tenant_id = %d", i))
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkFingerprint = f
+	}
+}
+
+var sinkFingerprint string
