@@ -137,6 +137,10 @@ type Plan struct {
 	// NextVal names the global sequence a `SELECT nextval('...')` reads;
 	// the router answers it without visiting a shard (Kind SessionLocal).
 	NextVal string
+	// Copy, when set, is a COPY ... FROM STDIN into a sharded table: the
+	// router splits the stream and sends each row to the shard its key
+	// belongs to.
+	Copy *Copy
 	// Explain is the rendered router plan of EXPLAIN (PGSHARD) ..., which
 	// the router answers itself. A user otherwise has no way to see the
 	// routing decision at all: a plain EXPLAIN is planned and sent to a
