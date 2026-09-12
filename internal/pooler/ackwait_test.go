@@ -7,10 +7,10 @@ import (
 	"time"
 )
 
-// An ack waits for the server to confirm the position it advanced to. It
-// used to ask again every ten milliseconds, so the caller heard between
-// zero and a full interval after the fact, on a path whose whole purpose is
-// to tell a consumer its position is durable.
+// An ack waits for the standby status message carrying its position to go
+// out. It used to ask again every ten milliseconds, so the caller heard
+// between zero and a full interval after the fact, on a path whose whole
+// purpose is to tell a consumer where its position stands.
 func TestAnAckHearsTheFlushAsItHappens(t *testing.T) {
 	r := &streamReader{wake: make(chan struct{}, 1)}
 	r.acked.Store(100)
@@ -18,7 +18,7 @@ func TestAnAckHearsTheFlushAsItHappens(t *testing.T) {
 	// Registered before the flush, which is the case that matters: a
 	// waiter that reads the value and then starts waiting must not miss an
 	// advance in between.
-	flushed, advanced := r.flushedAt()
+	flushed, advanced := r.sentAt()
 	if flushed != 0 {
 		t.Fatalf("flushed = %d, want 0", flushed)
 	}
@@ -31,7 +31,7 @@ func TestAnAckHearsTheFlushAsItHappens(t *testing.T) {
 	}()
 
 	time.Sleep(20 * time.Millisecond)
-	r.noteFlushed(100)
+	r.noteSent(100)
 
 	select {
 	case took := <-done:
@@ -43,7 +43,7 @@ func TestAnAckHearsTheFlushAsItHappens(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the flush did not wake the waiter")
 	}
-	if got := r.flushed.Load(); got != 100 {
+	if got := r.sent.Load(); got != 100 {
 		t.Fatalf("flushed = %d, want 100", got)
 	}
 }
@@ -53,8 +53,8 @@ func TestAnAckHearsTheFlushAsItHappens(t *testing.T) {
 // caller sees the advance it already missed.
 func TestAnAckThatIsAlreadySatisfiedDoesNotWait(t *testing.T) {
 	r := &streamReader{wake: make(chan struct{}, 1)}
-	r.noteFlushed(50)
-	if flushed, _ := r.flushedAt(); flushed != 50 {
+	r.noteSent(50)
+	if flushed, _ := r.sentAt(); flushed != 50 {
 		t.Fatalf("flushed = %d, want the advance that already happened", flushed)
 	}
 }
@@ -64,10 +64,10 @@ func TestEveryWaiterHearsTheFlush(t *testing.T) {
 	r := &streamReader{wake: make(chan struct{}, 1)}
 	var chans []<-chan struct{}
 	for range 4 {
-		_, c := r.flushedAt()
+		_, c := r.sentAt()
 		chans = append(chans, c)
 	}
-	r.noteFlushed(7)
+	r.noteSent(7)
 	for i, c := range chans {
 		select {
 		case <-c:
@@ -97,9 +97,9 @@ func TestTheWaitIsWokenByTheFlushRatherThanAClock(t *testing.T) {
 		go func() {
 			time.Sleep(delay)
 			flushed <- time.Now()
-			r.noteFlushed(100)
+			r.noteSent(100)
 		}()
-		if err := r.awaitFlush(context.Background(), 100, 5*time.Second); err != nil {
+		if err := r.awaitSent(context.Background(), 100, 5*time.Second); err != nil {
 			t.Fatal(err)
 		}
 		if late := time.Since(<-flushed); late > worst {
@@ -114,9 +114,9 @@ func TestTheWaitIsWokenByTheFlushRatherThanAClock(t *testing.T) {
 // A wait that is already satisfied returns without waiting at all.
 func TestAWaitThatIsAlreadySatisfiedReturnsAtOnce(t *testing.T) {
 	r := &streamReader{wake: make(chan struct{}, 1)}
-	r.noteFlushed(100)
+	r.noteSent(100)
 	start := time.Now()
-	if err := r.awaitFlush(context.Background(), 100, time.Millisecond); err != nil {
+	if err := r.awaitSent(context.Background(), 100, time.Millisecond); err != nil {
 		t.Fatalf("awaitFlush: %v", err)
 	}
 	if took := time.Since(start); took > 500*time.Millisecond {
@@ -143,7 +143,7 @@ func TestRegisteringForTheNextFlushCannotMissThisOne(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				flushed, advanced := r.flushedAt()
+				flushed, advanced := r.sentAt()
 				if flushed >= target {
 					return
 				}
@@ -154,7 +154,7 @@ func TestRegisteringForTheNextFlushCannotMissThisOne(t *testing.T) {
 				}
 			}()
 		}
-		go r.noteFlushed(target)
+		go r.noteSent(target)
 		wg.Wait()
 		close(stranded)
 		if saw, ok := <-stranded; ok {

@@ -132,12 +132,15 @@ const ackConfirmTimeout = 10 * time.Second
 
 // streamReader is the one admitted reader of a slot.
 type streamReader struct {
-	acked     atomic.Uint64
-	flushed   atomic.Uint64
+	acked atomic.Uint64
+	// sent is how far a standby status message has carried the position.
+	// Not how far the server has confirmed: nothing reports that back on
+	// this connection.
+	sent      atomic.Uint64
 	delivered atomic.Uint64
 	wake      chan struct{}
 
-	// mu guards progress, the channel closed each time flushed advances.
+	// mu guards progress, the channel closed each time sent advances.
 	// An ack waits on it rather than asking again every few milliseconds:
 	// polling put its own interval between the slot moving and the caller
 	// hearing so, on a path whose whole job is to tell a consumer its
@@ -146,29 +149,38 @@ type streamReader struct {
 	progress chan struct{}
 }
 
-// flushedAt returns the channel closed the next time flushed advances, and
+// sentAt returns the channel closed the next time the sent position
+// advances, and
 // the value it stands at now. Both under one lock, so a caller cannot miss
 // an advance between reading the value and starting to wait for the next.
-func (r *streamReader) flushedAt() (uint64, <-chan struct{}) {
+func (r *streamReader) sentAt() (uint64, <-chan struct{}) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.progress == nil {
 		r.progress = make(chan struct{})
 	}
-	return r.flushed.Load(), r.progress
+	return r.sent.Load(), r.progress
 }
 
-// awaitFlush waits until the server has confirmed lsn.
+// awaitSent waits until a standby status message carrying lsn has been
+// written to the replication connection.
 //
-// It waits on the flush rather than asking again on a timer: polling put
-// its own interval between the slot moving and the caller hearing so, on
-// the one path whose purpose is to tell a consumer its position is durable.
-func (r *streamReader) awaitFlush(ctx context.Context, lsn uint64, within time.Duration) error {
+// NOT until the server has confirmed it, because there is nothing to wait
+// for: a standby status update is one-way, PostgreSQL never replies to it,
+// and the only place the slot's position can be read back is
+// pg_replication_slots on a different connection. So what this can promise
+// is that the position was ASKED FOR, and that the asking did not fail.
+//
+// It waits on the send rather than asking again on a timer: polling put its
+// own interval between the message going out and the caller hearing so, on
+// the one path whose purpose is to tell a consumer where its position
+// stands.
+func (r *streamReader) awaitSent(ctx context.Context, lsn uint64, within time.Duration) error {
 	timeout := time.NewTimer(within)
 	defer timeout.Stop()
 	for {
-		flushed, advanced := r.flushedAt()
-		if flushed >= lsn {
+		sent, advanced := r.sentAt()
+		if sent >= lsn {
 			return nil
 		}
 		select {
@@ -184,11 +196,33 @@ func (r *streamReader) awaitFlush(ctx context.Context, lsn uint64, within time.D
 	}
 }
 
-// noteFlushed records how far the server has confirmed and wakes whoever is
-// waiting for it.
-func (r *streamReader) noteFlushed(lsn uint64) {
+// statusSender is the write half of a replication connection, so the order
+// below can be tested without one.
+type statusSender interface {
+	SendStandbyStatus(pgrepl.StandbyStatus) error
+}
+
+// sendStatus tells the server how far this reader has got, and records the
+// position ONLY once the write has returned without error.
+//
+// The order is the guarantee. Recording first would have an ack report a
+// position that no status message carried -- the consumer told its position
+// stands while the connection was dropping the message that said so.
+func (r *streamReader) sendStatus(c statusSender) error {
+	lsn := r.acked.Load()
+	if err := c.SendStandbyStatus(pgrepl.StandbyStatus{Written: pgrepl.LSN(lsn), Flushed: pgrepl.LSN(lsn), Applied: pgrepl.LSN(lsn)}); err != nil {
+		return err
+	}
+	r.noteSent(lsn)
+	return nil
+}
+
+// noteSent records how far a standby status message has carried the
+// position, and wakes whoever is waiting for it. It is called after the
+// write to the socket returns, which is the last thing this side observes.
+func (r *streamReader) noteSent(lsn uint64) {
 	r.mu.Lock()
-	r.flushed.Store(lsn)
+	r.sent.Store(lsn)
 	c := r.progress
 	r.progress = nil
 	r.mu.Unlock()
@@ -355,7 +389,7 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	case r.wake <- struct{}{}:
 	default:
 	}
-	if err := r.awaitFlush(ctx, lsn, ackConfirmTimeout); err != nil {
+	if err := r.awaitSent(ctx, lsn, ackConfirmTimeout); err != nil {
 		return nil, err
 	}
 	return &pgshardv1.AckResponse{ConfirmedLsn: lsn}, nil
@@ -464,11 +498,9 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 	lastStatus := time.Now()
 	var serverEnd pgrepl.LSN
 	sendStatus := func() error {
-		lsn := reader.acked.Load()
-		if err := conn.SendStandbyStatus(pgrepl.StandbyStatus{Written: pgrepl.LSN(lsn), Flushed: pgrepl.LSN(lsn), Applied: pgrepl.LSN(lsn)}); err != nil {
+		if err := reader.sendStatus(conn); err != nil {
 			return err
 		}
-		reader.noteFlushed(lsn)
 		lastStatus = time.Now()
 		return nil
 	}
@@ -498,7 +530,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		case ctx.Err() != nil:
 			return nil
 		case pgrepl.IsTimeout(err):
-			if reader.flushed.Load() < reader.acked.Load() || time.Since(lastStatus) > 10*time.Second {
+			if reader.sent.Load() < reader.acked.Load() || time.Since(lastStatus) > 10*time.Second {
 				if err := sendStatus(); err != nil {
 					return status.Errorf(codes.Unavailable, "standby status: %v", err)
 				}

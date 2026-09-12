@@ -3183,10 +3183,26 @@ func (x *AckRequest) GetGeneration() *Generation {
 type AckResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Error *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
-	// LSN the pooler actually confirmed to PostgreSQL, which is the ack
-	// clamped to what this reader has delivered. A caller that records the
-	// LSN it asked for rather than this one believes a slot advanced when it
-	// did not, and never asks again.
+	// LSN the pooler ASKED PostgreSQL to confirm: the ack clamped to what
+	// this reader has actually delivered, once a standby status message
+	// carrying it has been written to the replication connection.
+	//
+	// The clamp is the important half, and it is exact: a caller that records
+	// the LSN it asked for rather than this one believes a slot advanced when
+	// it did not, and never asks again.
+	//
+	// It is NOT a durability receipt, and the name is older than this
+	// comment. A standby status update is one-way -- PostgreSQL never replies
+	// to it -- so the only thing this side can observe is that the message
+	// went out and the write did not fail. The slot's real position is
+	// readable only from pg_replication_slots, on another connection.
+	//
+	// That is safe for the guarantee the stream makes. A consumer that
+	// records this and restarts resumes from the SLOT's position, which can
+	// only be at or behind it, so the result is redelivery -- the
+	// at-least-once the stream already promises -- and never a gap. A
+	// consumer must not read it as "the server has this, I may discard my
+	// copy".
 	ConfirmedLsn  uint64 `protobuf:"varint,2,opt,name=confirmed_lsn,json=confirmedLsn,proto3" json:"confirmed_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
