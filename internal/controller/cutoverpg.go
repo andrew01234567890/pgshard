@@ -1201,10 +1201,19 @@ func (o *pgCutover) DrainSources(ctx context.Context) error {
 }
 
 // pauseSet flips default_transaction_read_only on every primary of a set.
+//
+// The claim in the catalog is written BEFORE the pause and dropped AFTER it
+// is lifted, so the two failure windows both fall on the harmless side: a
+// claim with no pause behind it costs a sweep one ALTER SYSTEM RESET of a
+// shard that was already writable, while a pause with no claim is the leak
+// the claim exists to close. See WritePauseSweep.
 func (o *pgCutover) pauseSet(ctx context.Context, set string, ids []int32, pause bool) error {
 	stmt := `ALTER SYSTEM RESET default_transaction_read_only`
 	if pause {
 		stmt = `ALTER SYSTEM SET default_transaction_read_only = on`
+		if err := o.claimPause(ctx, set, ids); err != nil {
+			return err
+		}
 	}
 	for _, s := range ids {
 		at, err := o.setReadOnly(ctx, set, s, stmt, pause)
@@ -1220,7 +1229,24 @@ func (o *pgCutover) pauseSet(ctx context.Context, set string, ids []int32, pause
 			delete(o.pausedAt, pausedShard{set, s})
 		}
 	}
+	if !pause {
+		return o.dropPauseClaim(ctx, set, ids)
+	}
 	return nil
+}
+
+func (o *pgCutover) claimPause(ctx context.Context, set string, ids []int32) error {
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = $3::uuid, updated_at = now()
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by IS DISTINCT FROM $3::uuid`, set, ids, o.wf.id)
+	return err
+}
+
+// dropPauseClaim is scoped to this workflow, so it releases nothing it did
+// not claim.
+func (o *pgCutover) dropPauseClaim(ctx context.Context, set string, ids []int32) error {
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by = $3::uuid`, set, ids, o.wf.id)
+	return err
 }
 
 // drainWriters waits until no client backend on the set still holds a
