@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
+
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	pgquerypb "github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
 )
@@ -19,51 +21,110 @@ import (
 // of a sharded database actually has when a query is slow.
 const ExplainOption = "pgshard"
 
-// explainsRouting reports whether EXPLAIN carries the pgshard option, which
-// PostgreSQL spells like every other boolean EXPLAIN option: bare means on,
-// and an explicit false means off.
-func explainsRouting(e *pgquerypb.ExplainStmt) bool {
+// explainRequest is what an EXPLAIN says about the pgshard option.
+type explainRequest int
+
+const (
+	// explainPlain does not mention it, and is routed to a shard as it is.
+	explainPlain explainRequest = iota
+	// explainRouting asks the router for its own plan.
+	explainRouting
+	// explainDeclined names the option and turns it off, which asks for
+	// what PostgreSQL means by EXPLAIN. The option is ours, so it has to
+	// come off the statement before a shard sees it.
+	explainDeclined
+)
+
+// explainsRouting reads the pgshard option, which PostgreSQL spells like
+// every other boolean EXPLAIN option: bare means on, and an explicit false
+// means off.
+//
+// The LAST spelling wins, because that is what defGetBoolean does with a
+// repeated option and the user writing (pgshard true, pgshard false) is
+// entitled to the answer PostgreSQL would have given.
+func explainsRouting(e *pgquerypb.ExplainStmt) (explainRequest, error) {
+	out := explainPlain
 	for _, o := range e.GetOptions() {
 		d := o.GetDefElem()
 		if d == nil || !strings.EqualFold(d.GetDefname(), ExplainOption) {
 			continue
 		}
-		return optionIsOn(d)
+		on, err := optionIsOn(d)
+		if err != nil {
+			return out, err
+		}
+		if on {
+			out = explainRouting
+		} else {
+			out = explainDeclined
+		}
 	}
-	return false
+	return out, nil
 }
 
-// optionIsOn reads a boolean EXPLAIN option the way defGetBoolean does: no
-// argument is true, and TRUE/ON/1 in any of the spellings the grammar puts
-// them in is true.
+// withoutExplainOption is the statement with every pgshard option removed,
+// so a shard is asked something it recognises.
+//
+// EXPLAIN (PGSHARD FALSE) means "do what PostgreSQL means by EXPLAIN", and
+// forwarding it verbatim got the user `unrecognized EXPLAIN option
+// "pgshard"` -- an error about a form we define, from a server that has
+// never heard of it.
+func withoutExplainOption(e *pgquerypb.ExplainStmt) *pgquerypb.Node {
+	kept := make([]*pgquerypb.Node, 0, len(e.GetOptions()))
+	for _, o := range e.GetOptions() {
+		if d := o.GetDefElem(); d != nil && strings.EqualFold(d.GetDefname(), ExplainOption) {
+			continue
+		}
+		kept = append(kept, o)
+	}
+	return &pgquerypb.Node{Node: &pgquerypb.Node_ExplainStmt{
+		ExplainStmt: &pgquerypb.ExplainStmt{Query: e.GetQuery(), Options: kept},
+	}}
+}
+
+// optionIsOn reads a boolean EXPLAIN option exactly as defGetBoolean does:
+// no argument is true, the integers 0 and 1, and the words true, false, on
+// and off in any case. Anything else is the error defGetBoolean raises.
+//
+// The error has to be raised here rather than left to a shard. Every other
+// EXPLAIN option is PostgreSQL's, so a shard rejects what it cannot read;
+// this one is ours, and the statement carrying it either never leaves the
+// router or leaves with the option stripped off. Treating an unreadable
+// value as false would run the statement the user did not ask for.
 //
 // The grammar hands the argument over as a bare String or Integer node
 // rather than an A_Const, so `(pgshard on)` and `(pgshard 1)` arrive in two
 // different shapes and neither is the shape a value expression has.
-func optionIsOn(d *pgquerypb.DefElem) bool {
+func optionIsOn(d *pgquerypb.DefElem) (bool, error) {
 	arg := d.GetArg()
 	switch {
 	case arg == nil:
-		return true
+		return true, nil
 	case arg.GetString_() != nil:
-		return isTrueWord(arg.GetString_().GetSval())
+		switch strings.ToLower(arg.GetString_().GetSval()) {
+		case "true", "on":
+			return true, nil
+		case "false", "off":
+			return false, nil
+		}
 	case arg.GetInteger() != nil:
-		// 1 and nothing else: defGetBoolean rejects any other number, and
-		// leaving the option unrecognised here sends the statement to a
-		// shard, where PostgreSQL raises that rejection itself.
-		return arg.GetInteger().GetIval() == 1
+		switch arg.GetInteger().GetIval() {
+		case 1:
+			return true, nil
+		case 0:
+			return false, nil
+		}
 	case arg.GetBoolean() != nil:
-		return arg.GetBoolean().GetBoolval()
+		return arg.GetBoolean().GetBoolval(), nil
 	}
-	return false
+	return false, notBoolean()
 }
 
-func isTrueWord(s string) bool {
-	switch strings.ToLower(s) {
-	case "true", "on", "yes", "t", "y", "1":
-		return true
-	}
-	return false
+// notBoolean is defGetBoolean's own refusal, message and SQLSTATE.
+func notBoolean() *pgwire.Error {
+	err := pgwire.Errorf(pgwire.CodeSyntaxError, "%s requires a Boolean value", ExplainOption)
+	err.Hint = "write " + ExplainOption + ", " + ExplainOption + " false, or leave it out"
+	return err
 }
 
 // refuseOtherExplainOptions refuses pgshard combined with any other EXPLAIN
@@ -87,7 +148,7 @@ func refuseOtherExplainOptions(e *pgquerypb.ExplainStmt) error {
 	return nil
 }
 
-// explainRouting plans the inner statement and renders the routing decision
+// planExplain plans the inner statement and renders the routing decision
 // instead of running it. The statement is never executed: EXPLAIN without
 // ANALYZE does not run its argument, and the router has nothing to measure
 // without doing so.
@@ -97,7 +158,7 @@ func refuseOtherExplainOptions(e *pgquerypb.ExplainStmt) error {
 // needs to see, and several of the refusals are raised before the walker is
 // ever reached. Rendering only the ones the walker raises would leave
 // EXPLAIN aborting on exactly the statements it was asked about.
-func (p *Planner) explainRouting(ctx context.Context, sess Session, version int32, e *pgquerypb.ExplainStmt) (Plan, error) {
+func (p *Planner) planExplain(ctx context.Context, sess Session, version int32, e *pgquerypb.ExplainStmt) (Plan, error) {
 	if err := refuseOtherExplainOptions(e); err != nil {
 		return refusalErr(err)
 	}
@@ -108,7 +169,40 @@ func (p *Planner) explainRouting(ctx context.Context, sess Session, version int3
 	}
 	sub, subErr := p.plan(ctx, sess, sql, false)
 	out.Explain = renderPlan(&sub, subErr)
+	out.ExplainParams = explainParamOIDs(e.GetQuery(), &sub)
 	return out, nil
+}
+
+// explainParamOIDs types the parameters of the statement being explained.
+//
+// The count is what matters: a driver sends no values at all unless the
+// server says how many it expects. The types are 0 -- the protocol's
+// "unspecified", which every driver answers by inferring from the value it
+// holds -- except where the sub-plan routes on a parameter and the catalog
+// has recorded the shard key column's type, which is the type PostgreSQL
+// would have inferred there.
+//
+// Claiming a type we have not determined would be worse than saying
+// nothing: the values are never read here, but a driver that trusts a wrong
+// one fails to encode a perfectly good argument.
+func explainParamOIDs(q *pgquerypb.Node, sub *Plan) []uint32 {
+	n := maxParam(q)
+	if n == 0 {
+		return nil
+	}
+	oids := make([]uint32, n)
+	for _, t := range sub.terms {
+		oid := inferredOID(t.keyType)
+		if oid == 0 {
+			continue
+		}
+		for _, ref := range t.params {
+			if i := int(ref.Number) - 1; i >= 0 && i < len(oids) {
+				oids[i] = oid
+			}
+		}
+	}
+	return oids
 }
 
 // renderPlan describes a plan in the terms the router decided it in.

@@ -904,6 +904,9 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		return e.afterBatch(ctx, e.runMigration(ctx, pl, w))
 	}
 	if pl.NextVal != "" {
+		if err := e.refuseSelfAnsweredInFailedTxn(); err != nil {
+			return e.afterBatch(ctx, err)
+		}
 		return e.afterBatch(ctx, e.answerNextval(ctx, pl.NextVal, true, true, false, w))
 	}
 	if pl.Class.Write {
@@ -1202,6 +1205,27 @@ func (e *Executor) refuseInFailedTransaction(class StmtClass) error {
 		return nil
 	}
 	if class.Txn == plan.TxnCommit || class.Txn == plan.TxnRollback {
+		return nil
+	}
+	return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+}
+
+// refuseSelfAnsweredInFailedTxn refuses nextval() over a global sequence in
+// a transaction PostgreSQL has already failed.
+//
+// refuseInFailedTransaction above only covers a session whose backend is
+// gone, because a session that still has one is refused by the backend when
+// the statement gets there. nextval() never gets there: the value comes
+// from the router's own block of the global sequence. It would be handed
+// out inside a transaction that cannot commit and never returned -- a gap
+// in the sequence, which is allowed, opened at precisely the point where
+// PostgreSQL would have done nothing at all.
+//
+// EXPLAIN (pgshard) is answered in a failed transaction on purpose and is
+// not routed through here: it is how a user sees why the statement that
+// failed was routed the way it was, without first losing the transaction.
+func (e *Executor) refuseSelfAnsweredInFailedTxn() error {
+	if e.tx != pgwire.TxFailed {
 		return nil
 	}
 	return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
