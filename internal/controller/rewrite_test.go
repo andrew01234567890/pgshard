@@ -417,3 +417,58 @@ func TestAShardThatCutOverIsLeftAloneAndReported(t *testing.T) {
 		t.Error("the shard whose cutover failed was not reverted")
 	}
 }
+
+// A cutover whose COMMIT reply never came back is still reported as
+// diverged, and its shard is not reverted.
+//
+// PGS-752 L4 reads Step and concludes otherwise: Step advances only for a
+// shard that did NOT fail, so a shard whose cutover errored keeps
+// Step == rewriteCutover, which anyShardCutOver reads as "did not cut
+// over". That much is true. What it misses is that the shard is asked
+// again -- cutover begins by checking whether the hidden column is still
+// there, and a lost reply leaves it gone, so the next attempt returns
+// ShardApplied and the step advances after all. The idempotence check that
+// exists for a resumed migration answers this case too.
+//
+// Kept although it passes, because nothing else pins it. The reporting
+// rests on cutover being attempted a second time AND on that check being
+// the first thing it does; either could be refactored away with no other
+// test noticing, and the cost is a schema diverged on one shard while the
+// migration reports a clean failure.
+func TestACutoverWhoseReplyWasLostIsStillReportedAsDiverged(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0c")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	// Shard 0's cutover commits on the server and the reply is lost. Shard
+	// 1 then fails for its own reason, which is what ends the migration.
+	cutOver := map[int32]bool{}
+	shards.exec = func(id int32, sql string) error {
+		if strings.Contains(sql, "RENAME COLUMN") {
+			cutOver[id] = true
+			if id == 0 {
+				return pgErr("08006", "connection closed before the reply")
+			}
+			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	shards.hiddenExists = func(id int32) bool { return !cutOver[id] }
+
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0c")
+	if m.State != catalog.MigrationFailed {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if !strings.Contains(m.Error, "already be cut over") {
+		t.Errorf("a shard cut over and the migration does not say so: %q", m.Error)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	if has(shards.superuserStatements(0), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("shard 0 cut over and was reverted anyway")
+	}
+}
