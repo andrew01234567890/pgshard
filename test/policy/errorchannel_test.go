@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"io/fs"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -105,11 +106,12 @@ func TestNoRPCReturnsAnErrorInAnOKResponse(t *testing.T) {
 			if !ok {
 				continue
 			}
-			// Counted per function so a second embedding in the same one
-			// can be listed separately; the order is source order, which
-			// ast.Inspect walks deterministically.
-			n := 0
-			lines := map[token.Pos]bool{}
+			// Collected first and SORTED, because ast.Inspect visits a
+			// block before its children: a return in the function's own
+			// list is reached before one nested in an if, so walk order
+			// numbered backupops.go's Verify #1 at line 294 and #2 at 288,
+			// and the two reasons in the list documented each other's site.
+			var at []token.Pos
 			ast.Inspect(fn, func(node ast.Node) bool {
 				var list []ast.Stmt
 				switch b := node.(type) {
@@ -122,26 +124,26 @@ func TestNoRPCReturnsAnErrorInAnOKResponse(t *testing.T) {
 				default:
 					return true
 				}
-				for _, pos := range embeddedErrorReturns(list) {
-					if lines[pos] {
-						continue
-					}
-					lines[pos] = true
-					n++
-					at := rel + " " + funcName(fn)
-					if n > 1 {
-						at += "#" + strconv.Itoa(n)
-					}
-					if seen[at] {
-						continue
-					}
-					seen[at] = true
-					if _, ok := deliberate[at]; !ok {
-						found = append(found, at+" (line "+strconv.Itoa(fset.Position(pos).Line)+")")
-					}
-				}
+				at = append(at, embeddedErrorReturns(list)...)
 				return true
 			})
+			slices.Sort(at)
+			for i, pos := range at {
+				key := rel + " " + funcName(fn)
+				if i > 0 {
+					key += "#" + strconv.Itoa(i+1)
+				}
+				if seen[key] {
+					// With a function key a repeat is a collision, not a
+					// duplicate sighting: two functions reduced to the same
+					// name would leave the second silently unscanned.
+					t.Fatalf("two functions produced the key %q; funcName cannot tell them apart", key)
+				}
+				seen[key] = true
+				if _, ok := deliberate[key]; !ok {
+					found = append(found, key+" (line "+strconv.Itoa(fset.Position(pos).Line)+")")
+				}
+			}
 		}
 		return nil
 	})
@@ -174,15 +176,29 @@ func funcName(fn *ast.FuncDecl) string {
 	switch t := fn.Recv.List[0].Type.(type) {
 	case *ast.StarExpr:
 		b.WriteString("*")
-		if id, ok := t.X.(*ast.Ident); ok {
-			b.WriteString(id.Name)
-		}
-	case *ast.Ident:
-		b.WriteString(t.Name)
+		b.WriteString(receiverName(t.X))
+	default:
+		b.WriteString(receiverName(t))
 	}
 	b.WriteString(").")
 	b.WriteString(fn.Name.Name)
 	return b.String()
+}
+
+// receiverName is the type name, reaching through the type arguments of a
+// generic receiver. Without that reach a method on Foo[T] keys as "(*)." and
+// two of them in one file collide, which the duplicate check above turns
+// into a failure rather than a silently unscanned function.
+func receiverName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr:
+		return receiverName(t.X)
+	case *ast.IndexListExpr:
+		return receiverName(t.X)
+	}
+	return ""
 }
 
 // embeddedErrorReturns finds, within ONE statement list, the returns of
