@@ -118,14 +118,14 @@ func TestGoldenDetails(t *testing.T) {
 		}
 		switch v := m.(type) {
 		case *Insert:
-			if v.Xid != 0 && d.InStream() {
+			if v.Xid != 0 && d.inStream {
 				streamedXid = true
 			}
 		case *StreamAbort:
 			abortLSN = v.AbortLSN != 0 && v.SubXid != v.Xid && !v.AbortTime.IsZero()
 		}
 	}
-	if d.InStream() {
+	if d.inStream {
 		t.Fatal("decoder still in stream after capture")
 	}
 	for name, ok := range map[string]bool{"unchanged toast": unchanged, "key-only old image": keyUpdate, "full old image": fullOld,
@@ -156,7 +156,7 @@ func TestDecodeErrors(t *testing.T) {
 			t.Errorf("%s: decoded %v", name, m)
 		}
 	}
-	if d.InStream() {
+	if d.inStream {
 		t.Fatal("errors changed stream state")
 	}
 }
@@ -172,18 +172,18 @@ func TestStreamStateAndXid(t *testing.T) {
 	if _, err := d.Decode([]byte{'S', 0, 0, 0, 42, 1}); err != nil {
 		t.Fatal(err)
 	}
-	if !d.InStream() {
+	if !d.inStream {
 		t.Fatal("not in stream")
 	}
 	m, err = d.Decode(append([]byte{'I', 0, 0, 0, 42}, ins[1:]...))
 	if err != nil || m.(*Insert).Xid != 42 || m.(*Insert).RelationID != 7 {
 		t.Fatalf("insert inside stream: %v %v", m, err)
 	}
-	if _, err := d.Decode([]byte{'E'}); err != nil || d.InStream() {
+	if _, err := d.Decode([]byte{'E'}); err != nil || d.inStream {
 		t.Fatal("stream stop")
 	}
 	// A short stream start must not flip the state.
-	if _, err := d.Decode([]byte{'S', 0, 0}); err == nil || d.InStream() {
+	if _, err := d.Decode([]byte{'S', 0, 0}); err == nil || d.inStream {
 		t.Fatal("short stream start")
 	}
 	// Stream abort without parallel info (protocol < 4 shape).

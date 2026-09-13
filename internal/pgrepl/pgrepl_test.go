@@ -238,7 +238,7 @@ func runCaptures(t *testing.T, image, label string) {
 		t.Fatal(err)
 	}
 	defer func() { _ = rc.Close(ctx) }()
-	sys, err := rc.IdentifySystem(ctx)
+	sys, err := rc.identifySystem(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

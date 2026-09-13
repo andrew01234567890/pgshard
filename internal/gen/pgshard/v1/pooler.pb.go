@@ -1338,6 +1338,12 @@ type ExecuteRequest_CopyFail struct {
 }
 
 type ExecuteRequest_Cancel struct {
+	// Cancel here cannot interrupt a statement that is already running:
+	// Execute reads the next message only after the current one is
+	// handled, so this one waits behind the statement it would cancel. The
+	// router uses the unary Cancel RPC, which arrives on its own
+	// connection. Kept because the pooler still honours it between
+	// statements and removing a wire field is a compatibility change.
 	Cancel *CancelRequest `protobuf:"bytes,20,opt,name=cancel,proto3,oneof"`
 }
 

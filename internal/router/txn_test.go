@@ -11,6 +11,7 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/controller"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -877,4 +878,55 @@ func TestCrossShardLockWaitsCanBeLeftUnbounded(t *testing.T) {
 		}
 	}
 	_ = tx.Rollback(ctx)
+}
+
+// A redundant BEGIN, sent while a transaction already spans shards, is
+// completed rather than swallowed.
+//
+// PostgreSQL answers one with a WARNING and completes it normally
+// (xact.c:4007-4010, ERRCODE_ACTIVE_SQL_TRANSACTION), and the tag is what a
+// driver counting replies needs: a missing CommandComplete desynchronises
+// pgjdbc, which then reports the next statement's result against this one.
+//
+// The reply comes from a backend -- the router answers no BEGIN itself --
+// and this pins that, in both protocols, for the one session state where a
+// router-side answer would be tempting. It is also the guard on
+// txnControlBatch, which claims a batch by its transaction-control
+// statement and can only answer COMMIT, ROLLBACK and the savepoint family:
+// were a BEGIN ever routed there, txnControl would fall through and write
+// nothing at all.
+func TestARedundantBeginIsCompletedAcrossShards(t *testing.T) {
+	ctx := context.Background()
+	h := newTxnHarness(t)
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
+		t.Fatalf("second writable shard must escalate, not refuse: %v", err)
+	}
+
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeSimpleProtocol} {
+		tag, err := tx.Exec(ctx, "begin", mode)
+		if err != nil {
+			t.Fatalf("%v: a redundant BEGIN must not fail: %v", mode, err)
+		}
+		if tag.String() != "BEGIN" {
+			t.Errorf("%v: BEGIN answered %q; a driver that counts replies desynchronises on a missing CommandComplete", mode, tag.String())
+		}
+	}
+
+	// And the transaction is still the one it was: still open, still
+	// spanning both shards, so the commit is still two-phase.
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.allRan("prepare transaction"); len(got) != 2 {
+		t.Fatalf("shards that prepared: %v, want the two the transaction wrote to; the redundant BEGIN ended it", got)
+	}
 }

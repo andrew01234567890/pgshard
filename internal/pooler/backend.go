@@ -90,9 +90,12 @@ type Backend struct {
 	credDigest [32]byte
 	// unflushed counts messages buffered in fe but not yet written.
 	unflushed int
-	// prepared names the statements this connection may hold; the set
-	// outlives the session that parsed them so a reused backend is never
-	// asked to PREPARE a name it already has.
+	// prepared names the statements this connection holds, for as long as
+	// one session holds the connection. Recycling a backend runs DISCARD
+	// ALL and clears it, so the set does NOT survive a handoff and a
+	// session that gets this backend next has to parse its names again --
+	// which is what makes the handoff safe, and what PreparedHits counts
+	// the absence of.
 	prepared preparedSet
 	// sqlPrepared is set when the backend may hold statements created by a
 	// SQL-level PREPARE the pooler did not parse the name out of; every

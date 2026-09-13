@@ -244,9 +244,6 @@ func (d *Decoder) Relation(id uint32) (*Relation, bool) {
 	return r, ok
 }
 
-// InStream reports whether the decoder is inside a streamed segment.
-func (d *Decoder) InStream() bool { return d.inStream }
-
 // Decode decodes one message (the payload of one XLogData frame).
 func (d *Decoder) Decode(data []byte) (Message, error) {
 	if len(data) == 0 {

@@ -100,8 +100,8 @@ func (c *Conn) simple(ctx context.Context, sql string) ([][]string, error) {
 	return rows, nil
 }
 
-// IdentifySystem runs IDENTIFY_SYSTEM.
-func (c *Conn) IdentifySystem(ctx context.Context) (SystemInfo, error) {
+// identifySystem runs IDENTIFY_SYSTEM.
+func (c *Conn) identifySystem(ctx context.Context) (SystemInfo, error) {
 	rows, err := c.simple(ctx, "IDENTIFY_SYSTEM")
 	if err != nil {
 		return SystemInfo{}, err
