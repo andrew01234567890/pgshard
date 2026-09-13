@@ -58,6 +58,10 @@ type Prober interface {
 	PauseWrites(ctx context.Context, dsn string) error
 	// WriteFenced reads the catalog write fence, given a catalog DSN.
 	WriteFenced(ctx context.Context, dsn string) (bool, error)
+	// WritePauseClaimed reports whether a cutover holds a write pause on
+	// this shard, which is a different statement of intent from the
+	// barrier's cluster-wide fence and has to be read separately.
+	WritePauseClaimed(ctx context.Context, dsn, shardSet string, shardID int) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
 	SetLoginPassword(ctx context.Context, dsn, role, password string) error
 	// EnsureGroupLogins creates or updates the login roles every group
@@ -732,6 +736,25 @@ func (PgxProber) PauseWrites(ctx context.Context, dsn string) error {
 	return nil
 }
 
+// WritePauseClaimed reads shard_status.write_paused_by, which a cutover
+// writes before it raises the pause and clears after it lifts it. A column
+// on a shard the caller does not know about reads as no claim, which is the
+// safe direction: this only ever puts a pause BACK.
+func (PgxProber) WritePauseClaimed(ctx context.Context, dsn, shardSet string, shardID int) (bool, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var claimed bool
+	err = conn.QueryRow(ctx, `SELECT coalesce(write_paused_by IS NOT NULL, false) FROM pgshard.shard_status
+		WHERE shard_set = $1 AND shard_id = $2`, shardSet, shardID).Scan(&claimed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return claimed, err
+}
+
 // WriteFenced reports whether the catalog write fence is raised.
 func (PgxProber) WriteFenced(ctx context.Context, dsn string) (bool, error) {
 	conn, err := pgx.Connect(ctx, dsn)
@@ -1029,6 +1052,12 @@ func (b boundedProber) PauseWrites(ctx context.Context, dsn string) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.PauseWrites(ctx, dsn)
+}
+
+func (b boundedProber) WritePauseClaimed(ctx context.Context, dsn, shardSet string, shardID int) (bool, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.WritePauseClaimed(ctx, dsn, shardSet, shardID)
 }
 
 func (b boundedProber) WriteFenced(ctx context.Context, dsn string) (bool, error) {

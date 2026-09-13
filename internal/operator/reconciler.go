@@ -1237,16 +1237,32 @@ func ordinalOf(g Group, member string) int {
 // durable statement of that intent is the catalog write fence, and this
 // makes the primary match it.
 //
-// Only the pause is reapplied. Lifting it belongs to the barrier that
-// raised the fence -- or, if that barrier died, to the recovery pass that
-// reads the still-raised fence and resumes the shards it left paused.
+// Two statements of intent are read, not one. The barrier's fence is
+// cluster-wide; a cutover pauses a single shard set and records that in
+// shard_status.write_paused_by. Reading only the fence left the cutover
+// case with no owner at all: a rollout pass that rewrote configuration
+// during a cutover unpaused the sources and nothing put the pause back, so
+// they took writes for the rest of it -- writes that arrive after the
+// forward subscriptions are dropped and are acknowledged and lost.
+//
+// Only the pause is reapplied. Lifting it belongs to whoever raised it --
+// the barrier that raised the fence, the cutover that wrote the claim, or
+// the recovery pass and the sweep that finish for one that died.
 func (r *ClusterReconciler) reapplyWritePause(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, dsn string, pstate PrimaryState, password string) error {
 	if g.Kind != "shard" || pstate.WritesPaused {
 		return nil
 	}
-	fenced, err := r.Prober.WriteFenced(ctx, DSN(Groups(c)[0].ServiceRW(), c.Namespace, password))
+	catalogDSN := DSN(Groups(c)[0].ServiceRW(), c.Namespace, password)
+	fenced, err := r.Prober.WriteFenced(ctx, catalogDSN)
 	if err != nil {
 		return fmt.Errorf("read the write fence: %w", err)
+	}
+	if !fenced {
+		claimed, cerr := r.Prober.WritePauseClaimed(ctx, catalogDSN, g.ShardSet(), g.ShardID)
+		if cerr != nil {
+			return fmt.Errorf("read the cutover write pause: %w", cerr)
+		}
+		fenced = claimed
 	}
 	if !fenced {
 		return nil

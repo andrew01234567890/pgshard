@@ -87,11 +87,15 @@ type fakeProber struct {
 	setCalls  []string
 	// fenced is the catalog write fence the operator reads; paused records
 	// the DSNs it made refuse writes, and pausedDSN those already paused.
-	fenced    bool
-	fenceErr  error
-	paused    []string
-	pausedDSN map[string]bool
-	migrated  int
+	fenced bool
+	// pauseClaimed keys on "<shardSet>/<shardID>", the way the cutover
+	// pause is recorded per shard rather than per cluster.
+	pauseClaimed  map[string]bool
+	pauseClaimErr error
+	fenceErr      error
+	paused        []string
+	pausedDSN     map[string]bool
+	migrated      int
 	// standbys is keyed by pod IP; missing IPs are unreachable.
 	standbys map[string]StandbyState
 	// published records shard_status upserts as "shard-<id>:<epoch>:<endpoint>".
@@ -595,6 +599,17 @@ func (f *fakeProber) WriteFenced(context.Context, string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.fenced, f.fenceErr
+}
+
+// WritePauseClaimed answers for the cutover pause, which is per shard and
+// independent of the cluster-wide fence above.
+func (f *fakeProber) WritePauseClaimed(_ context.Context, _, shardSet string, shardID int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pauseClaimErr != nil {
+		return false, f.pauseClaimErr
+	}
+	return f.pauseClaimed[fmt.Sprintf("%s/%d", shardSet, shardID)], nil
 }
 
 func (f *fakeProber) MigrateCatalog(_ context.Context, dsn string) error {

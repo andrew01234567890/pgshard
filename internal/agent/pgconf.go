@@ -275,14 +275,20 @@ func hostKeyword(h string) string {
 
 // autoConfHeader replaces whatever postgresql.auto.conf held. The control
 // plane does use ALTER SYSTEM at runtime -- the barrier pauses writes with
-// default_transaction_read_only, the operator probes the catalog the same
-// way -- and those settings live here until the agent next writes
-// configuration, which it does on bootstrap, on promotion and after a
-// restore. A setting that has to outlive any of those belongs in the
-// rendered postgresql.conf instead, or with an owner that reapplies it: the
-// write pause is held by the catalog write fence, which the operator reads
-// on every pass and before a promoted member serves.
-const autoConfHeader = "# Managed by pgshard-agent: rewritten on bootstrap, promotion and restore.\n" +
+// default_transaction_read_only, a cutover pauses its sources the same way,
+// the operator probes the catalog the same way -- and those settings live
+// here until the agent next writes configuration.
+//
+// Which is ANY configuration write, not only the three that used to be
+// listed here: Reload calls WriteConfig too, and it runs on every rollout
+// pass whose settings hash differs. A setting that has to outlive that
+// belongs in the rendered postgresql.conf instead, or with an owner that
+// reapplies it. The write pause has two such owners, because it has two
+// sources: the catalog write fence for a barrier, and
+// shard_status.write_paused_by for a cutover. The operator reads both on
+// every pass (reapplyWritePause) and before a promoted member serves.
+const autoConfHeader = "# Managed by pgshard-agent: rewritten whenever the agent writes configuration,\n" +
+	"# which includes bootstrap, promotion, restore and a settings reload.\n" +
 	"# A runtime ALTER SYSTEM lasts only until then; anything that must survive\n" +
 	"# belongs in postgresql.conf, which pgshard renders.\n"
 
