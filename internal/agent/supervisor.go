@@ -156,10 +156,32 @@ func (s *Supervisor) Untrack(pid int) {
 
 // Command builds an exec.Cmd for a binary in binDir with the given
 // environment, tracked so the reaper does not steal its exit status.
+//
+// The command gets its own process group and a cancel that kills the whole
+// group, because these binaries spawn children of their own: pg_rewind runs
+// the target's crash recovery through system(), so a deadline that killed
+// only pg_rewind would leave a `postgres --single` writing to PGDATA,
+// reparented to this agent as PID 1 and reaped by nothing -- and the next
+// attempt clears that directory out from under it.
 func (s *Supervisor) Command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, filepath.Join(s.binDir, name), args...)
 	cmd.Env = append(append(os.Environ(), "PGDATA="+s.pgdata), s.Env...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
 	return cmd
+}
+
+// killGroup SIGKILLs a process group, answering as Process.Kill does so that
+// exec's own handling of a cancelled command is unchanged: a group that has
+// already gone is ErrProcessDone, not a failure to cancel.
+func killGroup(pgid int) error {
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	return nil
 }
 
 // StartTracked starts cmd and registers its pid with the reaper atomically

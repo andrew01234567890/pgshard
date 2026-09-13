@@ -224,14 +224,47 @@ func (in *Instance) baseBackup(ctx context.Context) error {
 	return WriteConfig(in.cfg, true)
 }
 
-func (in *Instance) pgRewind(ctx context.Context, source string) error {
-	args := []string{"--target-pgdata=" + in.cfg.PGData, "--source-server=" + withDatabase(source), "--no-ensure-shutdown"}
+// rewindArgs is the pg_rewind invocation for a primary being demoted.
+//
+// Deliberately WITHOUT --no-ensure-shutdown. That flag tells pg_rewind to
+// skip the single-user recovery it would otherwise run on a target that did
+// not shut down cleanly, after which pg_rewind refuses any target whose
+// control file is not DB_SHUTDOWNED or DB_SHUTDOWNED_IN_RECOVERY
+// (pg_rewind.c: "target server must be shut down cleanly").
+//
+// An unplanned failover does not leave that state. Fencing deletes the old
+// primary's Pod with podFenceGrace, ten seconds; the agent answers the
+// kubelet's SIGTERM with a smart stop whose own budget is three times
+// ShutdownTimeout, 90 seconds by default, so the grace expires first and the
+// container is SIGKILLed mid-shutdown. The case the flag was covering is
+// therefore the normal one, not the exception, and with it every fenced
+// primary failed rewind and recloned the whole data directory.
+//
+// Without it pg_rewind starts the target once in single-user mode to finish
+// recovery, which is what that mode is for and what the flag's own
+// documentation calls "automatically fix unclean shutdown". The target is
+// stopped before this runs and standby.signal is not written until after,
+// so the cluster it recovers is the former primary, which is the case
+// pg_rewind is built for.
+func (in *Instance) rewindArgs(source string) []string {
+	args := []string{"--target-pgdata=" + in.cfg.PGData, "--source-server=" + withDatabase(source)}
 	if in.cfg.Postgres.RestoreCommand != "" {
 		args = append(args, "--restore-target-wal")
 	}
-	cmd := in.sup.Command(ctx, "pg_rewind", args...)
-	_, err := in.sup.RunTracked(cmd)
-	return err
+	return args
+}
+
+func (in *Instance) pgRewind(ctx context.Context, source string) error {
+	cmd := in.sup.Command(ctx, "pg_rewind", in.rewindArgs(source)...)
+	out, err := in.sup.RunTracked(cmd)
+	if err != nil {
+		return err
+	}
+	// Recovering the target can take as long as replaying max_wal_size, and
+	// pg_rewind's output is the only account of it anyone gets: without this
+	// a demote that is working looks identical to one that has hung.
+	in.log.Info("pg_rewind finished", "output", strings.TrimSpace(string(out)))
+	return nil
 }
 
 // pgpass lets libpq tools authenticate against the source without exposing
