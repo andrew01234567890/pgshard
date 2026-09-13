@@ -670,3 +670,46 @@ func BenchmarkStatementFingerprint(b *testing.B) {
 }
 
 var sinkFingerprint string
+
+// BenchmarkPlannerPlanShardedVaryingLiteral is the workload PGS-773 is
+// about: the same statement shape with a different literal every time, which
+// is what anything not using prepared statements sends -- psql scripts, ORMs
+// in their default mode, generated SQL.
+//
+// The parse cache is keyed on the statement text, so every one of these is a
+// miss: a full grammar parse and a full plan. Its neighbour above plans a
+// parameterised form that hits the cache every time. The gap between the two
+// is the prize, and the reason to measure before changing anything.
+func BenchmarkPlannerPlanShardedVaryingLiteral(b *testing.B) {
+	p := plan.New()
+	sess := plan.Session{Database: "app", HomeShard: 0, Snapshot: benchSnapshot(b)}
+	ctx := context.Background()
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		pl, err := p.Plan(ctx, sess, fmt.Sprintf("SELECT * FROM orders WHERE tenant_id = %d", i))
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkPlan = pl
+	}
+}
+
+// BenchmarkPlannerPlanShardedFixedLiteral is the same statement with the
+// literal held still, so the cache hits. It separates "this shape is
+// expensive to plan" from "this shape is expensive because the literal keeps
+// moving", which is the only one PGS-773 can fix.
+func BenchmarkPlannerPlanShardedFixedLiteral(b *testing.B) {
+	p := plan.New()
+	sess := plan.Session{Database: "app", HomeShard: 0, Snapshot: benchSnapshot(b)}
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		pl, err := p.Plan(ctx, sess, "SELECT * FROM orders WHERE tenant_id = 42")
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkPlan = pl
+	}
+}
