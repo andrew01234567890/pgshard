@@ -441,16 +441,22 @@ func TestACutoverWhoseReplyWasLostIsStillReportedAsDiverged(t *testing.T) {
 	shards := newFakeShards()
 	shards.columns = []string{"tenant_id", "id", "amount"}
 	shards.pks = []string{"id"}
-	// Shard 0's cutover commits on the server and the reply is lost. Shard
-	// 1 then fails for its own reason, which is what ends the migration.
+	// Shard 0's cutover COMMITS on the server and the reply is lost. The
+	// failure has to be on the COMMIT, not on a statement inside the
+	// transaction: a connection dropped mid-transaction aborts it, and the
+	// hidden column is still there afterwards. Shard 1 then fails for its
+	// own reason, which is what ends the migration.
 	cutOver := map[int32]bool{}
 	shards.exec = func(id int32, sql string) error {
-		if strings.Contains(sql, "RENAME COLUMN") {
-			cutOver[id] = true
-			if id == 0 {
-				return pgErr("08006", "connection closed before the reply")
-			}
+		if id == 1 && strings.Contains(sql, "RENAME COLUMN") {
 			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	shards.txnExec = func(id int32, sql string) error {
+		if id == 0 && sql == "COMMIT" {
+			cutOver[0] = true
+			return pgErr("08006", "connection closed before the reply")
 		}
 		return nil
 	}
@@ -466,6 +472,75 @@ func TestACutoverWhoseReplyWasLostIsStillReportedAsDiverged(t *testing.T) {
 	}
 	if !strings.Contains(m.Error, "already be cut over") {
 		t.Errorf("a shard cut over and the migration does not say so: %q", m.Error)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	if has(shards.superuserStatements(0), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("shard 0 cut over and was reverted anyway")
+	}
+	if !has(shards.superuserStatements(1), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("shard 1 did not cut over and was not reverted")
+	}
+	// What the operator reads to find the diverged shard. Saying "reverted"
+	// about the one shard that was deliberately left alone is the same
+	// misreport as a missing DEGRADED note, pointing the wrong way.
+	if got := m.PerShard["0"].Error; !strings.Contains(got, "cut over") {
+		t.Errorf("shard 0 reports %q; it is the shard whose schema moved", got)
+	}
+}
+
+// PGS-752 L4 proper: the lost reply lands on the attempt that exhausts the
+// retry budget, so nothing asks the shard again.
+//
+// retrying re-runs a transient failure until the budget is spent, and 08006
+// is transient, which is why the ordinary case recovers: the second attempt
+// finds the hidden column gone and records the shard as applied. Give the
+// shard no budget left and that second attempt never happens. Step stays at
+// the cutover phase, and reading the step alone reports a clean failure for
+// a shard whose schema has moved -- the misreport the finding describes,
+// reachable whenever a slow cutover has spent its budget on lock-timeout
+// retries before the COMMIT whose reply is lost.
+//
+// So the state is read from the shard, not from the step.
+func TestALostReplyOnTheLastAttemptIsStillReportedAsDiverged(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0d")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	cutOver := map[int32]bool{}
+	shards.exec = func(id int32, sql string) error {
+		if id == 1 && strings.Contains(sql, "RENAME COLUMN") {
+			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	shards.txnExec = func(id int32, sql string) error {
+		if id == 0 && sql == "COMMIT" {
+			cutOver[0] = true
+			return pgErr("08006", "connection closed before the reply")
+		}
+		return nil
+	}
+	shards.hiddenExists = func(id int32) bool { return !cutOver[id] }
+
+	a := newRewriteApplier(store, shards)
+	// The smallest budget backoff() will honour -- it reads a zero Total as
+	// "unset" and substitutes the default. One nanosecond is spent by the
+	// first attempt, so the failure is the last attempt and the retry that
+	// would have discovered the committed cutover never runs.
+	a.Backoff = Backoff{Min: time.Nanosecond, Max: time.Nanosecond, Total: time.Nanosecond}
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0d")
+	if m.State != catalog.MigrationFailed {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if got := m.PerShard["0"].Step; got > rewriteCutover {
+		t.Fatalf("shard 0 step = %d: the premise is a shard left AT the cutover phase, so the step cannot answer", got)
+	}
+	if !strings.Contains(m.Error, "already be cut over") {
+		t.Errorf("shard 0 committed its cutover and the migration reports a clean failure: %q", m.Error)
 	}
 	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
 	if has(shards.superuserStatements(0), `DROP COLUMN IF EXISTS "`+hidden+`"`) {

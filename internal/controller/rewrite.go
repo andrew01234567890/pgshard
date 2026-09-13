@@ -107,21 +107,29 @@ func shardID(key string) int32 {
 // and reported.
 func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, msg string) error {
 	m.State, m.Error = catalog.MigrationFailed, msg
-	if anyShardCutOver(m) {
+	cutOver := a.cutOverShards(ctx, logger, m)
+	if len(cutOver) > 0 {
 		m.Error += "; some shards may already be cut over (schema is DEGRADED until resolved)"
 	}
 	for _, key := range sortedShardKeys(m.PerShard) {
 		s := m.PerShard[key]
 		if s.State != catalog.ShardFailed {
 			s.State = catalog.ShardFailed
-			if s.Error == "" {
-				s.Error = "reverted: another shard failed"
-			}
 		}
-		m.PerShard[key] = s
-		if s.Step > rewriteCutover {
+		if cutOver[key] {
+			// Said before the revert is skipped, because "reverted" on a
+			// shard that was deliberately left alone is the same misreport
+			// as a missing DEGRADED note: an operator reading PerShard to
+			// find the diverged shard is told it is the one shard that is
+			// not.
+			s.Error = "left as it is: this shard cut over"
+			m.PerShard[key] = s
 			continue
 		}
+		if s.Error == "" {
+			s.Error = "reverted: another shard failed"
+		}
+		m.PerShard[key] = s
 		if err := a.revertRewrite(ctx, m, shardID(key)); err != nil {
 			logger.Warn("rewrite revert failed", "shard", key, "err", err)
 		}
@@ -133,17 +141,64 @@ func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catal
 	return nil
 }
 
-// anyShardCutOver reports whether any shard is past the cutover phase, which
-// is what makes the schema divergent and the migration DEGRADED. Reaching the
-// cutover is not the same as finishing it: a cutover that rolls back leaves
-// its shard exactly as it was.
-func anyShardCutOver(m *catalog.DDLMigration) bool {
-	for _, s := range m.PerShard {
-		if s.Step > rewriteCutover {
-			return true
+// cutOverShards is the set of shards whose schema has moved, which is what
+// makes the migration DEGRADED rather than merely failed.
+//
+// Step alone cannot answer it. A shard that finished the cutover is past the
+// phase, but a shard whose cutover COMMITTED and whose reply never came back
+// is recorded as having failed at it -- and if that attempt was the one that
+// exhausted the retry budget, nothing asks again. Reaching the cutover is
+// also not the same as finishing it: one that rolls back leaves its shard
+// exactly as it was, so the step cannot simply be trusted in the other
+// direction either.
+//
+// The shard can answer it. The cutover renames the hidden column onto the
+// real one, so at the cutover phase a hidden column that is GONE is a shard
+// that cut over -- the same fact the cutover itself uses to be idempotent.
+//
+// A shard that cannot be reached counts as cut over. The cost of saying
+// DEGRADED when nothing diverged is an operator who looks and finds
+// nothing; the cost of the other mistake is a schema diverged on one shard
+// while the migration reports a clean failure, which nobody looks for.
+func (a *Applier) cutOverShards(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration) map[string]bool {
+	out := map[string]bool{}
+	for key, s := range m.PerShard {
+		switch {
+		case s.Step > rewriteCutover:
+			out[key] = true
+		case s.Step < rewriteCutover:
+			// Never reached the cutover; there is nothing to ask about.
+		default:
+			done, err := a.cutoverCommitted(ctx, m, shardID(key))
+			if err != nil {
+				logger.Warn("cannot tell whether the shard cut over; reporting it as if it did",
+					"shard", key, "err", err)
+				out[key] = true
+				continue
+			}
+			if done {
+				out[key] = true
+			}
 		}
 	}
-	return false
+	return out
+}
+
+// cutoverCommitted asks one shard whether its hidden column is gone.
+func (a *Applier) cutoverCommitted(ctx context.Context, m *catalog.DDLMigration, id int32) (bool, error) {
+	ctx = context.WithoutCancel(ctx)
+	set, err := a.shardSet(ctx)
+	if err != nil {
+		return false, err
+	}
+	conn, err := a.Shards.DialDatabase(ctx, set, id, m.Database)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rw := m.Meta.Rewrite
+	exists, err := columnExists(ctx, conn, rw, rw.HiddenColumn(m.ID))
+	return !exists, err
 }
 
 // rewriteColumnDependents lists the objects an ALTER TABLE ... DROP COLUMN of

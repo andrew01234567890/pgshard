@@ -209,11 +209,16 @@ type fakeShards struct {
 	dbs               map[int32][]string
 	logins            map[int32][]string
 	exec              func(shard int32, sql string) error
-	exists            func(shard int32, kind, name string) bool
-	invalid           func(shard int32, name string) bool
-	rolsuper          func(shard int32, name string) bool
-	check             func(shard int32, kind, table, name string) bool
-	dialErr           func(shard int32) error
+	// txnExec scripts BEGIN, COMMIT and ROLLBACK, which exec never sees:
+	// they are answered before it so that no test has to match them. A
+	// COMMIT is the only place a lost reply can leave work committed, so a
+	// test about one has to be able to fail it.
+	txnExec  func(shard int32, sql string) error
+	exists   func(shard int32, kind, name string) bool
+	invalid  func(shard int32, name string) bool
+	rolsuper func(shard int32, name string) bool
+	check    func(shard int32, kind, table, name string) bool
+	dialErr  func(shard int32) error
 	// dialed records the shard sets the applier actually connected to.
 	dialed []string
 	// provisioned models the DDL role EXISTING on a shard, per shard set
@@ -314,13 +319,18 @@ func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (CommandTag, er
 	} else {
 		c.f.ran[c.id] = append(c.f.ran[c.id], sql)
 	}
-	exec := c.f.exec
+	exec, txnExec := c.f.exec, c.f.txnExec
 	c.f.mu.Unlock()
 	if c.superuser {
 		return pgconn.CommandTag{}, nil
 	}
 	switch {
-	case sql == "BEGIN", sql == "COMMIT", sql == "ROLLBACK", strings.HasPrefix(sql, "SET lock_timeout"), strings.HasPrefix(sql, "SET ROLE"):
+	case sql == "BEGIN", sql == "COMMIT", sql == "ROLLBACK":
+		if txnExec != nil {
+			return pgconn.CommandTag{}, txnExec(c.id, sql)
+		}
+		return pgconn.CommandTag{}, nil
+	case strings.HasPrefix(sql, "SET lock_timeout"), strings.HasPrefix(sql, "SET ROLE"):
 		return pgconn.CommandTag{}, nil
 	}
 	if exec != nil {
