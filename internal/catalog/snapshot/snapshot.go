@@ -118,10 +118,18 @@ func (s *Snapshot) IsPartial() bool { return s != nil && s.Partial }
 
 // MaxAge is how old a snapshot may be before the router serving it must
 // stop rather than plan against a view of the catalog it can no longer
-// trust. It is one fallback reload plus a margin, so a healthy router --
-// which reloads every DefaultReloadInterval -- never trips it, and a
-// router whose reloads are failing stops within one interval of the last
-// one that worked.
+// trust. It is one fallback reload plus a margin, so a router whose reloads
+// are failing stops within one interval of the last one that worked.
+//
+// The margin is what the next reload has to finish in, not a guarantee that
+// it will. Five seconds is generous for four queries on a live connection
+// and is not a bound on a reload that has to redial first -- a dropped
+// LISTEN connection makes the next load reconnect, with TLS and SCRAM ahead
+// of the queries (loadOnce closes the connection on any failure). Under
+// catalog latency that can cross the margin, and the router then fails
+// closed for as long as the reload takes: correct, and deliberately so, but
+// it is a refusal caused by slowness rather than by a stale view, and it is
+// a real operating mode rather than an impossible one.
 //
 // The online rewrite's settle window is the same quantity, and that is the
 // point: the applier publishes the visible column list, waits, and then
