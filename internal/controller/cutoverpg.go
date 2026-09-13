@@ -1190,7 +1190,7 @@ func (o *pgCutover) EnableReverse(ctx context.Context) error {
 // Pausing is confirmed on a fresh backend: the reload is asynchronous, and
 // a pause that is not yet in force is the same as no pause at all.
 func (o *pgCutover) PauseSources(ctx context.Context, pause bool) error {
-	return o.pauseSet(ctx, o.srcSet, o.srcIDs, pause)
+	return o.pauseSetClaimed(ctx, o.srcSet, o.srcIDs, pause)
 }
 
 // DrainSources waits out the writers the pause could not stop. The rollback
@@ -1200,7 +1200,14 @@ func (o *pgCutover) DrainSources(ctx context.Context) error {
 	return o.drainWriters(ctx, o.srcSet, o.srcIDs)
 }
 
-// pauseSet flips default_transaction_read_only on every primary of a set.
+// pauseSet flips default_transaction_read_only on every primary of a set,
+// and claims nothing.
+//
+// Not every pause is a workflow's to give back. Complete makes a RETIRED set
+// read-only for good, on purpose and with no owner; a claim on that would
+// make WritePauseSweep undo it the moment the workflow reached its terminal
+// state -- which is immediately, since Complete is the last thing every
+// terminal path does. Use pauseSetClaimed for a pause that will be lifted.
 func (o *pgCutover) pauseSet(ctx context.Context, set string, ids []int32, pause bool) error {
 	stmt := `ALTER SYSTEM RESET default_transaction_read_only`
 	if pause {
@@ -1221,6 +1228,54 @@ func (o *pgCutover) pauseSet(ctx context.Context, set string, ids []int32, pause
 		}
 	}
 	return nil
+}
+
+// pauseSetClaimed is a pause this workflow intends to lift, recorded in the
+// catalog so that WritePauseSweep can lift it if the workflow never does.
+//
+// The claim is written BEFORE the pause and dropped AFTER it is lifted, so
+// both failure windows fall on the harmless side: a claim with no pause
+// behind it costs the sweep one ALTER SYSTEM RESET of a shard that was
+// already writable, while a pause with no claim is the leak the claim
+// exists to close.
+func (o *pgCutover) pauseSetClaimed(ctx context.Context, set string, ids []int32, pause bool) error {
+	if pause {
+		if err := o.claimPause(ctx, set, ids); err != nil {
+			return err
+		}
+	}
+	if err := o.pauseSet(ctx, set, ids, pause); err != nil {
+		return err
+	}
+	if !pause {
+		return o.dropPauseClaim(ctx, set, ids)
+	}
+	return nil
+}
+
+func (o *pgCutover) claimPause(ctx context.Context, set string, ids []int32) error {
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = $3::uuid, updated_at = now()
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by IS DISTINCT FROM $3::uuid`, set, ids, o.wf.id)
+	return err
+}
+
+// dropPauseClaim is scoped to this workflow, so it releases nothing it did
+// not claim.
+func (o *pgCutover) dropPauseClaim(ctx context.Context, set string, ids []int32) error {
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by = $3::uuid`, set, ids, o.wf.id)
+	return err
+}
+
+// abandonPauseClaim clears the claim on a set whatever wrote it, for the
+// retirement pause alone. A transient claim left behind by a partly-failed
+// release would otherwise make the sweep lift the permanent pause that
+// Complete is about to raise -- and after retirement no transient claim can
+// be legitimate, because nothing is left to lift.
+func (o *pgCutover) abandonPauseClaim(ctx context.Context, set string, ids []int32) error {
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by IS NOT NULL`, set, ids)
+	return err
 }
 
 // drainWriters waits until no client backend on the set still holds a
@@ -1572,6 +1627,15 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 	// Best effort, and last: a set that cannot be reached is already
 	// beyond reach of a client too, and a retirement that has otherwise
 	// finished must not be undone by it.
+	//
+	// Unclaimed, and any claim on the set is abandoned first. This pause is
+	// permanent and belongs to nobody; WritePauseSweep lifts claimed pauses
+	// whose workflow is gone or finished, and this workflow is about to be
+	// both.
+	if err := o.abandonPauseClaim(ctx, set, ids); err != nil {
+		o.c.logger().Info("reshard complete: a stale write-pause claim could not be cleared; the sweep may lift the retirement pause",
+			"workflow", o.wf.id, "set", set, "err", err)
+	}
 	if err := o.pauseSet(ctx, set, ids, true); err != nil {
 		o.c.logger().Info("reshard complete: retired set not made read-only", "workflow", o.wf.id, "set", set, "err", err)
 	}

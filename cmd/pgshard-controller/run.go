@@ -205,6 +205,10 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		// reconciliation finishes; Barrier.Recover leaves that one alone
 		// because it came out of the backup and predates this postmaster.
 		go barrier.RunRecovery(ctx, *resolveEvery, leader)
+		// The same shape for a cutover's write pause: every ordinary exit
+		// gives it back, but deleting the workflow row leaves the sources
+		// refusing writes with 25006 and nothing left to run the release.
+		go (&controller.WritePauseSweep{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *resolveEvery, leader)
 		subTemplate := *subscriptionTemplate
 		if subTemplate == "" {
 			subTemplate = *shardDSNTemplate

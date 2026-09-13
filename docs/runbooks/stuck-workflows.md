@@ -77,6 +77,73 @@ VStream consumers: a completed reshard ends streams with
 `Error{RESHARDED}` (or a `Journal` with `stop_on_reshard`); they resume
 against the new shard map ([streams.md](../streams.md)).
 
+## Sources refusing writes with 25006 after a workflow row was deleted
+
+Every write to the old shards fails with `25006 cannot execute ... in a
+read-only transaction`, with no hint and no workflow in
+`pgshard.workflows` to explain it.
+
+A cutover past its swap step pauses writes on its source set with
+`ALTER SYSTEM SET default_transaction_read_only = on`. Every ordinary exit
+gives it back: the swap lifts it on success and on each retry, the fatal and
+abort paths lift it, an unwind lifts it, and a controller that dies mid-swap
+resumes the step and reaches one of those. **Deleting the workflow row
+directly does not** — nothing is left to run the release, and `ALTER SYSTEM`
+survives a restart.
+
+The controller sweeps for this on every resolve tick and lifts it, logging
+`lifted a write pause whose workflow no longer exists`. Wait a tick before
+doing anything by hand. What it sweeps:
+
+```sql
+SELECT shard_set, shard_id, write_paused_by
+FROM pgshard.shard_status s
+WHERE write_paused_by IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM pgshard.workflows w
+                  WHERE w.id = s.write_paused_by
+                    AND w.state NOT IN ('completed', 'failed', 'cancelled'));
+```
+
+Rows here are pauses with no live owner — the workflow row was deleted, or
+it is in a terminal state, which it cannot be while it still means to lift
+the pause. If the sweep cannot reach a shard it
+says so and leaves the claim in place, which is deliberate: the claim is the
+only record that the shard is paused, so it is dropped only after the shard
+is writable again. Fix the connectivity and the next tick finishes.
+
+To lift one by hand — on that shard's **primary**, not through the router:
+
+```sql
+ALTER SYSTEM RESET default_transaction_read_only;
+SELECT pg_reload_conf();
+```
+
+then clear the claim so the sweep stops revisiting it:
+
+```sql
+UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+WHERE shard_set = '<set>' AND shard_id = <id>;
+```
+
+Do this in that order. A claim left on a writable shard costs one wasted
+`ALTER SYSTEM RESET` per sweep; a paused shard with no claim is invisible
+again.
+
+Two pauses the sweep never touches, because it keys on `write_paused_by` and
+not on `default_transaction_read_only` itself:
+
+- one an operator raised for their own maintenance;
+- the permanent one a **retired** set carries. Completing a reshard makes the
+  retired set read-only for good — its pods stay up for the retirement window
+  and its `-rw` Service still answers, so a client connected straight to it
+  would have writes acknowledged by a primary nothing reads from again. That
+  pause has no claim, deliberately. If you find a retired set refusing
+  writes, that is the design and not this fault.
+
+The range fence is a separate thing with the same shape — `shard_status.migrating`
+and `migrating_by`. A stuck fence makes routers buffer and then refuse with a
+retry hint, which is much easier to recognise than this.
+
 ## A cluster left write-fenced by a barrier whose controller died
 
 Every write fails with `57P03` and the routers say the cluster is fenced,
