@@ -354,11 +354,12 @@ func TestASourceConnectionNamesADatabaseThatExists(t *testing.T) {
 //
 // --no-ensure-shutdown skips the single-user recovery pg_rewind runs on a
 // target that crashed, and pg_rewind then refuses any target whose control
-// file is not DB_SHUTDOWNED or DB_SHUTDOWNED_IN_RECOVERY. The old primary's
-// Pod is deleted with podFenceGrace -- ten seconds -- and SIGKILLed after,
-// which is a crash for any primary too busy to checkpoint in the time. So
-// the flag turned "rewind, falling back to a full reclone" into "always
-// reclone", and on a large shard that runs into the startup probe.
+// file is not DB_SHUTDOWNED or DB_SHUTDOWNED_IN_RECOVERY. Fencing deletes
+// the old primary's Pod with podFenceGrace -- ten seconds -- while the
+// agent's own stop budget is three times ShutdownTimeout, so the SIGKILL
+// lands mid-shutdown and the target crashed. The flag therefore turned
+// "rewind, falling back to a full reclone" into "always reclone", and on a
+// large shard that runs into the startup probe.
 //
 // The argument list is the whole of the decision, which is why it is
 // asserted directly: nothing else in the agent can tell these two
@@ -370,7 +371,7 @@ func TestRewindMayFixAnUncleanShutdown(t *testing.T) {
 			t.Fatal("--no-ensure-shutdown makes pg_rewind refuse a crashed target, so an unplanned failover always recloses instead of rewinding")
 		}
 	}
-	if !has(in.rewindArgs("host=new"), "--source-server=") {
+	if !hasPrefixArg(in.rewindArgs("host=new"), "--source-server=") {
 		t.Errorf("args = %v, want the source server", in.rewindArgs("host=new"))
 	}
 }
@@ -379,17 +380,17 @@ func TestRewindMayFixAnUncleanShutdown(t *testing.T) {
 // fetch the WAL with: pg_rewind refuses the flag without one.
 func TestRewindAsksForArchivedWALOnlyWhenItCanFetchIt(t *testing.T) {
 	in := newTestInstance(t)
-	if has(in.rewindArgs("host=new"), "--restore-target-wal") {
+	if hasPrefixArg(in.rewindArgs("host=new"), "--restore-target-wal") {
 		t.Error("no restore_command is configured, so there is nothing to restore the WAL with")
 	}
 	in.cfg.Postgres.RestoreCommand = "cp /archive/%f %p"
-	if !has(in.rewindArgs("host=new"), "--restore-target-wal") {
+	if !hasPrefixArg(in.rewindArgs("host=new"), "--restore-target-wal") {
 		t.Error("a restore_command is configured and the WAL the rewind needs may only be in the archive")
 	}
 }
 
-// has reports whether any arg starts with prefix.
-func has(args []string, prefix string) bool {
+// hasPrefixArg reports whether any arg starts with prefix.
+func hasPrefixArg(args []string, prefix string) bool {
 	for _, a := range args {
 		if strings.HasPrefix(a, prefix) {
 			return true

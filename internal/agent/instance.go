@@ -232,13 +232,13 @@ func (in *Instance) baseBackup(ctx context.Context) error {
 // control file is not DB_SHUTDOWNED or DB_SHUTDOWNED_IN_RECOVERY
 // (pg_rewind.c: "target server must be shut down cleanly").
 //
-// An unplanned failover never leaves that state. The old primary's Pod is
-// deleted with podFenceGrace, ten seconds, after which the kubelet SIGKILLs
-// it -- which is a crash, not a clean shutdown, for any primary too busy to
-// checkpoint in the time. So with the flag every crashed primary failed
-// rewind and fell through to a full reclone of the whole data directory,
-// and the code describing "pg_rewind, falling back to a full reclone"
-// described a fallback that was the only path.
+// An unplanned failover does not leave that state. Fencing deletes the old
+// primary's Pod with podFenceGrace, ten seconds; the agent answers the
+// kubelet's SIGTERM with a smart stop whose own budget is three times
+// ShutdownTimeout, 90 seconds by default, so the grace expires first and the
+// container is SIGKILLed mid-shutdown. The case the flag was covering is
+// therefore the normal one, not the exception, and with it every fenced
+// primary failed rewind and recloned the whole data directory.
 //
 // Without it pg_rewind starts the target once in single-user mode to finish
 // recovery, which is what that mode is for and what the flag's own
@@ -256,8 +256,15 @@ func (in *Instance) rewindArgs(source string) []string {
 
 func (in *Instance) pgRewind(ctx context.Context, source string) error {
 	cmd := in.sup.Command(ctx, "pg_rewind", in.rewindArgs(source)...)
-	_, err := in.sup.RunTracked(cmd)
-	return err
+	out, err := in.sup.RunTracked(cmd)
+	if err != nil {
+		return err
+	}
+	// Recovering the target can take as long as replaying max_wal_size, and
+	// pg_rewind's output is the only account of it anyone gets: without this
+	// a demote that is working looks identical to one that has hung.
+	in.log.Info("pg_rewind finished", "output", strings.TrimSpace(string(out)))
+	return nil
 }
 
 // pgpass lets libpq tools authenticate against the source without exposing

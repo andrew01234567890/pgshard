@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -138,5 +140,60 @@ func TestRunTrackedSurvivesConcurrentReaper(t *testing.T) {
 		if _, err := sup.RunTracked(exec.CommandContext(ctx, "/bin/true")); err != nil {
 			t.Fatalf("iteration %d: the reaper stole the tracked child: %v", i, err)
 		}
+	}
+}
+
+// TestCommandCancelKillsTheWholeProcessGroup covers the process pg_rewind
+// starts for itself: it recovers an unclean target by running
+// `postgres --single` through system(), and a cancel that reached only
+// pg_rewind would leave that writing to PGDATA while the caller moves on to
+// clear the directory and re-clone.
+func TestCommandCancelKillsTheWholeProcessGroup(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\nsleep 60 &\necho $! > \"$PGDATA/grandchild.pid\"\nsleep 60\n"
+	if err := os.WriteFile(filepath.Join(bin, "pg_rewind"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sup := NewSupervisor(bin, t.TempDir(), slog.New(slog.DiscardHandler))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := sup.RunTracked(sup.Command(ctx, "pg_rewind"))
+		done <- err
+	}()
+
+	pidFile := filepath.Join(sup.pgdata, "grandchild.pid")
+	var grandchild int
+	for i := 0; ; i++ {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if grandchild, err = strconv.Atoi(strings.TrimSpace(string(b))); err == nil && grandchild > 0 {
+				break
+			}
+		}
+		if i > 500 {
+			t.Fatal("fake pg_rewind never reported its grandchild")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		// The grandchild inherits the write end of the pipe RunTracked reads,
+		// so an unkilled one holds Wait open for its whole lifetime.
+		t.Fatal("RunTracked did not return after cancel: the grandchild still holds the output pipe")
+	}
+
+	for i := 0; ; i++ {
+		if err := syscall.Kill(grandchild, 0); err == syscall.ESRCH {
+			break
+		}
+		if i > 500 {
+			t.Fatalf("grandchild %d survived the cancel", grandchild)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
