@@ -42,7 +42,7 @@ var deliberate = map[string]string{
 	// Partial outcomes, which is exactly what the embedded channel is for.
 	"internal/controller/server.go:112":      "ResolveTransactions returns counts AND what stopped it",
 	"internal/controller/streamadmin.go:192": "CreateStream returns the slots it made AND the error that stopped it",
-	"internal/router/vstream/server.go:161":  "Create forwards those partial slots; losing them loses WAL-retaining slots nobody knows to drop",
+	"internal/router/vstream/server.go:192":  "Create forwards those partial slots; losing them loses WAL-retaining slots nobody knows to drop",
 }
 
 // TestNoRPCReturnsAnErrorInAnOKResponse enforces the rule PGS-393 settled:
