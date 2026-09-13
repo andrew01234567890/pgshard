@@ -35,10 +35,16 @@ type Watcher struct {
 	kick    chan struct{}
 	logf    func(format string, args ...any)
 
-	// Notification budget, touched only by Run's own goroutine.
-	tokens     float64
-	lastRefill time.Time
-	now        func() time.Time
+	// servingKick records that the pending kick was raised by a serving
+	// notification, so Run charges the right budget. Set from the LISTEN
+	// goroutine, read and cleared by Run.
+	servingKick atomic.Bool
+
+	// Notification budgets, touched only by Run's own goroutine. Two of
+	// them: see notifyDelay.
+	desired budget
+	serving budget
+	now     func() time.Time
 }
 
 // Change is published to subscribers whenever a reload observes a different
@@ -105,7 +111,8 @@ func NewWatcher(dsn string, opts Options) *Watcher {
 		subs:           map[chan Change]struct{}{},
 		kick:           make(chan struct{}, 1),
 		logf:           opts.Logf,
-		tokens:         notifyBurst,
+		desired:        budget{tokens: notifyBurst},
+		serving:        budget{tokens: notifyBurst},
 		now:            time.Now,
 	}
 }
@@ -194,7 +201,10 @@ func (w *Watcher) Run(ctx context.Context) error {
 			case <-w.kick:
 			default:
 			}
-			if wait := w.notifyDelay(); wait > 0 {
+			// A kick raised by both kinds at once counts as serving: the
+			// urgent one must not be charged to the bucket the other may
+			// have drained.
+			if wait := w.notifyDelay(w.servingKick.Swap(false)); wait > 0 {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -211,32 +221,61 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 // notifyDelay draws one notification-driven reload from the budget and
 // returns how long to wait for it. Called only from Run's goroutine.
-func (w *Watcher) notifyDelay() time.Duration {
+//
+// The serving channel has its OWN budget, because the two carry different
+// urgency and one used to be able to spend the other's. A cutover flip is a
+// serving change, and the burst above exists to make exactly that reload
+// immediate -- "a cutover flip bumps the generation and wants every router
+// reloading now". Desired-state churn is ordinary administration: tables,
+// databases, roles. With one shared bucket, enough of the second delays the
+// first, and a busy cluster produces that without anybody meaning to.
+//
+// Measured on the shipped defaults (PGS-750): with one bucket, sustained
+// desired-state notifications pushed the time for a router AND a source
+// pooler to see a flip from 52ms to 976ms -- the refill period, near enough
+// exactly. That interval is the window in which both still route by the old
+// map, which is where a straggling write to a retiring source comes from.
+func (w *Watcher) notifyDelay(serving bool) time.Duration {
+	b := &w.desired
+	if serving {
+		b = &w.serving
+	}
 	now := w.now()
-	if !w.lastRefill.IsZero() {
-		w.tokens += now.Sub(w.lastRefill).Seconds() / notifyRefill.Seconds()
+	if !b.lastRefill.IsZero() {
+		b.tokens += now.Sub(b.lastRefill).Seconds() / notifyRefill.Seconds()
 	}
-	w.lastRefill = now
-	if w.tokens > notifyBurst {
-		w.tokens = notifyBurst
+	b.lastRefill = now
+	if b.tokens > notifyBurst {
+		b.tokens = notifyBurst
 	}
-	if w.tokens >= 1 {
-		w.tokens--
+	if b.tokens >= 1 {
+		b.tokens--
 		return 0
 	}
 	// The reload this returns for is charged now, so the balance goes
 	// negative and the refill has to catch up: charging it on the next call
 	// instead would let a flood through at twice the rate.
-	wait := time.Duration((1 - w.tokens) * float64(notifyRefill))
-	w.tokens--
+	wait := time.Duration((1 - b.tokens) * float64(notifyRefill))
+	b.tokens--
 	return wait
 }
 
-func (w *Watcher) requestReload() {
+// requestReload asks Run for a reload. serving says the notification was a
+// change to the map routers route by, which gets its own budget.
+func (w *Watcher) requestReload(serving bool) {
+	if serving {
+		w.servingKick.Store(true)
+	}
 	select {
 	case w.kick <- struct{}{}:
 	default:
 	}
+}
+
+// budget is a token bucket of notification-driven reloads.
+type budget struct {
+	tokens     float64
+	lastRefill time.Time
 }
 
 func (w *Watcher) reload(ctx context.Context) error {
@@ -333,11 +372,14 @@ func (w *Watcher) listenOnce(ctx context.Context) error {
 		}
 	}
 	// A notification may have fired between the last load and LISTEN.
-	w.requestReload()
+	// Charged to the serving budget: what it may have missed is unknown,
+	// and the serving map is the half that cannot wait.
+	w.requestReload(true)
 	for {
-		if _, err := conn.WaitForNotification(ctx); err != nil {
+		n, err := conn.WaitForNotification(ctx)
+		if err != nil {
 			return errors.Join(err, ctx.Err())
 		}
-		w.requestReload()
+		w.requestReload(n.Channel == catalog.ServingChannel)
 	}
 }
