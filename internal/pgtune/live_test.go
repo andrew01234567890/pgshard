@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"sync/atomic"
+
 	"github.com/andrew01234567890/pgshard/internal/dockertest"
 )
 
@@ -42,6 +44,9 @@ func TestLiveEveryGUCExists(t *testing.T) {
 	}
 }
 
+// liveContainerSeq names containers apart within one test binary.
+var liveContainerSeq atomic.Uint64
+
 func liveCheck(t *testing.T, img string, p Profile) {
 	// The subtest is what starts a container, so the slot is taken here
 	// rather than in the parent, which starts none.
@@ -63,7 +68,14 @@ func liveCheck(t *testing.T, img string, p Profile) {
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	name := fmt.Sprintf("pgtune-live-%d", time.Now().UnixNano())
+	// Counted, not clocked. The two profile subtests run in parallel
+	// (dockertest.Parallel above), and a runner whose clock is coarser than
+	// the gap between their two calls hands both the same nanosecond -- at
+	// which point docker refuses the second with "container name is already
+	// in use" and the suite fails for a reason that has nothing to do with
+	// what it tests. The pid keeps it unique against another run of the
+	// same package on the same machine.
+	name := fmt.Sprintf("pgtune-live-%d-%d", os.Getpid(), liveContainerSeq.Add(1))
 	script := `set -e
 initdb -D "$PGDATA" --auth=trust --username=postgres >/dev/null
 openssl req -new -x509 -days 1 -nodes -subj /CN=pgtune -keyout "$PGDATA/server.key" -out "$PGDATA/server.crt" 2>/dev/null

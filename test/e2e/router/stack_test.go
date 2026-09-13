@@ -18,6 +18,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"sync/atomic"
+
 	"github.com/andrew01234567890/pgshard/internal/router"
 )
 
@@ -239,12 +241,18 @@ func containerAt(tb testing.TB, addr string) string {
 	return name.(string)
 }
 
+// e2eContainerSeq names containers apart within one test binary.
+var e2eContainerSeq atomic.Uint64
+
 func startPostgres(tb testing.TB, name string, opts ...string) (addr, adminDSN string) {
 	tb.Helper()
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical ` + strings.Join(opts, " ")
-	cname := fmt.Sprintf("pgshard-router-e2e-%s-%d", name, time.Now().UnixNano())
+	// Counted rather than clocked, for the reason internal/pgtune's live
+	// test has: concurrent callers on a coarse clock get the same
+	// nanosecond and docker refuses the second name.
+	cname := fmt.Sprintf("pgshard-router-e2e-%s-%d-%d", name, os.Getpid(), e2eContainerSeq.Add(1))
 	// Docker chooses the host port and is asked which one it took. Choosing
 	// it here would mean binding a listener, closing it, and asking Docker
 	// to bind the same number a moment later; between those two anything
