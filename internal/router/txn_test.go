@@ -1045,12 +1045,27 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
 		t.Fatal(err)
 	}
-	// The commit may report the cancellation to the client. What matters
-	// is what the coordinator did with the transaction.
+	// The client is told COMMIT: runQuery returns the step's nil, and the
+	// step succeeded. What matters is what the coordinator did with the
+	// transaction.
 	_ = tx.Commit(ctx)
 	if cancelLanded.Load() {
 		t.Error("the decision was written on the statement's own context: a cancel arriving between PREPARE and the decision reaches it")
 	}
+	// The positive control, without which this test would also pass if the
+	// cancel request were a no-op in this harness -- wrong key, wrong
+	// listener, routed to a peer. The router forwards a cancel to the
+	// participants while the transaction is undecided, so seeing one there
+	// proves the request reached THIS session's executor and that the only
+	// thing keeping the decision context alive was the detach.
+	waitFor(t, 10*time.Second, func() bool {
+		for _, sh := range []int64{a, b} {
+			if len(h.poolers[h.shardOf(t, sh)].cancelled()) > 0 {
+				return true
+			}
+		}
+		return false
+	}, "no participant saw the cancel: the request never reached this session, so the assertion above proves nothing")
 
 	waitFor(t, 10*time.Second, func() bool {
 		for _, ev := range h.log.log() {

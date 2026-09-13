@@ -682,10 +682,21 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	// a ROLLBACK PREPARED skipped because the client left is a prepared
 	// transaction pinning WAL and blocking slot creation.
 	//
-	// No added deadline. The transport already bounds each call, and a
-	// timeout here could only turn a slow decision into an undecided one,
-	// which is the outcome this exists to avoid.
-	decide := context.WithoutCancel(ctx)
+	// Bounded, because detaching removes the only bound these calls had.
+	// poolerStream.recv escapes a silent pooler through ctx.Done() alone,
+	// and the decision log's batch runs with no statement timeout, so a
+	// peer that is up but not answering -- a shard whose COMMIT PREPARED is
+	// waiting on a departed synchronous standby, a catalog in the same
+	// state -- would pin this session, its pooler session and a catalog
+	// connection for ever, where a cancel used to free them. Enough of
+	// those and every other multi-shard commit blocks behind the pool.
+	//
+	// decisionDeadline is far longer than any healthy commit and far
+	// shorter than for ever. Crossing it lands in the in-doubt path this
+	// function already has: participants stay prepared and the resolver
+	// finishes them, which is what used to happen on a cancel anyway.
+	decide, stopDeciding := context.WithTimeout(context.WithoutCancel(ctx), decisionDeadline)
+	defer stopDeciding()
 	hbCtx, stopHeartbeat := context.WithCancel(decide)
 	defer stopHeartbeat()
 	go heartbeatUntilDecided(hbCtx, log, gid)
@@ -759,6 +770,13 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	e.finishTxn("COMMIT")
 	return w.CommandComplete("COMMIT")
 }
+
+// decisionDeadline bounds the part of two-phase commit that no longer
+// answers to the client's cancellation. It is not a latency target: nothing
+// healthy comes close to it, and the only thing it decides is how long a
+// peer that has stopped answering can hold a session before the transaction
+// is handed to the resolver.
+const decisionDeadline = 2 * time.Minute
 
 // decisionHeartbeatInterval is how often a coordinator marks its
 // preparing decision row alive; the resolver's preparing timeout spans
