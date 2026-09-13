@@ -403,10 +403,10 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	// transactions, and the ones already open are waited out: the setting
 	// is read when a transaction starts, so the pause alone does not end
 	// a writer that began before it.
-	if err := o.pauseSet(ctx, o.wf.set, o.wf.ids, true); err != nil {
+	if err := o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, true); err != nil {
 		return err
 	}
-	defer func() { _ = o.pauseSet(ctx, o.wf.set, o.wf.ids, false) }()
+	defer func() { _ = o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false) }()
 	if err := o.drainWriters(ctx, o.wf.set, o.wf.ids); err != nil {
 		return err
 	}

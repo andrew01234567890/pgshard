@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -118,7 +119,13 @@ func waitReadOnly(t *testing.T, dsn string, want bool) {
 	t.Helper()
 	ctx := context.Background()
 	var last bool
-	for range 100 {
+	for i := range 100 {
+		if i > 0 {
+			// pg_reload_conf returns before the setting reaches a new
+			// backend, so a tight loop of connects can finish before the
+			// reload lands and report the old value as final.
+			time.Sleep(50 * time.Millisecond)
+		}
 		conn, err := pgx.Connect(ctx, dsn)
 		if err != nil {
 			t.Fatal(err)
@@ -133,4 +140,83 @@ func waitReadOnly(t *testing.T, dsn string, want bool) {
 		}
 	}
 	t.Fatalf("default_transaction_read_only is %v, want %v", last, want)
+}
+
+// The retirement pause is not a claimed pause, and the sweep must never lift
+// it.
+//
+// Complete makes a RETIRED set read-only for good: its pods stay up for the
+// retirement window and its -rw Service still answers, so a client connected
+// straight to it would have writes acknowledged by a primary nothing reads
+// from again and lose them at deletion, with no error anywhere. Complete is
+// also the last thing every terminal path does, so a claim on that pause
+// would be an orphan by the time the next sweep ran -- the sweep would hand
+// the retired set back within seconds of retirement, reversing the guarantee
+// Complete exists to make.
+func TestOnlyAPauseSomebodyMeansToLiftIsClaimed(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	catalogDSN := startPostgres(t)
+	shardDSN := startPostgres(t)
+
+	cat := connect(t, catalogDSN)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, catalogDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
+		VALUES ('default', 0, 'shard0', 'serving', 1, 'shard0:5432')`)
+
+	const wfID = "22222222-2222-2222-2222-222222222222"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state) VALUES ($1::uuid, 'reshard', 'running')`, wfID)
+	o := &pgCutover{c: &Copier{Pool: pool, Shards: realShards{shardDSN}},
+		wf: &copyWorkflow{id: wfID}, srcSet: "default", srcIDs: []int32{0}}
+
+	// The swap's pause: claimed, so the sweep can finish it.
+	if err := o.pauseSetClaimed(ctx, "default", []int32{0}, true); err != nil {
+		t.Fatal(err)
+	}
+	if claim := pauseClaim(t, cat); claim != wfID {
+		t.Fatalf("a pause that will be lifted is claimed, got %q", claim)
+	}
+	if err := o.pauseSetClaimed(ctx, "default", []int32{0}, false); err != nil {
+		t.Fatal(err)
+	}
+	if claim := pauseClaim(t, cat); claim != "" {
+		t.Fatalf("the claim outlived the pause: %q", claim)
+	}
+
+	// The retirement pause: unclaimed, and invisible to the sweep even with
+	// no workflow row left at all.
+	if err := o.pauseSet(ctx, "default", []int32{0}, true); err != nil {
+		t.Fatal(err)
+	}
+	if claim := pauseClaim(t, cat); claim != "" {
+		t.Fatalf("the retirement pause was claimed as %q; the sweep would lift it the moment the workflow finished", claim)
+	}
+	waitReadOnly(t, shardDSN, true)
+	mustExec(t, cat, `DELETE FROM pgshard.workflows WHERE id = $1::uuid`, wfID)
+
+	sweep := &WritePauseSweep{Pool: pool, Shards: realShards{shardDSN}}
+	if freed, err := sweep.Pass(ctx); err != nil || freed != 0 {
+		t.Fatalf("the sweep lifted the retirement pause: freed %d, %v", freed, err)
+	}
+	waitReadOnly(t, shardDSN, true)
+}
+
+func pauseClaim(t *testing.T, cat *pgx.Conn) string {
+	t.Helper()
+	var claim *string
+	if err := cat.QueryRow(context.Background(),
+		`SELECT write_paused_by::text FROM pgshard.shard_status WHERE shard_set = 'default' AND shard_id = 0`).Scan(&claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim == nil {
+		return ""
+	}
+	return *claim
 }

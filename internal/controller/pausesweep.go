@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -22,11 +23,12 @@ import (
 // writing transaction with 25006 -- with no hint, because as far as
 // PostgreSQL is concerned nothing is wrong.
 //
-// The sweep is keyed on shard_status.write_paused_by, which pauseSet claims
-// before it raises the pause, and NOT on migrating_by: the range fence is
-// also raised by workflows that never pause, and resetting
-// default_transaction_read_only on a shard pgshard did not pause would undo
-// an operator's own maintenance setting.
+// The sweep is keyed on shard_status.write_paused_by, which pauseSetClaimed
+// writes before it raises a pause it means to lift again. Two things it is
+// deliberately not keyed on: migrating_by, because the range fence is also
+// raised by workflows that never pause; and the setting itself, because an
+// operator pausing a shard for their own maintenance, and the permanent
+// pause a retired set carries, both look exactly like a stuck one.
 type WritePauseSweep struct {
 	Pool   CatalogDB
 	Shards ShardDialer
@@ -64,32 +66,46 @@ func (s *WritePauseSweep) Pass(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	freed := 0
+	var errs []error
 	for _, sh := range orphans {
 		// The shard first, the claim second. A crash between them leaves a
 		// claim on a shard that is already writable, which the next pass
 		// resets again for nothing; the other order would lose the record
 		// of a pause that is still on.
 		if err := s.unpause(ctx, sh); err != nil {
-			return freed, fmt.Errorf("shard %s/%d: %w", sh.Set, sh.ID, err)
+			// Collected, not returned: a shard_status row outlives the
+			// pods of a set that was deleted, so one unreachable shard can
+			// hold a claim no pass will ever clear. Stopping at it would
+			// leave every orphan that sorts after it paused for as long as
+			// that row exists.
+			errs = append(errs, fmt.Errorf("shard %s/%d: %w", sh.Set, sh.ID, err))
+			continue
 		}
 		if _, err := s.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
 			WHERE shard_set = $1 AND shard_id = $2`, sh.Set, sh.ID); err != nil {
-			return freed, err
+			errs = append(errs, err)
+			continue
 		}
 		freed++
-		s.logger().Warn("lifted a write pause whose workflow no longer exists; the source was refusing writes with 25006",
+		s.logger().Warn("lifted a write pause whose workflow is gone or finished; the shard was refusing writes with 25006",
 			"shard_set", sh.Set, "shard_id", sh.ID)
 	}
-	return freed, nil
+	return freed, errors.Join(errs...)
 }
 
 func (s *WritePauseSweep) orphans(ctx context.Context) ([]ShardRef, error) {
 	// A workflow that is gone OR finished. Deleting the row is the case
-	// this was written for, but a terminal workflow is the same fact: the
-	// pause lives inside a single swap attempt, so a completed, failed or
-	// cancelled workflow cannot still be relying on one, and any exit that
-	// ends a workflow without releasing leaves a claim exactly like a
-	// deletion does.
+	// this was written for, but a terminal workflow is the same fact: a
+	// claimed pause is one a workflow intends to lift, so a completed,
+	// failed or cancelled workflow cannot still be relying on one, and any
+	// exit that ends a workflow without releasing leaves a claim exactly
+	// like a deletion does.
+	//
+	// Only CLAIMED pauses. The retirement pause Complete raises on a set
+	// that will never serve again is deliberate, permanent and unclaimed,
+	// and lifting it would hand a retired primary back to any client still
+	// connected straight to it -- writes acknowledged by a shard nothing
+	// reads from again.
 	rows, err := s.Pool.Query(ctx, `SELECT shard_set, shard_id FROM pgshard.shard_status s
 		WHERE write_paused_by IS NOT NULL
 		  AND NOT EXISTS (SELECT 1 FROM pgshard.workflows w

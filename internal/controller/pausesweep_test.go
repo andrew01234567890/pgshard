@@ -138,21 +138,35 @@ func TestASweepWithNoOrphansTouchesNothing(t *testing.T) {
 	}
 }
 
-// The shard is reset before the claim is dropped. A crash between them
-// leaves a claim on a shard that is already writable, which the next pass
-// resets again for nothing; the other order would lose the record of a pause
-// that is still on, which is the leak this exists to close.
-func TestAShardThatCannotBeReachedKeepsItsClaim(t *testing.T) {
+// A shard that cannot be reached keeps its claim, and does not take the rest
+// of the sweep down with it.
+//
+// Keeping the claim: the shard is reset before the claim is dropped, because
+// the claim is the only record that the shard is paused. The other order
+// would lose a pause that is still on, which is the leak this exists to
+// close.
+//
+// Not stopping: a shard_status row outlives the pods of a set that was
+// deleted, so one unreachable shard can hold a claim no pass will ever
+// clear. Returning at it would leave every orphan sorting after it paused
+// for as long as that row exists.
+func TestAnUnreachableShardKeepsItsClaimAndStopsNothingElse(t *testing.T) {
 	cat := &fakeCatalog{orphans: []ShardRef{{Set: "default", ID: 0}, {Set: "default", ID: 1}}}
 	dialer := &pauseDialer{failOn: ShardRef{Set: "default", ID: 0}, failErr: errors.New("no route to host")}
 	freed, err := (&WritePauseSweep{Pool: cat, Shards: dialer}).Pass(context.Background())
-	if err == nil {
-		t.Fatal("a shard that could not be reached must fail the pass")
+	if err == nil || !strings.Contains(err.Error(), "default/0") {
+		t.Fatalf("the pass must report the shard it could not reach, got %v", err)
 	}
-	if freed != 0 {
-		t.Fatalf("freed %d, want 0: the first shard is the one that failed", freed)
+	if freed != 1 {
+		t.Fatalf("freed %d, want 1: the second shard is reachable and was still paused", freed)
 	}
-	if len(cat.execs) != 0 {
+	if _, ok := dialer.ran["default/1"]; !ok {
+		t.Fatal("the sweep stopped at the unreachable shard and never reached the next orphan")
+	}
+	if len(cat.execs) != 1 {
+		t.Fatalf("want exactly the reachable shard's claim dropped, got %v", cat.execs)
+	}
+	if strings.Contains(cat.execs[0], "default 0") {
 		t.Fatalf("the claim was dropped for a shard still refusing writes: %v", cat.execs)
 	}
 }

@@ -105,8 +105,8 @@ WHERE write_paused_by IS NOT NULL
 ```
 
 Rows here are pauses with no live owner — the workflow row was deleted, or
-it is in a terminal state, which it cannot be while still inside its swap
-step. If the sweep cannot reach a shard it
+it is in a terminal state, which it cannot be while it still means to lift
+the pause. If the sweep cannot reach a shard it
 says so and leaves the claim in place, which is deliberate: the claim is the
 only record that the shard is paused, so it is dropped only after the shard
 is writable again. Fix the connectivity and the next tick finishes.
@@ -129,9 +129,16 @@ Do this in that order. A claim left on a writable shard costs one wasted
 `ALTER SYSTEM RESET` per sweep; a paused shard with no claim is invisible
 again.
 
-Note that a shard paused by an operator for their own maintenance is never
-touched: the sweep keys on `write_paused_by`, which only a cutover writes,
-and not on `default_transaction_read_only` itself.
+Two pauses the sweep never touches, because it keys on `write_paused_by` and
+not on `default_transaction_read_only` itself:
+
+- one an operator raised for their own maintenance;
+- the permanent one a **retired** set carries. Completing a reshard makes the
+  retired set read-only for good — its pods stay up for the retirement window
+  and its `-rw` Service still answers, so a client connected straight to it
+  would have writes acknowledged by a primary nothing reads from again. That
+  pause has no claim, deliberately. If you find a retired set refusing
+  writes, that is the design and not this fault.
 
 The range fence is a separate thing with the same shape — `shard_status.migrating`
 and `migrating_by`. A stuck fence makes routers buffer and then refuse with a
