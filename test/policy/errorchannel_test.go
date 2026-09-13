@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"io/fs"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,31 +19,42 @@ import (
 //
 // Listed rather than pattern-matched, so each one is a decision somebody
 // made and a new embedding has to be argued for here rather than merely
-// written. A line that moves shows up as a failure, which is the point: it
-// forces a second look at whether the reason still holds.
+// written.
+//
+// Keyed by the enclosing function, not by line. Line numbers were the point
+// once -- a line that moved forced a second look at whether the reason still
+// held -- but in practice they move when something ELSE in the file gains a
+// few lines, and the second look has nothing to look at. Twice in one day
+// that failed make test on a rule the change never touched, which teaches
+// people to update the number without reading the reason: the opposite of
+// what the list is for. A function that is renamed, or a return that moves
+// to a different function, still trips it, and those are the changes where
+// the reason really does need re-reading.
+//
+// The suffix on a repeat is its order within the function.
 var deliberate = map[string]string{
 	// The agent's Status is a REPORT. A role it cannot read is reported as
 	// an error rather than as primary, because the operator promotes and
 	// fences on this answer -- the RPC succeeded and the report says the
 	// role is unknown.
-	"internal/agent/server.go:122": "Status reports a role it could not read",
-	"internal/agent/server.go:129": "Status could not connect; the report says so",
-	"internal/agent/server.go:139": "Status could not read the LSN; the report says so",
+	"internal/agent/server.go (*Server).Status":   "Status reports a role it could not read",
+	"internal/agent/server.go (*Server).Status#2": "Status could not connect; the report says so",
+	"internal/agent/server.go (*Server).Status#3": "Status could not read the LSN; the report says so",
 
 	// pgBackRest's own output is the only diagnostic a failed backup has,
 	// and the backup reconciler writes it into the group's status. One
 	// channel per RPC, so the failures with nothing to carry go the same
 	// way as the one that has.
-	"internal/agent/backupops.go:211": "Backup: fenced at the wrong epoch, same channel as the failure that carries a log",
-	"internal/agent/backupops.go:218": "Backup: unknown type, same channel",
-	"internal/agent/backupops.go:228": "Backup failed and its log is the diagnostic",
-	"internal/agent/backupops.go:288": "Verify could not start",
-	"internal/agent/backupops.go:294": "Verify ran and found a problem: the finding is the result",
+	"internal/agent/backupops.go (*Server).Backup":   "Backup: fenced at the wrong epoch, same channel as the failure that carries a log",
+	"internal/agent/backupops.go (*Server).Backup#2": "Backup: unknown type, same channel",
+	"internal/agent/backupops.go (*Server).Backup#3": "Backup failed and its log is the diagnostic",
+	"internal/agent/backupops.go (*Server).Verify":   "Verify could not start",
+	"internal/agent/backupops.go (*Server).Verify#2": "Verify ran and found a problem: the finding is the result",
 
 	// Partial outcomes, which is exactly what the embedded channel is for.
-	"internal/controller/server.go:112":      "ResolveTransactions returns counts AND what stopped it",
-	"internal/controller/streamadmin.go:192": "CreateStream returns the slots it made AND the error that stopped it",
-	"internal/router/vstream/server.go:192":  "Create forwards those partial slots; losing them loses WAL-retaining slots nobody knows to drop",
+	"internal/controller/server.go (*Server).ResolveTransactions": "ResolveTransactions returns counts AND what stopped it",
+	"internal/controller/streamadmin.go (*Server).CreateStream":   "CreateStream returns the slots it made AND the error that stopped it",
+	"internal/router/vstream/server.go (*Server).Create":          "Create forwards those partial slots; losing them loses WAL-retaining slots nobody knows to drop",
 }
 
 // TestNoRPCReturnsAnErrorInAnOKResponse enforces the rule PGS-393 settled:
@@ -88,32 +100,51 @@ func TestNoRPCReturnsAnErrorInAnOKResponse(t *testing.T) {
 		if perr != nil {
 			return nil // not ours to police; the build catches it
 		}
-		ast.Inspect(file, func(n ast.Node) bool {
-			var list []ast.Stmt
-			switch b := n.(type) {
-			case *ast.BlockStmt:
-				list = b.List
-			case *ast.CaseClause:
-				// A case body is a statement list without being a block,
-				// and the agent's Status embeds inside one.
-				list = b.Body
-			default:
+		rel, _ := filepath.Rel(root, path)
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			// Collected first and SORTED, because ast.Inspect visits a
+			// block before its children: a return in the function's own
+			// list is reached before one nested in an if, so walk order
+			// numbered backupops.go's Verify #1 at line 294 and #2 at 288,
+			// and the two reasons in the list documented each other's site.
+			var at []token.Pos
+			ast.Inspect(fn, func(node ast.Node) bool {
+				var list []ast.Stmt
+				switch b := node.(type) {
+				case *ast.BlockStmt:
+					list = b.List
+				case *ast.CaseClause:
+					// A case body is a statement list without being a
+					// block, and the agent's Status embeds inside one.
+					list = b.Body
+				default:
+					return true
+				}
+				at = append(at, embeddedErrorReturns(list)...)
 				return true
-			}
-			for _, pos := range embeddedErrorReturns(list) {
-				p := fset.Position(pos)
-				rel, _ := filepath.Rel(root, p.Filename)
-				at := rel + ":" + strconv.Itoa(p.Line)
-				if seen[at] {
-					continue
+			})
+			slices.Sort(at)
+			for i, pos := range at {
+				key := rel + " " + funcName(fn)
+				if i > 0 {
+					key += "#" + strconv.Itoa(i+1)
 				}
-				seen[at] = true
-				if _, ok := deliberate[at]; !ok {
-					found = append(found, at)
+				if seen[key] {
+					// With a function key a repeat is a collision, not a
+					// duplicate sighting: two functions reduced to the same
+					// name would leave the second silently unscanned.
+					t.Fatalf("two functions produced the key %q; funcName cannot tell them apart", key)
+				}
+				seen[key] = true
+				if _, ok := deliberate[key]; !ok {
+					found = append(found, key+" (line "+strconv.Itoa(fset.Position(pos).Line)+")")
 				}
 			}
-			return true
-		})
+		}
 		return nil
 	})
 	if err != nil {
@@ -132,6 +163,42 @@ func TestNoRPCReturnsAnErrorInAnOKResponse(t *testing.T) {
 			t.Errorf("deliberate lists %s, which no longer returns an embedded error: remove it", at)
 		}
 	}
+}
+
+// funcName is the receiver-qualified name, so two methods of different
+// types in one file do not collide.
+func funcName(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return fn.Name.Name
+	}
+	var b strings.Builder
+	b.WriteString("(")
+	switch t := fn.Recv.List[0].Type.(type) {
+	case *ast.StarExpr:
+		b.WriteString("*")
+		b.WriteString(receiverName(t.X))
+	default:
+		b.WriteString(receiverName(t))
+	}
+	b.WriteString(").")
+	b.WriteString(fn.Name.Name)
+	return b.String()
+}
+
+// receiverName is the type name, reaching through the type arguments of a
+// generic receiver. Without that reach a method on Foo[T] keys as "(*)." and
+// two of them in one file collide, which the duplicate check above turns
+// into a failure rather than a silently unscanned function.
+func receiverName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr:
+		return receiverName(t.X)
+	case *ast.IndexListExpr:
+		return receiverName(t.X)
+	}
+	return ""
 }
 
 // embeddedErrorReturns finds, within ONE statement list, the returns of
