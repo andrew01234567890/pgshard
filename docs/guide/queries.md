@@ -118,8 +118,16 @@ A refusal is rendered as the plan rather than raised, so you can see why a
 statement would be refused without the refusal ending your transaction --
 including the statements `pgshard.fanout` below would reject. A plain
 `EXPLAIN` still means what PostgreSQL means by it: it is routed like any
-other statement and comes back with one shard's plan. The option takes no
-others (`ANALYZE` would promise a run that does not happen).
+other statement and comes back with one shard's plan, and so does the
+explicit `EXPLAIN (PGSHARD FALSE)`. The option takes no others (`ANALYZE`
+would promise a run that does not happen).
+
+It also answers in a transaction that has already failed, where PostgreSQL
+refuses everything else with `25P02` until you end the block. That is
+deliberate: seeing why the statement that failed was routed the way it was
+should not cost you the transaction. Every other statement, including
+`nextval()` over a global sequence, is refused there as PostgreSQL refuses
+it.
 
 **Targeting one shard.** An operator can send reads and writes to a named
 shard, whatever the shard map says:

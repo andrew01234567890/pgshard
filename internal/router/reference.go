@@ -214,12 +214,17 @@ func (e *Executor) routerAnswers(batch []*pgshardv1.ExecuteRequest, parsed []str
 
 // answerBatch replays an extended batch against an answer the router makes
 // itself: Describe reports the row shape, Execute produces the rows.
-func answerBatch(batch []*pgshardv1.ExecuteRequest, answer func(describe, execute bool) error, w pgwire.ResultWriter) error {
+//
+// paramOIDs are the parameter types a Describe(statement) reports. A driver
+// that prepares and then binds sends no values at all unless the server
+// says how many it expects, so answering nothing here is not "this takes no
+// parameters" but "this cannot be prepared with any".
+func answerBatch(batch []*pgshardv1.ExecuteRequest, paramOIDs []uint32, answer func(describe, execute bool) error, w pgwire.ResultWriter) error {
 	for _, req := range batch {
 		switch r := req.Message.(type) {
 		case *pgshardv1.ExecuteRequest_Describe:
 			if r.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
-				if err := w.ParameterDescription(nil); err != nil {
+				if err := w.ParameterDescription(paramOIDs); err != nil {
 					return err
 				}
 			}
@@ -247,7 +252,10 @@ func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteR
 		err.Hint = "send a Sync before and after it"
 		return true, err
 	}
-	return true, answerBatch(batch, func(describe, execute bool) error {
+	if err := e.refuseSelfAnsweredInFailedTxn(); err != nil {
+		return true, err
+	}
+	return true, answerBatch(batch, nil, func(describe, execute bool) error {
 		return e.answerNextval(ctx, pl.NextVal, describe, execute, binary, w)
 	}, w)
 }
@@ -264,7 +272,7 @@ func (e *Executor) explainBatch(batch []*pgshardv1.ExecuteRequest, parsed []stri
 		err.Hint = "send a Sync before and after it"
 		return true, err
 	}
-	return true, answerBatch(batch, func(describe, execute bool) error {
+	return true, answerBatch(batch, pl.ExplainParams, func(describe, execute bool) error {
 		return e.answerExplain(pl.Explain, describe, execute, w)
 	}, w)
 }

@@ -147,6 +147,14 @@ type Plan struct {
 	// shard, so it returns that shard's PostgreSQL plan and says nothing
 	// about which shards were chosen or why.
 	Explain []string
+	// ExplainParams are the parameter types of the statement EXPLAIN
+	// (PGSHARD) was given, reported to a Describe of the EXPLAIN itself.
+	//
+	// The values are never used -- the statement is not run and the
+	// rendering does not depend on them -- but a driver that prepares and
+	// then binds refuses to send any at all unless the server says how
+	// many it expects, which left the feature reachable only from psql.
+	ExplainParams []uint32
 	// Migration describes a DDL/DCL statement of Kind MigrationKind.
 	Migration *Migration
 	// Rewritten, when set, is the statement text the shards run instead of

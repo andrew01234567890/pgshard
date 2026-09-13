@@ -70,8 +70,34 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 	}
 	// Before every gate below: EXPLAIN (pgshard) runs nothing, so nothing
 	// it names needs refusing here -- the refusal is what it renders.
-	if e := raw.GetStmt().GetExplainStmt(); e != nil && explainsRouting(e) {
-		return p.explainRouting(ctx, sess, parseVersion(res.Tree), e)
+	if e := raw.GetStmt().GetExplainStmt(); e != nil {
+		switch explainsRouting(e) {
+		case explainRouting:
+			return p.planExplain(ctx, sess, parseVersion(res.Tree), e)
+		case explainDeclined:
+			// Re-planned from the stripped text rather than routed from
+			// this tree: everything downstream derives the shards' SQL by
+			// deparsing, and the option has to be gone from the text they
+			// derive it from. The stripped statement no longer names the
+			// option, so this cannot recurse.
+			plain, derr := pgparser.Deparse(&pgquerypb.ParseResult{Version: parseVersion(res.Tree),
+				Stmts: []*pgquerypb.RawStmt{{Stmt: withoutExplainOption(e)}}})
+			if derr != nil {
+				return Plan{}, derr
+			}
+			out, perr := p.plan(ctx, sess, plain, masked)
+			if perr != nil {
+				return out, perr
+			}
+			if out.Rewritten == "" {
+				// Rewritten, not just replanned: the shards are sent the
+				// prepared statement's own text unless the plan names
+				// another, so re-planning alone routed the stripped
+				// statement and still forwarded the original.
+				out.Rewritten = plain
+			}
+			return out, nil
+		}
 	}
 	pl := &Plan{Generation: sess.generation(), home: sess.HomeShard, set: sess.shardSet(), snap: sess.Snapshot}
 	if err := classify(raw.GetStmt(), &pl.Class, sess.localOnly()); err != nil {
