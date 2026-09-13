@@ -224,12 +224,38 @@ func (in *Instance) baseBackup(ctx context.Context) error {
 	return WriteConfig(in.cfg, true)
 }
 
-func (in *Instance) pgRewind(ctx context.Context, source string) error {
-	args := []string{"--target-pgdata=" + in.cfg.PGData, "--source-server=" + withDatabase(source), "--no-ensure-shutdown"}
+// rewindArgs is the pg_rewind invocation for a primary being demoted.
+//
+// Deliberately WITHOUT --no-ensure-shutdown. That flag tells pg_rewind to
+// skip the single-user recovery it would otherwise run on a target that did
+// not shut down cleanly, after which pg_rewind refuses any target whose
+// control file is not DB_SHUTDOWNED or DB_SHUTDOWNED_IN_RECOVERY
+// (pg_rewind.c: "target server must be shut down cleanly").
+//
+// An unplanned failover never leaves that state. The old primary's Pod is
+// deleted with podFenceGrace, ten seconds, after which the kubelet SIGKILLs
+// it -- which is a crash, not a clean shutdown, for any primary too busy to
+// checkpoint in the time. So with the flag every crashed primary failed
+// rewind and fell through to a full reclone of the whole data directory,
+// and the code describing "pg_rewind, falling back to a full reclone"
+// described a fallback that was the only path.
+//
+// Without it pg_rewind starts the target once in single-user mode to finish
+// recovery, which is what that mode is for and what the flag's own
+// documentation calls "automatically fix unclean shutdown". The target is
+// stopped before this runs and standby.signal is not written until after,
+// so the cluster it recovers is the former primary, which is the case
+// pg_rewind is built for.
+func (in *Instance) rewindArgs(source string) []string {
+	args := []string{"--target-pgdata=" + in.cfg.PGData, "--source-server=" + withDatabase(source)}
 	if in.cfg.Postgres.RestoreCommand != "" {
 		args = append(args, "--restore-target-wal")
 	}
-	cmd := in.sup.Command(ctx, "pg_rewind", args...)
+	return args
+}
+
+func (in *Instance) pgRewind(ctx context.Context, source string) error {
+	cmd := in.sup.Command(ctx, "pg_rewind", in.rewindArgs(source)...)
 	_, err := in.sup.RunTracked(cmd)
 	return err
 }
