@@ -181,7 +181,7 @@ func unnamedBatch(sql string, oids []uint32, batch []*pgshardv1.ExecuteRequest) 
 // Anything else is a refusal rather than a split, because the rest of the
 // batch needs a backend and this statement never reaches one: interleaving
 // the two would reorder the replies.
-func (e *Executor) routerAnswers(batch []*pgshardv1.ExecuteRequest, parsed []string, wanted func(plan.Plan) bool) (pl plan.Plan, binary, other, found bool) {
+func (e *Executor) routerAnswers(batch []*pgshardv1.ExecuteRequest, parsed []string, wanted func(plan.Plan) bool) (st prepared, binary, other, found bool) {
 	stmtOf := func(portal string) string { return e.portals[portal] }
 	for _, req := range batch {
 		var stmt string
@@ -201,15 +201,15 @@ func (e *Executor) routerAnswers(batch []*pgshardv1.ExecuteRequest, parsed []str
 		default:
 			continue
 		}
-		st, ok := e.stmts[stmt]
+		p, ok := e.stmts[stmt]
 		switch {
-		case ok && wanted(st.plan):
-			pl, found = st.plan, true
+		case ok && wanted(p.plan):
+			st, found = p, true
 		default:
 			other = true
 		}
 	}
-	return pl, binary, other, found
+	return st, binary, other, found
 }
 
 // answerBatch replays an extended batch against an answer the router makes
@@ -243,7 +243,7 @@ func answerBatch(batch []*pgshardv1.ExecuteRequest, paramOIDs []uint32, answer f
 // nextvalBatch answers an extended batch whose statement is a nextval()
 // over a global sequence; such a statement must be alone in its batch.
 func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, parsed []string, w pgwire.ResultWriter) (bool, error) {
-	pl, binary, other, found := e.routerAnswers(batch, parsed, func(pl plan.Plan) bool { return pl.NextVal != "" })
+	st, binary, other, found := e.routerAnswers(batch, parsed, func(pl plan.Plan) bool { return pl.NextVal != "" })
 	if !found {
 		return false, nil
 	}
@@ -256,14 +256,14 @@ func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteR
 		return true, err
 	}
 	return true, answerBatch(batch, nil, func(describe, execute bool) error {
-		return e.answerNextval(ctx, pl.NextVal, describe, execute, binary, w)
+		return e.answerNextval(ctx, st.plan.NextVal, describe, execute, binary, w)
 	}, w)
 }
 
 // explainBatch answers an extended batch whose statement is
 // EXPLAIN (PGSHARD) ...; such a statement must be alone in its batch.
 func (e *Executor) explainBatch(batch []*pgshardv1.ExecuteRequest, parsed []string, w pgwire.ResultWriter) (bool, error) {
-	pl, _, other, found := e.routerAnswers(batch, parsed, func(pl plan.Plan) bool { return pl.Explain != nil })
+	st, _, other, found := e.routerAnswers(batch, parsed, func(pl plan.Plan) bool { return pl.Explain != nil })
 	if !found {
 		return false, nil
 	}
@@ -272,9 +272,27 @@ func (e *Executor) explainBatch(batch []*pgshardv1.ExecuteRequest, parsed []stri
 		err.Hint = "send a Sync before and after it"
 		return true, err
 	}
-	return true, answerBatch(batch, pl.ExplainParams, func(describe, execute bool) error {
-		return e.answerExplain(pl.Explain, describe, execute, w)
+	return true, answerBatch(batch, declaredOver(st.plan.ExplainParams, st.oids), func(describe, execute bool) error {
+		return e.answerExplain(st.plan.Explain, describe, execute, w)
 	}, w)
+}
+
+// declaredOver reports the types the client declared at Parse over the ones
+// the planner worked out, which is the order PostgreSQL reports them in: a
+// declared parameter type is the parameter's type, and inference only fills
+// the rest.
+func declaredOver(inferred, declared []uint32) []uint32 {
+	if len(declared) == 0 {
+		return inferred
+	}
+	out := make([]uint32, max(len(inferred), len(declared)))
+	copy(out, inferred)
+	for i, oid := range declared {
+		if oid != 0 {
+			out[i] = oid
+		}
+	}
+	return out
 }
 
 // answerNextval serves `SELECT nextval('seq')` from the router's block of

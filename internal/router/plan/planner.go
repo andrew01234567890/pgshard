@@ -71,7 +71,11 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 	// Before every gate below: EXPLAIN (pgshard) runs nothing, so nothing
 	// it names needs refusing here -- the refusal is what it renders.
 	if e := raw.GetStmt().GetExplainStmt(); e != nil {
-		switch explainsRouting(e) {
+		want, oerr := explainsRouting(e)
+		if oerr != nil {
+			return refusalErr(oerr)
+		}
+		switch want {
 		case explainRouting:
 			return p.planExplain(ctx, sess, parseVersion(res.Tree), e)
 		case explainDeclined:

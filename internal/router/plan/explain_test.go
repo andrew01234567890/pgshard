@@ -2,8 +2,12 @@ package plan
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 func explain(t *testing.T, sql string) string {
@@ -185,15 +189,63 @@ func TestExplainPgshardSeparatesForwardedFromRouterAnswered(t *testing.T) {
 	}
 }
 
-// PostgreSQL's defGetBoolean takes 0 and 1 and rejects every other number.
-// Recognising (pgshard 2) here would answer a statement PostgreSQL would
-// have rejected, in our own dialect.
-func TestExplainPgshardIntegerOptionIsZeroOrOne(t *testing.T) {
-	p, err := New().Plan(context.Background(), session(fixture(t)), "explain (pgshard 2) select * from orders where tenant_id = 1")
-	if err != nil {
-		t.Fatalf("it is the shard's rejection to raise: %v", err)
+// The pgshard option takes exactly what defGetBoolean takes: nothing, 0, 1,
+// and the words true, false, on and off.
+//
+// The refusal is ours to raise. Every other EXPLAIN option is PostgreSQL's,
+// so a shard rejects what it cannot read; this one is stripped from the
+// statement before a shard sees it, and a value we cannot read would
+// otherwise be treated as false and run the statement the user did not ask
+// for.
+func TestThePgshardOptionTakesWhatDefGetBooleanTakes(t *testing.T) {
+	ctx := context.Background()
+	for _, on := range []string{"explain (pgshard) %s", "explain (pgshard true) %s", "explain (pgshard on) %s", "explain (pgshard 1) %s"} {
+		p, err := New().Plan(ctx, session(fixture(t)), fmt.Sprintf(on, "select * from orders where tenant_id = 1"))
+		if err != nil || p.Explain == nil {
+			t.Errorf("%q: want the router's plan, got %v %v", on, p.Explain, err)
+		}
 	}
-	if p.Explain != nil {
-		t.Errorf("2 is not a boolean: %v", p.Explain)
+	for _, off := range []string{"explain (pgshard false) %s", "explain (pgshard off) %s", "explain (pgshard 0) %s"} {
+		p, err := New().Plan(ctx, session(fixture(t)), fmt.Sprintf(off, "select * from orders where tenant_id = 1"))
+		if err != nil {
+			t.Errorf("%q: an explicit false is a plain EXPLAIN, not a refusal: %v", off, err)
+		}
+		if p.Explain != nil {
+			t.Errorf("%q: the router answered a statement that asked for PostgreSQL's EXPLAIN", off)
+		}
+	}
+	// yes/no/t/f are GUC spellings, not defGetBoolean's, and 2 is not a
+	// boolean at all.
+	for _, bad := range []string{"explain (pgshard 2) %s", "explain (pgshard yes) %s", "explain (pgshard t) %s", "explain (pgshard 'nope') %s"} {
+		_, err := New().Plan(ctx, session(fixture(t)), fmt.Sprintf(bad, "select * from orders where tenant_id = 1"))
+		if err == nil || !strings.Contains(err.Error(), "requires a Boolean value") {
+			t.Errorf("%q: want defGetBoolean's own refusal, got %v", bad, err)
+		}
+	}
+}
+
+// The parameter types EXPLAIN (PGSHARD) reports are 0 -- the protocol's
+// "unspecified", which a driver answers by inferring from the value it
+// holds -- except for a parameter the plan routes on, where the catalog has
+// recorded the shard key column's type and that is the type PostgreSQL
+// would have inferred.
+//
+// Claiming a type we have not determined would be worse than saying
+// nothing: no value is read here, and a driver that trusts a wrong one
+// fails to encode a perfectly good argument.
+func TestExplainReportsTheShardKeysTypeAndNothingElse(t *testing.T) {
+	snap := fixture(t)
+	key := snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "orders"}
+	pl := snap.Tables[key]
+	pl.ShardKeyType = "bigint"
+	snap.Tables[key] = pl
+
+	p, err := New().Plan(context.Background(), session(snap),
+		"explain (pgshard) select * from orders where tenant_id = $2 and note = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint32{0, 20}; !slices.Equal(p.ExplainParams, want) {
+		t.Fatalf("ExplainParams = %v, want %v: $2 is the shard key (bigint), $1 is not determined", p.ExplainParams, want)
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
+
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	pgquerypb "github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
 )
@@ -40,20 +42,24 @@ const (
 // The LAST spelling wins, because that is what defGetBoolean does with a
 // repeated option and the user writing (pgshard true, pgshard false) is
 // entitled to the answer PostgreSQL would have given.
-func explainsRouting(e *pgquerypb.ExplainStmt) explainRequest {
+func explainsRouting(e *pgquerypb.ExplainStmt) (explainRequest, error) {
 	out := explainPlain
 	for _, o := range e.GetOptions() {
 		d := o.GetDefElem()
 		if d == nil || !strings.EqualFold(d.GetDefname(), ExplainOption) {
 			continue
 		}
-		if optionIsOn(d) {
+		on, err := optionIsOn(d)
+		if err != nil {
+			return out, err
+		}
+		if on {
 			out = explainRouting
 		} else {
 			out = explainDeclined
 		}
 	}
-	return out
+	return out, nil
 }
 
 // withoutExplainOption is the statement with every pgshard option removed,
@@ -76,37 +82,49 @@ func withoutExplainOption(e *pgquerypb.ExplainStmt) *pgquerypb.Node {
 	}}
 }
 
-// optionIsOn reads a boolean EXPLAIN option the way defGetBoolean does: no
-// argument is true, and TRUE/ON/1 in any of the spellings the grammar puts
-// them in is true.
+// optionIsOn reads a boolean EXPLAIN option exactly as defGetBoolean does:
+// no argument is true, the integers 0 and 1, and the words true, false, on
+// and off in any case. Anything else is the error defGetBoolean raises.
+//
+// The error has to be raised here rather than left to a shard. Every other
+// EXPLAIN option is PostgreSQL's, so a shard rejects what it cannot read;
+// this one is ours, and the statement carrying it either never leaves the
+// router or leaves with the option stripped off. Treating an unreadable
+// value as false would run the statement the user did not ask for.
 //
 // The grammar hands the argument over as a bare String or Integer node
 // rather than an A_Const, so `(pgshard on)` and `(pgshard 1)` arrive in two
 // different shapes and neither is the shape a value expression has.
-func optionIsOn(d *pgquerypb.DefElem) bool {
+func optionIsOn(d *pgquerypb.DefElem) (bool, error) {
 	arg := d.GetArg()
 	switch {
 	case arg == nil:
-		return true
+		return true, nil
 	case arg.GetString_() != nil:
-		return isTrueWord(arg.GetString_().GetSval())
+		switch strings.ToLower(arg.GetString_().GetSval()) {
+		case "true", "on":
+			return true, nil
+		case "false", "off":
+			return false, nil
+		}
 	case arg.GetInteger() != nil:
-		// 1 and nothing else: defGetBoolean rejects any other number, and
-		// leaving the option unrecognised here sends the statement to a
-		// shard, where PostgreSQL raises that rejection itself.
-		return arg.GetInteger().GetIval() == 1
+		switch arg.GetInteger().GetIval() {
+		case 1:
+			return true, nil
+		case 0:
+			return false, nil
+		}
 	case arg.GetBoolean() != nil:
-		return arg.GetBoolean().GetBoolval()
+		return arg.GetBoolean().GetBoolval(), nil
 	}
-	return false
+	return false, notBoolean()
 }
 
-func isTrueWord(s string) bool {
-	switch strings.ToLower(s) {
-	case "true", "on", "yes", "t", "y", "1":
-		return true
-	}
-	return false
+// notBoolean is defGetBoolean's own refusal, message and SQLSTATE.
+func notBoolean() *pgwire.Error {
+	err := pgwire.Errorf(pgwire.CodeSyntaxError, "%s requires a Boolean value", ExplainOption)
+	err.Hint = "write " + ExplainOption + ", " + ExplainOption + " false, or leave it out"
+	return err
 }
 
 // refuseOtherExplainOptions refuses pgshard combined with any other EXPLAIN
