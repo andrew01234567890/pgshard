@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -415,5 +416,226 @@ func TestAShardThatCutOverIsLeftAloneAndReported(t *testing.T) {
 	}
 	if !has(shards.superuserStatements(1), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
 		t.Error("the shard whose cutover failed was not reverted")
+	}
+}
+
+// A cutover whose COMMIT reply never came back is still reported as
+// diverged, and its shard is not reverted.
+//
+// PGS-752 L4 reads Step and concludes otherwise: Step advances only for a
+// shard that did NOT fail, so a shard whose cutover errored keeps
+// Step == rewriteCutover, which anyShardCutOver reads as "did not cut
+// over". That much is true. What it misses is that the shard is asked
+// again -- cutover begins by checking whether the hidden column is still
+// there, and a lost reply leaves it gone, so the next attempt returns
+// ShardApplied and the step advances after all. The idempotence check that
+// exists for a resumed migration answers this case too.
+//
+// Kept although it passes, because nothing else pins it. The reporting
+// rests on cutover being attempted a second time AND on that check being
+// the first thing it does; either could be refactored away with no other
+// test noticing, and the cost is a schema diverged on one shard while the
+// migration reports a clean failure.
+func TestACutoverWhoseReplyWasLostIsStillReportedAsDiverged(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0c")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	// Shard 0's cutover COMMITS on the server and the reply is lost. The
+	// failure has to be on the COMMIT, not on a statement inside the
+	// transaction: a connection dropped mid-transaction aborts it, and the
+	// hidden column is still there afterwards. Shard 1 then fails for its
+	// own reason, which is what ends the migration.
+	cutOver := map[int32]bool{}
+	shards.exec = func(id int32, sql string) error {
+		if id == 1 && strings.Contains(sql, "RENAME COLUMN") {
+			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	shards.txnExec = func(id int32, sql string) error {
+		if id == 0 && sql == "COMMIT" {
+			cutOver[0] = true
+			return pgErr("08006", "connection closed before the reply")
+		}
+		return nil
+	}
+	shards.hiddenExists = func(id int32) bool { return !cutOver[id] }
+
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0c")
+	if m.State != catalog.MigrationFailed {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if !strings.Contains(m.Error, "already be cut over") {
+		t.Errorf("a shard cut over and the migration does not say so: %q", m.Error)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	if has(shards.superuserStatements(0), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("shard 0 cut over and was reverted anyway")
+	}
+	if !has(shards.superuserStatements(1), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("shard 1 did not cut over and was not reverted")
+	}
+	// What the operator reads to find the diverged shard. Saying "reverted"
+	// about the one shard that was deliberately left alone is the same
+	// misreport as a missing DEGRADED note, pointing the wrong way.
+	if got := m.PerShard["0"].Error; !strings.Contains(got, "cut over") {
+		t.Errorf("shard 0 reports %q; it is the shard whose schema moved", got)
+	}
+}
+
+// PGS-752 L4 proper: the lost reply lands on the attempt that exhausts the
+// retry budget, so nothing asks the shard again.
+//
+// retrying re-runs a transient failure until the budget is spent, and 08006
+// is transient, which is why the ordinary case recovers: the second attempt
+// finds the hidden column gone and records the shard as applied. Give the
+// shard no budget left and that second attempt never happens. Step stays at
+// the cutover phase, and reading the step alone reports a clean failure for
+// a shard whose schema has moved -- the misreport the finding describes,
+// reachable whenever a slow cutover has spent its budget on lock-timeout
+// retries before the COMMIT whose reply is lost.
+//
+// So the state is read from the shard, not from the step.
+func TestALostReplyOnTheLastAttemptIsStillReportedAsDiverged(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0d")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	cutOver := map[int32]bool{}
+	shards.exec = func(id int32, sql string) error {
+		if id == 1 && strings.Contains(sql, "RENAME COLUMN") {
+			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	shards.txnExec = func(id int32, sql string) error {
+		if id == 0 && sql == "COMMIT" {
+			cutOver[0] = true
+			return pgErr("08006", "connection closed before the reply")
+		}
+		return nil
+	}
+	shards.hiddenExists = func(id int32) bool { return !cutOver[id] }
+
+	a := newRewriteApplier(store, shards)
+	// The smallest budget backoff() will honour -- it reads a zero Total as
+	// "unset" and substitutes the default. One nanosecond is spent by the
+	// first attempt, so the failure is the last attempt and the retry that
+	// would have discovered the committed cutover never runs.
+	a.Backoff = Backoff{Min: time.Nanosecond, Max: time.Nanosecond, Total: time.Nanosecond}
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0d")
+	if m.State != catalog.MigrationFailed {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if got := m.PerShard["0"].Step; got > rewriteCutover {
+		t.Fatalf("shard 0 step = %d: the premise is a shard left AT the cutover phase, so the step cannot answer", got)
+	}
+	if !strings.Contains(m.Error, "already be cut over") {
+		t.Errorf("shard 0 committed its cutover and the migration reports a clean failure: %q", m.Error)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	if has(shards.superuserStatements(0), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("shard 0 cut over and was reverted anyway")
+	}
+}
+
+// A shard nobody can reach is reported as unresolved, not asserted to have
+// cut over, and keeps the error that says why it failed.
+//
+// Treating unknown as possibly-diverged is the safe direction: the cost of
+// looking and finding nothing is an hour, the cost of never being told is
+// the schema. Writing "this shard cut over" about it is a different thing --
+// a certainty nobody established, replacing the one fact that was, which is
+// the same confident wrong answer the rest of this is about.
+func TestAnUnreachableShardIsReportedAsUnresolvedNotAsCutOver(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0e")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.exec = func(id int32, sql string) error {
+		if id == 0 && strings.Contains(sql, "RENAME COLUMN") {
+			return pgErr("08006", "connection closed before the reply")
+		}
+		return nil
+	}
+	// Shard 0 goes away entirely the moment the cutover fails, so nothing
+	// can ask it what happened.
+	down := false
+	shards.dialErr = func(id int32) error {
+		if id == 0 && down {
+			return errors.New("no route to host")
+		}
+		return nil
+	}
+	shards.hiddenExists = func(int32) bool { down = true; return true }
+
+	a := newRewriteApplier(store, shards)
+	a.Backoff = Backoff{Min: time.Nanosecond, Max: time.Nanosecond, Total: time.Nanosecond}
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0e")
+	if !strings.Contains(m.Error, "already be cut over") {
+		t.Errorf("a shard nobody could reach must count as possibly diverged: %q", m.Error)
+	}
+	got := m.PerShard["0"].Error
+	if strings.Contains(got, "left as it is: this shard cut over") {
+		t.Errorf("shard 0 reports %q, which nobody established", got)
+	}
+	if !strings.Contains(got, "unreachable") {
+		t.Errorf("shard 0 reports %q, which does not say the answer is unknown", got)
+	}
+	if !strings.Contains(got, "08006") {
+		t.Errorf("shard 0 reports %q; the error that says why it failed was overwritten", got)
+	}
+}
+
+// The failure path asks the shards of the set the migration PINNED, not the
+// set serving now.
+//
+// migrationSet exists because a cutover part-way through a long rewrite must
+// not silently redirect the remaining shards at another set's databases, and
+// the failure path has to honour the same pin: reading the serving set would
+// dial a shard that never had the hidden column, which reads as "this shard
+// cut over" -- an affirmative false report, with the revert then skipped on
+// the shard that actually still carries the trigger and the working column.
+//
+// Driven directly rather than through RunOnce, because drive refuses a
+// running migration whose pinned set is no longer the serving one, so the
+// divergence cannot be reached from the top. It can still be reached WITHIN
+// a pass: the pin is read once at the start, and a set that changes while a
+// long backfill runs is not noticed until the next pass.
+func TestTheFailurePathAsksThePinnedSetNotTheServingSet(t *testing.T) {
+	m := rewriteMigration("00000000-0000-0000-0000-00000000ab0f")
+	m.Meta.ShardSet = "pinned"
+	store := &memStore{migrations: []catalog.DDLMigration{m}, shards: []int32{0, 1}, serving: "serving"}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	a := newRewriteApplier(store, shards)
+
+	if _, err := a.cutoverCommitted(context.Background(), &m, 0); err != nil {
+		t.Fatal(err)
+	}
+	shards.mu.Lock()
+	dialed := append([]string(nil), shards.dialed...)
+	shards.mu.Unlock()
+	if len(dialed) == 0 {
+		t.Fatal("nothing was dialled, so this test proves nothing")
+	}
+	for _, set := range dialed {
+		if set != "pinned" {
+			t.Fatalf("the probe dialled set %q; the migration is pinned to \"pinned\", and another set's shard has no hidden column to find", set)
+		}
 	}
 }
