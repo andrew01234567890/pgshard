@@ -8,21 +8,21 @@
 # pass/fail signal a pull request should wait on, and a crasher is worth
 # finding a day late.
 #
-# Bounded by EXECUTIONS, not by -fuzztime 5m, because the duration form makes
-# the job fail at random. With a duration the coordinator wraps its context in
-# context.WithTimeout and, when the deadline fires, calls stop(ctx.Err());
-# that error is meant to be suppressed by comparing it against the derived
-# worker context's Err(). But cancelCtx.cancel closes the parent's done
-# channel BEFORE it cancels its children, so the coordinator can wake on the
-# parent and read the child's Err() as nil, fail the comparison, and report
-# its own deadline as the failure -- `--- FAIL: FuzzDecode (300.08s)` with
-# `context deadline exceeded` and no crasher written. Twice in the week to
-# 2026-09-13. An execution limit leaves opts.Timeout at zero, so no deadline
-# context is built at all and the limit path stops with a nil error.
+# Bounded by EXECUTIONS, not by -fuzztime 5m, because the duration form
+# fails the job at random: go.dev/issue/75804, where the coordinator reports
+# its own expired deadline as the failure -- `--- FAIL: FuzzDecode (300.08s)`
+# with `context deadline exceeded` and no crasher written. Once in the
+# twelve nightly runs to 2026-09-13.
+#
+# REVERT THIS when the toolchain reaches Go 1.27, which carries the fix
+# (`err == ctx.Err() ||` added to the suppression in internal/fuzz); go1.26.8
+# still does not, so there is no patch release to wait for on this line.
 #
 # The counts are what each target reached in five minutes on this runner
-# (2026-09-11..13): ~4.9M, ~4.8M and ~23M. timeout-minutes below is the
-# wall-clock backstop, with roughly six times that headroom.
+# (2026-09-11..13): ~4.9M, ~4.8M and ~23M. timeout-minutes below is the only
+# wall-clock bound -- go test stops its own -timeout alarm before fuzzing
+# starts -- and leaves roughly six times that headroom.
+
 name: fuzz
 
 on:
@@ -71,8 +71,13 @@ jobs:
       # Go writes a failing input under testdata/fuzz/<target>/. Keeping it
       # is the whole point: committed as a seed it becomes a permanent
       # regression test, so the same defect cannot return unnoticed.
+      #
+      # cancelled() as well as failure(): timeout-minutes cancels the job
+      # rather than failing it, and a crasher found before the cap is
+      # already on disk -- exactly the run whose input is hardest to get
+      # back, since it is the slow one.
       - name: Keep any crasher
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-crasher-${{ matrix.target }}
