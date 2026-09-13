@@ -260,7 +260,10 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.DemoteResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	// AcceptOrRetry, not fence: a demotion that fenced and then failed has
+	// already stored this epoch, and the controller has no higher one to
+	// send for a demotion it still needs done.
+	if err := s.epoch.AcceptOrRetry(req.GetEpoch()); err != nil {
 		return nil, s.rpcErr(err)
 	}
 	resp.Epoch = req.GetEpoch()

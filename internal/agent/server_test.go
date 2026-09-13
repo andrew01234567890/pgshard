@@ -78,3 +78,43 @@ func TestAFailedRejoinStillHandsBackThePrimaryLease(t *testing.T) {
 		t.Error("the primary lease is still held by a member whose database is down")
 	}
 }
+
+// PGS-752 L3. A demote that failed after the fence was written could never
+// be retried.
+//
+// Demote fences with EpochStore.Accept, which takes an epoch strictly
+// greater than the one it holds -- the property that makes the fence a fence.
+// But the fence is written first and the work happens after it, so a demote
+// that stopped PostgreSQL and then failed to rejoin has already moved the
+// stored epoch to the epoch it was asked for. The controller retries the
+// same operation with the same epoch, and every retry is refused as stale,
+// for ever. Converge skips a member whose database is not running, so
+// nothing else picks it up either: the group is left short a member until
+// something restarts the pod.
+//
+// A retry at the epoch already accepted is the same controller asking again,
+// not a stale one. A LOWER epoch is still refused, which is the part that
+// matters.
+func TestADemoteThatFailedCanBeRetriedAtTheSameEpoch(t *testing.T) {
+	in := newTestInstance(t)
+	in.rewindFn = func(context.Context, string) error { return errors.New("no common ancestor") }
+	in.recloneFn = func(context.Context) error { return errors.New("source unreachable") }
+	srv := NewServer(in, in.epoch, nil, in.log, nil)
+	srv.holdStop = func() {}
+
+	if _, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 7}); err == nil {
+		t.Fatal("the rejoin was set up to fail")
+	}
+
+	// The source comes back; the controller asks again, as it must, with
+	// the epoch it is still on.
+	in.recloneFn = func(context.Context) error { return nil }
+	if _, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 7}); err != nil {
+		t.Fatalf("the retry was refused: %v; the member is fenced at this epoch and no controller will ever send a higher one for this demotion", err)
+	}
+
+	// And the fence still holds against a controller that has fallen behind.
+	if _, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 6}); err == nil {
+		t.Fatal("an epoch below the one accepted must still be refused: that is a controller that has been replaced")
+	}
+}
