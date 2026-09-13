@@ -4,9 +4,25 @@
 # name. Two of them sit on the pre-authentication wire surface, which is
 # where a length field trusted before it is bounded does the most damage.
 #
-# Scheduled rather than a PR gate. Fuzzing is time-boxed exploration, not a
+# Scheduled rather than a PR gate. Fuzzing is bounded exploration, not a
 # pass/fail signal a pull request should wait on, and a crasher is worth
 # finding a day late.
+#
+# Bounded by EXECUTIONS, not by -fuzztime 5m, because the duration form makes
+# the job fail at random. With a duration the coordinator wraps its context in
+# context.WithTimeout and, when the deadline fires, calls stop(ctx.Err());
+# that error is meant to be suppressed by comparing it against the derived
+# worker context's Err(). But cancelCtx.cancel closes the parent's done
+# channel BEFORE it cancels its children, so the coordinator can wake on the
+# parent and read the child's Err() as nil, fail the comparison, and report
+# its own deadline as the failure -- `--- FAIL: FuzzDecode (300.08s)` with
+# `context deadline exceeded` and no crasher written. Twice in the week to
+# 2026-09-13. An execution limit leaves opts.Timeout at zero, so no deadline
+# context is built at all and the limit path stops with a nil error.
+#
+# The counts are what each target reached in five minutes on this runner
+# (2026-09-11..13): ~4.9M, ~4.8M and ~23M. timeout-minutes below is the
+# wall-clock backstop, with roughly six times that headroom.
 name: fuzz
 
 on:
@@ -15,9 +31,9 @@ on:
   workflow_dispatch:
     inputs:
       fuzztime:
-        description: How long to fuzz each target
+        description: -fuzztime override for every target, e.g. 30m or 50000000x
         required: false
-        default: "5m"
+        default: ""
 
 permissions:
   contents: read
@@ -36,10 +52,13 @@ jobs:
         include:
           - target: FuzzCountStatements
             package: ./internal/pgwire/
+            execs: 5000000x
           - target: FuzzDecodeStartupPacket
             package: ./internal/pgwire/
+            execs: 5000000x
           - target: FuzzDecode
             package: ./internal/pgoutput/
+            execs: 23000000x
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -48,7 +67,7 @@ jobs:
       - name: Fuzz ${{ matrix.target }}
         run: |
           go test -run '^$' -fuzz '${{ matrix.target }}' \
-            -fuzztime '${{ inputs.fuzztime || '5m' }}' '${{ matrix.package }}'
+            -fuzztime '${{ inputs.fuzztime || matrix.execs }}' '${{ matrix.package }}'
       # Go writes a failing input under testdata/fuzz/<target>/. Keeping it
       # is the whole point: committed as a seed it becomes a permanent
       # regression test, so the same defect cannot return unnoticed.
