@@ -10,6 +10,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/placement"
 
 	"github.com/andrew01234567890/pgshard/internal/pgsequence"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestUpgradeWorkflowKindOnPostgres: the reconciler creates a kind=upgrade
@@ -449,4 +450,63 @@ func TestRollbackWaitsForAWriterThatStartedBeforeTheFence(t *testing.T) {
 	waitFor(t, 30*time.Second, func() bool {
 		return queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'in-flight-on-19'`) == 1
 	}, "a write that was in flight when the rollback began must reach the source")
+}
+
+// PGS-725: a rolled-back run keeps its targets read-only from the drain
+// until the reverse subscriptions are dropped.
+//
+// Rollback pauses the targets, drains the writers that began before the
+// pause, waits for reverse replication, flips the serving map back and
+// returns. It used to lift the pause on the way out, and the caller's very
+// next step is Complete, which drops the reverse subscriptions. A router
+// still holding the pre-flip snapshot -- the reload budget is one a second
+// after a burst, with a thirty-second periodic -- could commit to a target
+// in that gap, and nothing was left to carry the row to the source. The
+// write is acknowledged and lost.
+//
+// The window is inside one controller pass, so no external writer can be
+// scheduled into it. What is observable is the state the pause leaves
+// behind: the claim this workflow wrote must still be on the targets when
+// Rollback returns, because that is what the pause being still on means.
+func TestRollbackLeavesTheTargetsPausedForComplete(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	catalogDSN := startPostgres(t)
+	shardDSN := startPostgres(t)
+
+	cat := connect(t, catalogDSN)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, catalogDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
+		VALUES ('g2', 0, 'g2-0', 'serving', 1, 'g2-0:5432')`)
+
+	wfID := newWorkflowID(t, cat)
+	o := &pgCutover{c: &Copier{Pool: pool, Shards: realShards{shardDSN}},
+		wf: &copyWorkflow{id: wfID, set: "g2", ids: []int32{0}}, srcSet: "default", srcIDs: []int32{0}}
+
+	if err := o.pauseSetClaimed(ctx, "g2", []int32{0}, true); err != nil {
+		t.Fatal(err)
+	}
+	if claim := queryOne[string](t, cat,
+		`SELECT coalesce(write_paused_by::text, '') FROM pgshard.shard_status WHERE shard_set = 'g2' AND shard_id = 0`); claim != wfID {
+		t.Fatalf("pause claim is %q, want this workflow: the pause is what the rest of this rests on", claim)
+	}
+
+	// What the successful path must NOT do. Lifting it here is the defect:
+	// Complete has not run yet, so the reverse subscriptions are still the
+	// only route home for a write that lands now.
+	if err := o.releaseRollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if claim := queryOne[string](t, cat,
+		`SELECT coalesce(write_paused_by::text, '') FROM pgshard.shard_status WHERE shard_set = 'g2' AND shard_id = 0`); claim != wfID {
+		t.Fatalf("the pause was released before Complete dropped reverse replication (claim %q); a write landing now has nothing to carry it to the source", claim)
+	}
+	waitReadOnly(t, shardDSN, true)
 }

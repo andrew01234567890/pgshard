@@ -406,7 +406,26 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if err := o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, true); err != nil {
 		return err
 	}
-	defer func() { _ = o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false) }()
+	// Lifted only if the rollback does NOT finish. On the way out it stays
+	// on, because the caller's next step is Complete, which drops the
+	// reverse subscriptions -- and a write that lands after the pause is
+	// lifted but before those subscriptions go has nothing left to carry it
+	// to the source. The forward path keeps its sources paused across
+	// DisableForward for the same reason; this is that, the other way
+	// round.
+	//
+	// Nothing has to lift it afterwards. Complete abandons the claim and
+	// makes the retired set -- which on a rolled-back run is this one --
+	// read-only for good, so the transient pause becomes the permanent one
+	// without a writable instant between them. If the workflow dies in
+	// between, WritePauseSweep lifts a claimed pause whose workflow is gone
+	// or finished, which is the recovery that already exists.
+	done := false
+	defer func() {
+		if !done {
+			_ = o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false)
+		}
+	}()
 	if err := o.drainWriters(ctx, o.wf.set, o.wf.ids); err != nil {
 		return err
 	}
@@ -431,7 +450,11 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if err := o.flipBack(ctx); err != nil {
 		return err
 	}
-	return o.releaseRollback(ctx)
+	if err := o.releaseRollback(ctx); err != nil {
+		return err
+	}
+	done = true
+	return nil
 }
 
 // reverseBehind lists the reverse subscriptions whose confirmed flush
