@@ -98,7 +98,13 @@ type cutoverState struct {
 	PauseMS    int64      `json:"pause_ms,omitempty"`
 	FenceMS    int64      `json:"fence_ms,omitempty"`
 	SwitchedAt *time.Time `json:"switched_at,omitempty"`
-	Gate       string     `json:"gate,omitempty"`
+	// DisablingAt records that THIS run is the one turning the forward
+	// subscriptions off, so a resume can tell its own half-finished swap
+	// from a subscription an operator disabled by hand. Saved before the
+	// disable, so a crash between the two leaves the catch-up check
+	// running rather than skipped.
+	DisablingAt *time.Time `json:"disabling_at,omitempty"`
+	Gate        string     `json:"gate,omitempty"`
 	// Pause names the configured pause holding the workflow
 	// (PauseSwitchWrites or PauseComplete) and PausedAt when it began.
 	// A configured pause leaves the workflow running -- only an operator
@@ -254,6 +260,10 @@ type cutoverOps interface {
 	// stay paused across the disable.
 	DisableForward(ctx context.Context) error
 	EnableReverse(ctx context.Context) error
+	// ForwardDisabled reports whether any forward subscription has already
+	// been disabled, which is how a resume tells that it is re-entering
+	// StepSwap past its point of no return rather than starting it.
+	ForwardDisabled(ctx context.Context) (bool, error)
 	// Release drops the range fence.
 	Release(ctx context.Context) error
 	// Complete drops every replication object of the run.
@@ -675,6 +685,38 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// and only start again once the forward subscriptions are off --
 		// which is also why enabling the reverse ones is a separate step,
 		// since their apply workers need the sources writable.
+		// Everything up to DisableForward establishes that the targets
+		// have all of the sources' writes. Once the forward subscriptions
+		// are off that cannot be re-established: their slots'
+		// confirmed_flush_lsn stops advancing while the sources' WAL keeps
+		// moving for reasons no fence stops, so CaughtUp compares a
+		// standing position against a moving one and reads as behind for
+		// good. Re-running the whole step after a crash in the middle of
+		// it retries that comparison forever and never reaches
+		// EnableReverse, leaving the targets serving with no reverse
+		// replication -- the rollback path -- while the workflow reports
+		// itself as merely retrying.
+		//
+		// So the resume skips that one pair and NOTHING else. Skipping the
+		// pause and the drain with it would be wrong: DisableForward walks
+		// databases and targets one at a time and its error path unpauses
+		// the sources with some subscriptions already disabled, so a stale
+		// router -- the actor the pause exists for -- could open a writing
+		// transaction on a source whose subscription is disabled out from
+		// under it, and the commit would be acknowledged into a slot
+		// Complete drops. The sequence carry is re-run for the same
+		// reason, and repeating it is safe because Apply takes the greater.
+		//
+		// Two conditions, not one. ForwardDisabled alone cannot tell our
+		// own disable from an operator disabling a subscription by hand,
+		// and skipping the check for that would finalize the run with
+		// changes still unapplied: a loud stall turned into a silent loss.
+		// The marker says we are the ones who did it.
+		disabled, err := ops.ForwardDisabled(ctx)
+		if err != nil {
+			return false, err
+		}
+		resuming := disabled && wf.cutover.DisablingAt != nil
 		if err := ops.PauseSources(ctx, true); err != nil {
 			return false, err
 		}
@@ -692,18 +734,20 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		if err := ops.DrainSources(ctx); err != nil {
 			return true, errors.Join(retryf("%s", err), ops.PauseSources(ctx, false))
 		}
-		pos, err := ops.Positions(ctx)
-		if err != nil {
-			return false, errors.Join(err, ops.PauseSources(ctx, false))
-		}
-		ok, why, err := ops.CaughtUp(ctx, pos)
-		if err != nil {
-			return false, errors.Join(err, ops.PauseSources(ctx, false))
-		}
-		if !ok {
-			// Left writable between attempts: a workflow that stops here
-			// must not leave the sources refusing writes for good.
-			return true, errors.Join(retryf("%s", why), ops.PauseSources(ctx, false))
+		if !resuming {
+			pos, err := ops.Positions(ctx)
+			if err != nil {
+				return false, errors.Join(err, ops.PauseSources(ctx, false))
+			}
+			ok, why, err := ops.CaughtUp(ctx, pos)
+			if err != nil {
+				return false, errors.Join(err, ops.PauseSources(ctx, false))
+			}
+			if !ok {
+				// Left writable between attempts: a workflow that stops
+				// here must not leave the sources refusing writes for good.
+				return true, errors.Join(retryf("%s", why), ops.PauseSources(ctx, false))
+			}
 		}
 		// Sequence positions are not replicated. Between the carry before
 		// the flip and here, a router that had not yet reloaded could
@@ -715,6 +759,13 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// liveness measure rather than the thing safety rests on.
 		if _, err := ops.Sequences(ctx); err != nil {
 			return false, errors.Join(err, ops.PauseSources(ctx, false))
+		}
+		if wf.cutover.DisablingAt == nil {
+			now := c.now()
+			wf.cutover.DisablingAt = &now
+			if err := c.saveCutover(ctx, wf, "switching: disabling forward replication"); err != nil {
+				return false, errors.Join(err, ops.PauseSources(ctx, false))
+			}
 		}
 		if err := ops.DisableForward(ctx); err != nil {
 			return false, errors.Join(err, ops.PauseSources(ctx, false))
