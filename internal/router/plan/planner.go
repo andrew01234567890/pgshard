@@ -58,6 +58,27 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 		}
 		return Plan{}, err
 	}
+	if sess.Snapshot.IsPartial() {
+		// Fail closed rather than route against a view that cannot say
+		// what is sharded. LoadServing reads the generations and the
+		// serving rows and nothing else, so Tables and Databases come back
+		// empty -- indistinguishable from a cluster that declares none, in
+		// which case every statement plans as unsharded and goes to the
+		// home shard. That is a silent misroute: the writes land, on one
+		// shard, and every later lookup of them goes somewhere else.
+		//
+		// Only the pooler asks for a partial view today (it enforces the
+		// generation and does not plan), so this cannot fire. It is here
+		// because the thing that would make it fire is a wiring change in
+		// another process, and nothing else would report it.
+		//
+		// Total rather than per statement kind, COMMIT and ROLLBACK
+		// included. A router that cannot say what is sharded cannot end a
+		// distributed transaction correctly either, and the session is
+		// going to be dropped; refusing everything is the honest report.
+		return refuse("the router's view of the catalog is incomplete, so a statement cannot be routed",
+			"this is a router misconfiguration: its catalog watcher was started in the pooler's serving-only mode")
+	}
 	if len(res.Stmts) == 0 {
 		return sess.session(), nil
 	}

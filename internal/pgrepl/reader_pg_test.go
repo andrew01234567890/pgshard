@@ -59,7 +59,7 @@ func testReader(t *testing.T, rc *Conn, dsn string) {
 		// The connection still speaks the protocol after three expiries,
 		// which is the whole reason a deadline is the right mechanism:
 		// pgconn does not close a connection on a timeout.
-		if _, err := rc.IdentifySystem(ctx); err != nil {
+		if _, err := rc.identifySystem(ctx); err != nil {
 			t.Fatalf("after expiry: %v", err)
 		}
 	})
@@ -130,7 +130,7 @@ func testReader(t *testing.T, rc *Conn, dsn string) {
 		// Without the clear -- or without Close waiting for a cancel
 		// already in flight -- the deadline the hook set is still on the
 		// socket and every later read on this connection fails at once.
-		if _, err := rc.IdentifySystem(ctx); err != nil {
+		if _, err := rc.identifySystem(ctx); err != nil {
 			t.Fatalf("after close: %v", err)
 		}
 	})

@@ -53,7 +53,7 @@ type PoolerClient interface {
 	// and read-replica selection.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[HealthStatus], error)
 	// StreamChanges exposes logical decoding output from the shard, one
-	// event per message. Stream is the batched form used by the controller.
+	// event per message. Stream is the batched form.
 	StreamChanges(ctx context.Context, in *StreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeEvent], error)
 	// Stream opens the shard's slot for a change stream and streams decoded
 	// pgoutput events batched per transaction (or per batch_bytes). Only one
@@ -229,7 +229,7 @@ type PoolerServer interface {
 	// and read-replica selection.
 	Health(*HealthRequest, grpc.ServerStreamingServer[HealthStatus]) error
 	// StreamChanges exposes logical decoding output from the shard, one
-	// event per message. Stream is the batched form used by the controller.
+	// event per message. Stream is the batched form.
 	StreamChanges(*StreamRequest, grpc.ServerStreamingServer[ChangeEvent]) error
 	// Stream opens the shard's slot for a change stream and streams decoded
 	// pgoutput events batched per transaction (or per batch_bytes). Only one

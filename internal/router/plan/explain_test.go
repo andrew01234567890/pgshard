@@ -249,3 +249,20 @@ func TestExplainReportsTheShardKeysTypeAndNothingElse(t *testing.T) {
 		t.Fatalf("ExplainParams = %v, want %v: $2 is the shard key (bigint), $1 is not determined", p.ExplainParams, want)
 	}
 }
+
+// PGS-752 L10. Snapshot.IsPartial documented an invariant -- "a partial view
+// must never be used to plan" -- that nothing checked.
+//
+// LoadServing reads the generations and the serving rows and nothing else,
+// so Tables and Databases come back empty, which is indistinguishable from a
+// cluster that declares none. Planning against one routes every statement as
+// unsharded to the home shard: the writes land, on one shard, and every
+// later lookup of them goes somewhere else. Nothing reports it.
+func TestAPartialSnapshotIsRefusedRatherThanRoutedAsUnsharded(t *testing.T) {
+	snap := fixture(t)
+	snap.Partial = true
+	_, err := New().Plan(context.Background(), session(snap), "select * from orders where tenant_id = 1")
+	if err == nil || !strings.Contains(err.Error(), "view of the catalog is incomplete") {
+		t.Fatalf("a partial view planned instead of refusing: %v", err)
+	}
+}

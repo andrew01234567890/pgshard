@@ -24,7 +24,7 @@ service Pooler {
   // and read-replica selection.
   rpc Health(HealthRequest) returns (stream HealthStatus);
   // StreamChanges exposes logical decoding output from the shard, one
-  // event per message. Stream is the batched form used by the controller.
+  // event per message. Stream is the batched form.
   rpc StreamChanges(StreamRequest) returns (stream ChangeEvent);
   // Stream opens the shard's slot for a change stream and streams decoded
   // pgoutput events batched per transaction (or per batch_bytes). Only one
@@ -195,6 +195,12 @@ message ExecuteRequest {
     CopyData copy_data = 17;
     CopyDone copy_done = 18;
     CopyFail copy_fail = 19;
+    // Cancel here cannot interrupt a statement that is already running:
+    // Execute reads the next message only after the current one is
+    // handled, so this one waits behind the statement it would cancel. The
+    // router uses the unary Cancel RPC, which arrives on its own
+    // connection. Kept because the pooler still honours it between
+    // statements and removing a wire field is a compatibility change.
     CancelRequest cancel = 20;
   }
 }

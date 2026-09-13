@@ -878,3 +878,74 @@ func TestCrossShardLockWaitsCanBeLeftUnbounded(t *testing.T) {
 	}
 	_ = tx.Rollback(ctx)
 }
+
+// PGS-752 L1. A redundant BEGIN, sent through the EXTENDED protocol while a
+// transaction already spans shards, was answered with nothing at all.
+//
+// txnControlBatch claimed the batch by any statement whose class.Txn was
+// not TxnNone, which includes BEGIN, and handed it to txnControl -- which
+// answers COMMIT, ROLLBACK and the savepoint family and falls through for
+// BEGIN. The batch was reported handled with no CommandComplete written and
+// no backend contacted. pgconn's reader concludes only on CommandComplete,
+// EmptyQueryResponse or ErrorResponse, so it read past the ReadyForQuery
+// and blocked on a message that never came; pgjdbc instead reports the next
+// statement's result against this one.
+//
+// The extended protocol has to be reached through pgconn: pgx overrides the
+// mode to simple for any statement with no arguments (conn.go:524, "Always
+// use simple protocol when there are no arguments"), so a tx.Exec loop over
+// QueryExecMode values tests one path twice and this defect not at all.
+//
+// PostgreSQL answers a redundant BEGIN with a WARNING and completes it
+// normally (xact.c:4007-4010, ERRCODE_ACTIVE_SQL_TRANSACTION). The router
+// answers no BEGIN itself: it lets the statement reach the shard the
+// session is on, which is what the simple protocol always did here.
+func TestARedundantBeginIsCompletedAcrossShards(t *testing.T) {
+	ctx := context.Background()
+	h := newTxnHarness(t)
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
+		t.Fatalf("second writable shard must escalate, not refuse: %v", err)
+	}
+
+	// Simple protocol, which is what pgx uses for any statement with no
+	// arguments whatever mode is asked for -- conn.go:524, "Always use
+	// simple protocol when there are no arguments."
+	tag, err := tx.Exec(ctx, "begin")
+	if err != nil {
+		t.Fatalf("simple protocol: a redundant BEGIN must not fail: %v", err)
+	}
+	if tag.String() != "BEGIN" {
+		t.Errorf("simple protocol: BEGIN answered %q", tag.String())
+	}
+
+	// And the extended protocol, which has to be reached through pgconn
+	// for exactly that reason. A driver that always prepares -- pgjdbc,
+	// Npgsql -- sends only this form.
+	xctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	res := conn.PgConn().ExecParams(xctx, "begin", nil, nil, nil, nil).Read()
+	if res.Err != nil {
+		t.Fatalf("extended protocol: a redundant BEGIN must not fail: %v", res.Err)
+	}
+	if res.CommandTag.String() != "BEGIN" {
+		t.Errorf("extended protocol: BEGIN answered %q; without a CommandComplete an always-prepare driver reads past ReadyForQuery and blocks on the next message", res.CommandTag.String())
+	}
+
+	// And the transaction is still the one it was: still open, still
+	// spanning both shards, so the commit is still two-phase.
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.allRan("prepare transaction"); len(got) != 2 {
+		t.Fatalf("shards that prepared: %v, want the two the transaction wrote to; the redundant BEGIN ended it", got)
+	}
+}
