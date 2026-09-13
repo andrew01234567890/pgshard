@@ -665,7 +665,39 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		e.finishTxn("ROLLBACK")
 		return pgwire.Errorf(codeConnectionFailure, "two-phase commit: writing the decision log failed, transaction rolled back: %v", err)
 	}
-	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	// Everything from here that decides or cleans up runs detached from the
+	// client's context.
+	//
+	// A client that goes away between the decision-log write and the
+	// decision used to take the whole sequence with it: the heartbeat
+	// stopped, log.Commit failed with the cancellation, and the
+	// transaction went in-doubt with every participant holding its locks
+	// until the resolver's preparing timeout expired. Nothing about that
+	// was undecidable -- the coordinator was running and the decision log
+	// was reachable. Deciding is the coordinator's job whether or not
+	// anyone is still listening for the answer.
+	//
+	// PREPARE itself keeps the client's context, because forward progress
+	// is what a client may abandon. What it may not abandon is the cleanup:
+	// a ROLLBACK PREPARED skipped because the client left is a prepared
+	// transaction pinning WAL and blocking slot creation.
+	//
+	// Bounded, because detaching removes the only bound these calls had.
+	// poolerStream.recv escapes a silent pooler through ctx.Done() alone,
+	// and the decision log's batch runs with no statement timeout, so a
+	// peer that is up but not answering -- a shard whose COMMIT PREPARED is
+	// waiting on a departed synchronous standby, a catalog in the same
+	// state -- would pin this session, its pooler session and a catalog
+	// connection for ever, where a cancel used to free them. Enough of
+	// those and every other multi-shard commit blocks behind the pool.
+	//
+	// decisionDeadline is far longer than any healthy commit and far
+	// shorter than for ever. Crossing it lands in the in-doubt path this
+	// function already has: participants stay prepared and the resolver
+	// finishes them, which is what used to happen on a cancel anyway.
+	decide, stopDeciding := context.WithTimeout(context.WithoutCancel(ctx), decisionDeadline)
+	defer stopDeciding()
+	hbCtx, stopHeartbeat := context.WithCancel(decide)
 	defer stopHeartbeat()
 	go heartbeatUntilDecided(hbCtx, log, gid)
 	crashpoint.Hit("before_prepare")
@@ -677,21 +709,21 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	if err := firstError(writers); err != nil {
 		e.each(writers, func(p *txnPart) error {
 			if p.prepared {
-				return e.runOn(ctx, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
+				return e.runOn(decide, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
 			}
-			return e.runOn(ctx, p, "ROLLBACK", discardWriter{})
+			return e.runOn(decide, p, "ROLLBACK", discardWriter{})
 		})
 		e.r.metrics.TwoPCAborts.Inc()
-		if aerr := log.Abort(ctx, gid); aerr != nil {
+		if aerr := log.Abort(decide, gid); aerr != nil {
 			e.r.cfg.Logger.Warn("two-phase commit: recording abort failed; the resolver will finish it", "gid", gid, "err", aerr)
 		} else if firstError(writers) == nil {
-			_ = log.Delete(ctx, gid)
+			_ = log.Delete(decide, gid)
 		}
 		e.finishTxn("ROLLBACK")
 		return nameFenceInTxn(err)
 	}
 	crashpoint.Hit("after_prepare")
-	decided, err := log.Commit(ctx, gid)
+	decided, err := log.Commit(decide, gid)
 	if err != nil {
 		e.r.inDoubt.Add(1)
 		e.r.metrics.TwoPCInDoubt.Inc()
@@ -703,7 +735,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	}
 	if !decided {
 		e.each(writers, func(p *txnPart) error {
-			return e.runOn(ctx, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
+			return e.runOn(decide, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
 		})
 		e.finishTxn("ROLLBACK")
 		e.r.metrics.TwoPCAborts.Inc()
@@ -723,7 +755,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	e.decided.Store(true)
 	e.r.metrics.TwoPCCommits.Inc()
 	commitPrepared := func(p *txnPart) error {
-		return e.runOn(ctx, p, "COMMIT PREPARED "+quoteLiteral(gid), discardWriter{})
+		return e.runOn(decide, p, "COMMIT PREPARED "+quoteLiteral(gid), discardWriter{})
 	}
 	writers[0].err = commitPrepared(writers[0])
 	crashpoint.Hit("during_commit_prepared")
@@ -732,12 +764,19 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		e.r.inDoubt.Add(1)
 		e.r.metrics.TwoPCInDoubt.Inc()
 		e.r.cfg.Logger.Warn("two-phase commit: COMMIT PREPARED failed after the commit decision; the resolver will finish it", "gid", gid, "err", err)
-	} else if err := log.Delete(ctx, gid); err != nil {
+	} else if err := log.Delete(decide, gid); err != nil {
 		e.r.cfg.Logger.Warn("two-phase commit: deleting the decision row failed", "gid", gid, "err", err)
 	}
 	e.finishTxn("COMMIT")
 	return w.CommandComplete("COMMIT")
 }
+
+// decisionDeadline bounds the part of two-phase commit that no longer
+// answers to the client's cancellation. It is not a latency target: nothing
+// healthy comes close to it, and the only thing it decides is how long a
+// peer that has stopped answering can hold a session before the transaction
+// is handed to the resolver.
+const decisionDeadline = 2 * time.Minute
 
 // decisionHeartbeatInterval is how often a coordinator marks its
 // preparing decision row alive; the resolver's preparing timeout spans
