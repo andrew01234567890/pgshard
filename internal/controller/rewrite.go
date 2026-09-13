@@ -8,11 +8,17 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"time"
+
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 // Rewrite phases, tracked per shard in ShardMigration.Step.
+// cutoverProbeTimeout bounds one shard's "did you cut over?" question. It
+// runs inside the failure path, once per shard, on the applier's goroutine.
+const cutoverProbeTimeout = 10 * time.Second
+
 const (
 	rewriteAdd = iota
 	rewriteTrigger
@@ -116,13 +122,20 @@ func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catal
 		if s.State != catalog.ShardFailed {
 			s.State = catalog.ShardFailed
 		}
-		if cutOver[key] {
-			// Said before the revert is skipped, because "reverted" on a
-			// shard that was deliberately left alone is the same misreport
-			// as a missing DEGRADED note: an operator reading PerShard to
-			// find the diverged shard is told it is the one shard that is
-			// not.
+		// Said before the revert is skipped, because "reverted" on a shard
+		// that was deliberately left alone is the same misreport as a
+		// missing DEGRADED note: an operator reading PerShard to find the
+		// diverged shard is told it is the one shard that is not.
+		switch cutOver[key] {
+		case schemaCutOver:
 			s.Error = "left as it is: this shard cut over"
+			m.PerShard[key] = s
+			continue
+		case schemaUnknown:
+			// The shard's own error is kept: it is the only clue to why
+			// this failed, and overwriting it to say something nobody
+			// established loses the one fact that was.
+			s.Error = "unreachable, may have cut over, left as it is: " + s.Error
 			m.PerShard[key] = s
 			continue
 		}
@@ -160,34 +173,57 @@ func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catal
 // DEGRADED when nothing diverged is an operator who looks and finds
 // nothing; the cost of the other mistake is a schema diverged on one shard
 // while the migration reports a clean failure, which nobody looks for.
-func (a *Applier) cutOverShards(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration) map[string]bool {
-	out := map[string]bool{}
+func (a *Applier) cutOverShards(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration) map[string]rewriteSchemaState {
+	out := map[string]rewriteSchemaState{}
 	for key, s := range m.PerShard {
 		switch {
 		case s.Step > rewriteCutover:
-			out[key] = true
+			out[key] = schemaCutOver
 		case s.Step < rewriteCutover:
 			// Never reached the cutover; there is nothing to ask about.
 		default:
 			done, err := a.cutoverCommitted(ctx, m, shardID(key))
-			if err != nil {
-				logger.Warn("cannot tell whether the shard cut over; reporting it as if it did",
+			switch {
+			case err != nil:
+				logger.Warn("cannot tell whether this shard cut over; leaving it alone and reporting it as unresolved",
 					"shard", key, "err", err)
-				out[key] = true
-				continue
-			}
-			if done {
-				out[key] = true
+				out[key] = schemaUnknown
+			case done:
+				out[key] = schemaCutOver
 			}
 		}
 	}
 	return out
 }
 
+// rewriteSchemaState is what is known about one shard's schema after a
+// rewrite failed. Unknown is kept apart from cut-over because the two are
+// reported differently: claiming a shard cut over when nobody could reach it
+// is the same kind of confident wrong answer this exists to stop.
+type rewriteSchemaState int
+
+const (
+	schemaUnchanged rewriteSchemaState = iota
+	schemaCutOver
+	schemaUnknown
+)
+
 // cutoverCommitted asks one shard whether its hidden column is gone.
+//
+// migrationSet, not shardSet: the phases ran against the set pinned when the
+// migration started, and reading the SERVING set would dial a different
+// set's shard after a cutover -- one that never had the hidden column, which
+// reads as "this shard cut over" and would skip the revert on the shard that
+// actually needs it.
+//
+// Bounded, because this runs on the applier's own goroutine inside the
+// failure path: every shard sits at the cutover phase when one of them
+// fails, so an accepting-but-silent server would stall the whole migration's
+// cleanup at the moment the cluster is already in trouble.
 func (a *Applier) cutoverCommitted(ctx context.Context, m *catalog.DDLMigration, id int32) (bool, error) {
-	ctx = context.WithoutCancel(ctx)
-	set, err := a.shardSet(ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cutoverProbeTimeout)
+	defer cancel()
+	set, err := a.migrationSet(ctx, m)
 	if err != nil {
 		return false, err
 	}
@@ -674,7 +710,10 @@ func columnFacts(ctx context.Context, conn ShardConn, rw *catalog.RewriteChange,
 // rewrite from one shard, leaving the old column intact.
 func (a *Applier) revertRewrite(ctx context.Context, m *catalog.DDLMigration, id int32) error {
 	ctx = context.WithoutCancel(ctx)
-	set, serr := a.shardSet(ctx)
+	// migrationSet for the same reason the probe uses it: reverting against
+	// the serving set would drop a hidden column on a shard that never had
+	// one and leave the real artifacts in place.
+	set, serr := a.migrationSet(ctx, m)
 	if serr != nil {
 		return serr
 	}
