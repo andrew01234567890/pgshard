@@ -351,13 +351,24 @@ func waitForLedgerRole(ctx context.Context, t *testing.T, c *e2e.Cluster) {
 	waitForWhy(ctx, t, c, "ledger role applied on every group", 3*time.Minute, func() string {
 		return "\nrole state: " + catalogSQL(ctx, t, c,
 			"SELECT coalesce(string_agg(group_name || '=' || roles_generation, ', ' ORDER BY group_name), 'no rows') FROM pgshard.role_group_status") +
-			"\ndesired: " + catalogSQL(ctx, t, c, "SELECT coalesce(max(desired_generation)::text, 'none') FROM pgshard.roles")
+			"\ndesired: " + catalogSQL(ctx, t, c, "SELECT "+rolesDesiredGeneration)
 	}, func() bool {
 		return catalogSQL(ctx, t, c, `SELECT count(*) = 0 FROM pgshard.role_group_status
-			WHERE roles_generation < (SELECT max(desired_generation) FROM pgshard.roles)`) == "t" &&
+			WHERE roles_generation < `+rolesDesiredGeneration) == "t" &&
 			catalogSQL(ctx, t, c, "SELECT count(*) > 0 FROM pgshard.role_group_status") == "t"
 	})
 }
+
+// rolesDesiredGeneration is the desired roles generation, and must stay the
+// same expression as (*catalog.RoleStore).Desired computes: one sequence
+// stamps all four desired-state tables, so the max over ONE of them is a
+// generation the controller passed some time ago, not the one it is working
+// towards. A new desired-state table has to be added here too.
+const rolesDesiredGeneration = `(SELECT coalesce(max(g), 0) FROM (
+	SELECT max(desired_generation) g FROM pgshard.roles
+	UNION ALL SELECT max(desired_generation) FROM pgshard.role_members
+	UNION ALL SELECT max(desired_generation) FROM pgshard.grants
+	UNION ALL SELECT max(desired_generation) FROM pgshard.role_settings) m)`
 
 // assertOnlyTheRouterAdmitsTheAppRole is the acceptance of the rule that a
 // shard's PostgreSQL port is the control plane's path and nothing else's.
