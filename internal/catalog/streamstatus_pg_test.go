@@ -9,7 +9,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/dockertest"
 )
 
-// TestStreamStatusIsReadOnlyToAdmin: status tables are the control plane's
+// TestStreamTablesAreReadOnlyToAdmin: status tables are the control plane's
 // to write and everyone else's to read, and stream_status was the one that
 // missed the rule -- 0009 granted it in the same statement as
 // pgshard.streams, which an administrator does declare streams in.
@@ -18,7 +18,7 @@ import (
 // rather than control: with DML an administrator could report a stream as
 // active and caught up while its slot was invalidated, or hide the WAL its
 // slots are pinning.
-func TestStreamStatusIsReadOnlyToAdmin(t *testing.T) {
+func TestStreamTablesAreReadOnlyToAdmin(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		dockertest.Unavailable(t, "docker not on PATH")
 	}
@@ -50,15 +50,25 @@ func TestStreamStatusIsReadOnlyToAdmin(t *testing.T) {
 			t.Errorf("pgshard_admin holds %s on stream_status: slot state is the controller's to report, and a console that can be written to reports whatever it is told", priv)
 		}
 	}
-	// The desired-state half of 0009's grant has to survive: this is where
-	// an administrator declares streams.
+	// 0009 re-granted BOTH tables, and pgshard.streams is the half that
+	// decides the console's "lost" verdict on its own, so leaving it
+	// writable would have closed the smaller door and cemented the larger
+	// one open. Streams are declared through the controller's CreateStream
+	// RPC, not by writing this table.
 	for _, priv := range []string{"INSERT", "UPDATE", "DELETE"} {
 		var held bool
 		if err := conn.QueryRow(ctx, `SELECT has_table_privilege($1, 'pgshard.streams', $2)`, RoleAdmin, priv).Scan(&held); err != nil {
 			t.Fatal(err)
 		}
-		if !held {
-			t.Errorf("pgshard_admin lost %s on pgshard.streams, which is how a stream is declared", priv)
+		if held {
+			t.Errorf("pgshard_admin holds %s on pgshard.streams: its state column alone decides whether the console calls a stream lost", priv)
 		}
+	}
+	var canReadStreams bool
+	if err := conn.QueryRow(ctx, `SELECT has_table_privilege($1, 'pgshard.streams', 'SELECT')`, RoleAdmin).Scan(&canReadStreams); err != nil {
+		t.Fatal(err)
+	}
+	if !canReadStreams {
+		t.Fatal("pgshard_admin cannot read pgshard.streams; the console lists streams from it")
 	}
 }
