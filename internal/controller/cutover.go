@@ -254,6 +254,10 @@ type cutoverOps interface {
 	// stay paused across the disable.
 	DisableForward(ctx context.Context) error
 	EnableReverse(ctx context.Context) error
+	// ForwardDisabled reports whether any forward subscription has already
+	// been disabled, which is how a resume tells that it is re-entering
+	// StepSwap past its point of no return rather than starting it.
+	ForwardDisabled(ctx context.Context) (bool, error)
 	// Release drops the range fence.
 	Release(ctx context.Context) error
 	// Complete drops every replication object of the run.
@@ -675,6 +679,36 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// and only start again once the forward subscriptions are off --
 		// which is also why enabling the reverse ones is a separate step,
 		// since their apply workers need the sources writable.
+		// Everything below up to DisableForward establishes that the
+		// targets have all of the sources' writes. Once the forward
+		// subscriptions are off it cannot be re-established: their slots'
+		// confirmed_flush_lsn stops advancing while the sources' WAL keeps
+		// moving for reasons no fence stops, so CaughtUp compares a frozen
+		// position against a moving one and reads as behind forever. A
+		// crash between the disable and the unpause below would leave the
+		// step retrying that comparison for good, never reaching
+		// EnableReverse -- so the run would sit with the targets serving
+		// and no reverse replication, which is the rollback path, gone
+		// while the workflow reported itself as merely retrying.
+		//
+		// Asked of the shards rather than of a record this controller
+		// might not have lived to write: the crash can land between
+		// DisableForward and the save just as easily.
+		disabled, err := ops.ForwardDisabled(ctx)
+		if err != nil {
+			return false, err
+		}
+		if disabled {
+			// DisableForward is idempotent and finishes a partial pass;
+			// the catch-up question was answered before it first ran.
+			if err := ops.DisableForward(ctx); err != nil {
+				return false, err
+			}
+			if err := ops.PauseSources(ctx, false); err != nil {
+				return false, err
+			}
+			return false, ops.EnableReverse(ctx)
+		}
 		if err := ops.PauseSources(ctx, true); err != nil {
 			return false, err
 		}

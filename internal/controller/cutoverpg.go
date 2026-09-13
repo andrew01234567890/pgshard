@@ -1162,6 +1162,38 @@ func (o *pgCutover) DisableForward(ctx context.Context) error {
 	return nil
 }
 
+// ForwardDisabled reports whether any forward subscription of this run has
+// already been disabled.
+//
+// ANY, not all: DisableForward walks databases and targets one at a time,
+// so a crash can leave the run half disabled -- and half is already past
+// the point where CaughtUp can be satisfied, because the slots of the
+// disabled half have stopped advancing.
+func (o *pgCutover) ForwardDisabled(ctx context.Context) (bool, error) {
+	for _, db := range o.dbs {
+		for _, t := range o.wf.ids {
+			conn, err := o.c.Shards.DialDatabase(ctx, o.wf.set, t, db.name)
+			if err != nil {
+				return false, err
+			}
+			rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_subscription WHERE subname LIKE $1 AND NOT subenabled`,
+				o.forwardPattern(t))
+			var n int64
+			if err == nil {
+				n, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
+			}
+			_ = conn.Close(ctx)
+			if err != nil {
+				return false, err
+			}
+			if n > 0 {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // EnableReverse starts the reverse subscriptions, which keep the sources
 // current for a rollback. Their apply workers write to the sources, so this
 // runs after the write pause is lifted.

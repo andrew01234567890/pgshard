@@ -49,6 +49,13 @@ type fakeOps struct {
 	journaled       map[string]int
 	lsn             int64
 	advance         int64
+	// forwardDisabled is set by DisableForward and read by ForwardDisabled,
+	// standing in for pg_subscription.subenabled on the targets.
+	forwardDisabled bool
+	// crashAfterDisable arms a failure on the unpause that follows
+	// DisableForward, which is the one instant where the run has passed
+	// the point of no return and not yet recorded anything.
+	crashAfterDisable bool
 	// backgroundAdvance moves the source's WAL position for reasons no
 	// fence can stop -- a checkpoint, an autovacuum, a standby snapshot.
 	// Measured on an idle PostgreSQL 18 with no writes at all, so a fake
@@ -186,7 +193,23 @@ func (f *fakeOps) DisableForward(context.Context) error {
 	if f.openWriters > 0 {
 		f.lostWrite = true
 	}
-	return f.step(StepSwap)
+	if err := f.step(StepSwap); err != nil {
+		return err
+	}
+	// Disabling is what freezes the forward slots, so from here the fake
+	// can no longer be caught up: exactly the real coordinate, where
+	// confirmed_flush_lsn stands still and the source's WAL does not.
+	f.forwardDisabled = true
+	f.caughtUp = false
+	if f.crashAfterDisable {
+		f.crashAfterDisable = false
+		f.fail["pause_sources"] = errors.New("controller crashed after disabling forward replication")
+	}
+	return nil
+}
+
+func (f *fakeOps) ForwardDisabled(context.Context) (bool, error) {
+	return f.forwardDisabled, f.step("forward_disabled")
 }
 func (f *fakeOps) EnableReverse(context.Context) error { return f.step("enable_reverse") }
 
@@ -260,7 +283,7 @@ func TestCutoverHappyPath(t *testing.T) {
 	h.runUntil(t, StageSwitched)
 	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepSequences, StepReverse, StepJournal,
 		StepPositions, StepCatchUp, StepFlip,
-		"pause_sources", "drain_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
+		"forward_disabled", "pause_sources", "drain_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
 		t.Fatalf("calls %s", got)
 	}
@@ -1205,4 +1228,70 @@ func TestVerifyIsBoundedByWhatIsLeftOfTheFence(t *testing.T) {
 				"step fails on the deadline check rather than on a context that was dead already", got, ok)
 		}
 	})
+}
+
+// TestCutoverResumesAfterForwardReplicationIsDisabled covers the one instant
+// in StepSwap where the step has passed its point of no return and recorded
+// nothing: between DisableForward and the unpause that follows it.
+//
+// Re-running the step from the top cannot work there. Disabling the forward
+// subscriptions freezes their slots' confirmed_flush_lsn while the sources'
+// WAL keeps moving on its own, so CaughtUp compares a standing position
+// against a moving one and reads as behind for good. The step would retry
+// that comparison forever and never reach EnableReverse -- leaving the
+// targets serving with no reverse replication, which is to say with the
+// rollback path gone, while the workflow reported itself as retrying.
+func TestCutoverResumesAfterForwardReplicationIsDisabled(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.crashAfterDisable = true
+	// The controller's own loop records a failed step and comes back, so a
+	// pass that errors is survivable here in the way the harness's pass is
+	// not: the crash is the point of the test, not its outcome.
+	var crashes int
+	for i := 0; i < 50 && h.wf.stage != StageSwitched; i++ {
+		if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err != nil {
+			crashes++
+		}
+	}
+	if h.wf.stage != StageSwitched {
+		t.Fatalf("never switched; at %s/%s after %d crash(es): %s", h.wf.stage, h.wf.cutover.Step, crashes, strings.Join(h.ops.calls, ","))
+	}
+	if crashes != 1 {
+		t.Fatalf("want exactly the one injected crash, got %d", crashes)
+	}
+
+	if !h.ops.forwardDisabled {
+		t.Fatal("forward replication was never disabled, so the test never reached the window it is about")
+	}
+	if h.ops.caughtUp {
+		t.Fatal("the fake stayed caught up after the disable, so the resume was never asked the hard question")
+	}
+	if h.ops.paused {
+		t.Fatal("the sources were left paused")
+	}
+	var enables int
+	for _, c := range h.ops.calls {
+		if c == "enable_reverse" {
+			enables++
+		}
+	}
+	if enables != 1 {
+		t.Fatalf("reverse replication enabled %d times, want exactly 1: %s", enables, strings.Join(h.ops.calls, ","))
+	}
+	// The resume must not re-ask the question the disable made unanswerable.
+	after := h.ops.calls[indexOfLast(h.ops.calls, "forward_disabled"):]
+	for _, c := range after {
+		if c == StepCatchUp {
+			t.Fatalf("resume re-ran the catch-up check it can never satisfy: %s", strings.Join(after, ","))
+		}
+	}
+}
+
+func indexOfLast(calls []string, name string) int {
+	for i := len(calls) - 1; i >= 0; i-- {
+		if calls[i] == name {
+			return i
+		}
+	}
+	return 0
 }
