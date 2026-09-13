@@ -64,8 +64,11 @@ type merger struct {
 	now           func() time.Time
 
 	position map[router.Shard]uint64
-	// emitted mirrors position for the unary Ack path, which runs on
-	// another goroutine and must not read the map above.
+	// emitted is what this stream has actually delivered, and the clamp
+	// both ack paths are held to. It is separate from position because
+	// position starts at the caller's claimed resume vector, and because
+	// the unary Ack path runs on another goroutine and must not read the
+	// map above.
 	emitted *emitted
 	// copying holds the copy state of every shard still in its copy phase.
 	copying    map[router.Shard]*pgshardv1.VCopyState
@@ -427,6 +430,14 @@ func (m *merger) emit(u *unit) error {
 
 // forwardAck clamps every shard's acked LSN to what was delivered and hands
 // it to the shard's acker.
+//
+// The clamp is emitted, not m.position: position starts at the vector the
+// caller asked to resume from, so clamping against it let a consumer that
+// opened at a position it had never reached confirm the slot straight back
+// to that claim. Nothing below this clamps -- the pooler seeds its own
+// delivered mark from what the router asks to start at -- so a resuming
+// consumer's first ack does nothing until the stream delivers something,
+// and the slot waits where it is rather than moving past WAL in flight.
 func (m *merger) forwardAck(pos *pgshardv1.VPosition) {
 	for _, p := range pos.GetShards() {
 		sh := router.Shard{Set: p.GetShard().GetShardSet(), ID: int32(p.GetShard().GetShardId())}
@@ -434,7 +445,7 @@ func (m *merger) forwardAck(pos *pgshardv1.VPosition) {
 			continue
 		}
 		lsn := p.GetLsn()
-		if d := m.position[sh]; lsn > d {
+		if d, ok := m.emitted.at(sh); !ok || lsn > d {
 			lsn = d
 		}
 		if lsn > 0 {

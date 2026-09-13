@@ -55,9 +55,10 @@ type Server struct {
 
 	// live holds the emitted position of each open stream, so a unary Ack
 	// can be clamped to what a consumer was actually sent. The pooler
-	// allows one reader per slot, so one stream name has at most one.
+	// admits one reader per slot, so a name is expected to have at most
+	// one open stream; registerLive does not rely on that.
 	mu   sync.Mutex
-	live map[string]*emitted
+	live map[string][]*emitted
 }
 
 // emitted is what one open stream has delivered, per shard. The merger
@@ -67,12 +68,17 @@ type emitted struct {
 	pos map[router.Shard]*atomic.Uint64
 }
 
-func newEmitted(shards []router.Shard, start map[router.Shard]uint64) *emitted {
+// newEmitted starts every shard at zero, whatever position the caller
+// claimed to be resuming from. Seeding the clamp from that claim made it
+// agree with the consumer instead of checking it: nothing has been
+// delivered yet, so an ack has nothing it can be held to.
+//
+// The cost is that a resuming consumer's first ack does nothing until the
+// stream delivers something. That is the safe direction.
+func newEmitted(shards []router.Shard) *emitted {
 	e := &emitted{pos: make(map[router.Shard]*atomic.Uint64, len(shards))}
 	for _, sh := range shards {
-		v := &atomic.Uint64{}
-		v.Store(start[sh])
-		e.pos[sh] = v
+		e.pos[sh] = &atomic.Uint64{}
 	}
 	return e
 }
@@ -88,7 +94,12 @@ func (e *emitted) advance(sh router.Shard, lsn uint64) {
 	}
 }
 
+// at is nil-safe: a merger without one has delivered nothing an ack can be
+// held to, which is what a false second return says.
 func (e *emitted) at(sh router.Shard) (uint64, bool) {
+	if e == nil {
+		return 0, false
+	}
 	v, ok := e.pos[sh]
 	if !ok {
 		return 0, false
@@ -98,26 +109,46 @@ func (e *emitted) at(sh router.Shard) (uint64, bool) {
 
 // registerLive publishes an open stream's emitted position and returns the
 // function that withdraws it.
+//
+// Registrations for one name queue in the order they opened rather than
+// overwriting each other, and liveStream answers with the oldest still
+// open. The entry is what a unary Ack is checked against, and two streams
+// of the same name have delivered different things: letting a newcomer take
+// the name would measure the older stream's acks against a delivery they
+// had nothing to do with. Dropping the newcomer instead is no better --
+// when a consumer reconnects, the old stream has not always noticed the
+// connection is gone, and the new one would go on serving a name whose
+// entry vanished with the stream that finally died.
 func (s *Server) registerLive(name string, e *emitted) func() {
 	s.mu.Lock()
 	if s.live == nil {
-		s.live = map[string]*emitted{}
+		s.live = map[string][]*emitted{}
 	}
-	s.live[name] = e
+	s.live[name] = append(s.live[name], e)
 	s.mu.Unlock()
 	return func() {
 		s.mu.Lock()
-		if s.live[name] == e {
+		defer s.mu.Unlock()
+		q := s.live[name]
+		for i, x := range q {
+			if x == e {
+				s.live[name] = append(q[:i:i], q[i+1:]...)
+				break
+			}
+		}
+		if len(s.live[name]) == 0 {
 			delete(s.live, name)
 		}
-		s.mu.Unlock()
 	}
 }
 
 func (s *Server) liveStream(name string) *emitted {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.live[name]
+	if q := s.live[name]; len(q) > 0 {
+		return q[0]
+	}
+	return nil
 }
 
 func (s *Server) logger() *slog.Logger {
@@ -401,7 +432,7 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 			}
 		}
 	}()
-	live := newEmitted(shards, startPos)
+	live := newEmitted(shards)
 	defer s.registerLive(def.Name, live)()
 	m := &merger{shards: shards, inputs: inputs, ready: ready, acks: acks, acker: ackers.request, send: send,
 		topo: s.Topology, set: set, generation: gen, fingerprint: fingerprint, opts: opts, position: startPos, copying: copying, emitted: live,
