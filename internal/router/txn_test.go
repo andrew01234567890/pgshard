@@ -11,7 +11,6 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/controller"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -880,21 +879,27 @@ func TestCrossShardLockWaitsCanBeLeftUnbounded(t *testing.T) {
 	_ = tx.Rollback(ctx)
 }
 
-// A redundant BEGIN, sent while a transaction already spans shards, is
-// completed rather than swallowed.
+// PGS-752 L1. A redundant BEGIN, sent through the EXTENDED protocol while a
+// transaction already spans shards, was answered with nothing at all.
 //
-// PostgreSQL answers one with a WARNING and completes it normally
-// (xact.c:4007-4010, ERRCODE_ACTIVE_SQL_TRANSACTION), and the tag is what a
-// driver counting replies needs: a missing CommandComplete desynchronises
-// pgjdbc, which then reports the next statement's result against this one.
+// txnControlBatch claimed the batch by any statement whose class.Txn was
+// not TxnNone, which includes BEGIN, and handed it to txnControl -- which
+// answers COMMIT, ROLLBACK and the savepoint family and falls through for
+// BEGIN. The batch was reported handled with no CommandComplete written and
+// no backend contacted. pgconn's reader concludes only on CommandComplete,
+// EmptyQueryResponse or ErrorResponse, so it read past the ReadyForQuery
+// and blocked on a message that never came; pgjdbc instead reports the next
+// statement's result against this one.
 //
-// The reply comes from a backend -- the router answers no BEGIN itself --
-// and this pins that, in both protocols, for the one session state where a
-// router-side answer would be tempting. It is also the guard on
-// txnControlBatch, which claims a batch by its transaction-control
-// statement and can only answer COMMIT, ROLLBACK and the savepoint family:
-// were a BEGIN ever routed there, txnControl would fall through and write
-// nothing at all.
+// The extended protocol has to be reached through pgconn: pgx overrides the
+// mode to simple for any statement with no arguments (conn.go:524, "Always
+// use simple protocol when there are no arguments"), so a tx.Exec loop over
+// QueryExecMode values tests one path twice and this defect not at all.
+//
+// PostgreSQL answers a redundant BEGIN with a WARNING and completes it
+// normally (xact.c:4007-4010, ERRCODE_ACTIVE_SQL_TRANSACTION). The router
+// answers no BEGIN itself: it lets the statement reach the shard the
+// session is on, which is what the simple protocol always did here.
 func TestARedundantBeginIsCompletedAcrossShards(t *testing.T) {
 	ctx := context.Background()
 	h := newTxnHarness(t)
@@ -911,14 +916,28 @@ func TestARedundantBeginIsCompletedAcrossShards(t *testing.T) {
 		t.Fatalf("second writable shard must escalate, not refuse: %v", err)
 	}
 
-	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeSimpleProtocol} {
-		tag, err := tx.Exec(ctx, "begin", mode)
-		if err != nil {
-			t.Fatalf("%v: a redundant BEGIN must not fail: %v", mode, err)
-		}
-		if tag.String() != "BEGIN" {
-			t.Errorf("%v: BEGIN answered %q; a driver that counts replies desynchronises on a missing CommandComplete", mode, tag.String())
-		}
+	// Simple protocol, which is what pgx uses for any statement with no
+	// arguments whatever mode is asked for -- conn.go:524, "Always use
+	// simple protocol when there are no arguments."
+	tag, err := tx.Exec(ctx, "begin")
+	if err != nil {
+		t.Fatalf("simple protocol: a redundant BEGIN must not fail: %v", err)
+	}
+	if tag.String() != "BEGIN" {
+		t.Errorf("simple protocol: BEGIN answered %q", tag.String())
+	}
+
+	// And the extended protocol, which has to be reached through pgconn
+	// for exactly that reason. A driver that always prepares -- pgjdbc,
+	// Npgsql -- sends only this form.
+	xctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	res := conn.PgConn().ExecParams(xctx, "begin", nil, nil, nil, nil).Read()
+	if res.Err != nil {
+		t.Fatalf("extended protocol: a redundant BEGIN must not fail: %v", res.Err)
+	}
+	if res.CommandTag.String() != "BEGIN" {
+		t.Errorf("extended protocol: BEGIN answered %q; without a CommandComplete an always-prepare driver reads past ReadyForQuery and blocks on the next message", res.CommandTag.String())
 	}
 
 	// And the transaction is still the one it was: still open, still

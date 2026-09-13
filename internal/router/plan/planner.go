@@ -71,6 +71,11 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 		// generation and does not plan), so this cannot fire. It is here
 		// because the thing that would make it fire is a wiring change in
 		// another process, and nothing else would report it.
+		//
+		// Total rather than per statement kind, COMMIT and ROLLBACK
+		// included. A router that cannot say what is sharded cannot end a
+		// distributed transaction correctly either, and the session is
+		// going to be dropped; refusing everything is the honest report.
 		return refuse("the router's view of the catalog is incomplete, so a statement cannot be routed",
 			"this is a router misconfiguration: its catalog watcher was started in the pooler's serving-only mode")
 	}

@@ -835,9 +835,23 @@ func (e *Executor) txnControlBatch(ctx context.Context, batch []*pgshardv1.Execu
 	if !e.multiShardTxn() {
 		return false, nil
 	}
+	// Only the kinds txnControl can answer. It answers COMMIT, ROLLBACK
+	// and the savepoint family; a BEGIN fell through it and wrote nothing
+	// at all, while this function still reported the batch handled. The
+	// client's Execute went unanswered: pgconn's reader concludes only on
+	// CommandComplete, EmptyQueryResponse or ErrorResponse, so it read
+	// past the ReadyForQuery and blocked on a message that never came, and
+	// pgjdbc reported the next statement's result against this one.
+	//
+	// Falling through is the whole fix. A redundant BEGIN goes to the
+	// shard the session is on and PostgreSQL answers it -- with the
+	// WARNING it raises for a transaction already in progress
+	// (xact.c:4007-4010) and the BEGIN tag -- which is what the simple
+	// protocol has always done here.
 	var control *execItem
 	for i := range executed {
-		if executed[i].class.Txn != plan.TxnNone {
+		switch executed[i].class.Txn {
+		case plan.TxnCommit, plan.TxnRollback, plan.TxnSavepoint, plan.TxnRelease, plan.TxnRollbackTo:
 			control = &executed[i]
 		}
 	}
