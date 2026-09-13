@@ -486,6 +486,9 @@ func (in *Instance) clearPromotionPending() error {
 	return syncDir(in.cfg.PGData)
 }
 
+// Running reports whether this member's PostgreSQL is up.
+func (in *Instance) Running() bool { return in.sup.Running() }
+
 // PromotionPending reports whether a promotion ran pg_ctl promote but has
 // not yet completed its post-promotion setup.
 func (in *Instance) PromotionPending() bool {

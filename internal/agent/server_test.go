@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -80,25 +81,15 @@ func TestAFailedRejoinStillHandsBackThePrimaryLease(t *testing.T) {
 }
 
 // PGS-752 L3. A demote that failed after the fence was written could never
-// be retried.
-//
-// Demote fences with EpochStore.Accept, which takes an epoch strictly
-// greater than the one it holds -- the property that makes the fence a fence.
-// But the fence is written first and the work happens after it, so a demote
-// that stopped PostgreSQL and then failed to rejoin has already moved the
-// stored epoch to the epoch it was asked for. The controller retries the
-// same operation with the same epoch, and every retry is refused as stale,
-// for ever. Converge skips a member whose database is not running, so
-// nothing else picks it up either: the group is left short a member until
-// something restarts the pod.
-//
-// A retry at the epoch already accepted is the same controller asking again,
-// not a stale one. A LOWER epoch is still refused, which is the part that
-// matters.
+// be retried: the fence is stored BEFORE the work it admits, so the retry
+// carries the epoch the first attempt already accepted and is refused as
+// stale, for ever. Nothing mints a higher epoch for a demotion that has
+// already happened, and converge skips a member whose database is down.
 func TestADemoteThatFailedCanBeRetriedAtTheSameEpoch(t *testing.T) {
 	in := newTestInstance(t)
 	in.rewindFn = func(context.Context, string) error { return errors.New("no common ancestor") }
-	in.recloneFn = func(context.Context) error { return errors.New("source unreachable") }
+	reclones := 0
+	in.recloneFn = func(context.Context) error { reclones++; return errors.New("source unreachable") }
 	srv := NewServer(in, in.epoch, nil, in.log, nil)
 	srv.holdStop = func() {}
 
@@ -108,13 +99,60 @@ func TestADemoteThatFailedCanBeRetriedAtTheSameEpoch(t *testing.T) {
 
 	// The source comes back; the controller asks again, as it must, with
 	// the epoch it is still on.
-	in.recloneFn = func(context.Context) error { return nil }
+	in.recloneFn = func(context.Context) error { reclones++; return nil }
 	if _, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 7}); err != nil {
-		t.Fatalf("the retry was refused: %v; the member is fenced at this epoch and no controller will ever send a higher one for this demotion", err)
+		t.Fatalf("the retry was refused: %v", err)
+	}
+	if reclones != 2 {
+		t.Fatalf("the rejoin ran %d times, want 2: the retry was admitted and then did nothing, which is not a retry", reclones)
 	}
 
 	// And the fence still holds against a controller that has fallen behind.
-	if _, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 6}); err == nil {
-		t.Fatal("an epoch below the one accepted must still be refused: that is a controller that has been replaced")
+	_, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 6})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "stale epoch") {
+		t.Fatalf("an epoch below the one accepted answered %v; it must be refused as stale, because that is a controller that has been replaced", err)
+	}
+}
+
+// And a repeat is admitted only when it RESUMES a demotion already begun.
+//
+// The operator sends Demote at the CURRENT epoch to any member that reports
+// itself primary while not being the designated one (failover.go), and that
+// member was promoted at that very epoch. Admitting a bare repeat of the
+// accepted epoch would let such a call stop a live primary, release its
+// lease and rewind it -- precisely what the strictly increasing rule is
+// there to prevent. What separates the two cases is observable: a demote
+// that is able to fail has already stopped PostgreSQL.
+func TestOnlyAStoppedMemberMayRepeatItsEpoch(t *testing.T) {
+	in := newTestInstance(t)
+	srv := NewServer(in, in.epoch, nil, in.log, nil)
+	if err := in.epoch.Accept(7); err != nil {
+		t.Fatal(err)
+	}
+
+	if !srv.demoteRetry(7) {
+		t.Error("a stopped member at the epoch it accepted is resuming its own demotion")
+	}
+	if srv.demoteRetry(6) {
+		t.Error("an epoch below the one accepted is a controller that has been replaced, never a retry")
+	}
+	if srv.demoteRetry(8) {
+		t.Error("a higher epoch is a fresh order and must go through the fence, which stores it")
+	}
+
+	// Still running at that epoch: this member was promoted at it, and a
+	// Demote carrying it is the operator acting on a stale designation.
+	in.sup.mu.Lock()
+	in.sup.cmd = &exec.Cmd{}
+	in.sup.mu.Unlock()
+	t.Cleanup(func() { in.sup.mu.Lock(); in.sup.cmd = nil; in.sup.mu.Unlock() })
+	if srv.demoteRetry(7) {
+		// Fatal: letting the Demote below run against a member this
+		// fixture only pretends is alive turns a clear failure into a
+		// panic in the supervisor.
+		t.Fatal("a running member repeated its epoch and was taken for a retry: that stops a live primary")
+	}
+	if _, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 7}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Demote at the promotion epoch of a running member answered %v, want it refused as stale", err)
 	}
 }

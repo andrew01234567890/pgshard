@@ -105,40 +105,8 @@ func (s *EpochStore) ensureTermLocked() {
 // Accept stores epoch if it is strictly greater than the current one; the
 // write is fsynced before returning so a crash cannot roll the fence back.
 func (s *EpochStore) Accept(epoch uint64) error {
-	return s.accept(epoch, false)
-}
-
-// AcceptOrRetry is Accept, and additionally admits the epoch already
-// accepted.
-//
-// It exists because the fence is written BEFORE the work it admits. An
-// operation that fenced and then failed -- a demotion that stopped
-// PostgreSQL and could not reach the new primary to rejoin -- has already
-// moved the stored epoch to the one it was asked for, so the controller
-// retrying the same operation is refused as stale, for ever, and no
-// controller will ever send a higher epoch for a demotion that has already
-// happened.
-//
-// Repeating the epoch is the same term asking again, which the strictly
-// increasing rule was never meant to stop. An epoch BELOW the one accepted
-// is a controller that has been replaced and is still refused, which is the
-// half that makes this a fence.
-//
-// Only for operations that are idempotent at their own epoch. Promote is
-// not one of them: it acquires the lease, and a repeat has to be told it is
-// not the holder rather than quietly re-running.
-func (s *EpochStore) AcceptOrRetry(epoch uint64) error {
-	return s.accept(epoch, true)
-}
-
-func (s *EpochStore) accept(epoch uint64, retry bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if retry && epoch == s.cur && s.cur != 0 {
-		// Already stored and already fsynced; the term it opened is the
-		// term this retry belongs to, so it must not be replaced.
-		return nil
-	}
 	if epoch <= s.cur {
 		return fmt.Errorf("%w: got %d, last accepted %d", ErrStaleEpoch, epoch, s.cur)
 	}

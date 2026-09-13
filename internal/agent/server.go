@@ -102,6 +102,14 @@ func (s *Server) fenceCurrent(ctx context.Context, epoch uint64) (context.Contex
 	return s.epoch.Term(ctx, epoch)
 }
 
+// demoteRetry reports a Demote at the epoch already accepted that resumes a
+// demotion this member has already begun. Read from the member's own state
+// rather than remembered, so it survives the agent restarting -- which is
+// exactly what a failed demotion tends to be followed by.
+func (s *Server) demoteRetry(epoch uint64) bool {
+	return epoch != 0 && epoch == s.epoch.Current() && !s.inst.Running()
+}
+
 // Status is read-only.
 func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgshardv1.StatusResponse, error) {
 	resp := &pgshardv1.StatusResponse{Epoch: s.epoch.Current(), Role: pgshardv1.StatusResponse_ROLE_PRIMARY,
@@ -260,11 +268,21 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.DemoteResponse{Epoch: s.epoch.Current()}
-	// AcceptOrRetry, not fence: a demotion that fenced and then failed has
-	// already stored this epoch, and the controller has no higher one to
-	// send for a demotion it still needs done.
-	if err := s.epoch.AcceptOrRetry(req.GetEpoch()); err != nil {
-		return nil, s.rpcErr(err)
+	// A demotion that fenced and then failed has already stored this epoch,
+	// so the controller retrying it is refused as stale -- for ever, because
+	// nothing mints a higher epoch for a demotion that has already happened.
+	//
+	// What makes a repeat a RETRY rather than a fresh order is that
+	// PostgreSQL is down: a demote gets past StopForDemote before it can
+	// fail at the rejoin. A member that is still running at this epoch was
+	// promoted at it, and the operator sends Demote at the current epoch to
+	// any member reporting itself primary while not being the designated one
+	// -- refusing that is what the strictly increasing rule is for, and it
+	// still does.
+	if !s.demoteRetry(req.GetEpoch()) {
+		if err := s.fence(req.GetEpoch()); err != nil {
+			return nil, s.rpcErr(err)
+		}
 	}
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
