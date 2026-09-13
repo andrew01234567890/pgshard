@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,11 @@ type fakeDecisionLog struct {
 	// can observe the coordinator beating while it is between the
 	// decision-log write and the decision.
 	waitHeartbeat bool
+	// onCommit runs at the top of Commit, which is exactly the window this
+	// models: every participant is PREPARED and no decision has been made.
+	// It is handed the context Commit was called with, so it can wait for
+	// the cancellation to actually land rather than racing it.
+	onCommit func(context.Context)
 }
 
 func (l *fakeDecisionLog) preparedCount() int {
@@ -51,8 +57,11 @@ func (l *fakeDecisionLog) record(op string) {
 	l.events = append(l.events, fmt.Sprintf("%s(prepared=%d)", op, l.preparedCount()))
 }
 
-func (l *fakeDecisionLog) Begin(_ context.Context, gid string, participants []int32, xids []string) error {
+func (l *fakeDecisionLog) Begin(ctx context.Context, gid string, participants []int32, xids []string) error {
 	if err := l.fail["begin"]; err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	l.record("begin")
@@ -81,8 +90,14 @@ func (l *fakeDecisionLog) heartbeatCount() int {
 	return l.heartbeats
 }
 
-func (l *fakeDecisionLog) Commit(_ context.Context, gid string) (bool, error) {
+func (l *fakeDecisionLog) Commit(ctx context.Context, gid string) (bool, error) {
 	if err := l.fail["commit"]; err != nil {
+		return false, err
+	}
+	if l.onCommit != nil {
+		l.onCommit(ctx)
+	}
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	if l.waitHeartbeat {
@@ -100,7 +115,10 @@ func (l *fakeDecisionLog) Commit(_ context.Context, gid string) (bool, error) {
 	return true, nil
 }
 
-func (l *fakeDecisionLog) Abort(_ context.Context, gid string) error {
+func (l *fakeDecisionLog) Abort(ctx context.Context, gid string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	l.record("abort")
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -108,12 +126,33 @@ func (l *fakeDecisionLog) Abort(_ context.Context, gid string) error {
 	return nil
 }
 
-func (l *fakeDecisionLog) Delete(_ context.Context, gid string) error {
+func (l *fakeDecisionLog) Delete(ctx context.Context, gid string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	l.record("delete")
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.rows, gid)
 	return nil
+}
+
+// row is the decision row's state, empty once it has been deleted.
+func (l *fakeDecisionLog) row(gid string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.rows[gid]
+}
+
+// onlyGID is the one gid this log has seen, for a test that runs a single
+// transaction.
+func (l *fakeDecisionLog) onlyGID() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for gid := range l.rows {
+		return gid
+	}
+	return ""
 }
 
 func (l *fakeDecisionLog) log() []string {
@@ -948,4 +987,82 @@ func TestARedundantBeginIsCompletedAcrossShards(t *testing.T) {
 	if got := h.allRan("prepare transaction"); len(got) != 2 {
 		t.Fatalf("shards that prepared: %v, want the two the transaction wrote to; the redundant BEGIN ended it", got)
 	}
+}
+
+// PGS-752 L2. The coordinator decides even when the statement is cancelled.
+//
+// The heartbeat and the decision-log write both ran on the statement's
+// context, which a cancel request cancels -- and so do MaxQueryDuration and
+// a session revocation. A cancel landing between the decision-log write and
+// the decision took the whole sequence with it: the heartbeat stopped, the
+// commit write failed with the cancellation, and the transaction went
+// in-doubt with every participant holding its locks until the resolver's
+// preparing timeout expired. Nothing about it was undecidable -- the
+// coordinator was running and the log was reachable.
+//
+// Deciding is the coordinator's job whether or not anyone is still waiting
+// for the answer, so everything from the decision-log write onwards that
+// decides or cleans up now runs detached from the statement.
+func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+
+	// Every participant is PREPARED and no decision has been made: the
+	// window L2 is about. The client cancels the statement here. A cancel
+	// request is what reaches the router's per-statement context (pgwire
+	// queryCancel); so do MaxQueryDuration and a session revocation, which
+	// is why this is not an exotic case.
+	//
+	// The hook then WAITS for the context it was handed, which is what
+	// makes the test decide rather than race. Handed the statement's own
+	// context -- the defect -- the wait ends as soon as the cancel lands.
+	// Handed a detached one -- the fix -- nothing cancels it and the wait
+	// times out, which is the point.
+	var cancelLanded atomic.Bool
+	h.log.onCommit = func(cctx context.Context) {
+		if err := conn.PgConn().CancelRequest(context.Background()); err != nil {
+			t.Errorf("cancel request: %v", err)
+		}
+		select {
+		case <-cctx.Done():
+			cancelLanded.Store(true)
+		case <-time.After(time.Second):
+			// One second is the cost of a clean run. With the defect the
+			// cancel lands in milliseconds, so this bound only decides how
+			// long the CORRECT behaviour waits to prove nothing arrived.
+		}
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
+		t.Fatal(err)
+	}
+	// The commit may report the cancellation to the client. What matters
+	// is what the coordinator did with the transaction.
+	_ = tx.Commit(ctx)
+	if cancelLanded.Load() {
+		t.Error("the decision was written on the statement's own context: a cancel arriving between PREPARE and the decision reaches it")
+	}
+
+	waitFor(t, 10*time.Second, func() bool {
+		for _, ev := range h.log.log() {
+			if strings.HasPrefix(ev, "commit(") {
+				return true
+			}
+		}
+		return false
+	}, "the coordinator never recorded a decision after the cancel; its participants are prepared and only the resolver's preparing timeout will free them")
+	if got := h.log.row(h.log.onlyGID()); got != "commit" && got != "" {
+		t.Fatalf("decision row is %q; a statement cancel left the transaction undecided and its participants prepared", got)
+	}
+	waitFor(t, 10*time.Second, func() bool { return h.log.preparedCount() == 0 },
+		"participants left prepared after the decision")
 }

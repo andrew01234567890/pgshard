@@ -665,7 +665,28 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		e.finishTxn("ROLLBACK")
 		return pgwire.Errorf(codeConnectionFailure, "two-phase commit: writing the decision log failed, transaction rolled back: %v", err)
 	}
-	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	// Everything from here that decides or cleans up runs detached from the
+	// client's context.
+	//
+	// A client that goes away between the decision-log write and the
+	// decision used to take the whole sequence with it: the heartbeat
+	// stopped, log.Commit failed with the cancellation, and the
+	// transaction went in-doubt with every participant holding its locks
+	// until the resolver's preparing timeout expired. Nothing about that
+	// was undecidable -- the coordinator was running and the decision log
+	// was reachable. Deciding is the coordinator's job whether or not
+	// anyone is still listening for the answer.
+	//
+	// PREPARE itself keeps the client's context, because forward progress
+	// is what a client may abandon. What it may not abandon is the cleanup:
+	// a ROLLBACK PREPARED skipped because the client left is a prepared
+	// transaction pinning WAL and blocking slot creation.
+	//
+	// No added deadline. The transport already bounds each call, and a
+	// timeout here could only turn a slow decision into an undecided one,
+	// which is the outcome this exists to avoid.
+	decide := context.WithoutCancel(ctx)
+	hbCtx, stopHeartbeat := context.WithCancel(decide)
 	defer stopHeartbeat()
 	go heartbeatUntilDecided(hbCtx, log, gid)
 	crashpoint.Hit("before_prepare")
@@ -677,21 +698,21 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	if err := firstError(writers); err != nil {
 		e.each(writers, func(p *txnPart) error {
 			if p.prepared {
-				return e.runOn(ctx, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
+				return e.runOn(decide, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
 			}
-			return e.runOn(ctx, p, "ROLLBACK", discardWriter{})
+			return e.runOn(decide, p, "ROLLBACK", discardWriter{})
 		})
 		e.r.metrics.TwoPCAborts.Inc()
-		if aerr := log.Abort(ctx, gid); aerr != nil {
+		if aerr := log.Abort(decide, gid); aerr != nil {
 			e.r.cfg.Logger.Warn("two-phase commit: recording abort failed; the resolver will finish it", "gid", gid, "err", aerr)
 		} else if firstError(writers) == nil {
-			_ = log.Delete(ctx, gid)
+			_ = log.Delete(decide, gid)
 		}
 		e.finishTxn("ROLLBACK")
 		return nameFenceInTxn(err)
 	}
 	crashpoint.Hit("after_prepare")
-	decided, err := log.Commit(ctx, gid)
+	decided, err := log.Commit(decide, gid)
 	if err != nil {
 		e.r.inDoubt.Add(1)
 		e.r.metrics.TwoPCInDoubt.Inc()
@@ -703,7 +724,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	}
 	if !decided {
 		e.each(writers, func(p *txnPart) error {
-			return e.runOn(ctx, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
+			return e.runOn(decide, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
 		})
 		e.finishTxn("ROLLBACK")
 		e.r.metrics.TwoPCAborts.Inc()
@@ -723,7 +744,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	e.decided.Store(true)
 	e.r.metrics.TwoPCCommits.Inc()
 	commitPrepared := func(p *txnPart) error {
-		return e.runOn(ctx, p, "COMMIT PREPARED "+quoteLiteral(gid), discardWriter{})
+		return e.runOn(decide, p, "COMMIT PREPARED "+quoteLiteral(gid), discardWriter{})
 	}
 	writers[0].err = commitPrepared(writers[0])
 	crashpoint.Hit("during_commit_prepared")
@@ -732,7 +753,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		e.r.inDoubt.Add(1)
 		e.r.metrics.TwoPCInDoubt.Inc()
 		e.r.cfg.Logger.Warn("two-phase commit: COMMIT PREPARED failed after the commit decision; the resolver will finish it", "gid", gid, "err", err)
-	} else if err := log.Delete(ctx, gid); err != nil {
+	} else if err := log.Delete(decide, gid); err != nil {
 		e.r.cfg.Logger.Warn("two-phase commit: deleting the decision row failed", "gid", gid, "err", err)
 	}
 	e.finishTxn("COMMIT")
