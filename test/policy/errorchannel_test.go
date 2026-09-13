@@ -25,9 +25,9 @@ var deliberate = map[string]string{
 	// an error rather than as primary, because the operator promotes and
 	// fences on this answer -- the RPC succeeded and the report says the
 	// role is unknown.
-	"internal/agent/server.go:114": "Status reports a role it could not read",
-	"internal/agent/server.go:121": "Status could not connect; the report says so",
-	"internal/agent/server.go:131": "Status could not read the LSN; the report says so",
+	"internal/agent/server.go:122": "Status reports a role it could not read",
+	"internal/agent/server.go:129": "Status could not connect; the report says so",
+	"internal/agent/server.go:139": "Status could not read the LSN; the report says so",
 
 	// pgBackRest's own output is the only diagnostic a failed backup has,
 	// and the backup reconciler writes it into the group's status. One
