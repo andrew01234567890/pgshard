@@ -56,6 +56,15 @@ type fakeOps struct {
 	// DisableForward, which is the one instant where the run has passed
 	// the point of no return and not yet recorded anything.
 	crashAfterDisable bool
+	// partialDisable makes DisableForward disable some subscriptions and
+	// THEN fail, which is what walking databases and targets one at a time
+	// does when the second one is unreachable. The step's error path then
+	// unpauses the sources with forward replication already half off.
+	partialDisable bool
+	// outsideDisable turns a forward subscription off at the flip, standing
+	// in for an operator doing it by hand: the run itself never recorded
+	// that it was disabling anything.
+	outsideDisable bool
 	// backgroundAdvance moves the source's WAL position for reasons no
 	// fence can stop -- a checkpoint, an autovacuum, a standby snapshot.
 	// Measured on an idle PostgreSQL 18 with no writes at all, so a fake
@@ -185,13 +194,26 @@ func (f *fakeOps) Journal(_ context.Context, id string) error {
 	f.journaled[id]++
 	return f.step(StepJournal)
 }
-func (f *fakeOps) Flip(context.Context, string) error { return f.step(StepFlip) }
+func (f *fakeOps) Flip(context.Context, string) error {
+	if f.outsideDisable {
+		f.forwardDisabled = true
+		f.caughtUp = false
+	}
+	return f.step(StepFlip)
+}
 func (f *fakeOps) DisableForward(context.Context) error {
 	// A writer still open at this point commits with the forward
 	// subscriptions already gone, so its row stays on a source nothing
 	// replicates from.
 	if f.openWriters > 0 {
 		f.lostWrite = true
+	}
+	if f.partialDisable {
+		// Half disabled is already past the point CaughtUp can speak for.
+		f.forwardDisabled = true
+		f.caughtUp = false
+		f.partialDisable = false
+		return errors.New("target 2 unreachable")
 	}
 	if err := f.step(StepSwap); err != nil {
 		return err
@@ -1279,7 +1301,7 @@ func TestCutoverResumesAfterForwardReplicationIsDisabled(t *testing.T) {
 		t.Fatalf("reverse replication enabled %d times, want exactly 1: %s", enables, strings.Join(h.ops.calls, ","))
 	}
 	// The resume must not re-ask the question the disable made unanswerable.
-	after := h.ops.calls[indexOfLast(h.ops.calls, "forward_disabled"):]
+	after := h.ops.calls[indexOfLast(t, h.ops.calls, "forward_disabled"):]
 	for _, c := range after {
 		if c == StepCatchUp {
 			t.Fatalf("resume re-ran the catch-up check it can never satisfy: %s", strings.Join(after, ","))
@@ -1287,11 +1309,92 @@ func TestCutoverResumesAfterForwardReplicationIsDisabled(t *testing.T) {
 	}
 }
 
-func indexOfLast(calls []string, name string) int {
+func indexOfLast(t *testing.T, calls []string, name string) int {
+	t.Helper()
 	for i := len(calls) - 1; i >= 0; i-- {
 		if calls[i] == name {
 			return i
 		}
 	}
-	return 0
+	// Returning 0 here would widen the caller's slice to everything and
+	// quietly turn a missing call into a passing assertion.
+	t.Fatalf("%q was never called: %s", name, strings.Join(calls, ","))
+	return -1
+}
+
+// TestCutoverPartialDisableResumesUnderAFreshPause is the other way into the
+// same window, and the one that decides whether the resume may skip the
+// write pause.
+//
+// DisableForward walks databases and targets one at a time. When a later one
+// fails, the step's error path unpauses the sources -- with forward
+// replication already half off. A resume that took "forward is disabled" to
+// mean "and the sources have been paused ever since" would then finish the
+// cutover across a window in which the sources were writable and undrained,
+// which is exactly where a stale router's commit is acknowledged into a slot
+// Complete is about to drop.
+func TestCutoverPartialDisableResumesUnderAFreshPause(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.partialDisable = true
+	var errs int
+	for i := 0; i < 50 && h.wf.stage != StageSwitched; i++ {
+		if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err != nil {
+			errs++
+		}
+	}
+	if h.wf.stage != StageSwitched {
+		t.Fatalf("never switched; at %s/%s: %s", h.wf.stage, h.wf.cutover.Step, strings.Join(h.ops.calls, ","))
+	}
+	if errs != 1 {
+		t.Fatalf("want the one injected failure, got %d", errs)
+	}
+	after := h.ops.calls[indexOfLast(t, h.ops.calls, "forward_disabled"):]
+	for _, want := range []string{"drain_sources", StepSequences} {
+		if !slices.Contains(after, want) {
+			t.Fatalf("resume skipped %s, so the sources were left writable and undrained across the disable: %s", want, strings.Join(after, ","))
+		}
+	}
+	// Two, not one: the resume has to raise the pause again as well as
+	// lift it at the end. Counting "any pause_sources call" would pass on
+	// the unpause alone, which is the bug rather than the fix.
+	if n := strings.Count(strings.Join(after, ","), "pause_sources"); n < 2 {
+		t.Fatalf("resume paused the sources %d time(s), want a pause and an unpause: %s", n, strings.Join(after, ","))
+	}
+	// The pair it may skip, and must: the disabled half has frozen.
+	if slices.Contains(after, StepCatchUp) {
+		t.Fatalf("resume re-ran the catch-up check it can never satisfy: %s", strings.Join(after, ","))
+	}
+	if h.ops.lostWrite {
+		t.Fatal("a writer was still open when forward replication went away")
+	}
+	if h.ops.paused {
+		t.Fatal("the sources were left paused")
+	}
+}
+
+// TestCutoverDoesNotSkipTheCheckForSomeoneElsesDisable pins the second half
+// of the resume condition.
+//
+// A subscription an operator disabled by hand looks exactly like one this
+// run disabled, and treating it as a resume would finalize the cutover with
+// that subscription's changes never applied -- a silent loss where the old
+// behaviour was a visible stall. Only the run that recorded that it was
+// disabling may skip the catch-up check.
+func TestCutoverDoesNotSkipTheCheckForSomeoneElsesDisable(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.outsideDisable = true
+	// The stall shows up as a retryable error every pass, which is the
+	// point: it is loud, and it is what this test is protecting.
+	for i := 0; i < 20 && h.wf.stage != StageSwitched; i++ {
+		_, _ = h.c.cutover(context.Background(), h.wf, h.ops)
+	}
+	if h.wf.stage == StageSwitched {
+		t.Fatalf("the switch finished over a subscription nobody checked: %s", strings.Join(h.ops.calls, ","))
+	}
+	if h.wf.cutover.DisablingAt != nil {
+		t.Fatal("the run recorded a disable it never made")
+	}
+	if !slices.Contains(h.ops.calls[indexOfLast(t, h.ops.calls, "forward_disabled"):], StepCatchUp) {
+		t.Fatalf("the catch-up check was skipped for a disable this run did not make: %s", strings.Join(h.ops.calls, ","))
+	}
 }
