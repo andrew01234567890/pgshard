@@ -60,6 +60,17 @@ func (s *ddlStack) roleStatus(tb testing.TB, role string) map[string]string {
 	return out
 }
 
+// rolesDesiredGeneration is the desired roles generation, and must stay
+// the same expression as (*catalog.RoleStore).Desired computes: one
+// sequence stamps all four desired-state tables, so the max over ONE of
+// them is a generation the controller passed some time ago, not the one it
+// is working towards. A new desired-state table has to be added here too.
+const rolesDesiredGeneration = `(SELECT coalesce(max(g), 0) FROM (
+	SELECT max(desired_generation) g FROM pgshard.roles
+	UNION ALL SELECT max(desired_generation) FROM pgshard.role_members
+	UNION ALL SELECT max(desired_generation) FROM pgshard.grants
+	UNION ALL SELECT max(desired_generation) FROM pgshard.role_settings) m)`
+
 // awaitRolesMaterialized waits until every group was materialized at the
 // current desired roles generation.
 func (s *ddlStack) awaitRolesMaterialized(tb testing.TB) {
@@ -72,7 +83,7 @@ func (s *ddlStack) awaitRolesMaterialized(tb testing.TB) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		var behind int
-		if err := cat.QueryRow(context.Background(), `SELECT 4 - count(*) FROM pgshard.role_group_status WHERE roles_generation >= (SELECT max(desired_generation) FROM pgshard.roles)`).Scan(&behind); err != nil {
+		if err := cat.QueryRow(context.Background(), `SELECT 4 - count(*) FROM pgshard.role_group_status WHERE roles_generation >= `+rolesDesiredGeneration).Scan(&behind); err != nil {
 			tb.Fatal(err)
 		}
 		if behind == 0 {
@@ -235,6 +246,13 @@ func TestRouterRolesAndGrants(t *testing.T) {
 	})
 
 	t.Run("drift_on_one_shard_is_repaired", func(t *testing.T) {
+		// Waiting for the CURRENT generation is what makes the assertion
+		// below mean repair. A stale group is materialized wholesale --
+		// MaterializeStale re-runs ALTER ROLE with the verifier for every
+		// group behind the generation -- so a hijack injected while one is
+		// still stale would be overwritten by that pass, the group would be
+		// recorded in_sync, and the test would pass without drift ever
+		// being detected. The subtest would then assert nothing it names.
 		s.awaitRolesMaterialized(t)
 		shard1, err := pgx.Connect(ctx, s.shardDSNs[1])
 		if err != nil {
