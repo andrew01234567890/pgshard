@@ -4,25 +4,10 @@
 # name. Two of them sit on the pre-authentication wire surface, which is
 # where a length field trusted before it is bounded does the most damage.
 #
-# Scheduled rather than a PR gate. Fuzzing is bounded exploration, not a
+# Scheduled rather than a PR gate. Fuzzing is time-boxed exploration, not a
 # pass/fail signal a pull request should wait on, and a crasher is worth
 # finding a day late.
 #
-# Bounded by EXECUTIONS, not by -fuzztime 5m, because the duration form
-# fails the job at random: go.dev/issue/75804, where the coordinator reports
-# its own expired deadline as the failure -- `--- FAIL: FuzzDecode (300.08s)`
-# with `context deadline exceeded` and no crasher written. Once in the
-# twelve nightly runs to 2026-09-13.
-#
-# REVERT THIS when the toolchain reaches Go 1.27, which carries the fix
-# (`err == ctx.Err() ||` added to the suppression in internal/fuzz); go1.26.8
-# still does not, so there is no patch release to wait for on this line.
-#
-# The counts are what each target reached in five minutes on this runner
-# (2026-09-11..13): ~4.9M, ~4.8M and ~23M. timeout-minutes below is the only
-# wall-clock bound -- go test stops its own -timeout alarm before fuzzing
-# starts -- and leaves roughly six times that headroom.
-
 name: fuzz
 
 on:
@@ -31,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       fuzztime:
-        description: -fuzztime override for every target, e.g. 30m or 50000000x
+        description: How long to fuzz each target
         required: false
-        default: ""
+        default: "5m"
 
 permissions:
   contents: read
@@ -52,13 +37,10 @@ jobs:
         include:
           - target: FuzzCountStatements
             package: ./internal/pgwire/
-            execs: 5000000x
           - target: FuzzDecodeStartupPacket
             package: ./internal/pgwire/
-            execs: 5000000x
           - target: FuzzDecode
             package: ./internal/pgoutput/
-            execs: 23000000x
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -67,7 +49,7 @@ jobs:
       - name: Fuzz ${{ matrix.target }}
         run: |
           go test -run '^$' -fuzz '${{ matrix.target }}' \
-            -fuzztime '${{ inputs.fuzztime || matrix.execs }}' '${{ matrix.package }}'
+            -fuzztime '${{ inputs.fuzztime || '5m' }}' '${{ matrix.package }}'
       # Go writes a failing input under testdata/fuzz/<target>/. Keeping it
       # is the whole point: committed as a seed it becomes a permanent
       # regression test, so the same defect cannot return unnoticed.
