@@ -477,36 +477,39 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 }
 
 // CertifiedBarrier reports whether a restore point of that name exists and
-// was certified. A barrier attempt that created the physical restore point
-// on every group and then failed certification leaves a name that restores
-// cleanly with no error, landing the cluster on a point recorded as NOT
-// two-phase-consistent -- so this has to be asked of the live source before
-// the restore, never of the restored catalog afterwards: certified is
-// WAL-logged after the catalog group's own restore point, so a catalog
-// recovered to that name always reads back uncertified, even for a good
-// barrier.
-func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, error) {
+// was certified, and the groups its manifest recorded a restore point on.
+// A barrier attempt that created the physical restore point on every group
+// and then failed certification leaves a name that restores cleanly with no
+// error, landing the cluster on a point recorded as NOT two-phase-consistent
+// -- so this has to be asked of the live source before the restore, never
+// of the restored catalog afterwards: certified is WAL-logged after the
+// catalog group's own restore point, so a catalog recovered to that name
+// always reads back uncertified, even for a good barrier.
+func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, []string, error) {
 	// The operator has no PGPASSWORD for an arbitrary cluster's superuser,
 	// so the password comes from that cluster's secret and is set on the
 	// parsed config rather than written into the DSN, which reaches logs
 	// and error messages.
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	cfg.Password = password
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	var certified bool
-	err = conn.QueryRow(ctx, `SELECT certified FROM pgshard.restore_points
-		WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&certified)
+	var (
+		certified bool
+		groups    []string
+	)
+	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1)
+		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&certified, &groups)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return false, nil, nil
 	}
-	return certified, err
+	return certified, groups, err
 }
 
 // ClearWriteFenceAfterRestore lifts the fence on a restored catalog,

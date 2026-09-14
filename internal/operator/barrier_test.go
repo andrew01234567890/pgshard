@@ -224,7 +224,7 @@ func recoveredRestore(t *testing.T, name string, target pgshardv1alpha1.RestoreT
 	cl := restoreClient(t, source, newPolicy(), bk, rs, superuserSecret("old"))
 	agents := newFakeAgents(nil)
 	twoPC := &fakeTwoPC{outcomes: map[string]twopc.Outcome{}, fail: map[string]error{}}
-	r := &RestoreReconciler{Client: cl, Agents: agents, TwoPC: twoPC, Barriers: &fakeCertifier{certified: true},
+	r := &RestoreReconciler{Client: cl, Agents: agents, TwoPC: twoPC, Barriers: &fakeCertifier{certified: true, groups: []string{"catalog", "shard-0", "shard-1"}},
 		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
 	if _, got := reconcileRestore(t, r, name); got.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
 		t.Fatalf("after create: %+v", got.Status)
