@@ -326,9 +326,28 @@ func (c *GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus,
 	}
 	st := AgentStatus{Running: resp.GetRunning(), Primary: resp.GetRole() == pgshardv1.StatusResponse_ROLE_PRIMARY, Epoch: resp.GetEpoch(), LSN: resp.GetLsn(), Timeline: resp.GetTimeline(), PromotionPending: resp.GetPromotionPending(), Build: resp.GetBuild()}
 	if e := resp.GetError(); e != nil {
-		return st, errors.New(e.GetMessage())
+		return st, &AgentStatusError{SQLState: e.GetSqlstate(), Message: e.GetMessage()}
 	}
 	return st, nil
+}
+
+// AgentStatusError is the error an agent embedded in its Status answer, with
+// the SQLSTATE it carried. The status beside it is still the agent's
+// partial answer.
+type AgentStatusError struct {
+	SQLState string
+	Message  string
+}
+
+func (e *AgentStatusError) Error() string { return e.Message }
+
+// runningButFull reports whether a Status answer says PostgreSQL is running
+// and only refused the agent a connection slot (53300). That server is up:
+// fencing it frees no slot, and taking it for gone would promote a second
+// primary beside a live one.
+func runningButFull(st AgentStatus, err error) bool {
+	var se *AgentStatusError
+	return st.Running && errors.As(err, &se) && se.SQLState == "53300"
 }
 
 // Promote calls Agent.Promote. A promotion that did not happen fails the

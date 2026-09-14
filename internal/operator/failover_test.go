@@ -188,6 +188,16 @@ func TestPrimaryHealthy(t *testing.T) {
 	if primaryHealthy(pod, false, AgentStatus{}, errors.New("rpc")) {
 		t.Error("not Ready and Status failing is unhealthy")
 	}
+	full := &AgentStatusError{SQLState: "53300", Message: "sorry, too many clients already"}
+	if !primaryHealthy(pod, false, live, full) {
+		t.Error("a running primary that only refused the agent a connection slot is up; failing over from it frees no slot")
+	}
+	if primaryHealthy(pod, false, AgentStatus{Primary: true}, full) {
+		t.Error("a 53300 without the agent saying PostgreSQL is running is not health")
+	}
+	if primaryHealthy(pod, false, live, &AgentStatusError{SQLState: "XX000", Message: "connection refused"}) {
+		t.Error("any other Status error is still unhealthy")
+	}
 }
 
 func TestRefuseAsyncFailover(t *testing.T) {

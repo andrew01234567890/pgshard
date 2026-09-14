@@ -32,9 +32,27 @@ func (in *Instance) IsPrimary() (bool, error) {
 	return !standby, err
 }
 
-// PrimaryAcceptsWrites checks the instance is out of recovery.
+// ConnectionSlotsFull reports whether err is PostgreSQL refusing a
+// connection because every slot is taken (53300). The agent connects as a
+// superuser, so neither the role's nor the database's connection limit
+// applies and the refusal can only mean the server as a whole is full --
+// which it can be even for a superuser: the superuser reserve is shared by
+// every superuser connection the control plane opens.
+func ConnectionSlotsFull(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "53300"
+}
+
+// PrimaryAcceptsWrites checks the instance is out of recovery. A primary
+// with no connection slot left for the check is taken as accepting writes:
+// it is running and serving the sessions it has, and reporting it unready
+// takes it out of its Service, which cuts off everything that would reach
+// it next without freeing a slot.
 func (in *Instance) PrimaryAcceptsWrites(ctx context.Context) error {
 	conn, err := in.Connect(ctx)
+	if ConnectionSlotsFull(err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}

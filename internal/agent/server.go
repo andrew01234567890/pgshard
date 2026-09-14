@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -51,8 +52,12 @@ func pgErr(err error) *pgshardv1.Error {
 		return nil
 	}
 	code := "XX000"
-	if errors.Is(err, ErrStaleEpoch) {
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, ErrStaleEpoch):
 		code = "55000"
+	case errors.As(err, &pgErr):
+		code = pgErr.Code
 	}
 	return &pgshardv1.Error{Sqlstate: code, Message: err.Error()}
 }
@@ -126,6 +131,11 @@ func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgsha
 	conn, err := s.inst.Connect(ctx)
 	if err != nil {
 		resp.Error = pgErr(err)
+		// A server with no connection slot left refused the connection
+		// itself, so it is running -- and failing over from it would fence
+		// a healthy primary without freeing a slot. The error still goes
+		// with it: the position below could not be read.
+		resp.Running = ConnectionSlotsFull(err)
 		return resp, nil
 	}
 	defer func() { _ = conn.Close(ctx) }()

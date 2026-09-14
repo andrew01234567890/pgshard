@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -24,6 +25,12 @@ func TestPgErrMapsStaleEpochToSQLState55000(t *testing.T) {
 	}
 	if e := pgErr(errors.New("boom")); e.GetSqlstate() != "XX000" || e.GetMessage() != "boom" {
 		t.Fatalf("other: %v", e)
+	}
+	// PostgreSQL's own code goes through: the operator tells a server that
+	// refused a connection slot (53300) from one that is down by it.
+	full := fmt.Errorf("connect: %w", &pgconn.PgError{Code: "53300", Message: "sorry, too many clients already"})
+	if e := pgErr(full); e.GetSqlstate() != "53300" {
+		t.Fatalf("postgres error: %v", e)
 	}
 }
 

@@ -1104,6 +1104,12 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 				}
 				return r.finishGroup(ctx, c, g, obs, members), nil
 			}
+			if errors.Is(err, errPrimaryStillLive) {
+				// Abandoned because the primary is still running, so the delay
+				// starts over: left expired, the next pass that catches its
+				// Status at a bad moment fences it again at once.
+				r.unhealthyFor(g.Prefix(), false)
+			}
 			if err != nil {
 				return obs, err
 			}

@@ -435,6 +435,110 @@ func TestFailoverRemovesAnUnreachableOldPrimaryBeforePromoting(t *testing.T) {
 	}
 }
 
+// TestFailoverDoesNotPromoteBesideAPrimaryThatIsOnlyFull: the superuser
+// reserve is shared by every superuser connection the control plane opens,
+// so a healthy primary can refuse its own agent a connection slot (53300).
+// That server is up. Taking it for gone during a failover's quiesce --
+// which is what an erroring Status used to mean -- fences a live primary
+// and promotes a second one beside it (PGS-819).
+//
+// The agent is unreachable while the failover decides to start, and answers
+// as a running primary that is only full once the failover is quiescing.
+func TestFailoverDoesNotPromoteBesideAPrimaryThatIsOnlyFull(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "fullold")
+
+	var old corev1.Pod
+	get(t, "fullold-shard-0-0", &old)
+	old.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+	if err := k8sClient.Status().Update(context.Background(), &old); err != nil {
+		t.Fatal(err)
+	}
+	fp.mu.Lock()
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 100}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 200}
+	fp.mu.Unlock()
+	oldAddr := agentAddr(podIP(1, 0))
+	fa.mu.Lock()
+	before := len(fa.promotes)
+	fa.statusHook = func(addr string) (AgentStatus, error, bool) {
+		if addr != oldAddr {
+			return AgentStatus{}, nil, false
+		}
+		fp.mu.Lock()
+		quiescing := fp.standbyProbes > 0
+		fp.mu.Unlock()
+		if !quiescing {
+			return AgentStatus{}, errors.New("connection refused"), true
+		}
+		return AgentStatus{Running: true, Primary: true}, &AgentStatusError{SQLState: "53300", Message: "sorry, too many clients already"}, true
+	}
+	fa.mu.Unlock()
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(c)}); !errors.Is(err, errPrimaryStillLive) {
+		t.Fatalf("reconcile = %v, want the failover abandoned because the old primary is still live", err)
+	}
+	if err := k8sClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "fullold-shard-0-0"}, &corev1.Pod{}); err != nil {
+		t.Fatalf("a primary that was only full was fenced: %v", err)
+	}
+	// The fence has to go with the failover: left in place, the live
+	// primary's agent finds a foreign holder at its next renewal and stops
+	// PostgreSQL -- the failover, carried out by the agent instead.
+	var lease coordinationv1.Lease
+	get(t, Groups(c)[1].LeaseName(), &lease)
+	if h := ptr.Deref(lease.Spec.HolderIdentity, ""); h == FenceHolder {
+		t.Fatalf("an abandoned failover left the fence on a live primary's Lease, holder %q", h)
+	}
+	// And the failover delay starts over, rather than letting the next pass
+	// that catches the primary's Status at a bad moment fence it at once.
+	r.mu.Lock()
+	_, stillTiming := r.unhealthySince[Groups(c)[1].Prefix()]
+	r.mu.Unlock()
+	if stillTiming {
+		t.Fatal("the failover delay was left running after the failover was abandoned for a live primary")
+	}
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+	if len(fa.promotes) != before {
+		t.Fatalf("a standby was promoted beside a live primary: %v", fa.promotes[before:])
+	}
+}
+
+// TestConvergeActsOnAFullMemberItNeedsNoSQLFor: a member with no connection
+// slot left still says what it is, and relabelling or demoting it needs no
+// SQL on it. Skipping it as unreachable left a healthy primary out of its
+// Service after an abandoned failover, and a second primary undemoted.
+func TestConvergeActsOnAFullMemberItNeedsNoSQLFor(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "fullconv")
+	full := &AgentStatusError{SQLState: "53300", Message: "sorry, too many clients already"}
+
+	var primary corev1.Pod
+	get(t, "fullconv-shard-0-0", &primary)
+	base := primary.DeepCopy()
+	primary.Labels[LabelRole] = RoleUnhealthy
+	if err := k8sClient.Patch(context.Background(), &primary, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true}, full)
+	fa.set(podIP(1, 2), AgentStatus{Running: true, Primary: true}, full)
+	fp.mu.Lock()
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 100}
+	fp.mu.Unlock()
+
+	reconcile(t, r, c)
+
+	get(t, "fullconv-shard-0-0", &primary)
+	if primary.Labels[LabelRole] != RolePrimary {
+		t.Fatalf("the designated primary, full but running, was left labelled %q and out of its Service", primary.Labels[LabelRole])
+	}
+	// Taken out of the -rw Service first, then demoted: the label is what
+	// shows converge acted on it rather than skipping it as unreachable.
+	var rogue corev1.Pod
+	get(t, "fullconv-shard-0-2", &rogue)
+	if rogue.Labels[LabelRole] != RoleUnhealthy {
+		t.Fatalf("a second member reporting itself primary was left labelled %q because it had no connection slot left", rogue.Labels[LabelRole])
+	}
+}
+
 // TestConvergeRefusesToPromoteAnUnsafeDesignatedPrimary: converge promoted
 // whatever the status named as primary, with none of the checks the
 // failover path is built around. A designated primary that is a standby
