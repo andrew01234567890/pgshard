@@ -232,13 +232,12 @@ func (in *Instance) baseBackup(ctx context.Context) error {
 // control file is not DB_SHUTDOWNED or DB_SHUTDOWNED_IN_RECOVERY
 // (pg_rewind.c: "target server must be shut down cleanly").
 //
-// An unplanned failover does not leave that state. Fencing deletes the old
-// primary's Pod with podFenceGrace, ten seconds; the agent answers the
-// kubelet's SIGTERM with a smart stop whose own budget is three times
-// ShutdownTimeout, 90 seconds by default, so the grace expires first and the
-// container is SIGKILLed mid-shutdown. The case the flag was covering is
-// therefore the normal one, not the exception, and with it every fenced
-// primary failed rewind and recloned the whole data directory.
+// An unplanned failover does not always leave that state. Fencing deletes
+// the old primary's Pod with a grace of seconds, and a fast shutdown that
+// overruns it -- a large checkpoint, a walsender draining to a slow standby
+// -- is SIGKILLed partway through, as is any primary on a node that is lost.
+// With the flag every such primary failed rewind and recloned its whole data
+// directory.
 //
 // Without it pg_rewind starts the target once in single-user mode to finish
 // recovery, which is what that mode is for and what the flag's own

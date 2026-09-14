@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -9,15 +10,22 @@ import (
 
 // TestAFencedPrimaryIsGivenTheTimeItsAgentTakesToStop: the operator fences an
 // old primary by deleting its Pod with podFenceGrace, and the kubelet
-// SIGKILLs whatever is still running when it runs out. It was ten seconds
-// against an agent that spent the first thirty in a smart shutdown and could
-// take ninety in all, so every fenced primary crashed and rejoined through a
-// full crash recovery inside pg_rewind (PGS-800). The two numbers now come
-// from one place; this pins the relationship, not the values.
+// SIGKILLs whatever is still running when it runs out. The agent is told how
+// long to spend by the ShutdownTimeout the operator renders, and exits within
+// that plus agent.TerminationOverhead. This pins the relationship between the
+// three, not their values (PGS-800).
 func TestAFencedPrimaryIsGivenTheTimeItsAgentTakesToStop(t *testing.T) {
-	if podFenceGrace <= agent.TerminationBudget {
-		t.Fatalf("podFenceGrace %s does not exceed the agent's stop budget %s: a fenced primary is SIGKILLed mid-shutdown",
-			podFenceGrace, agent.TerminationBudget)
+	c := newCluster("grace")
+	g := Groups(c)[0]
+	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, nil, false, true)
+	var cfg agent.Config
+	if err := json.Unmarshal([]byte(cm.Data[agentConfigKey(g.MemberName(0))]), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	budget := time.Duration(cfg.ShutdownTimeout) + agent.TerminationOverhead
+	if podFenceGrace < budget {
+		t.Fatalf("podFenceGrace %s is less than the %s a rendered agent may take to stop: a fenced primary is SIGKILLed mid-shutdown",
+			podFenceGrace, budget)
 	}
 	if podFenceGrace%time.Second != 0 {
 		t.Fatalf("podFenceGrace %s is not whole seconds, and the delete rounds it down to %ds", podFenceGrace, int64(podFenceGrace/time.Second))
@@ -26,14 +34,12 @@ func TestAFencedPrimaryIsGivenTheTimeItsAgentTakesToStop(t *testing.T) {
 	// gets Kubernetes' default. If one is ever rendered, it has to cover the
 	// budget too.
 	const kubernetesDefaultGrace = 30 * time.Second
-	c := newCluster("grace")
-	g := Groups(c)[0]
 	pod := Renderer{}.Pod(c, g, 0, RolePrimary, "pvc", Template(c, g, nil, nil))
 	grace := kubernetesDefaultGrace
 	if s := pod.Spec.TerminationGracePeriodSeconds; s != nil {
 		grace = time.Duration(*s) * time.Second
 	}
-	if grace <= agent.TerminationBudget {
-		t.Fatalf("member Pods are deleted with a %s grace, not more than the agent's %s stop budget", grace, agent.TerminationBudget)
+	if grace < budget {
+		t.Fatalf("member Pods are deleted with a %s grace, less than the agent's %s stop", grace, budget)
 	}
 }

@@ -275,21 +275,25 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	_ = httpSrv.Shutdown(shutCtx)
 	shutCancel()
 
-	// Fast, always, and inside TerminationBudget. The operator fences an old
-	// primary by deleting its Pod with a grace of only a few seconds, and a
-	// smart shutdown -- which waits for clients to disconnect, and a primary
-	// with a pooler in front of it always has clients -- never finished
-	// inside it: every fenced primary was SIGKILLed mid-shutdown, crashed,
-	// and rejoined through a full crash recovery inside pg_rewind. A fast
-	// shutdown ends the sessions and writes a shutdown checkpoint; if even
-	// that has not finished when its time is up the stop escalates to
-	// immediate, which is still an exit this process chose.
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), terminationStopTimeout)
+	// Fast, straight away, for ShutdownTimeout. A smart shutdown waits for
+	// every client to disconnect, and a member always has clients -- the
+	// pooler's -- so the smart phase preserved nothing and only spent time
+	// the Pod's grace could have given a fast shutdown instead. Fast ends the
+	// sessions (prepared transactions stay prepared, and walsenders still
+	// drain to their standbys) and writes the shutdown checkpoint that lets
+	// the member rejoin by pg_rewind without crash recovery.
+	//
+	// When ShutdownTimeout runs out the stop gives up and the agent exits;
+	// whatever of postgres is still running dies with the container. There
+	// is no immediate phase worth budgeting for: a checkpointer stuck in
+	// fsync -- the usual reason a fast shutdown overruns -- cannot act on
+	// SIGQUIT either, and the postmaster itself waits seconds for children.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeout))
 	defer stopCancel()
-	if err := sup.Stop(stopCtx, ShutdownFast, terminationFastTimeout); err != nil {
-		// postgres may still be running, so the Lease is not given back:
-		// another member promoting over a live primary is worse than waiting
-		// for the Lease to expire.
+	if err := sup.Stop(stopCtx, ShutdownFast, time.Duration(cfg.ShutdownTimeout)); err != nil {
+		log.Warn("postgres did not finish a fast shutdown in time; exiting, which kills it", "err", err)
+		// The Lease is left for the operator, which fences it itself when it
+		// promotes; releasing it here would only race that.
 		return errors.Join(runErr, err)
 	}
 	leaseCtx, leaseCancel := context.WithTimeout(context.Background(), terminationLeaseTimeout)
@@ -298,15 +302,15 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	return runErr
 }
 
-// The agent's stop on SIGTERM, phase by phase. They add up to
-// TerminationBudget, which the operator must give every Pod it deletes: a
-// grace shorter than the budget is a SIGKILL partway through a stop.
+// terminationHTTPTimeout and terminationLeaseTimeout are the parts of the
+// SIGTERM stop that are not postgres's; TerminationOverhead is their sum.
 const (
 	terminationHTTPTimeout  = 1 * time.Second
-	terminationFastTimeout  = 6 * time.Second
-	terminationStopTimeout  = 7 * time.Second // fast, then immediate for what is left
 	terminationLeaseTimeout = 1 * time.Second
 )
 
-// TerminationBudget is the longest the agent takes to exit after SIGTERM.
-const TerminationBudget = terminationHTTPTimeout + terminationStopTimeout + terminationLeaseTimeout
+// TerminationOverhead is what the agent's stop on SIGTERM takes beyond the
+// fast shutdown itself. The longest the agent takes to exit is
+// ShutdownTimeout plus this, and whoever deletes its Pod has to allow that
+// much grace or the shutdown is SIGKILLed partway through.
+const TerminationOverhead = terminationHTTPTimeout + terminationLeaseTimeout

@@ -466,14 +466,14 @@ func agentAddr(ip string) string { return fmt.Sprintf("%s:%d", ip, agentGRPCPort
 // without the kubelet confirming anything, so "the Pod is gone" would be
 // observed while the container was still running.
 //
-// It is a ceiling, not a wait: the Pod goes as soon as the agent exits, and
-// on SIGTERM the agent runs a fast shutdown bounded by agent.TerminationBudget,
-// which this must exceed or the agent is SIGKILLed partway through it. It
-// used to be ten seconds against a smart shutdown the agent gave thirty
-// before even escalating, so every fenced primary crashed. A fast shutdown
-// under load can still overrun its share of the budget; it then escalates to
-// immediate, and the old primary rejoins through crash recovery as before.
-const podFenceGrace = agent.TerminationBudget + time.Second
+// It is a ceiling, not a wait: the Pod goes once the agent has exited and the
+// pooler sidecar has drained, which a fast shutdown's ending of sessions
+// lets it do at once. So it caps how long a slow shutdown can hold up the
+// promotion, and it is derived from what the agent is told to spend: its
+// fast shutdown plus the agent's own overhead. It used to be ten seconds
+// against a stop that spent the first five in a smart shutdown the pooler's
+// connections never let finish, leaving a fast shutdown five.
+const podFenceGrace = agentShutdownTimeout + agent.TerminationOverhead
 
 // fencePod deletes the old primary's Pod and waits for the kubelet to confirm
 // it is gone, so a primary that is alive but unreachable to the operator is

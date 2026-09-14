@@ -45,9 +45,12 @@ const (
 	// poolerMetricsPort serves the pooler sidecar's /metrics.
 	poolerMetricsPort = int32(9127)
 	poolerContainer   = "pooler"
-	// agentShutdownTimeout bounds the smart shutdown on SIGTERM so a planned
-	// switchover pauses for seconds, not the pod grace period.
-	agentShutdownTimeout = 5 * time.Second
+	// agentShutdownTimeout is how long a member's agent gives a fast shutdown
+	// on SIGTERM. It is most of podFenceGrace, which is derived from it: the
+	// fence is the shortest grace a member is ever deleted with, and a fast
+	// shutdown that finishes inside it leaves a primary that rejoins by
+	// pg_rewind without crash recovery.
+	agentShutdownTimeout = 8 * time.Second
 )
 
 // Renderer builds the Kubernetes objects for one cluster.

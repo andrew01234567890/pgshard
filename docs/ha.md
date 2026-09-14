@@ -20,7 +20,7 @@ JSON config per member into the group ConfigMap (`<member>.json`) and runs
 | `lease` | `{enabled: true, namespace: <ns>}`; the Lease is `<cluster>-<group>-primary` |
 | `postgres.synchronousStandbyNames` | initial value; the operator maintains it afterwards |
 | `postgres.parameters` | `spec.postgresql.parameters`; agent-owned settings win |
-| `shutdownTimeout` | `5s` (smart shutdown bound before fast) |
+| `shutdownTimeout` | `8s` (fast shutdown on SIGTERM, before the agent exits; the fence grace is derived from it) |
 | `passwordFile` | `/etc/pgshard-secret/password` from the superuser Secret |
 | `replicationPasswordFile` | `/etc/pgshard/replication/password` from the `<cluster>-replication` Secret; the agent writes it into its `.pgpass` and sends it with any conninfo naming the replication role |
 
