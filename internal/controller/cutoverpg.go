@@ -764,9 +764,10 @@ func (o *pgCutover) Reverse(ctx context.Context) error {
 // fingerprint describe a source that did not yet have the journal, so a
 // rollback compared against it saw drift and refused -- "schema changed
 // since the switch ... needs reconciling by hand" -- on a set whose
-// structure nobody had touched. It was invisible because the flip's
-// re-carry rewound through StepReverse and re-took the fingerprints once
-// the journal existed; a cutover that did not re-carry had no rollback.
+// structure nobody had touched. It was invisible because the flip then
+// re-carried sequences by rewinding through StepReverse, re-taking the
+// fingerprints once the journal existed; a cutover that did not re-carry had
+// no rollback.
 const schemaFingerprintSQL = `SELECT coalesce(md5(string_agg(line, E'\n' ORDER BY line)), '')
 FROM (
     SELECT 'col ' || n.nspname || ' ' || c.relname || ' ' || c.relkind::text || ' ' || a.attname
@@ -1032,18 +1033,21 @@ func (o *pgCutover) Journal(ctx context.Context, id string) error {
 				return err
 			}
 			err = func() error {
+				// The sources are paused from StepQuiesce; the journal is
+				// this workflow's own write and reaches no router.
+				if err := writeThroughPause(ctx, conn); err != nil {
+					return err
+				}
 				for _, ddl := range journalDDL {
 					if _, err := conn.Exec(ctx, ddl); err != nil {
 						return err
 					}
 				}
-				// The targets are updated rather than left alone: a flip
-				// that found the sources had advanced rewinds to re-carry
-				// the sequences and comes back through here, and the
-				// journal has to describe the attempt that actually
-				// flipped. Leaving the first attempt's positions in place
-				// starts a consumer that repositions off the journal
-				// before the cutover it is repositioning to.
+				// The targets are updated rather than left alone, so a
+				// journal step that runs again describes the positions it
+				// read this time. Leaving an earlier attempt's positions
+				// in place starts a consumer that repositions off the
+				// journal before the cutover it is repositioning to.
 				_, err := conn.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.%s (id, generation, source_shard, participants, targets)
 					VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
 					ON CONFLICT (id, source_shard) DO UPDATE SET targets = EXCLUDED.targets`, JournalSchema, JournalTable),
@@ -1215,14 +1219,30 @@ func (o *pgCutover) EnableReverse(ctx context.Context) error {
 }
 
 // PauseSources flips default_transaction_read_only on every source primary,
-// so a router that has not yet seen the fence cannot commit to one while
-// the swap decides the targets are caught up. Reads, and the replication
-// the swap itself depends on, are unaffected.
+// so nothing that has not already begun can commit on one between quiesce
+// and the swap disabling forward replication. Reads, and the replication
+// the cutover itself depends on, are unaffected.
 //
 // Pausing is confirmed on a fresh backend: the reload is asynchronous, and
 // a pause that is not yet in force is the same as no pause at all.
 func (o *pgCutover) PauseSources(ctx context.Context, pause bool) error {
 	return o.pauseSetClaimed(ctx, o.srcSet, o.srcIDs, pause)
+}
+
+// SourcesPaused reports whether every source still carries this workflow's
+// claimed pause and a fresh backend on it starts read-only.
+func (o *pgCutover) SourcesPaused(ctx context.Context) (bool, error) {
+	claimed, err := o.claimedShards(ctx, o.srcSet, o.srcIDs)
+	if err != nil || len(claimed) != len(o.srcIDs) {
+		return false, err
+	}
+	for _, s := range o.srcIDs {
+		on, err := o.refusesWrites(ctx, o.srcSet, s)
+		if err != nil || !on {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // DrainSources waits out the writers the pause could not stop. The rollback
@@ -1275,14 +1295,29 @@ func (o *pgCutover) pauseSetClaimed(ctx context.Context, set string, ids []int32
 		if err := o.claimPause(ctx, set, ids); err != nil {
 			return err
 		}
+		return o.pauseSet(ctx, set, ids, true)
 	}
-	if err := o.pauseSet(ctx, set, ids, pause); err != nil {
+	// Lifting is scoped to this workflow's claim, like dropping it: an
+	// undone switch lifts its own pause and must not lift a pause some
+	// other workflow holds on the same shards -- or the retired set's
+	// permanent one, which carries no claim.
+	claimed, err := o.claimedShards(ctx, set, ids)
+	if err != nil {
 		return err
 	}
-	if !pause {
-		return o.dropPauseClaim(ctx, set, ids)
+	if err := o.pauseSet(ctx, set, claimed, false); err != nil {
+		return err
 	}
-	return nil
+	return o.dropPauseClaim(ctx, set, ids)
+}
+
+func (o *pgCutover) claimedShards(ctx context.Context, set string, ids []int32) ([]int32, error) {
+	rows, err := o.c.Pool.Query(ctx, `SELECT shard_id FROM pgshard.shard_status
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by = $3::uuid ORDER BY shard_id`, set, ids, o.wf.id)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int32])
 }
 
 func (o *pgCutover) claimPause(ctx context.Context, set string, ids []int32) error {

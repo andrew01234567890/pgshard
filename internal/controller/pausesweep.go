@@ -13,11 +13,13 @@ import (
 
 // WritePauseSweep gives back a write pause whose workflow is gone.
 //
-// A cutover past its swap step has set default_transaction_read_only = on
+// A cutover past its quiesce step has set default_transaction_read_only = on
 // via ALTER SYSTEM on every source primary, and every ordinary exit gives it
-// back: the swap lifts it on success and on each retry, the fatal and abort
-// paths lift it, an unwind lifts it, and a controller that dies mid-swap
-// resumes the step and reaches one of those. An operator deleting the
+// back: quiesce lifts it whenever it has to wait, the swap lifts it once
+// forward replication is off, the fatal and abort paths lift it, and a
+// controller that dies in between resumes the switch and reaches one of
+// those. A switch that waits at its flip or swap keeps the pause for as long
+// as it waits, which is the one it is for. An operator deleting the
 // pgshard.workflows row directly does not. Nothing is left to run the
 // release, ALTER SYSTEM survives a restart, and the sources refuse every
 // writing transaction with 25006 -- with no hint, because as far as

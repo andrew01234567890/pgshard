@@ -46,13 +46,14 @@ const (
 	StepVerify    = "verify"
 	StepSequences = "sequences"
 	StepReverse   = "reverse"
+	StepQuiesce   = "quiesce"
 	StepJournal   = "journal"
 	StepFlip      = "flip"
 	StepSwap      = "swap_replication"
 	StepRelease   = "release"
 )
 
-var switchSteps = []string{StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepSequences, StepReverse, StepJournal, StepFlip, StepSwap, StepRelease}
+var switchSteps = []string{StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepReverse, StepQuiesce, StepSequences, StepJournal, StepFlip, StepSwap, StepRelease}
 
 // Pause points of spec.resharding.pauseBefore, mirrored into the workflow
 // spec by the operator together with the proceed list.
@@ -70,9 +71,6 @@ const (
 	DefaultCutoverAttempts = 3
 	// DefaultRetireAfter is how long the old groups stay after the switch.
 	DefaultRetireAfter = 24 * time.Hour
-	// maxSeqRecarries bounds how often a moving source sends the flip back
-	// to re-carry sequences before it proceeds anyway.
-	maxSeqRecarries = 2
 )
 
 // cutoverState is the cutover record under workflows.status->'cutover'.
@@ -86,13 +84,6 @@ type cutoverState struct {
 	Verify     *VerifyReport    `json:"verify,omitempty"`
 	FlippedAt  *time.Time       `json:"flipped_at,omitempty"`
 	ReleasedAt *time.Time       `json:"released_at,omitempty"`
-	// Recarries counts how many times the flip has sent the switch back to
-	// re-carry sequences because a sequence moved.
-	Recarries int `json:"recarries,omitempty"`
-	// SeqFingerprint is what the sequence carry carried, so the flip can
-	// ask whether a sequence advanced since rather than whether the WAL
-	// did.
-	SeqFingerprint string `json:"seq_fingerprint,omitempty"`
 	// PauseMS is the router-visible write pause: fence raised to new map
 	// published. FenceMS is fence raised to fence released.
 	PauseMS    int64      `json:"pause_ms,omitempty"`
@@ -224,12 +215,7 @@ type cutoverOps interface {
 	Verify(ctx context.Context) (VerifyReport, error)
 	// Sequences carries every user-database sequence position from the
 	// sources to the targets inside the fence.
-	// Sequences carries the sources' sequence positions to the targets and
-	// returns a fingerprint of what it carried.
-	Sequences(ctx context.Context) (string, error)
-	// SequenceFingerprint recomputes that fingerprint from the sources, so
-	// the flip can tell an advance from an unchanged position.
-	SequenceFingerprint(ctx context.Context) (string, error)
+	Sequences(ctx context.Context) error
 	// Reverse creates the reverse publications and disabled subscriptions.
 	Reverse(ctx context.Context) error
 	// SchemaFingerprints hashes every database on both sets, keyed
@@ -241,15 +227,19 @@ type cutoverOps interface {
 	Flip(ctx context.Context, journalID string) error
 	// Swap disables forward and enables reverse replication.
 	// PauseSources stops the sources accepting new writing transactions,
-	// and lets them again. The swap's last catch-up check and the
-	// disabling of the forward subscriptions have to happen with nothing
-	// able to arrive in between, or a write acknowledged in that gap is
-	// left on a source nothing replicates from any more.
+	// and lets them again; lifting touches only this workflow's claim.
+	// From quiesce to the swap disabling forward replication nothing may
+	// commit on a source: before the flip such a write lands on a target
+	// that may hold a newer one, and after DisableForward it is left on a
+	// source nothing replicates from any more.
 	//
 	// The pause alone does not buy that, which is what DrainSources is
 	// for: default_transaction_read_only is read when a transaction
 	// STARTS, so one already open commits straight through it.
 	PauseSources(ctx context.Context, pause bool) error
+	// SourcesPaused reports whether every source still refuses new writing
+	// transactions under this workflow's claim.
+	SourcesPaused(ctx context.Context) (bool, error)
 	// DrainSources waits for the writing transactions that were already
 	// open when the pause went up. Until it returns, "paused" means only
 	// that no NEW writer can begin.
@@ -444,6 +434,9 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 					if oerr := holdClaim(ctx, c.Pool, wf.id, wf.owner); oerr != nil {
 						return false, oerr
 					}
+					if perr := ops.PauseSources(ctx, false); perr != nil {
+						return false, perr
+					}
 					if rerr := ops.Release(ctx); rerr != nil {
 						return false, rerr
 					}
@@ -546,11 +539,9 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// cannot run away from the targets. And nothing is lost by it. A
 		// write landing after the positions were read is still carried by
 		// the forward subscriptions, which stay enabled until StepSwap --
-		// and StepSwap pauses the sources, drains the writers already
-		// open, re-reads the positions and re-checks them before it
-		// disables anything. That is where a straggler is caught, and it
-		// is the only place the sources can be stopped without failing the
-		// writes of clients the fence deliberately let through.
+		// and StepQuiesce pauses the sources, drains the writers already
+		// open, re-reads the positions and re-checks them before the
+		// journal. That is where a straggler is caught.
 		ok, why, err := ops.CaughtUp(ctx, wf.cutover.Positions)
 		if err != nil {
 			return false, err
@@ -593,12 +584,41 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			}
 			return false, fatal("verification failed, the same digests twice: %s", strings.Join(report.Mismatches, "; "))
 		}
+	case StepQuiesce:
+		// The sources stop taking writing transactions here, before the
+		// journal, and stay stopped until StepSwap has disabled forward
+		// replication. The fence lets a transaction that was already open
+		// go on writing, and nothing else stops a router or pooler that has
+		// not reloaded; a write like that committing on a source after the
+		// flip is carried to a target that is already serving, over
+		// whatever the target committed meanwhile -- an older write over a
+		// newer one, or a duplicate key that stalls the apply (PGS-750). On
+		// one PostgreSQL the target's statement would have waited for it.
+		//
+		// Before the journal, so a transaction that will not end cannot
+		// hold the fence for good: waiting here is bounded by the cutover
+		// timeout, which undoes the switch and lifts the pause. The pause
+		// is lifted whenever the step has to wait, too, so a quiet moment
+		// between attempts lets new writers through rather than holding
+		// them behind a drain that may not converge. Not right after the fence, either: an
+		// attempt that paused milliseconds after it failed client
+		// transfers with 25006 (PGS-784), most likely from routers that had
+		// not yet seen the fence; by now it has stood through verify.
+		if waiting, err := quiesceSources(ctx, ops); waiting || err != nil {
+			return waiting, err
+		}
 	case StepSequences:
-		fp, err := ops.Sequences(ctx)
-		if err != nil {
+		if wf.cutover.Schema == nil {
+			// A switch saved at this step by a controller that ran reverse
+			// after the sequences, resumed here: reverse never ran, and
+			// going on would complete a switch with no reverse replication
+			// and so no rollback. Back to it, and quiesce with it.
+			wf.cutover.Step = StepReverse
+			return true, retryf("reverse replication was never created; running reverse and quiesce first")
+		}
+		if err := ops.Sequences(ctx); err != nil {
 			return false, err
 		}
-		wf.cutover.SeqFingerprint = fp
 	case StepReverse:
 		if err := ops.Reverse(ctx); err != nil {
 			return false, err
@@ -626,10 +646,30 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			return false, err
 		}
 	case StepFlip:
-		// Last check before the flip: a router that missed the fence may
-		// have written (or called nextval) after the recorded positions;
-		// the flip only happens once the targets applied everything the
-		// sources hold and the sources stood still through the check.
+		// The pause quiesce raised has to have stood since, or the drain it
+		// did proves nothing about now. It does not when a controller
+		// upgraded mid-switch resumes past a quiesce it never ran, or when
+		// something lifted the pause by hand. Then this is quiesce again,
+		// after the journal: it cannot abort, and it waits for as long as a
+		// transaction begun before the pause stays open -- but it lifts the
+		// pause while it waits, which is safe because the targets do not
+		// serve yet, so each attempt measures from a pause of its own.
+		stood, err := ops.SourcesPaused(ctx)
+		if err != nil {
+			return false, err
+		}
+		if !stood {
+			if waiting, err := quiesceSources(ctx, ops); waiting || err != nil {
+				return waiting, err
+			}
+		} else {
+			// The pause stood, so the transactions left are read-only ones
+			// begun under it. Only one that has written -- a client that
+			// overrode the pause for its own transaction -- is waited for.
+			if err := ops.DrainSources(ctx); err != nil {
+				return true, retryf("%s", err)
+			}
+		}
 		pos, err := ops.Positions(ctx)
 		if err != nil {
 			return false, err
@@ -640,33 +680,6 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		}
 		if !ok {
 			return true, retryf("%s", why)
-		}
-		// Sequence positions are the part CaughtUp cannot speak for, so
-		// the flip asks the sources directly whether one advanced since
-		// the carry. It used to ask whether the WAL POSITION had moved,
-		// which is a much wider question than the one it needs: a
-		// checkpoint or an autovacuum moves pg_current_wal_lsn with no
-		// user write behind it, so the answer was yes on every cutover,
-		// twice, until the bound below stopped it. Each of those recarried
-		// sequences that had not moved -- Apply takes the greater of the
-		// two, so it wrote nothing -- and each cost a full pass over every
-		// source and target INSIDE THE WRITE FENCE. Measured at rest, that
-		// was about 500ms of a 1.2s pause.
-		//
-		// Still bounded, because a source is never obliged to stand still
-		// and after the journal there is no timeout to end the wait.
-		seqFP, err := ops.SequenceFingerprint(ctx)
-		if err != nil {
-			return false, err
-		}
-		if seqFP != wf.cutover.SeqFingerprint && wf.cutover.Recarries < maxSeqRecarries {
-			wf.cutover.Positions = pos
-			wf.cutover.Recarries++
-			wf.cutover.Step = StepSequences
-			if err := c.saveCutover(ctx, wf, "switching: a sequence advanced before the flip; re-carrying sequences"); err != nil {
-				return false, err
-			}
-			return true, retryf("a sequence advanced past the carried position before the flip")
 		}
 		if err := ops.Flip(ctx, wf.cutover.JournalID); err != nil {
 			return false, err
@@ -703,15 +716,11 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// replication -- the rollback path -- while the workflow reports
 		// itself as merely retrying.
 		//
-		// So the resume skips that one pair and NOTHING else. Skipping the
-		// pause and the drain with it would be wrong: DisableForward walks
-		// databases and targets one at a time and its error path unpauses
-		// the sources with some subscriptions already disabled, so a stale
-		// router -- the actor the pause exists for -- could open a writing
-		// transaction on a source whose subscription is disabled out from
-		// under it, and the commit would be acknowledged into a slot
-		// Complete drops. The sequence carry is re-run for the same
-		// reason, and repeating it is safe because Apply takes the greater.
+		// So the resume skips that one pair and NOTHING else. The pause and
+		// the drain are re-run: a crash can land anywhere after the flip
+		// raised the pause, and re-raising one that stood is free. The
+		// sequence carry is re-run for the same reason, and repeating it is
+		// safe because Apply takes the greater.
 		//
 		// Two conditions, not one. ForwardDisabled alone cannot tell our
 		// own disable from an operator disabling a subscription by hand,
@@ -723,8 +732,17 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			return false, err
 		}
 		resuming := disabled && wf.cutover.DisablingAt != nil
-		if err := ops.PauseSources(ctx, true); err != nil {
+		// Raised again only when it did not stand since quiesce: raising a
+		// standing pause measures from now, and the drain would then wait
+		// for every read begun under it.
+		stood, err := ops.SourcesPaused(ctx)
+		if err != nil {
 			return false, err
+		}
+		if !stood {
+			if err := ops.PauseSources(ctx, true); err != nil {
+				return false, err
+			}
 		}
 		// The pause stops transactions that BEGIN after it. One that began
 		// before commits straight through it, because
@@ -736,45 +754,49 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// anywhere: an acknowledged commit is lost when the source goes.
 		//
 		// A drain timing out is a long transaction, not a broken cutover,
-		// so the sources are made writable again and the step retries.
+		// so the step retries -- with the pause up, as StepFlip leaves it:
+		// the sources are retired, and a source made writable between
+		// attempts is one a stale router can commit on while its forward
+		// subscription is being disabled.
 		if err := ops.DrainSources(ctx); err != nil {
-			return true, errors.Join(retryf("%s", err), ops.PauseSources(ctx, false))
+			if !stood && !resuming {
+				// A pause this pass raised and could not drain is not one
+				// the next pass may trust as having stood: lifted, it is
+				// raised and measured afresh. Forward replication is still
+				// whole, so what lands meanwhile is carried.
+				return true, errors.Join(retryf("%s", err), ops.PauseSources(ctx, false))
+			}
+			return true, retryf("%s", err)
 		}
 		if !resuming {
 			pos, err := ops.Positions(ctx)
 			if err != nil {
-				return false, errors.Join(err, ops.PauseSources(ctx, false))
+				return false, err
 			}
 			ok, why, err := ops.CaughtUp(ctx, pos)
 			if err != nil {
-				return false, errors.Join(err, ops.PauseSources(ctx, false))
+				return false, err
 			}
 			if !ok {
-				// Left writable between attempts: a workflow that stops
-				// here must not leave the sources refusing writes for good.
-				return true, errors.Join(retryf("%s", why), ops.PauseSources(ctx, false))
+				return true, retryf("%s", why)
 			}
 		}
-		// Sequence positions are not replicated. Between the carry before
-		// the flip and here, a router that had not yet reloaded could
-		// still have called nextval on a source: the row it wrote reaches
-		// the targets, the sequence position does not, and the targets
-		// hand the same value out again. The carry runs a second time
-		// with the sources paused, so nothing can consume a value after
-		// it -- which is what makes the flip's bounded re-carry a
-		// liveness measure rather than the thing safety rests on.
-		if _, err := ops.Sequences(ctx); err != nil {
-			return false, errors.Join(err, ops.PauseSources(ctx, false))
+		// Sequence positions are not replicated. The flip carried them with
+		// the sources paused; carrying them again here costs nothing, since
+		// Apply takes the greater, and covers a pause that did not stand
+		// between the two -- a crash, or one lifted by hand.
+		if err := ops.Sequences(ctx); err != nil {
+			return false, err
 		}
 		if wf.cutover.DisablingAt == nil {
 			now := c.now()
 			wf.cutover.DisablingAt = &now
 			if err := c.saveCutover(ctx, wf, "switching: disabling forward replication"); err != nil {
-				return false, errors.Join(err, ops.PauseSources(ctx, false))
+				return false, err
 			}
 		}
 		if err := ops.DisableForward(ctx); err != nil {
-			return false, errors.Join(err, ops.PauseSources(ctx, false))
+			return false, err
 		}
 		if err := ops.PauseSources(ctx, false); err != nil {
 			return false, err
@@ -803,11 +825,9 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 // the point of no return: once its rows are on the sources, every consumer
 // of the change stream has been told the cutover happened, and nothing
 // retracts that. So the question is answered from the durable fact that a
-// journal id was allocated, not from the step cursor -- StepFlip rewinds
-// the cursor back to StepSequences when the sources advanced before the
-// flip, and a cursor that can move backwards across the boundary cannot
-// stand for a write that cannot be taken back. Past that point every error
-// is retried instead.
+// journal id was allocated, not from the step cursor, which a controller
+// upgraded mid-switch may read against a different step order. Past that
+// point every error is retried instead.
 func (c *Copier) mayAbort(wf *copyWorkflow) bool {
 	return wf.cutover.FencedAt != nil && wf.cutover.JournalID == ""
 }
@@ -844,8 +864,53 @@ func (c *Copier) abandonSwitch(ctx context.Context, wf *copyWorkflow, ops cutove
 
 // abortSwitch undoes the fence before the journal and returns to the gate,
 // failing the workflow once the attempts are used up.
+// quiesceSources pauses the sources, waits out the writers and prepared
+// transactions begun before the pause, and confirms the targets have applied
+// everything the sources hold. Whenever it has to wait it lifts the pause
+// again: the targets do not serve yet, so the forward subscriptions carry
+// anything written meanwhile, and the next attempt measures from its own
+// pause. It reports waiting, or an error, with the pause lifted.
+func quiesceSources(ctx context.Context, ops cutoverOps) (bool, error) {
+	if err := ops.PauseSources(ctx, true); err != nil {
+		return false, errors.Join(err, ops.PauseSources(ctx, false))
+	}
+	lift := func(waiting bool, err error) (bool, error) {
+		return waiting, errors.Join(err, ops.PauseSources(ctx, false))
+	}
+	if err := ops.DrainSources(ctx); err != nil {
+		return lift(true, retryf("%s", err))
+	}
+	// A prepared transaction has no backend for the drain to see, and
+	// COMMIT PREPARED runs in a read-only transaction.
+	prepared, err := ops.Drain(ctx)
+	if err != nil {
+		return lift(false, err)
+	}
+	if len(prepared) > 0 {
+		return lift(true, retryf("prepared transactions %v", prepared))
+	}
+	pos, err := ops.Positions(ctx)
+	if err != nil {
+		return lift(false, err)
+	}
+	ok, why, err := ops.CaughtUp(ctx, pos)
+	if err != nil {
+		return lift(false, err)
+	}
+	if !ok {
+		return lift(true, retryf("%s", why))
+	}
+	return false, nil
+}
+
 func (c *Copier) abortSwitch(ctx context.Context, wf *copyWorkflow, ops cutoverOps, reason string) (bool, error) {
 	if err := holdClaim(ctx, c.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
+	// A switch undone after quiesce leaves its pause behind otherwise, on
+	// sources that still serve. Only this workflow's claim is lifted, and
+	// before the fence: routers that see the fence drop send writes at once.
+	if err := ops.PauseSources(ctx, false); err != nil {
 		return false, err
 	}
 	if err := ops.Release(ctx); err != nil {
