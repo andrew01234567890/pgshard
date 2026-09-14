@@ -333,7 +333,11 @@ func (c *Config) Validate() error {
 	if c.EpochFile != "" {
 		if !filepath.IsAbs(c.EpochFile) {
 			errs = append(errs, fmt.Errorf("epochFile must be an absolute path, got %q", c.EpochFile))
-		} else if rel, err := filepath.Rel(c.PGData, c.EpochFile); err == nil && !strings.HasPrefix(rel, "..") {
+		} else if rel, err := filepath.Rel(c.PGData, c.EpochFile); err != nil {
+			errs = append(errs, fmt.Errorf("cannot tell whether epochFile %q is inside pgdata %q: %w", c.EpochFile, c.PGData, err))
+		} else if rel != ".." && !strings.HasPrefix(rel, "../") {
+			// Not HasPrefix(rel, ".."): that also matches a file called
+			// "..epoch" directly inside pgdata.
 			errs = append(errs, fmt.Errorf("epochFile %q is inside pgdata, where a reclone removes it; put it beside pgdata on the same volume", c.EpochFile))
 		}
 	}

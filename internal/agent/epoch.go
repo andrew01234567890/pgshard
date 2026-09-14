@@ -20,7 +20,10 @@ var ErrStaleEpoch = errors.New("stale epoch")
 type EpochStore struct {
 	mu   sync.Mutex
 	path string
-	cur  uint64
+	// legacy is the in-PGDATA file when path is somewhere else, and empty
+	// when path IS the legacy file.
+	legacy string
+	cur    uint64
 	// term is cancelled when a later epoch is accepted. An RPC that passed
 	// the epoch check runs under a context derived from it, so work started
 	// in one term does not continue into the next -- which is the whole
@@ -44,36 +47,48 @@ func OpenEpochStore(pgdata string) (*EpochStore, error) { return OpenEpochStoreA
 // part-way through a clone restarts with no file, loads 0, and treats any
 // epoch at all as newer: a delayed Promote from a term long over included.
 //
-// A member upgrading onto a configured file carries its epoch across: the
-// configured file wins once it exists, and until then the legacy one is
-// read and copied into it. After that the legacy file is ignored, because
-// what a clone copies into it is another member's fence, not this one's.
+// Both files are read and the HIGHER wins, written through to the
+// configured one. Taking the higher is the only safe direction, because
+// every value in either file came from the group's single increasing epoch
+// sequence, and a fence only ever needs to refuse more:
+//
+//   - an upgrading member's configured file does not exist yet, and its
+//     epoch is in the legacy one;
+//   - an agent rolled back to a binary that knows only the legacy file, then
+//     forward again, has accepted epochs there that the configured file
+//     never saw -- preferring the configured file would lower the fence and
+//     admit a replay of an epoch it had already refused;
+//   - a clone copies the primary's legacy file in, which is at least as high
+//     as this member's own, and raising this member's fence to it is safe.
+//
+// Accept writes the legacy file too, for as long as it exists, so a
+// rolled-back binary finds the current epoch.
 func OpenEpochStoreAt(pgdata, file string) (*EpochStore, error) {
 	legacy := filepath.Join(pgdata, "pgshard", "epoch")
-	if file == "" {
-		file = legacy
+	if file == "" || file == legacy {
+		v, _, err := readEpochFile(legacy)
+		if err != nil {
+			return nil, err
+		}
+		return &EpochStore{path: legacy, cur: v}, nil
 	}
-	s := &EpochStore{path: file}
-	v, found, err := readEpochFile(file)
+	s := &EpochStore{path: file, legacy: legacy}
+	configured, foundConfigured, err := readEpochFile(file)
 	if err != nil {
 		return nil, err
 	}
-	if found || file == legacy {
-		s.cur = v
-		return s, nil
-	}
-	old, found, err := readEpochFile(legacy)
+	old, _, err := readEpochFile(legacy)
 	if err != nil {
 		return nil, err
 	}
-	if found && old > 0 {
+	s.cur = max(configured, old)
+	if s.cur > configured || (!foundConfigured && s.cur > 0) {
 		if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
 			return nil, err
 		}
-		if err := writeFileSync(file, []byte(strconv.FormatUint(old, 10)+"\n")); err != nil {
-			return nil, fmt.Errorf("carry the epoch from %s to %s: %w", legacy, file, err)
+		if err := writeFileSync(file, []byte(strconv.FormatUint(s.cur, 10)+"\n")); err != nil {
+			return nil, fmt.Errorf("carry epoch %d into %s: %w", s.cur, file, err)
 		}
-		s.cur = old
 	}
 	return s, nil
 }
@@ -161,6 +176,20 @@ func (s *EpochStore) Accept(epoch uint64) error {
 	}
 	if err := writeFileSync(s.path, []byte(strconv.FormatUint(epoch, 10)+"\n")); err != nil {
 		return err
+	}
+	// The legacy file too, so a rolled-back binary finds the current epoch --
+	// but only into an initialised data directory. Mid-clone PGDATA has just
+	// been emptied and pg_basebackup refuses a directory that is not empty,
+	// so writing there then would break the clone; PG_VERSION is absent
+	// exactly then. Best effort beyond that: the configured file is the
+	// fence, and this copy only spares a rolled-back binary a lower one.
+	if s.legacy != "" {
+		pgdata := filepath.Dir(filepath.Dir(s.legacy))
+		if _, err := os.Stat(filepath.Join(pgdata, "PG_VERSION")); err == nil {
+			if err := os.MkdirAll(filepath.Dir(s.legacy), 0o700); err == nil {
+				_ = writeFileSync(s.legacy, []byte(strconv.FormatUint(epoch, 10)+"\n"))
+			}
+		}
 	}
 	s.cur = epoch
 	// Everything the old term admitted stops here, whether or not it has

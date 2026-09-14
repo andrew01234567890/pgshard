@@ -505,6 +505,17 @@ func runAgentSuite(t *testing.T, image, bin string) {
 		t.Fatalf("recloned standby rows: %s", got)
 	}
 
+	t.Log("the epoch survives a restart that finds no epoch inside PGDATA")
+	// What an agent dying partway through that clone would come back to: a
+	// PGDATA with no epoch file in it. The fence lives beside it now.
+	docker(t, "exec", p.container, "rm", "-f", "/var/lib/postgresql/data/pgshard/epoch")
+	docker(t, "restart", p.container)
+	p.connect()
+	p.waitServing(120 * time.Second)
+	if st := p.status(); st.GetEpoch() != 1 {
+		t.Fatalf("epoch %d after restarting with no epoch inside PGDATA: the fence was lost with it", st.GetEpoch())
+	}
+
 	t.Log("slot RPCs and backup RPCs without a policy")
 	if _, err := s.grpc.CreateSlot(ctx, &pgshardv1.CreateSlotRequest{Epoch: 1, Name: "extra", Kind: pgshardv1.SlotKind_SLOT_KIND_PHYSICAL}); err != nil {
 		t.Fatalf("create slot: %v", err)

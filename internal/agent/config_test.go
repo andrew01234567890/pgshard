@@ -484,4 +484,8 @@ func TestAnEpochFileInsidePGDATAIsRefused(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Fatal("a relative epoch file was accepted")
 	}
+	c.EpochFile = "/var/lib/postgresql/data/pgdata/..epoch"
+	if err := c.Validate(); err == nil {
+		t.Fatal("a file named ..epoch inside pgdata was taken for one outside it")
+	}
 }
