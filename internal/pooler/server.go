@@ -1255,8 +1255,10 @@ wait:
 		delete(s.sessions, id)
 	}
 	s.mu.Unlock()
+	// Abandon, not Discard: a session still holding a backend past the
+	// deadline has a relay inside a read or write on it.
 	for _, b := range held {
-		s.cfg.Pool.Discard(b)
+		s.cfg.Pool.Abandon(b)
 	}
 	s.cfg.Pool.Close()
 	s.closed.Store(true)
