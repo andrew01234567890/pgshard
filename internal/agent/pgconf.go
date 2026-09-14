@@ -85,10 +85,10 @@ func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 // defaultSettings are applied when neither the agent nor the operator named
 // them. They are a floor for settings whose ABSENCE is unsafe, not tuning.
 //
-// pgtune derives max_slot_wal_keep_size from the disk size, but Tuning
-// returns nothing at all when spec.resources names no memory -- "without a
-// budget nothing can be derived and the agent's fixed configuration stands
-// alone". So an unbudgeted cluster got PostgreSQL's default of -1, unlimited
+// pgtune derives max_slot_wal_keep_size from the disk size, but without a
+// memory budget Tuning sets only the connection limits -- nothing
+// memory-shaped is derived and the agent's fixed configuration stands for
+// the rest. So an unbudgeted cluster got PostgreSQL's default of -1, unlimited
 // retention, and a slot left for a member that no longer exists pinned WAL
 // on a PRIMARY until pg_wal filled the disk. A failover that leaves a slot
 // behind is enough; nothing else has to go wrong.

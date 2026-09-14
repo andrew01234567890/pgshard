@@ -150,7 +150,7 @@ func TestNextPVCName(t *testing.T) {
 	}
 }
 
-func TestTuningDropsAgentOwnedSettingsAndNeedsMemory(t *testing.T) {
+func TestTuningDropsAgentOwnedSettingsAndSetsConnectionsWithoutMemory(t *testing.T) {
 	c := newCluster("tune")
 	c.Spec.PostgreSQL.Parameters = nil
 	g := Groups(c)[1]
@@ -172,10 +172,27 @@ func TestTuningDropsAgentOwnedSettingsAndNeedsMemory(t *testing.T) {
 	if maxConns, _ := strconv.Atoi(got["max_connections"]); maxConns-8 < defaultMaxBackends {
 		t.Fatalf("non-superusers get %d slots, fewer than the pooler's budget of %d", maxConns-8, defaultMaxBackends)
 	}
-	c.Spec.PostgreSQL.Parameters = map[string]string{"Max_Connections ": "300"}
+	c.Spec.PostgreSQL.Parameters = map[string]string{"max_connections": "300"}
 	if s, _ := Tuning(c, g); !contains(OverrideConf(s), "max_connections = 300") {
 		t.Errorf("a user's max_connections must survive in the override, which is read after the parameters: %s", OverrideConf(s))
 	}
+	// Two spellings of one setting resolve the same way every time; map
+	// order used to decide, and the settings hash then changed between
+	// passes and rolled the members for ever.
+	c.Spec.PostgreSQL.Parameters = map[string]string{"max_connections": "200", "MAX_CONNECTIONS": "300"}
+	first, _ := Tuning(c, g)
+	for range 50 {
+		if again, _ := Tuning(c, g); OverrideConf(again) != OverrideConf(first) {
+			t.Fatalf("the same spec rendered two overrides:\n%s\n%s", OverrideConf(first), OverrideConf(again))
+		}
+	}
+	// A memory budget too small to derive from still gets the limits.
+	c.Spec.PostgreSQL.Parameters = nil
+	c.Spec.Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")}}
+	if s, err := Tuning(c, g); err == nil || !contains(OverrideConf(s), "max_connections = 108") {
+		t.Errorf("a failed derivation must still set the connection limits: %v %s", err, OverrideConf(s))
+	}
+	c.Spec.Resources = corev1.ResourceRequirements{}
 	c.Spec.PostgreSQL.Parameters = nil
 	c.Spec.Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceCPU: resource.MustParse("2")}}
 	s, err = Tuning(c, g)

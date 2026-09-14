@@ -248,11 +248,19 @@ func connectionSettings(maxBackends int) Settings {
 // setting is kept, as Derive keeps it.
 func Connections(maxBackends int, overrides map[string]string) Settings {
 	s := connectionSettings(maxBackends)
-	for name, value := range overrides {
+	// In name order, as applyOverrides goes: two keys that name one setting
+	// in different case must resolve the same way on every pass, or the
+	// settings hash changes between reconciles and the members roll for ever.
+	names := make([]string, 0, len(overrides))
+	for name := range overrides {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		key := strings.ToLower(strings.TrimSpace(name))
 		for i := range s {
 			if s[i].Name == key {
-				s[i].Value, s[i].Reason = value, "operator override"
+				s[i].Value, s[i].Reason = overrides[name], "operator override"
 			}
 		}
 	}

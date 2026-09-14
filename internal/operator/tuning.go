@@ -63,7 +63,9 @@ func Tuning(c *pgshardv1alpha1.PgShardCluster, g Group) (pgtune.Settings, error)
 	}
 	settings, err := pgtune.Derive(in)
 	if err != nil {
-		return nil, err
+		// What failed is the memory-shaped part; the connection limits do
+		// not depend on it, so they still stand.
+		return pgtune.Connections(defaultMaxBackends, c.Spec.PostgreSQL.Parameters), err
 	}
 	return dropAgentOwned(settings), nil
 }
