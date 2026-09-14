@@ -505,6 +505,11 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 			if err := p.verifyPlacement(ctx, wf); err != nil {
 				return false, err
 			}
+			if len(wf.st.Swapped) == 0 {
+				if err := p.recheckDependents(ctx, wf); err != nil {
+					return false, err
+				}
+			}
 			if err := p.swapAll(ctx, wf); err != nil {
 				return false, err
 			}
