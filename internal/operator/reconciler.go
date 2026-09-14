@@ -1084,7 +1084,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	obs.primaryAgentMTLS = primary.pod != nil && primary.pod.Annotations[AnnotationAgentMTLS] == "true"
 
 	healthy := primaryHealthy(primary.pod, primary.ready, st, stErr)
-	unhealthyFor := r.unhealthyFor(g.Prefix(), !healthy)
+	unhealthyFor := r.unhealthyFor(c, g, !healthy)
 	if !healthy {
 		obs.failing = true
 		obs.primaryErr = "primary unhealthy"
@@ -1096,7 +1096,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 			obs.state = state
 			if errors.Is(err, errNoCandidate) {
 				logf.FromContext(ctx).Info("primary unhealthy but no candidate; keeping the current primary", "group", g.Name(), "primary", state.primary)
-				r.unhealthyFor(g.Prefix(), false)
+				r.unhealthyFor(c, g, false)
 				if primary.pod == nil {
 					if _, err := r.observePod(ctx, c, g, ordinalOf(g, state.primary), state, obs.template, true); err != nil {
 						return obs, err
@@ -1108,7 +1108,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 				// Abandoned because the primary is still running, so the delay
 				// starts over: left expired, the next pass that catches its
 				// Status at a bad moment fences it again at once.
-				r.unhealthyFor(g.Prefix(), false)
+				r.unhealthyFor(c, g, false)
 			}
 			if err != nil {
 				return obs, err
@@ -1312,7 +1312,6 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 	// crash-looping -- and the old code found that out only after deleting
 	// the primary pod, which left the group with no primary at all.
 	if why, catchUp := r.switchoverCandidate(ctx, c, g, state, members, password, target); why != "" {
-		key := g.Prefix()
 		if catchUp {
 			// The target is admissible and merely behind another standby
 			// for the moment. Keep the request: refusing here dropped the
@@ -1320,17 +1319,17 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 			// so an ordinary switchover failed whenever replication
 			// happened to be a few bytes skewed at the instant of the
 			// check.
-			if waited := r.switchoverWaiting(key, true); waited < r.switchoverCatchUp() {
+			if waited := r.switchoverWaiting(c, g, true); waited < r.switchoverCatchUp() {
 				log.Info("switchover waiting for the target to catch up", "reason", why, "waited", waited.Round(time.Second))
 				return obs, nil
 			}
 			why = fmt.Sprintf("%s, still after %s", why, r.switchoverCatchUp())
 		}
-		r.switchoverWaiting(key, false)
+		r.switchoverWaiting(c, g, false)
 		log.Info("switchover refused: the target cannot be promoted", "reason", why)
 		return obs, clearAnnotation()
 	}
-	r.switchoverWaiting(g.Prefix(), false)
+	r.switchoverWaiting(c, g, false)
 	if old := members[state.primary]; old != nil && old.pod != nil {
 		if err := r.patchRole(ctx, old.pod, RoleUnhealthy); err != nil {
 			return obs, err
