@@ -530,9 +530,19 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 			if err := p.verifyPlacement(ctx, wf); err != nil {
 				return false, err
 			}
-			if len(wf.st.Swapped) == 0 && wf.st.PoliciesAtSwap {
-				if err := p.checkPolicyDependencies(ctx, nil, wf); err != nil {
+			// Both rechecks belong here, and neither covers the other: one
+			// asks what has become bound to the table by identity since the
+			// preflight, the other what the policies captured then still
+			// resolve to. Only before the first shard swaps, because after
+			// that the table is already half moved.
+			if len(wf.st.Swapped) == 0 {
+				if err := p.recheckDependents(ctx, wf); err != nil {
 					return false, err
+				}
+				if wf.st.PoliciesAtSwap {
+					if err := p.checkPolicyDependencies(ctx, nil, wf); err != nil {
+						return false, err
+					}
 				}
 			}
 			if err := p.swapAll(ctx, wf); err != nil {
