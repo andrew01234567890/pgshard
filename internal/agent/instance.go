@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -416,7 +418,13 @@ func (in *Instance) Start(ctx context.Context) error {
 	if err := in.sup.Start(); err != nil {
 		return err
 	}
-	return in.waitReady(ctx)
+	if err := in.waitReady(ctx); err != nil {
+		return err
+	}
+	// A rewind marker describes a data directory that has not run since the
+	// rewind. Once postgres has come up on it, the next rejoin -- after some
+	// later promotion and demotion -- needs a rewind of its own.
+	return in.clearRewound()
 }
 
 func (in *Instance) waitReady(ctx context.Context) error {
@@ -478,6 +486,11 @@ func (in *Instance) Promote(ctx context.Context) error {
 			}
 		}
 	}
+	// A primary is never resuming a rejoin, and a marker surviving into its
+	// term would let its eventual demotion skip the rewind it will need.
+	if err := in.clearRewound(); err != nil {
+		return err
+	}
 	if err := WriteConfig(in.cfg, false); err != nil {
 		return err
 	}
@@ -509,6 +522,47 @@ func (in *Instance) setPromotionPending() error {
 
 func (in *Instance) clearPromotionPending() error {
 	err := os.Remove(filepath.Join(in.cfg.PGData, promotionPendingMarker))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return syncDir(in.cfg.PGData)
+}
+
+// rewoundMarker is a file in PGDATA recording that pg_rewind completed
+// against a source and nothing has run on the result since. It holds a
+// digest of the source rather than the conninfo, which is not this file's
+// to keep. pg_basebackup's clear of PGDATA removes it, and so does any
+// start and any promotion.
+const rewoundMarker = "pgshard_rewound_for"
+
+func sourceDigest(source string) string {
+	sum := sha256.Sum256([]byte(source))
+	return hex.EncodeToString(sum[:])
+}
+
+func (in *Instance) markRewound(source string) error {
+	return writeFileSync(filepath.Join(in.cfg.PGData, rewoundMarker), []byte(sourceDigest(source)+"\n"))
+}
+
+// rewoundFor reports whether the data directory was rewound against source
+// and has not run since. A marker for any other source is not a rewind this
+// rejoin can use.
+func (in *Instance) rewoundFor(source string) (bool, error) {
+	b, err := os.ReadFile(filepath.Join(in.cfg.PGData, rewoundMarker))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(b)) == sourceDigest(source), nil
+}
+
+func (in *Instance) clearRewound() error {
+	err := os.Remove(filepath.Join(in.cfg.PGData, rewoundMarker))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -586,20 +640,44 @@ func (in *Instance) Follow(ctx context.Context, source string) error {
 	if err := in.follow(ctx, source); err != nil {
 		return err
 	}
-	return in.startFn(ctx)
+	if err := in.startFn(ctx); err != nil {
+		return err
+	}
+	return in.clearRewound()
 }
 
 // follow turns a stopped former primary into a standby of source: pg_rewind
 // (falling back to a full reclone), stale slot removal and standby
 // configuration. postgres must not be running.
 func (in *Instance) follow(ctx context.Context, source string) error {
-	if err := in.rewindFn(ctx, source); err != nil {
+	// A rejoin that got past pg_rewind and then failed -- the slot on the
+	// source is a network call, the rest are writes to disk -- is retried
+	// from the top. Running pg_rewind again then points it at a target it
+	// has already rewound, whose control file is no longer a clean
+	// shutdown, and whatever it makes of that, a failure there falls back to
+	// a full reclone: seconds of rewind become a copy of the whole volume.
+	// The marker records that the rewind is done for this source, so the
+	// retry picks up after it.
+	rewound, err := in.rewoundFor(source)
+	if err != nil {
+		return err
+	}
+	recloned := false
+	if rewound {
+		in.log.Info("pg_rewind already completed against this source; resuming the rejoin after it")
+	} else if err := in.rewindFn(ctx, source); err != nil {
 		in.log.Warn("pg_rewind failed; recloning", "err", err)
 		if err := in.rebuild(ctx); err != nil {
 			return fmt.Errorf("reclone after failed rewind: %w", err)
 		}
-	} else if err := in.slotFn(ctx, source); err != nil {
+		recloned = true
+	} else if err := in.markRewound(source); err != nil {
 		return err
+	}
+	if !recloned {
+		if err := in.slotFn(ctx, source); err != nil {
+			return err
+		}
 	}
 	if err := in.dropStaleSlots(); err != nil {
 		return err

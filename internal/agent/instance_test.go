@@ -74,6 +74,91 @@ func TestDemoteUsesConfiguredSourceAndSkipsRecloneOnSuccess(t *testing.T) {
 	}
 }
 
+// TestARejoinRetriedAfterItsRewindResumesAfterIt: pg_rewind succeeds and a
+// step after it fails -- here the slot on the source, which is a network
+// call. The retry used to start from the top and point pg_rewind at a
+// target it had already rewound, whose control file is no longer a clean
+// shutdown; any failure there fell back to a full reclone, turning seconds
+// of rewind into a copy of the whole volume.
+func TestARejoinRetriedAfterItsRewindResumesAfterIt(t *testing.T) {
+	in := newTestInstance(t)
+	var rewinds, reclones, slots int
+	in.rewindFn = func(context.Context, string) error { rewinds++; return nil }
+	in.recloneFn = func(context.Context) error { reclones++; return nil }
+	in.slotFn = func(context.Context, string) error {
+		slots++
+		if slots == 1 {
+			return errors.New("source unreachable")
+		}
+		return nil
+	}
+
+	if err := in.Demote(context.Background(), "host=new"); err == nil {
+		t.Fatal("the first attempt was meant to fail after the rewind")
+	}
+	if err := in.Demote(context.Background(), "host=new"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if rewinds != 1 {
+		t.Errorf("pg_rewind ran %d times; the retry repeated a rewind that had already completed", rewinds)
+	}
+	if reclones != 0 {
+		t.Errorf("recloned %d times after a rewind that succeeded", reclones)
+	}
+	if slots != 2 {
+		t.Errorf("slot step ran %d times, want the failed attempt and the retry", slots)
+	}
+	if standby, err := in.IsStandby(); err != nil || !standby {
+		t.Fatal("standby.signal missing after the resumed rejoin")
+	}
+	// Started, so the marker is spent: a later term's rejoin needs its own
+	// rewind.
+	if rewound, err := in.rewoundFor("host=new"); err != nil || rewound {
+		t.Fatalf("the rewind marker outlived the start it was for: rewound=%v err=%v", rewound, err)
+	}
+}
+
+// TestARewindMarkerForAnotherSourceIsNotUsed: a rewind makes a target
+// consistent with ONE source. A retry pointed at a different primary --
+// failover moved on while the rejoin was failing -- has to rewind again.
+func TestARewindMarkerForAnotherSourceIsNotUsed(t *testing.T) {
+	in := newTestInstance(t)
+	if err := in.markRewound("host=old"); err != nil {
+		t.Fatal(err)
+	}
+	var rewoundAgainst []string
+	in.rewindFn = func(_ context.Context, src string) error { rewoundAgainst = append(rewoundAgainst, src); return nil }
+	in.recloneFn = func(context.Context) error { t.Fatal("recloned"); return nil }
+	if err := in.Demote(context.Background(), "host=new"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rewoundAgainst) != 1 || rewoundAgainst[0] != "host=new" {
+		t.Fatalf("rewound against %v; a marker for host=old must not stand in for a rewind against host=new", rewoundAgainst)
+	}
+}
+
+// TestAFailedStartKeepsTheRewindMarker: the marker is spent only once
+// postgres has come up on the rewound directory. A start that fails leaves
+// nothing run on it, so the retry must still skip the rewind.
+func TestAFailedStartKeepsTheRewindMarker(t *testing.T) {
+	in := newTestInstance(t)
+	in.rewindFn = func(context.Context, string) error { return nil }
+	starts := 0
+	in.startFn = func(context.Context) error {
+		starts++
+		if starts == 1 {
+			return errors.New("postgres exited during startup")
+		}
+		return nil
+	}
+	if err := in.Demote(context.Background(), "host=new"); err == nil {
+		t.Fatal("the first start was meant to fail")
+	}
+	if rewound, err := in.rewoundFor("host=new"); err != nil || !rewound {
+		t.Fatalf("a failed start cleared the rewind marker: rewound=%v err=%v", rewound, err)
+	}
+}
+
 func TestDemoteReportsRecloneFailure(t *testing.T) {
 	in := newTestInstance(t)
 	in.rewindFn = func(context.Context, string) error { return errors.New("rewind boom") }
