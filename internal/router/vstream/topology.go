@@ -155,7 +155,7 @@ type PGCatalog struct {
 
 // Lookup implements Catalog.
 func (c PGCatalog) Lookup(ctx context.Context, name string) (catalog.Stream, error) {
-	rows, err := c.Pool.Query(ctx, `SELECT name, database, two_phase, state, created_at FROM pgshard.streams WHERE name = $1`, name)
+	rows, err := c.Pool.Query(ctx, `SELECT name, database, two_phase, state, created_at, shard_set FROM pgshard.streams WHERE name = $1`, name)
 	if err != nil {
 		return catalog.Stream{}, err
 	}

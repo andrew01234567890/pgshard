@@ -48,9 +48,11 @@ func (m *StreamMonitor) Sweep(ctx context.Context) (int, error) {
 		if set == "" {
 			// listShards("") is every shard in the cluster, which is the
 			// behaviour this is replacing -- so an unset row must not
-			// reach it. The migration backfills, and CreateStream always
-			// records one, so this covers a row written by something that
-			// forgot rather than a supported state.
+			// reach it. The migration backfills and CreateStream always
+			// records one, so this is a row written by something that
+			// forgot; it is resolved rather than skipped so the stream
+			// keeps being reported, and said out loud because nothing
+			// else would ever mention it.
 			serving, err := catalog.ServingShardSet(ctx, m.Pool)
 			if err != nil {
 				if firstErr == nil {
@@ -58,12 +60,29 @@ func (m *StreamMonitor) Sweep(ctx context.Context) (int, error) {
 				}
 				continue
 			}
+			if m.Logger != nil {
+				m.Logger.Warn("stream has no shard set recorded; sweeping the serving set",
+					"streams", len(inSet), "serving", serving)
+			}
 			set = serving
 		}
 		shards, err := (&Resolver{Pool: m.Pool}).listShards(ctx, set)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
+			}
+			continue
+		}
+		if len(shards) == 0 {
+			// The set was dropped under the stream -- a cancelled reshard,
+			// or a retired set finally removed. Sweeping nothing leaves
+			// every stream_status row frozen at whatever it last said,
+			// which for a monitor is worse than saying nothing at all:
+			// the rows go on looking current. Nothing here can repair it,
+			// so it is reported rather than hidden.
+			if m.Logger != nil {
+				m.Logger.Warn("stream's shard set has no shards; its status will not be updated",
+					"shard_set", set, "streams", len(inSet))
 			}
 			continue
 		}
