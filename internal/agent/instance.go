@@ -2,8 +2,6 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,13 +23,17 @@ type Instance struct {
 	epoch *EpochStore
 	log   *slog.Logger
 	// pgctl and basebackup hooks are swappable for unit tests.
-	rewindFn     func(ctx context.Context, source string) error
-	recloneFn    func(ctx context.Context) error
-	repoCloneFn  func(ctx context.Context) error
-	restoreFn    func(ctx context.Context) error
-	startFn      func(ctx context.Context) error
-	slotFn       func(ctx context.Context, source string) error
-	waitSourceFn func(ctx context.Context, source string) error
+	rewindFn    func(ctx context.Context, source string) error
+	recloneFn   func(ctx context.Context) error
+	repoCloneFn func(ctx context.Context) error
+	restoreFn   func(ctx context.Context) error
+	startFn     func(ctx context.Context) error
+	slotFn      func(ctx context.Context, source string) error
+	// sourceIdentityFn names the SERVER behind source, which the conninfo
+	// does not: it is the -rw Service, and the same string reaches whichever
+	// member is primary now.
+	sourceIdentityFn func(ctx context.Context, source string) (string, error)
+	waitSourceFn     func(ctx context.Context, source string) error
 	// cloneRetry is the pause between bootstrap clone attempts.
 	cloneRetry time.Duration
 	// newRunner overrides the pgbackrest runner in tests.
@@ -69,6 +71,7 @@ func NewInstance(cfg *Config, sup *Supervisor, epoch *EpochStore, log *slog.Logg
 	in.restoreFn = in.restoreBootstrap
 	in.startFn = in.Start
 	in.slotFn = in.ensureSlotOnSource
+	in.sourceIdentityFn = in.sourceIdentity
 	in.waitSourceFn = in.waitSource
 	sup.Env = append(sup.Env, "PGPASSFILE="+in.pgpassPath())
 	return in
@@ -532,25 +535,19 @@ func (in *Instance) clearPromotionPending() error {
 }
 
 // rewoundMarker is a file in PGDATA recording that pg_rewind completed
-// against a source and nothing has run on the result since. It holds a
-// digest of the source rather than the conninfo, which is not this file's
-// to keep. pg_basebackup's clear of PGDATA removes it, and so does any
-// start and any promotion.
+// against a particular server and nothing has run on the result since. It
+// holds that server's identity -- system identifier and timeline -- not
+// the conninfo, which names a Service rather than a server. pg_basebackup's
+// clear of PGDATA removes it, and so does any start and any promotion.
 const rewoundMarker = "pgshard_rewound_for"
 
-func sourceDigest(source string) string {
-	sum := sha256.Sum256([]byte(source))
-	return hex.EncodeToString(sum[:])
+func (in *Instance) markRewound(identity string) error {
+	return writeFileSync(filepath.Join(in.cfg.PGData, rewoundMarker), []byte(identity+"\n"))
 }
 
-func (in *Instance) markRewound(source string) error {
-	return writeFileSync(filepath.Join(in.cfg.PGData, rewoundMarker), []byte(sourceDigest(source)+"\n"))
-}
-
-// rewoundFor reports whether the data directory was rewound against source
-// and has not run since. A marker for any other source is not a rewind this
-// rejoin can use.
-func (in *Instance) rewoundFor(source string) (bool, error) {
+// rewoundAgainst reports whether the data directory was rewound against the
+// server identity names and has not run since.
+func (in *Instance) rewoundAgainst(identity string) (bool, error) {
 	b, err := os.ReadFile(filepath.Join(in.cfg.PGData, rewoundMarker))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -558,7 +555,31 @@ func (in *Instance) rewoundFor(source string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(string(b)) == sourceDigest(source), nil
+	return strings.TrimSpace(string(b)) == identity, nil
+}
+
+// sourceIdentity is the source's system identifier and the timeline it is
+// writing on now. pg_walfile_name of the insert position carries the
+// timeline as soon as a promotion has happened, where pg_control_checkpoint
+// would still report the old one until the next checkpoint. On a server in
+// recovery it fails, which is the answer wanted: a standby behind the
+// Service is not a source a marker can be matched against.
+func (in *Instance) sourceIdentity(ctx context.Context, source string) (string, error) {
+	cfg, err := in.sourceConfig(source)
+	if err != nil {
+		return "", err
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return "", fmt.Errorf("connect to source: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var id string
+	if err := conn.QueryRow(ctx, `SELECT (SELECT system_identifier FROM pg_control_system())::text || '/' ||
+		substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)`).Scan(&id); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (in *Instance) clearRewound() error {
@@ -656,23 +677,46 @@ func (in *Instance) follow(ctx context.Context, source string) error {
 	// has already rewound, whose control file is no longer a clean
 	// shutdown, and whatever it makes of that, a failure there falls back to
 	// a full reclone: seconds of rewind become a copy of the whole volume.
-	// The marker records that the rewind is done for this source, so the
-	// retry picks up after it.
-	rewound, err := in.rewoundFor(source)
+	// The marker records that the rewind is done, so the retry picks up
+	// after it.
+	//
+	// Done against WHICH server is the whole question. The conninfo is the
+	// -rw Service and names whoever is primary now, so a failover between
+	// the attempts leaves the string unchanged while the history behind it
+	// has forked: skipping the rewind then starts this member on data
+	// rewound to the old primary, which the new one either refuses to
+	// stream to -- for good, since nothing re-runs the rewind -- or, with
+	// no archive and the right WAL on hand, follows silently diverged. So
+	// the marker records the source's system identifier and the timeline it
+	// was on, read just before the rewind, and a retry reuses the rewind
+	// only if the server behind the Service still reports both. A promotion
+	// always moves the timeline.
+	identity, err := in.sourceIdentityFn(ctx, source)
 	if err != nil {
-		return err
+		// Not knowing is not a reason to skip the rewind. pg_rewind needs
+		// the same source, and its failure path is the one that is safe.
+		in.log.Warn("could not identify the rejoin source; rewinding rather than trusting a marker", "err", err)
+		identity = ""
+	}
+	rewound := false
+	if identity != "" {
+		if rewound, err = in.rewoundAgainst(identity); err != nil {
+			return err
+		}
 	}
 	recloned := false
 	if rewound {
-		in.log.Info("pg_rewind already completed against this source; resuming the rejoin after it")
+		in.log.Info("pg_rewind already completed against this source and it has not changed since; resuming the rejoin after it", "source", identity)
 	} else if err := in.rewindFn(ctx, source); err != nil {
 		in.log.Warn("pg_rewind failed; recloning", "err", err)
 		if err := in.rebuild(ctx); err != nil {
 			return fmt.Errorf("reclone after failed rewind: %w", err)
 		}
 		recloned = true
-	} else if err := in.markRewound(source); err != nil {
-		return err
+	} else if identity != "" {
+		if err := in.markRewound(identity); err != nil {
+			return err
+		}
 	}
 	if !recloned {
 		if err := in.slotFn(ctx, source); err != nil {
