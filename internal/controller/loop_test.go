@@ -145,3 +145,60 @@ func TestAPassIsNotCancelledWhileStillTheLeader(t *testing.T) {
 		t.Error("a pass that kept its term was cancelled anyway")
 	}
 }
+
+// TestClaimsAreHandedBackOnlyAfterThePassEnds. A claim is what keeps a
+// successor off a workflow the old leader is still driving, and these
+// passes are deliberately not cancelled on demotion -- so releasing the
+// moment leadership ends would hand the workflow over while the old pass
+// was still inside it. ownedExec stops that pass at its NEXT catalog
+// write, which is not the same as having stopped.
+func TestClaimsAreHandedBackOnlyAfterThePassEnds(t *testing.T) {
+	var releaseErr error // always nil here; the failing release is the loop's to log, not this test's subject
+	var leader atomic.Bool
+	leader.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	inPass := make(chan struct{})
+	finish := make(chan struct{})
+	var releasedDuringPass atomic.Bool
+	var releases atomic.Int64
+	var passRunning atomic.Bool
+
+	go runLoopHoldingClaims(ctx, time.Millisecond, leader.Load, func() *slog.Logger { return slog.New(slog.DiscardHandler) },
+		"claimer",
+		func(context.Context) {
+			passRunning.Store(true)
+			select {
+			case inPass <- struct{}{}:
+			default:
+			}
+			<-finish
+			passRunning.Store(false)
+		},
+		func(context.Context) (int64, error) {
+			if passRunning.Load() {
+				releasedDuringPass.Store(true)
+			}
+			return releases.Add(1), releaseErr
+		})
+
+	<-inPass
+	leader.Store(false) // demoted while the pass is still running
+	time.Sleep(50 * time.Millisecond)
+	if releases.Load() != 0 {
+		t.Fatal("the claim was handed back while the pass was still driving the workflow; a successor would claim it and drive it too")
+	}
+	close(finish)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for releases.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if releases.Load() == 0 {
+		t.Fatal("the claim was never handed back, so a successor waits out the lease")
+	}
+	if releasedDuringPass.Load() {
+		t.Error("a hand-back overlapped a running pass")
+	}
+}
