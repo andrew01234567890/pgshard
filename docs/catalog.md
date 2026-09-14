@@ -35,6 +35,13 @@ Every desired-state table has `desired_generation` and `updated_at`. A
 statement a trigger sends `NOTIFY pgshard_desired` with payload
 `<table>:<generation>` (deletes take a fresh generation).
 
+The tables one workflow reads share a generation, so a wait on that
+workflow has to take the max over all of them: the max over one is a
+generation the controller passed some time ago. For roles that is
+`pgshard.roles_desired_generation()` (migration `0052`), the single
+definition of the max over `roles`, `role_members`, `grants` and
+`role_settings`.
+
 ### `pgshard.databases`
 
 | Column | Meaning |

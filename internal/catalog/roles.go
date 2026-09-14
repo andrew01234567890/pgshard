@@ -400,11 +400,9 @@ func LoadDesiredRoles(ctx context.Context, q Querier) (*DesiredRoles, error) {
 	if err != nil {
 		return nil, fmt.Errorf("catalog: role_settings: %w", err)
 	}
-	rows, err = q.Query(ctx, `SELECT coalesce(max(g), 0) FROM (
-		SELECT max(desired_generation) g FROM pgshard.roles
-		UNION ALL SELECT max(desired_generation) FROM pgshard.role_members
-		UNION ALL SELECT max(desired_generation) FROM pgshard.grants
-		UNION ALL SELECT max(desired_generation) FROM pgshard.role_settings) m`)
+	// One definition, in the catalog: see 0052. Three copies of this
+	// expression had silently diverged before it existed.
+	rows, err = q.Query(ctx, `SELECT pgshard.roles_desired_generation()`)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: roles generation: %w", err)
 	}
