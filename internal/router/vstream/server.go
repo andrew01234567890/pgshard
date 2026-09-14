@@ -64,8 +64,15 @@ type Server struct {
 // emitted is what one open stream has delivered, per shard. The merger
 // writes it as it emits; the unary Ack path reads it from another
 // goroutine, which is why it is atomics and not the merger's own map.
+//
+// copying is published beside it for the same reason. The in-stream ack
+// skips a shard still in its copy phase, because no LSN there is a
+// position anything can be confirmed at -- and a shard copying from
+// nothing has already been sent its snapshot's consistent point, so pos
+// alone is not zero and does not stop a unary ack.
 type emitted struct {
-	pos map[router.Shard]*atomic.Uint64
+	pos     map[router.Shard]*atomic.Uint64
+	copying map[router.Shard]*atomic.Bool
 }
 
 // newEmitted starts every shard at zero, whatever position the caller
@@ -76,11 +83,30 @@ type emitted struct {
 // The cost is that a resuming consumer's first ack does nothing until the
 // stream delivers something. That is the safe direction.
 func newEmitted(shards []router.Shard) *emitted {
-	e := &emitted{pos: make(map[router.Shard]*atomic.Uint64, len(shards))}
+	e := &emitted{pos: make(map[router.Shard]*atomic.Uint64, len(shards)), copying: make(map[router.Shard]*atomic.Bool, len(shards))}
 	for _, sh := range shards {
 		e.pos[sh] = &atomic.Uint64{}
+		e.copying[sh] = &atomic.Bool{}
 	}
 	return e
+}
+
+func (e *emitted) setCopying(sh router.Shard, copying bool) {
+	if e == nil {
+		return
+	}
+	if v := e.copying[sh]; v != nil {
+		v.Store(copying)
+	}
+}
+
+// isCopying is nil-safe, like at.
+func (e *emitted) isCopying(sh router.Shard) bool {
+	if e == nil {
+		return false
+	}
+	v := e.copying[sh]
+	return v != nil && v.Load()
 }
 
 func (e *emitted) advance(sh router.Shard, lsn uint64) {
@@ -260,6 +286,11 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pg
 			"stream %q is not open on this router, so an ack cannot be checked against what was delivered; ack inside the stream, or on the router serving it", req.GetStream())
 	}
 	for sh, lsn := range positionFrom(req.GetPosition()) {
+		// The same two rules as merger.forwardAck, in the same order: a
+		// shard still copying first, then the clamp.
+		if live.isCopying(sh) {
+			continue
+		}
 		delivered, ok := live.at(sh)
 		if !ok {
 			continue
@@ -433,6 +464,9 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		}
 	}()
 	live := newEmitted(shards)
+	for sh := range copying {
+		live.setCopying(sh, true)
+	}
 	defer s.registerLive(def.Name, live)()
 	m := &merger{shards: shards, inputs: inputs, ready: ready, acks: acks, acker: ackers.request, send: send,
 		topo: s.Topology, set: set, generation: gen, fingerprint: fingerprint, opts: opts, position: startPos, copying: copying, emitted: live,
