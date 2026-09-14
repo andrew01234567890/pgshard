@@ -2,11 +2,8 @@ package operator
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -15,6 +12,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/twopc"
 )
 
@@ -143,19 +141,13 @@ func NewGRPCBarrierClient(certFile, keyFile, caFile string) (GRPCBarrierClient, 
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return GRPCBarrierClient{}, errors.New("--controller-tls-cert, --controller-tls-key and --controller-tls-ca must be set together")
 	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	// Through grpccreds so a renewed certificate or CA is used from the next
+	// connection on.
+	creds, err := grpccreds.Dialer(certFile, keyFile, caFile, "", false)
 	if err != nil {
 		return GRPCBarrierClient{}, err
 	}
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return GRPCBarrierClient{}, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return GRPCBarrierClient{}, fmt.Errorf("%s: no certificates found", caFile)
-	}
-	return GRPCBarrierClient{Creds: credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS13})}, nil
+	return GRPCBarrierClient{Creds: creds}, nil
 }
 
 const barrierRPCTimeout = 5 * time.Minute

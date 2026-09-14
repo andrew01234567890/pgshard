@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -501,19 +500,9 @@ func poolerCredentials(certFile, keyFile, caFile string, insecureDev bool) (cred
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, errors.New("--pooler-tls-cert, --pooler-tls-key and --pooler-tls-ca are required (or --insecure-dev)")
 	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("%s: no certificates found", caFile)
-	}
-	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS13}), nil
+	// Through grpccreds so a renewed certificate or CA is used from the next
+	// connection on, as every other internal dialer does.
+	return grpccreds.Dialer(certFile, keyFile, caFile, "", false)
 }
 
 // serveAux runs one of the router's auxiliary listeners and reports its
