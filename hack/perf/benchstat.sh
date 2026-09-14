@@ -36,8 +36,17 @@ run_bench() {
 base_dir="$(mktemp -d)"
 trap 'git -C "$root" worktree remove --force "$base_dir" >/dev/null 2>&1 || true' EXIT
 git -C "$root" worktree add --detach "$base_dir" "$base_ref" >/dev/null
+# Timed, and reported, because this script's own duration is what decides
+# whether the job finishes inside timeout-minutes -- and the only symptom
+# of outgrowing it is a "fail" that says nothing about the benchmarks.
+# Anyone widening $pkgs or raising $count sees the cost here.
+started=$(date +%s)
 run_bench "$base_dir" > "$out/base.txt"
+mid=$(date +%s)
 run_bench "$root" > "$out/head.txt"
+finished=$(date +%s)
+printf 'benchmarks: base %ds, head %ds, total %ds\n' \
+  "$((mid - started))" "$((finished - mid))" "$((finished - started))" >&2
 
 "$benchstat" -format csv "$out/base.txt" "$out/head.txt" > "$out/compare.csv"
 "$benchstat" "$out/base.txt" "$out/head.txt" > "$out/compare.txt"
