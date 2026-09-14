@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +34,13 @@ type Config struct {
 	PodName string `json:"podName"`
 	Role    Role   `json:"role"`
 	PGData  string `json:"pgdata"`
-	BinDir  string `json:"binDir"`
+	// EpochFile is where the last accepted fencing epoch is kept. It belongs
+	// on the data volume but outside PGDATA: a reclone empties PGDATA, and
+	// an agent that dies mid-clone would otherwise come back fenced at
+	// epoch 0. Empty keeps the legacy PGDATA/pgshard/epoch, which is right
+	// only where PGDATA is itself the root of a persistent volume.
+	EpochFile string `json:"epochFile,omitempty"`
+	BinDir    string `json:"binDir"`
 	// PasswordFile holds the postgres superuser password (initdb --pwfile).
 	PasswordFile string `json:"passwordFile"`
 	// ReplicationPasswordFile holds the password for the role
@@ -322,6 +329,17 @@ func (c *Config) Validate() error {
 		req(c.PrimaryConninfo, "primaryConninfo")
 	default:
 		errs = append(errs, fmt.Errorf("role must be %q or %q, got %q", RolePrimary, RoleStandby, c.Role))
+	}
+	if c.EpochFile != "" {
+		if !filepath.IsAbs(c.EpochFile) {
+			errs = append(errs, fmt.Errorf("epochFile must be an absolute path, got %q", c.EpochFile))
+		} else if rel, err := filepath.Rel(c.PGData, c.EpochFile); err != nil {
+			errs = append(errs, fmt.Errorf("cannot tell whether epochFile %q is inside pgdata %q: %w", c.EpochFile, c.PGData, err))
+		} else if rel != ".." && !strings.HasPrefix(rel, "../") {
+			// Not HasPrefix(rel, ".."): that also matches a file called
+			// "..epoch" directly inside pgdata.
+			errs = append(errs, fmt.Errorf("epochFile %q is inside pgdata, where a reclone removes it; put it beside pgdata on the same volume", c.EpochFile))
+		}
 	}
 	if (c.TLS.CertFile == "") != (c.TLS.KeyFile == "") {
 		errs = append(errs, errors.New("tls.certFile and tls.keyFile must be set together"))

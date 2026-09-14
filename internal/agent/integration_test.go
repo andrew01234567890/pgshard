@@ -128,11 +128,16 @@ func (h *harness) containerName(member string) string {
 // run with.
 const integrationShutdownTimeout = 20 * time.Second
 
+const integrationEpochFile = "/var/lib/postgresql/pgshard-epoch"
+
 func (h *harness) writeConfig(member string, role Role, source string, peers []string) string {
 	h.t.Helper()
 	cfg := map[string]any{
 		"cluster": "it", "shard": "s0", "member": member, "role": string(role),
 		"pgdata": "/var/lib/postgresql/data", "passwordFile": "/cfg/pw", "authTokenFile": "/cfg/token",
+		// Outside PGDATA, as the operator renders it, so a reclone below
+		// cannot take the fence with it.
+		"epochFile":       integrationEpochFile,
 		"primaryConninfo": "host=" + h.containerName(source) + " port=5432 user=postgres",
 		"podCIDR":         "0.0.0.0/0", "peerFailsafeURLs": peers, "isolationGrace": "5s",
 		"lease":           map[string]any{"enabled": false},
@@ -399,6 +404,12 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if st.GetRole() != pgshardv1.StatusResponse_ROLE_PRIMARY || st.GetEpoch() != 1 || st.GetTimeline() != 2 {
 		t.Fatalf("status after promote: %v", st)
 	}
+	// The epoch the agent accepted is on disk where the configuration says,
+	// not inside PGDATA: that is Run wiring epochFile through, which no unit
+	// test reaches.
+	if got := docker(t, "exec", s.container, "cat", integrationEpochFile); got != "1" {
+		t.Fatalf("epoch file %s holds %q after accepting epoch 1", integrationEpochFile, got)
+	}
 	s.waitHTTP("/readyz", 200, 30*time.Second)
 	if s.psql("SELECT pg_is_in_recovery()") != "f" {
 		t.Fatal("new primary still in recovery")
@@ -492,6 +503,17 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	p.waitStandbyCaughtUp(s, 60*time.Second)
 	if got := p.psql("SELECT count(*) FROM t"); got != "3" {
 		t.Fatalf("recloned standby rows: %s", got)
+	}
+
+	t.Log("the epoch survives a restart that finds no epoch inside PGDATA")
+	// What an agent dying partway through that clone would come back to: a
+	// PGDATA with no epoch file in it. The fence lives beside it now.
+	docker(t, "exec", p.container, "rm", "-f", "/var/lib/postgresql/data/pgshard/epoch")
+	docker(t, "restart", p.container)
+	p.connect()
+	p.waitServing(120 * time.Second)
+	if st := p.status(); st.GetEpoch() != 1 {
+		t.Fatalf("epoch %d after restarting with no epoch inside PGDATA: the fence was lost with it", st.GetEpoch())
 	}
 
 	t.Log("slot RPCs and backup RPCs without a policy")

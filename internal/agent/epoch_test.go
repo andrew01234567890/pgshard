@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -136,5 +137,143 @@ func TestATermEndsWhenTheNextEpochIsAccepted(t *testing.T) {
 		t.Fatalf("the term did not survive one operation ending: %v %v", err, again.Err())
 	} else {
 		rel()
+	}
+}
+
+// TestTheEpochSurvivesAReclonesClearOfPGDATA: a reclone empties PGDATA
+// before pg_basebackup fills it again, and an agent that dies in between
+// used to restart with no epoch file, loaded 0, and treated any epoch at all
+// as newer -- a delayed Promote from a term long over included. Kept beside
+// PGDATA, the clear does not reach it.
+func TestTheEpochSurvivesAReclonesClearOfPGDATA(t *testing.T) {
+	vol := t.TempDir()
+	pgdata := filepath.Join(vol, "pgdata")
+	file := filepath.Join(vol, "pgshard-epoch")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Accept(5); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearDir(pgdata); err != nil {
+		t.Fatal(err)
+	}
+	again, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.Current(); got != 5 {
+		t.Fatalf("epoch %d after the clear, want 5: an agent restarting mid-clone would accept any epoch", got)
+	}
+}
+
+// TestAnUpgradedMemberCarriesItsEpochAcross: a member that has only ever
+// kept its epoch inside PGDATA must not start at 0 the first time it is
+// told where the file now lives.
+func TestAnUpgradedMemberCarriesItsEpochAcross(t *testing.T) {
+	vol := t.TempDir()
+	pgdata := filepath.Join(vol, "pgdata")
+	file := filepath.Join(vol, "pgshard-epoch")
+	legacy, err := OpenEpochStore(pgdata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Accept(7); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Current(); got != 7 {
+		t.Fatalf("epoch %d on first open of the configured file, want the 7 accepted before it existed", got)
+	}
+	if b, err := os.ReadFile(file); err != nil || strings.TrimSpace(string(b)) != "7" {
+		t.Fatalf("configured file holds %q (err %v), want the carried 7", b, err)
+	}
+}
+
+// TestAnAgentRolledBackAndForwardDoesNotLowerItsFence is the review's
+// sequence: a newer agent accepts on the configured file, an older one --
+// knowing only the legacy file -- accepts past it, and the newer one comes
+// back. Preferring the configured file then lowers the fence to an epoch
+// already superseded, and a replay of the one in between is admitted.
+func TestAnAgentRolledBackAndForwardDoesNotLowerItsFence(t *testing.T) {
+	vol := t.TempDir()
+	pgdata := filepath.Join(vol, "pgdata")
+	file := filepath.Join(vol, "pgshard-epoch")
+	// An initialised data directory, and nothing more: a member created by
+	// the newer agent has never had PGDATA/pgshard, and the older one still
+	// has to find the epoch after a rollback.
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	newer, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newer.Accept(8); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rolled back: the older binary reads only the legacy file, which the
+	// newer one kept current.
+	older, err := OpenEpochStore(pgdata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := older.Current(); got != 8 {
+		t.Fatalf("a rolled-back agent sees epoch %d, not the 8 accepted before the rollback", got)
+	}
+	if err := older.Accept(9); err != nil {
+		t.Fatal(err)
+	}
+
+	// Forward again.
+	again, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.Current(); got != 9 {
+		t.Fatalf("epoch %d after rolling forward, want the 9 the older agent accepted", got)
+	}
+	if err := again.Accept(9); err == nil {
+		t.Fatal("a replay of epoch 9 was admitted after rolling forward")
+	}
+}
+
+// TestAcceptDoesNotRecreateAClearedPGDATA: the legacy copy is written only
+// where its directory still exists. A clone empties PGDATA before
+// pg_basebackup, which refuses a directory that is not empty, so an Accept
+// arriving mid-clone must not put PGDATA/pgshard back.
+func TestAcceptDoesNotRecreateAClearedPGDATA(t *testing.T) {
+	vol := t.TempDir()
+	pgdata := filepath.Join(vol, "pgdata")
+	file := filepath.Join(vol, "pgshard-epoch")
+	s, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Accept(3); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(pgdata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("Accept recreated %v inside an emptied PGDATA; pg_basebackup would refuse it", entries)
 	}
 }

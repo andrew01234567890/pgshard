@@ -15,11 +15,15 @@ import (
 // accepted one.
 var ErrStaleEpoch = errors.New("stale epoch")
 
-// EpochStore persists the last accepted fencing epoch under PGDATA/pgshard/epoch.
+// EpochStore persists the last accepted fencing epoch: in the file
+// Config.EpochFile names, or under PGDATA/pgshard/epoch when that is unset.
 type EpochStore struct {
 	mu   sync.Mutex
 	path string
-	cur  uint64
+	// legacy is the in-PGDATA file when path is somewhere else, and empty
+	// when path IS the legacy file.
+	legacy string
+	cur    uint64
 	// term is cancelled when a later epoch is accepted. An RPC that passed
 	// the epoch check runs under a context derived from it, so work started
 	// in one term does not continue into the next -- which is the whole
@@ -29,22 +33,79 @@ type EpochStore struct {
 	termCancel context.CancelFunc
 }
 
-// OpenEpochStore loads the stored epoch, treating a missing file as 0.
-func OpenEpochStore(pgdata string) (*EpochStore, error) {
-	s := &EpochStore{path: filepath.Join(pgdata, "pgshard", "epoch")}
-	b, err := os.ReadFile(s.path)
+// OpenEpochStore loads the epoch from its legacy place inside PGDATA,
+// treating a missing file as 0.
+func OpenEpochStore(pgdata string) (*EpochStore, error) { return OpenEpochStoreAt(pgdata, "") }
+
+// OpenEpochStoreAt loads the epoch from file, or from inside PGDATA when
+// file is empty.
+//
+// Inside PGDATA is the wrong place for a fence, which is why file exists. A
+// reclone empties PGDATA before pg_basebackup copies the primary's in --
+// its epoch file included -- and pg_rewind replaces the file with the
+// source's. The running agent keeps its epoch in memory, but one that dies
+// part-way through a clone restarts with no file, loads 0, and treats any
+// epoch at all as newer: a delayed Promote from a term long over included.
+//
+// Both files are read and the HIGHER wins, written through to the
+// configured one. Taking the higher is the only safe direction, because
+// every value in either file came from the group's single increasing epoch
+// sequence, and a fence only ever needs to refuse more:
+//
+//   - an upgrading member's configured file does not exist yet, and its
+//     epoch is in the legacy one;
+//   - an agent rolled back to a binary that knows only the legacy file, then
+//     forward again, has accepted epochs there that the configured file
+//     never saw -- preferring the configured file would lower the fence and
+//     admit a replay of an epoch it had already refused;
+//   - a clone copies the primary's legacy file in, which is at least as high
+//     as this member's own, and raising this member's fence to it is safe.
+//
+// Accept writes the legacy file too, for as long as it exists, so a
+// rolled-back binary finds the current epoch.
+func OpenEpochStoreAt(pgdata, file string) (*EpochStore, error) {
+	legacy := filepath.Join(pgdata, "pgshard", "epoch")
+	if file == "" || file == legacy {
+		v, _, err := readEpochFile(legacy)
+		if err != nil {
+			return nil, err
+		}
+		return &EpochStore{path: legacy, cur: v}, nil
+	}
+	s := &EpochStore{path: file, legacy: legacy}
+	configured, foundConfigured, err := readEpochFile(file)
+	if err != nil {
+		return nil, err
+	}
+	old, _, err := readEpochFile(legacy)
+	if err != nil {
+		return nil, err
+	}
+	s.cur = max(configured, old)
+	if s.cur > configured || (!foundConfigured && s.cur > 0) {
+		if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+			return nil, err
+		}
+		if err := writeFileSync(file, []byte(strconv.FormatUint(s.cur, 10)+"\n")); err != nil {
+			return nil, fmt.Errorf("carry epoch %d into %s: %w", s.cur, file, err)
+		}
+	}
+	return s, nil
+}
+
+func readEpochFile(path string) (uint64, bool, error) {
+	b, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return s, nil
+		return 0, false, nil
 	case err != nil:
-		return nil, err
+		return 0, false, err
 	}
 	v, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("corrupt epoch file %s: %w", s.path, err)
+		return 0, false, fmt.Errorf("corrupt epoch file %s: %w", path, err)
 	}
-	s.cur = v
-	return s, nil
+	return v, true, nil
 }
 
 // Current returns the last accepted epoch.
@@ -115,6 +176,20 @@ func (s *EpochStore) Accept(epoch uint64) error {
 	}
 	if err := writeFileSync(s.path, []byte(strconv.FormatUint(epoch, 10)+"\n")); err != nil {
 		return err
+	}
+	// The legacy file too, so a rolled-back binary finds the current epoch --
+	// but only into an initialised data directory. Mid-clone PGDATA has just
+	// been emptied and pg_basebackup refuses a directory that is not empty,
+	// so writing there then would break the clone; PG_VERSION is absent
+	// exactly then. Best effort beyond that: the configured file is the
+	// fence, and this copy only spares a rolled-back binary a lower one.
+	if s.legacy != "" {
+		pgdata := filepath.Dir(filepath.Dir(s.legacy))
+		if _, err := os.Stat(filepath.Join(pgdata, "PG_VERSION")); err == nil {
+			if err := os.MkdirAll(filepath.Dir(s.legacy), 0o700); err == nil {
+				_ = writeFileSync(s.legacy, []byte(strconv.FormatUint(epoch, 10)+"\n"))
+			}
+		}
 	}
 	s.cur = epoch
 	// Everything the old term admitted stops here, whether or not it has

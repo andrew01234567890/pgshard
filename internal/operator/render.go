@@ -37,7 +37,10 @@ const (
 	internalTLSVolume  = "internal-tls"
 	dataMountPath      = "/var/lib/postgresql/data"
 	pgdataPath         = dataMountPath + "/pgdata"
-	postgresUID        = int64(999)
+	// epochFilePath is on the data volume and outside PGDATA, where neither
+	// a reclone nor pg_rewind reaches it.
+	epochFilePath = dataMountPath + "/pgshard-epoch"
+	postgresUID   = int64(999)
 	// pgSocketDir is the agent's fixed unix_socket_directories; the pooler
 	// sidecar reaches the local server through it over a shared emptyDir.
 	pgSocketDir    = "/tmp"
@@ -180,6 +183,7 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 		Member:        member,
 		Role:          role,
 		PGData:        pgdataPath,
+		EpochFile:     epochFilePath,
 		PasswordFile:  secretMountPath + "/" + secretKey,
 		AuthTokenFile: agentTokenDir + "/" + agentTokenKey,
 		// A standby streams as its own role, not as the superuser. This

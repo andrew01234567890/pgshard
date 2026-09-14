@@ -468,3 +468,24 @@ func TestBackupPolicyIsSafeToReadWhileAReloadReplacesIt(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestAnEpochFileInsidePGDATAIsRefused(t *testing.T) {
+	c := testConfig()
+	c.PGData = "/var/lib/postgresql/data/pgdata"
+	c.EpochFile = "/var/lib/postgresql/data/pgdata/pgshard/epoch"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "inside pgdata") {
+		t.Fatalf("an epoch file a reclone would remove was accepted: %v", err)
+	}
+	c.EpochFile = "/var/lib/postgresql/data/pgshard-epoch"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an epoch file beside pgdata was refused: %v", err)
+	}
+	c.EpochFile = "pgshard-epoch"
+	if err := c.Validate(); err == nil {
+		t.Fatal("a relative epoch file was accepted")
+	}
+	c.EpochFile = "/var/lib/postgresql/data/pgdata/..epoch"
+	if err := c.Validate(); err == nil {
+		t.Fatal("a file named ..epoch inside pgdata was taken for one outside it")
+	}
+}
