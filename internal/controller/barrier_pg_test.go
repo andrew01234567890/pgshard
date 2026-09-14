@@ -402,13 +402,13 @@ func TestABarrierLeavesARetiredSetPaused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Retirement is reached through a whole lifecycle of triggers; the state
-	// is what this test is about, so it is written directly.
+	// Retirement is reached through a whole cutover; the state is what this
+	// test is about, so it is written directly. The fixture's pool is a
+	// superuser, which the shard-set lifecycle trigger lets through as the
+	// control plane.
 	for _, stmt := range []string{
-		`SET session_replication_role = replica`,
 		`INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('old', 99, 'retired')`,
 		`INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch) VALUES ('old', 0, 'o0', 'retired', 1)`,
-		`RESET session_replication_role`,
 	} {
 		if _, err := cat.Exec(ctx, stmt); err != nil {
 			cat.Release()
@@ -429,7 +429,7 @@ func TestABarrierLeavesARetiredSetPaused(t *testing.T) {
 		_, err = c.Exec(ctx, `INSERT INTO t VALUES ('after the barrier')`)
 		return err
 	}
-	waitFor(t, 30*time.Second, func() bool {
+	waitFor(t, 10*time.Second, func() bool {
 		var pgErr *pgconn.PgError
 		return errors.As(write(), &pgErr) && pgErr.Code == "25006"
 	}, "the retirement pause never took, so the barrier below has nothing to lift")

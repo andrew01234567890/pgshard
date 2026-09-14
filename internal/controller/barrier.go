@@ -44,6 +44,35 @@ type GroupRef struct {
 	// Set and ID locate a shard group; both are empty for the catalog.
 	Set string
 	ID  int32
+	// Retired marks a group of a retired shard set. A barrier asks it only
+	// whether it is applying a subscription, and neither pauses, resumes nor
+	// takes a restore point on it: see activeGroups.
+	Retired bool
+}
+
+// activeGroups drops the groups of retired shard sets.
+//
+// A retired set keeps a permanent, unclaimed write pause from the cutover
+// that retired it, and the barrier resumes every group it pauses, so a
+// barrier that included one lifted that pause for good -- and Recover read
+// the pause a retired set always carries as one an interrupted run left.
+// Nor is a finished retired set anything to certify: it is going to be
+// deleted.
+//
+// But retired is not terminal. For as long as a cutover sits switched -- a
+// day by default -- its old set is retired yet live, applying reverse
+// replication so a rollback can return serving to it. A barrier must not
+// certify then, and the subscription guard is what refuses it; so the guard
+// is asked about every group, retired ones included, and only everything
+// after it uses this.
+func activeGroups(groups []GroupRef) []GroupRef {
+	out := make([]GroupRef, 0, len(groups))
+	for _, g := range groups {
+		if !g.Retired {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // Catalog reports whether g is the catalog group.
@@ -260,10 +289,11 @@ func (b *Barrier) Run(ctx context.Context, name string) (RestorePoint, error) {
 
 // run performs a reserved barrier: fence, points, certification.
 func (b *Barrier) run(ctx context.Context, name string) (RestorePoint, error) {
-	groups, err := b.Groups.List(ctx)
+	all, err := b.Groups.List(ctx)
 	if err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: groups: %w", name, err)
 	}
+	groups := activeGroups(all)
 	if len(groups) == 0 {
 		return RestorePoint{}, fmt.Errorf("barrier %s: no groups", name)
 	}
@@ -299,7 +329,7 @@ func (b *Barrier) run(ctx context.Context, name string) (RestorePoint, error) {
 	var at map[string]time.Time
 	err = b.settleFence(ctx)
 	if err == nil {
-		at, err = b.pauseAll(ctx, name, groups)
+		at, err = b.pauseAll(ctx, name, all)
 	}
 	if err == nil {
 		rp, err = b.fenced(ctx, name, owner, groups, at)
@@ -423,7 +453,7 @@ func (b *Barrier) pauseAll(ctx context.Context, name string, groups []GroupRef) 
 	}
 	at := map[string]time.Time{}
 	for _, g := range groups {
-		if g.Catalog() {
+		if g.Catalog() || g.Retired {
 			continue
 		}
 		t, err := b.Groups.PauseWrites(ctx, g, true)
@@ -571,10 +601,11 @@ func (b *Barrier) Recover(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
-	groups, err := b.Groups.List(ctx)
+	all, err := b.Groups.List(ctx)
 	if err != nil {
 		return err
 	}
+	groups := activeGroups(all)
 	paused := false
 	for _, g := range groups {
 		if g.Catalog() {
@@ -988,22 +1019,13 @@ type SQLBarrierGroups struct {
 }
 
 // List implements BarrierGroups.
-// List leaves out the groups of a retired shard set. A retired set keeps a
-// permanent, unclaimed write pause from the cutover that retired it, which
-// is all that stops a router still on an old snapshot committing on a set
-// nothing replicates from any more; and the barrier resumes every group it
-// lists, so listing one lifted that pause for good -- after every run, and
-// again from Recover, which reads the pause a retired set always carries as
-// one an interrupted run left behind. Nor is a retired set anything a
-// barrier should certify: it is going to be deleted, and a restore point on
-// it restores nothing anyone routes to.
-//
-// A set with no shard_sets row is kept: that is not a set anyone retired.
+// List returns every group, with those of a retired shard set flagged: see
+// activeGroups for why a barrier needs them marked rather than left out.
+// A set with no shard_sets row is not retired.
 func (s *SQLBarrierGroups) List(ctx context.Context) ([]GroupRef, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT st.group_name, st.shard_set, st.shard_id
+	rows, err := s.Pool.Query(ctx, `SELECT st.group_name, st.shard_set, st.shard_id, coalesce(ss.state = 'retired', false)
 		  FROM pgshard.shard_status st
 		  LEFT JOIN pgshard.shard_sets ss ON ss.shard_set = st.shard_set
-		 WHERE ss.state IS DISTINCT FROM 'retired'
 		 ORDER BY st.shard_set, st.shard_id`)
 	if err != nil {
 		return nil, err
