@@ -84,12 +84,13 @@ func TestTheDesiredRolesLoadIsOneSnapshot(t *testing.T) {
 	// Each call inserts a row under its own name and leaves it there. It
 	// cannot clean up after itself: deleting the row again drops
 	// role_settings back to its previous max, and the generation with it.
+	var writeErr error
 	write := func() {
 		n++
 		if _, err := writer.Exec(ctx,
 			`INSERT INTO pgshard.role_settings (rolname, database, name, value) VALUES ('app', '', $1, '64MB')`,
 			settingName(n)); err != nil {
-			t.Errorf("interloping write: %v", err)
+			writeErr = err
 		}
 	}
 
@@ -99,14 +100,18 @@ func TestTheDesiredRolesLoadIsOneSnapshot(t *testing.T) {
 	load := func(t *testing.T, force pgx.TxIsoLevel) (*DesiredRoles, int64, string) {
 		t.Helper()
 		was := n
+		writeErr = nil
 		before := generationNow(t, ctx, conn)
 		sm := &seam{inner: conn, force: force, write: write}
 		d, err := LoadDesiredRoles(ctx, sm)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if force == "" {
-			t.Logf("LoadDesiredRoles asked for %q", sm.asked)
+		if force == "" && sm.asked != pgx.RepeatableRead {
+			t.Fatalf("LoadDesiredRoles asked for %q, so the subtest below is not testing the snapshot it claims to", sm.asked)
+		}
+		if writeErr != nil {
+			t.Fatalf("interloping write: %v", writeErr)
 		}
 		if n != was+1 {
 			t.Fatalf("the interloping write ran %d times, not once; the seam counts the wrong read", n-was)
@@ -143,7 +148,9 @@ func TestTheDesiredRolesLoadIsOneSnapshot(t *testing.T) {
 			t.Fatalf("%s was read by the data queries, which run BEFORE the write; the seam is in the wrong place", appeared)
 		}
 		if d.Generation == before {
-			t.Skip("READ COMMITTED held one snapshot across five statements; the premise of the fix is gone, not the fix")
+			t.Fatalf("the write committed in the gap (the generation moved past %d on another connection) "+
+				"but the generation read still returned %d under READ COMMITTED: the seam is not forcing "+
+				"the isolation level it thinks it is", before, d.Generation)
 		}
 		t.Logf("as expected: generation %d beside data as of %d, which is the split this fix removes", d.Generation, before)
 	})

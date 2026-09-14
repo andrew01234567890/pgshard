@@ -361,12 +361,22 @@ func (d *DesiredRoles) Role(name string) (DesiredRole, bool) {
 // generation whose change it never received, which reads as up to date; the
 // repair falls to the verifier's drift check, which is the slow path and
 // not what the generation is for.
+//
+// That makes the five reads agree with each other. It does NOT make the
+// generation agree with commit order: it is stamped from a sequence in a
+// BEFORE ROW trigger, and a sequence is not transactional, so a writer that
+// stamps first can commit last and its row never exceeds the generation a
+// reader saw in between (PGS-813). The snapshot is one of the two holes,
+// not both.
 func LoadDesiredRoles(ctx context.Context, db Beginner) (*DesiredRoles, error) {
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("catalog: desired roles: %w", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	// Rolled back past a cancelled ctx so the connection returns to the pool
+	// instead of being destroyed: pgx sends no ROLLBACK on a done context and
+	// kills the connection rather than risk leaving it in a transaction.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	q := Querier(tx)
 	d := &DesiredRoles{}
 	rows, err := q.Query(ctx, `SELECT rolname, coalesce(verifier, ''), login, createdb, createrole, inherit, connection_limit, valid_until FROM pgshard.roles ORDER BY rolname`)
