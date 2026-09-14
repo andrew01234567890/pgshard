@@ -330,7 +330,7 @@ func (a *Applier) now() time.Time {
 // Run drives pending migrations every interval while leader() is true.
 func (a *Applier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	a.leader = leader
-	runLoop(ctx, interval, leader, a.logger, "applier", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, a.logger, "applier", func(ctx context.Context) {
 		if _, err := a.RunOnce(ctx); err != nil && ctx.Err() == nil {
 			a.logger().Warn("applier pass failed", "err", err)
 		}

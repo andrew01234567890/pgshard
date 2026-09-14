@@ -21,7 +21,46 @@ const leaderCheck = time.Second
 
 // runLoop drives pass on every tick while leader() holds, and reports a
 // pass that stops making progress. pass logs its own outcome.
+//
+// The pass is NOT abandoned when the term drops, which is right only for
+// a loop that holds a workflow CLAIM -- the copier and the placer.
+// Nothing releases a claim: claimWorkflow lets a successor in only once
+// owned_at is DefaultOwnerLease old, and there is no site anywhere that
+// sets owner back to NULL. So abandoning one of those partway leaves the
+// claim, and any write pause it had raised, standing for five minutes --
+// where letting the pass finish clears it inside the cutover's own
+// timeout. That is a worse outage than the one being avoided, and during
+// the same event.
+//
+// Everything else uses runLoopStoppable.
 func runLoop(ctx context.Context, interval time.Duration, leader func() bool, log func() *slog.Logger, name string, pass func(context.Context)) {
+	loop(ctx, interval, leader, nil, log, name, pass)
+}
+
+// runLoopStoppable is runLoop for a pass that is abandoned partway
+// through when its loop stops being the leader.
+//
+// Leadership is otherwise only a gate on STARTING a pass: one that began
+// as leader runs to completion on the loop's own context, so during a
+// handover a demoted leader goes on working beside the new one. For the
+// resolver that means committing and rolling back prepared transactions;
+// for the applier, DDL statements on shards; for the stream monitor,
+// status rows a new leader is writing too.
+//
+// Catalog fences do not cover this. The applier stamps its writes with
+// the term it latched, so its CATALOG writes are refused -- but the
+// statement already in flight on a shard is not a catalog write, and no
+// fence reaches it. The resolver fences nothing at all.
+//
+// Safe because these passes hold no claim and persist their progress
+// before each side effect: a cancelled pass is one that stopped early,
+// which the next leader resumes from the row. It is the same property
+// their recovery from process death rests on.
+func runLoopStoppable(ctx context.Context, interval time.Duration, leader func() bool, log func() *slog.Logger, name string, pass func(context.Context)) {
+	loop(ctx, interval, leader, leader, log, name, pass)
+}
+
+func loop(ctx context.Context, interval time.Duration, leader, stopOn func() bool, log func() *slog.Logger, name string, pass func(context.Context)) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -33,22 +72,13 @@ func runLoop(ctx context.Context, interval time.Duration, leader func() bool, lo
 		if leader != nil && !leader() {
 			continue
 		}
-		watchPass(ctx, stallAfter, leader, log, name, pass)
+		watchPass(ctx, stallAfter, stopOn, log, name, pass)
 	}
 }
 
-// watchPass runs one pass, reporting it if it stalls and CANCELLING it if
-// the loop stops being the leader while it runs.
-//
-// Checking leadership before the pass is not enough: these passes write
-// catalog state -- the applier applies DDL, the resolver commits and rolls
-// back prepared transactions, the copier drives a reshard -- and a pass
-// that began as leader used to run to completion after the term had moved
-// on. During a handover the old leader and the new one then write at the
-// same time, each believing it is alone. Cancelling is safe because a pass
-// is already interruptible: the process can die mid-pass at any moment,
-// so every one of them is written to be resumed rather than completed.
-func watchPass(ctx context.Context, stall time.Duration, leader func() bool, log func() *slog.Logger, name string, pass func(context.Context)) {
+// watchPass runs one pass, reporting it if it stalls and, when stopOn is
+// set and goes false, cancelling it. A nil stopOn never cancels.
+func watchPass(ctx context.Context, stall time.Duration, stopOn func() bool, log func() *slog.Logger, name string, pass func(context.Context)) {
 	passCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan struct{})
@@ -65,7 +95,7 @@ func watchPass(ctx context.Context, stall time.Duration, leader func() bool, log
 			case <-ctx.Done():
 				return
 			case <-lost.C:
-				if leader != nil && !leader() {
+				if stopOn != nil && !stopOn() {
 					if l := log(); l != nil {
 						l.Warn(name+" pass abandoned: no longer the leader",
 							"running_for", time.Since(started).Round(time.Second))

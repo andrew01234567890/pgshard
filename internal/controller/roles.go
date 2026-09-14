@@ -251,7 +251,7 @@ func (v *RoleVerifier) groups(ctx context.Context) ([]roleGroup, error) {
 
 // Run verifies every interval while leader() is true.
 func (v *RoleVerifier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, v.logger, "role verification", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, v.logger, "role verification", func(ctx context.Context) {
 		if err := v.RunOnce(ctx); err != nil && ctx.Err() == nil {
 			v.logger().Warn("role verification failed", "err", err)
 		}

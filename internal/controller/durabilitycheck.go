@@ -73,7 +73,7 @@ func (d *DurabilityCheck) logger() *slog.Logger {
 
 // Run re-audits on a ticker while this process is the leader.
 func (d *DurabilityCheck) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, d.logger, "durability check", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, d.logger, "durability check", func(ctx context.Context) {
 		if _, err := d.Pass(ctx); err != nil {
 			d.logger().Warn("durability check pass failed", "err", err)
 		}

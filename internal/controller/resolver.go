@@ -488,7 +488,7 @@ func (r *Resolver) listShards(ctx context.Context, shardSet string) ([]ShardRef,
 // the leader. Only the leader may: a pass commits and rolls back prepared
 // transactions on every group.
 func (r *Resolver) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, func() *slog.Logger { return r.Logger }, "resolver", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, func() *slog.Logger { return r.Logger }, "resolver", func(ctx context.Context) {
 		out, err := r.Resolve(ctx, "")
 		if err != nil && r.Logger != nil {
 			r.Logger.Warn("resolver pass failed", "err", err)
