@@ -491,7 +491,7 @@ func TestFailoverDoesNotPromoteBesideAPrimaryThatIsOnlyFull(t *testing.T) {
 	// And the failover delay starts over, rather than letting the next pass
 	// that catches the primary's Status at a bad moment fence it at once.
 	r.mu.Lock()
-	_, stillTiming := r.unhealthySince[Groups(c)[1].Prefix()]
+	_, stillTiming := r.unhealthySince[groupTimerKey(c, Groups(c)[1])]
 	r.mu.Unlock()
 	if stillTiming {
 		t.Fatal("the failover delay was left running after the failover was abandoned for a live primary")
