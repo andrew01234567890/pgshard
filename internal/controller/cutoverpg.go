@@ -1551,7 +1551,10 @@ func (o *pgCutover) DropJournal(ctx context.Context, id string) error {
 				o.c.logger().Info("abandoned switch: source unreachable, its journal rows stay", "workflow", o.wf.id, "source", src, "err", err)
 				continue
 			}
-			_, err = conn.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.%s WHERE id = $1::uuid`, JournalSchema, JournalTable), id)
+			err = writeThroughPause(ctx, conn)
+			if err == nil {
+				_, err = conn.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.%s WHERE id = $1::uuid`, JournalSchema, JournalTable), id)
+			}
 			_ = conn.Close(ctx)
 			if err != nil && !missingObject(err) {
 				return err
@@ -1568,6 +1571,13 @@ func (o *pgCutover) DropJournal(ctx context.Context, id string) error {
 // on them drops subscriptions and publications, which is DDL, and the pause
 // refuses that with 25006 like any other write. Dropping a replication
 // slot is not refused, so the slot loop does not need it.
+//
+// Sources need it too. A set another workflow retired carries the
+// permanent retirement pause, and so does this run's own source set once a
+// Complete has reached its tail and a later pass runs Complete again. The
+// journal rows and the replication objects on it are this workflow's to
+// clean up, and without this every attempt failed with 25006 and the
+// workflow was retried for ever, holding its slots (PGS-816).
 //
 // It is a SESSION setting, in a statement of its own, because the pause
 // is read when a transaction starts: set inside the transaction that then
@@ -1587,7 +1597,10 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 				o.c.logger().Info("reshard complete: source unreachable, skipping its reverse subscriptions", "workflow", o.wf.id, "source", s, "err", err)
 				continue
 			}
-			err = dropSubscriptionsLike(ctx, conn, o.reversePattern(s))
+			err = writeThroughPause(ctx, conn)
+			if err == nil {
+				err = dropSubscriptionsLike(ctx, conn, o.reversePattern(s))
+			}
 			_ = conn.Close(ctx)
 			if err != nil {
 				return err
@@ -1638,7 +1651,10 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			err = dropPublications(ctx, conn, o.wf.gen)
+			err = writeThroughPause(ctx, conn)
+			if err == nil {
+				err = dropPublications(ctx, conn, o.wf.gen)
+			}
 			_ = conn.Close(ctx)
 			if err != nil {
 				return err

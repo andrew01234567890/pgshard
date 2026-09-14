@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -579,5 +580,94 @@ func TestARollbackLeavesTheTargetsPausedForComplete(t *testing.T) {
 	}
 	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'g2' AND write_paused_by IS NOT NULL`); n != 0 {
 		t.Fatalf("%d target shards still carry this run's pause claim; the sweep would lift the retirement pause behind it", n)
+	}
+}
+
+// TestCleanupWritesThroughARetiredSourcesPause: a retired set carries the
+// permanent, unclaimed write pause Complete's tail puts on it. Cleaning up a
+// switch whose sources are in that state -- abandonSwitch, when another
+// workflow retired them, or Complete run again on a pass after its own tail
+// -- deletes journal rows and drops reverse subscriptions and publications
+// on those sources, and the pause refused every one of them with 25006. The
+// workflow was retried for ever and never failed, holding its slots
+// (PGS-816).
+func TestCleanupWritesThroughARetiredSourcesPause(t *testing.T) {
+	parallelPG(t)
+	f := newUpgradeFixture(t)
+	id := f.startWorkflowKind(KindUpgrade)
+	ctx := context.Background()
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var state, stage, msg string
+	for {
+		f.pass()
+		state, stage, msg = f.workflow(id)
+		if stage == StageSwitched || state == StateFailed || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if stage != StageSwitched {
+		t.Fatalf("upgrade did not switch: %s %s %q", state, stage, msg)
+	}
+	wfs, err := f.copier.listCopyWorkflows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := slices.IndexFunc(wfs, func(w copyWorkflow) bool { return w.id == id })
+	if idx < 0 {
+		t.Fatalf("workflow %s not listed", id)
+	}
+	wf := &wfs[idx]
+	var held bool
+	if wf.owner, held, err = claimWorkflow(ctx, f.pool, f.copier.Replica, wf.id, f.copier.OwnerLease); err != nil || !held {
+		t.Fatalf("claim: held=%v err=%v", held, err)
+	}
+	wf.fence = wf.state
+	ops, err := f.copier.pgCutover(ctx, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := wf.cutover.JournalID
+	if journal == "" {
+		t.Fatal("a switched workflow has no journal id")
+	}
+	onSources := func(sql string, args ...any) int64 {
+		t.Helper()
+		var total int64
+		for _, s := range ops.srcIDs {
+			conn := connect(t, f.appDSN(ops.srcSet, s))
+			total += queryOne[int64](t, conn, sql, args...)
+		}
+		return total
+	}
+	journalRows := fmt.Sprintf(`SELECT count(*) FROM %s.%s WHERE id = $1::uuid`, JournalSchema, JournalTable)
+	reverse := func() int64 {
+		var n int64
+		for _, s := range ops.srcIDs {
+			conn := connect(t, f.appDSN(ops.srcSet, s))
+			n += queryOne[int64](t, conn, `SELECT count(*) FROM pg_subscription WHERE subname LIKE $1`, ops.reversePattern(s))
+		}
+		return n
+	}
+	if onSources(journalRows, journal) == 0 || reverse() == 0 {
+		t.Fatal("the sources hold no journal rows or reverse subscriptions to clean up, so this proves nothing")
+	}
+
+	// The retirement pause: permanent and unclaimed, as Complete leaves it.
+	if err := ops.pauseSet(ctx, ops.srcSet, ops.srcIDs, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := ops.DropJournal(ctx, journal); err != nil {
+		t.Fatalf("dropping the journal on read-only retired sources: %v", err)
+	}
+	if err := ops.Complete(ctx); err != nil {
+		t.Fatalf("completing with read-only retired sources: %v", err)
+	}
+	if n := onSources(journalRows, journal); n != 0 {
+		t.Fatalf("%d journal rows left on the sources", n)
+	}
+	if n := reverse(); n != 0 {
+		t.Fatalf("%d reverse subscriptions left on the sources", n)
 	}
 }
