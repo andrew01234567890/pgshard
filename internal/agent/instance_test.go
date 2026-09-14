@@ -30,6 +30,9 @@ func newTestInstance(t *testing.T) *Instance {
 	in.startFn = func(context.Context) error { return nil }
 	in.slotFn = func(context.Context, string) error { return nil }
 	in.waitSourceFn = func(context.Context, string) error { return nil }
+	// No source to ask, so every rejoin rewinds -- what these tests assumed
+	// before the marker existed. The marker tests set their own.
+	in.sourceIdentityFn = func(context.Context, string) (string, error) { return "", errors.New("no source in this test") }
 	return in
 }
 
@@ -71,6 +74,140 @@ func TestDemoteUsesConfiguredSourceAndSkipsRecloneOnSuccess(t *testing.T) {
 	}
 	if src != in.cfg.PrimaryConninfo || recloned || slotSrc != src {
 		t.Fatalf("src=%q recloned=%v slotSrc=%q", src, recloned, slotSrc)
+	}
+}
+
+// TestARejoinRetriedAfterItsRewindResumesAfterIt: pg_rewind succeeds and a
+// step after it fails -- here the slot on the source, which is a network
+// call. The retry used to start from the top and point pg_rewind at a
+// target it had already rewound, whose control file is no longer a clean
+// shutdown; any failure there fell back to a full reclone, turning seconds
+// of rewind into a copy of the whole volume.
+func TestARejoinRetriedAfterItsRewindResumesAfterIt(t *testing.T) {
+	in := newTestInstance(t)
+	in.sourceIdentityFn = func(context.Context, string) (string, error) { return "7384/00000002", nil }
+	var rewinds, reclones, slots int
+	in.rewindFn = func(context.Context, string) error { rewinds++; return nil }
+	in.recloneFn = func(context.Context) error { reclones++; return nil }
+	in.slotFn = func(context.Context, string) error {
+		slots++
+		if slots == 1 {
+			return errors.New("source unreachable")
+		}
+		return nil
+	}
+
+	if err := in.Demote(context.Background(), "host=pg-rw"); err == nil {
+		t.Fatal("the first attempt was meant to fail after the rewind")
+	}
+	if err := in.Demote(context.Background(), "host=pg-rw"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if rewinds != 1 {
+		t.Errorf("pg_rewind ran %d times; the retry repeated a rewind that had already completed", rewinds)
+	}
+	if reclones != 0 {
+		t.Errorf("recloned %d times after a rewind that succeeded", reclones)
+	}
+	if standby, err := in.IsStandby(); err != nil || !standby {
+		t.Fatal("standby.signal missing after the resumed rejoin")
+	}
+	if rewound, err := in.rewoundAgainst("7384/00000002"); err != nil || rewound {
+		t.Fatalf("the rewind marker outlived the start it was for: rewound=%v err=%v", rewound, err)
+	}
+}
+
+// TestAFailoverBetweenAttemptsRewindsAgain: the conninfo is the -rw Service,
+// so it is the same string before and after a failover, and a marker keyed
+// on it would skip the rewind against a NEW primary whose history has
+// forked from the one this member was rewound to. The server behind the
+// Service reports a new timeline once it has been promoted, and that is
+// what the marker is checked against.
+func TestAFailoverBetweenAttemptsRewindsAgain(t *testing.T) {
+	in := newTestInstance(t)
+	timeline := "00000002"
+	in.sourceIdentityFn = func(context.Context, string) (string, error) { return "7384/" + timeline, nil }
+	var rewinds int
+	in.rewindFn = func(context.Context, string) error { rewinds++; return nil }
+	in.recloneFn = func(context.Context) error { t.Fatal("recloned"); return nil }
+	slots := 0
+	in.slotFn = func(context.Context, string) error {
+		slots++
+		if slots == 1 {
+			return errors.New("the primary is going away")
+		}
+		return nil
+	}
+
+	if err := in.Demote(context.Background(), "host=pg-rw"); err == nil {
+		t.Fatal("the first attempt was meant to fail after the rewind")
+	}
+	timeline = "00000003" // the Service now reaches the promoted standby
+	if err := in.Demote(context.Background(), "host=pg-rw"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if rewinds != 2 {
+		t.Fatalf("pg_rewind ran %d times; the retry reused a rewind against a primary that has since failed over", rewinds)
+	}
+}
+
+// TestAnUnidentifiableSourceIsRewoundRatherThanTrusted: not being able to
+// ask the source who it is is no reason to believe the marker.
+func TestAnUnidentifiableSourceIsRewoundRatherThanTrusted(t *testing.T) {
+	in := newTestInstance(t)
+	if err := in.markRewound("7384/00000002"); err != nil {
+		t.Fatal(err)
+	}
+	in.sourceIdentityFn = func(context.Context, string) (string, error) { return "", errors.New("recovery is in progress") }
+	rewinds := 0
+	in.rewindFn = func(context.Context, string) error { rewinds++; return nil }
+	if err := in.Demote(context.Background(), "host=pg-rw"); err != nil {
+		t.Fatal(err)
+	}
+	if rewinds != 1 {
+		t.Fatalf("pg_rewind ran %d times; an unanswerable identity must not stand in for a rewind", rewinds)
+	}
+}
+
+// TestAnUnreadableMarkerIsRewoundRather: a marker that cannot be read is no
+// better evidence than none, and failing the rejoin over it would fail every
+// retry the same way.
+func TestAnUnreadableMarkerIsRewoundRather(t *testing.T) {
+	in := newTestInstance(t)
+	if err := os.Mkdir(filepath.Join(in.cfg.PGData, rewoundMarker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	in.sourceIdentityFn = func(context.Context, string) (string, error) { return "7384/00000002", nil }
+	rewinds := 0
+	in.rewindFn = func(context.Context, string) error { rewinds++; return nil }
+	if err := in.follow(context.Background(), "host=pg-rw"); err != nil && rewinds == 0 {
+		t.Fatalf("an unreadable marker failed the rejoin before it rewound: %v", err)
+	}
+	if rewinds != 1 {
+		t.Fatalf("pg_rewind ran %d times; an unreadable marker must mean rewind", rewinds)
+	}
+}
+
+// TestAFailedStartKeepsTheRewindMarker: the marker is spent only once
+// postgres has come up on the rewound directory. A start that fails leaves
+// nothing run on it, so the retry must still skip the rewind.
+func TestAFailedStartKeepsTheRewindMarker(t *testing.T) {
+	in := newTestInstance(t)
+	in.sourceIdentityFn = func(context.Context, string) (string, error) { return "7384/00000002", nil }
+	in.rewindFn = func(context.Context, string) error { return nil }
+	starts := 0
+	in.startFn = func(context.Context) error {
+		starts++
+		if starts == 1 {
+			return errors.New("postgres exited during startup")
+		}
+		return nil
+	}
+	if err := in.Demote(context.Background(), "host=pg-rw"); err == nil {
+		t.Fatal("the first start was meant to fail")
+	}
+	if rewound, err := in.rewoundAgainst("7384/00000002"); err != nil || !rewound {
+		t.Fatalf("a failed start cleared the rewind marker: rewound=%v err=%v", rewound, err)
 	}
 }
 

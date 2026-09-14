@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -245,6 +246,18 @@ func (n *node) psqlFails(sql string) string {
 	return string(out)
 }
 
+const rewindMarkerPath = "/var/lib/postgresql/data/pgshard_rewound_for"
+
+func (n *node) plantRewindMarker() {
+	n.t.Helper()
+	docker(n.t, "exec", n.container, "sh", "-c", "echo 0/00000000 > "+rewindMarkerPath)
+}
+
+func (n *node) hasRewindMarker() bool {
+	n.t.Helper()
+	return docker(n.t, "exec", n.container, "sh", "-c", "test -e "+rewindMarkerPath+" && echo present || echo absent") == "present"
+}
+
 func (n *node) status() *pgshardv1.StatusResponse {
 	n.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -393,9 +406,21 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	}
 
 	t.Log("promote with epoch 1")
+	// A rewind marker left in a member that becomes primary would let its
+	// eventual demotion skip the rewind it needs, so promotion clears it.
+	s.plantRewindMarker()
 	resp, err := s.grpc.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: 1})
 	if err != nil {
 		t.Fatalf("promote: err=%v\n%s", err, s.logs())
+	}
+	if s.hasRewindMarker() {
+		t.Fatal("promotion left a rewind marker in the new primary's data directory")
+	}
+	// The identity a rewind marker is keyed on, asked of a real primary: a
+	// query that stopped working would turn every marker into a rewind
+	// quietly rather than fail anything.
+	if id := s.psql(sourceIdentityQuery); !regexp.MustCompile(`^[0-9]+/[0-9A-F]{8}$`).MatchString(id) {
+		t.Fatalf("source identity %q is not system_identifier/timeline", id)
 	}
 	if resp.GetEpoch() != 1 || resp.GetTimeline() != 2 {
 		t.Fatalf("promote response: %v", resp)
@@ -465,6 +490,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if strings.Contains(p.logs(), "pg_rewind failed") {
 		t.Fatalf("demote fell back to reclone; expected rewind\n%s", p.logs())
 	}
+	if strings.Contains(docker(t, "logs", p.container), msgUnidentifiedSource) {
+		t.Fatalf("the rejoin could not identify its source, so a retry would never reuse a completed rewind\n%s", p.logs())
+	}
 	// p.status() below is an RPC, and the agent restarted to rewind.
 	p.waitServing(90 * time.Second)
 	p.waitStandbyCaughtUp(s, 60*time.Second)
@@ -479,6 +507,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	}
 
 	t.Log("epoch survives an agent restart")
+	// And a rewind marker does not: postgres coming up on the directory
+	// spends it, on this path through Bootstrap and Start rather than Follow.
+	p.plantRewindMarker()
 	docker(t, "restart", p.container)
 	p.connect()
 	// A restart reopens the same window as a start: the probes answer
@@ -486,6 +517,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	p.waitServing(120 * time.Second)
 	if st := p.status(); st.GetEpoch() != 1 || st.GetRole() != pgshardv1.StatusResponse_ROLE_STANDBY {
 		t.Fatalf("status after restart: %v", st)
+	}
+	if p.hasRewindMarker() {
+		t.Fatal("a rewind marker survived postgres starting on the directory")
 	}
 
 	t.Log("reclone rebuilds the standby from the primary")
