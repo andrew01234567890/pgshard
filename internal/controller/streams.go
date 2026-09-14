@@ -11,9 +11,10 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
-// StreamMonitor copies the state of every change stream's slot on every
-// shard into pgshard.stream_status and marks a stream lost once one of its
-// slots was invalidated (wal_status 'lost').
+// StreamMonitor copies the state of every change stream's slot, on the
+// shards of that stream's own set, into pgshard.stream_status -- and marks
+// a stream lost once one of those slots has been unresumable, invalidated
+// or gone, on two consecutive sweeps.
 type StreamMonitor struct {
 	Pool   *pgxpool.Pool
 	Shards ShardDialer

@@ -115,8 +115,9 @@ func DeleteStream(ctx context.Context, q Execer, name string) error {
 	return err
 }
 
-// UpsertStreamStatus records the slot state of a stream on one shard; a
-// lost slot also marks the stream lost.
+// UpsertStreamStatus records the slot state of a stream on one shard. A
+// slot that cannot be resumed from -- invalidated, or gone -- also marks
+// the stream lost, on the second consecutive sighting: see markStreamLost.
 func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
 	if Unresumable(st.WALStatus) {
 		if err := markStreamLost(ctx, q, st); err != nil {
@@ -153,23 +154,45 @@ func Unresumable(walStatus string) bool { return walStatus == "lost" || walStatu
 // markStreamLost moves a stream to lost. Called BEFORE the upsert that
 // overwrites this shard's last report, because that report is the evidence.
 //
-// "lost" is acted on at once. "missing" needs TWO consecutive sightings,
-// and the stored row is the first one: a -rw Service flip during a
-// failover can land a sweep on a member whose synced copy of the slot has
-// not caught up, and that resolves itself by the next tick. One sighting
-// is a glimpse; two is a slot that is not coming back. Making a stream
-// lost is not reversible -- only Create writes active, and CreateStream
-// refuses a duplicate name -- so the bar is the higher one.
+// TWO consecutive sightings, for "lost" as well as "missing", and the
+// stored row is the first. Both can be transient on a standby: a -rw
+// Service flip can land a sweep on a member whose synced copy of the slot
+// has not caught up ("missing"), and slotsync can invalidate a synced slot
+// on the standby -- its own max_slot_wal_keep_size, or primary_slot_name
+// reset -- while the slot is perfectly valid on the primary ("lost"), then
+// drop and recreate it on the next cycle. So "the slot is there and says
+// its WAL is gone" is true of a primary and not of a standby, and a sweep
+// cannot tell which member answered it.
 //
-// A stream still being created is exempt from both: its slots do not
-// exist until CreateStream has made them, and the sweep reports every one
-// of them missing in the meantime.
+// Making a stream lost is not reversible -- only Create writes active, and
+// CreateStream refuses a duplicate name, so recovery costs the consumer
+// its position. One glimpse is not evidence enough for that.
+//
+// A stream still being created is exempt: its slots do not exist until
+// CreateStream has made them. Create clears the rows that phase leaves
+// behind, so they cannot serve as the first sighting afterwards.
 func markStreamLost(ctx context.Context, q Execer, st StreamStatus) error {
 	_, err := q.Exec(ctx, `UPDATE pgshard.streams SET state = $4
 		WHERE name = $1 AND state <> $5
-		  AND ($6 OR EXISTS (SELECT 1 FROM pgshard.stream_status
-		        WHERE stream = $1 AND shard_set = $2 AND shard_id = $3 AND wal_status = 'missing'))`,
-		st.Stream, st.ShardSet, st.ShardID, StreamLost, StreamCreating, st.WALStatus == "lost")
+		  AND EXISTS (SELECT 1 FROM pgshard.stream_status
+		        WHERE stream = $1 AND shard_set = $2 AND shard_id = $3
+		          AND wal_status IN ('missing', 'lost'))`,
+		st.Stream, st.ShardSet, st.ShardID, StreamLost, StreamCreating)
+	return err
+}
+
+// ClearUnresumableStatus forgets the unresumable rows a stream accumulated
+// before it was fully created.
+//
+// The sweep runs while Create is still making slots, so it records every
+// shard it has not reached yet as "missing". Those rows are suppressed as
+// a reason to condemn the stream while it is creating -- but they stay in
+// the table, and once the stream goes active they would serve as the first
+// of the two sightings the debounce needs. One real sighting would then be
+// enough, which is the thing the debounce exists to prevent.
+func ClearUnresumableStatus(ctx context.Context, q Execer, stream string) error {
+	_, err := q.Exec(ctx, `DELETE FROM pgshard.stream_status
+		WHERE stream = $1 AND wal_status IN ('missing', 'lost')`, stream)
 	return err
 }
 

@@ -79,12 +79,67 @@ func TestAVanishedSlotMarksTheStreamLost(t *testing.T) {
 		t.Errorf("a slot that reappeared between sightings left the stream %q, want %q", got, StreamActive)
 	}
 
-	// PostgreSQL's own "lost" needs no second look: the slot is there and
-	// says the WAL it needed is gone.
+	// A row left behind by the pre-PGS-391 cluster-wide sweep, on a set
+	// this stream never had slots on. Nothing deletes those, so they are
+	// still in the table after the upgrade -- and if one counted as the
+	// first sighting, the first post-upgrade sweep would mark the stream
+	// lost on a single real observation. That is PR #899's failure mode
+	// arriving by the back door, so it is pinned rather than reasoned
+	// about: the debounce is keyed on the shard being written, not on the
+	// stream.
+	active("stale_foreign")
+	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.stream_status (stream, shard_set, shard_id, slot, wal_status)
+		VALUES ('stale_foreign', 'g2', 0, 'leftover', 'missing')`); err != nil {
+		t.Fatal(err)
+	}
+	sweep("stale_foreign", "missing")
+	if got := state("stale_foreign"); got != StreamActive {
+		t.Errorf("a leftover missing row on a set this stream has no slots on counted as a sighting; the stream went %q on one real observation", got)
+	}
+	sweep("stale_foreign", "missing")
+	if got := state("stale_foreign"); got != StreamLost {
+		t.Errorf("two sightings on the stream's OWN shard still left it %q, want %q", got, StreamLost)
+	}
+
+	// "lost" gets the same two sightings. It reads as unambiguous -- the
+	// slot is there and says its WAL is gone -- but only on a primary:
+	// slotsync can invalidate a synced slot on a standby while it is valid
+	// on the primary, then drop and recreate it next cycle, and a sweep
+	// cannot tell which member answered it.
 	active("invalidated")
 	sweep("invalidated", "lost")
+	if got := state("invalidated"); got != StreamActive {
+		t.Errorf("one sighting of an invalidated slot made the stream %q; on a standby that clears by the next slotsync cycle", got)
+	}
+	sweep("invalidated", "lost")
 	if got := state("invalidated"); got != StreamLost {
-		t.Errorf("an invalidated slot left the stream %q, want %q", got, StreamLost)
+		t.Errorf("an invalidated slot seen twice left the stream %q, want %q", got, StreamLost)
+	}
+
+	// The rows a stream's own creation leaves behind must not become the
+	// first of the two sightings. The sweep runs while Create is still
+	// making slots and records every shard it has not reached as missing;
+	// those are suppressed while the stream is creating, but they stay in
+	// the table. Create clears them when it activates -- without that, the
+	// first real sighting afterwards would condemn the stream on one
+	// observation, which is the thing the debounce exists to prevent.
+	if err := CreateStream(ctx, conn, Stream{Name: "half_made", Database: "app", ShardSet: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	sweep("half_made", "missing") // a sweep that ran mid-create
+	if err := ClearUnresumableStatus(ctx, conn, "half_made"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetStreamState(ctx, conn, "half_made", StreamActive); err != nil {
+		t.Fatal(err)
+	}
+	sweep("half_made", "missing") // the first sighting since it went active
+	if got := state("half_made"); got != StreamActive {
+		t.Errorf("a row left by the stream's own creation counted as a sighting; it went %q on one observation", got)
+	}
+	sweep("half_made", "missing")
+	if got := state("half_made"); got != StreamLost {
+		t.Errorf("two sightings after activation left the stream %q, want %q", got, StreamLost)
 	}
 
 	// Still creating: its slots do not exist yet by definition.

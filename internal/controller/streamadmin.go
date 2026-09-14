@@ -77,6 +77,13 @@ func (a *StreamAdmin) Create(ctx context.Context, name, database string, twoPhas
 		}
 		out = append(out, StreamSlot{Shard: sh, Slot: slot, LSN: lsn})
 	}
+	// The sweep has been running throughout, recording every shard this
+	// loop had not reached yet as having no slot. Those rows are stale the
+	// moment the last slot is made, and leaving them would let one later
+	// sighting satisfy a debounce that is supposed to need two.
+	if err := catalog.ClearUnresumableStatus(ctx, a.Pool, name); err != nil {
+		return out, err
+	}
 	if err := catalog.SetStreamState(ctx, a.Pool, name, catalog.StreamActive); err != nil {
 		return out, err
 	}
