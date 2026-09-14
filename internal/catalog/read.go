@@ -337,7 +337,17 @@ var ErrNoShardMapGeneration = errors.New(
 		"its schema exists but its singleton row does not, which is what a catalog being copied into looks like before the copy delivers it")
 
 // Generations returns the shard-map generation and the highest desired
-// generation stamped on any desired-state row.
+// generation stamped on rows of pgshard.databases, tables, shard_ranges,
+// roles and grants.
+//
+// That is five of the nine tables carrying the column -- it omits
+// role_members, role_settings, functions and shard_sets -- and the number
+// is therefore a lower bound on "something in desired state changed", not
+// the maximum over all of it. Nothing depends on it being the maximum: its
+// only consumer is the snapshot, which publishes a change whenever the
+// snapshot's fingerprint moves and uses this pair only as a cheap first
+// test (PGS-811). Widen it if a caller ever needs the real maximum, and say
+// so here.
 func Generations(ctx context.Context, q Querier) (shardMap, desired int64, err error) {
 	rows, err := q.Query(ctx, `
 		SELECT (SELECT generation FROM pgshard.shard_map_generation),
