@@ -33,6 +33,39 @@ func replicaToken() (string, error) {
 	return replicaID, replicaErr
 }
 
+// ReleaseClaims gives up every workflow this replica owns, and reports how
+// many it let go.
+//
+// A claim is otherwise only surrendered by expiry: claimWorkflow admits a
+// successor once owned_at is DefaultOwnerLease old, and nothing else ever
+// writes the column. So a controller that stopped leading left its
+// workflows unownable for the whole lease, and the successor skipped them
+// every tick until it aged out -- five minutes of a reshard or a placement
+// standing still, with whatever write pause the pass had raised standing
+// with it, because WritePauseSweep lifts only pauses whose workflow is
+// gone or terminal and this one is still running.
+//
+// The lease still covers the case no code can: a controller that crashes
+// releases nothing. This covers the one it can -- losing the lock, or
+// shutting down -- and turns that from a five-minute stall into a handover
+// on the successor's next tick.
+//
+// Scoped to this replica's own claims by the WHERE, so a controller that
+// is wrong about having lost leadership cannot take anyone else's.
+func ReleaseClaims(ctx context.Context, pool *pgxpool.Pool, me string) (int64, error) {
+	if me == "" {
+		var err error
+		if me, err = replicaToken(); err != nil {
+			return 0, err
+		}
+	}
+	tag, err := pool.Exec(ctx, `UPDATE pgshard.workflows SET owner = NULL WHERE owner = $1`, me)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // claimWorkflow takes ownership of a workflow for one replica and reports
 // whether it holds it. Every write the pass makes carries the claim.
 //
