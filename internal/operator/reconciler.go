@@ -30,10 +30,12 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agent"
 	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgparser/grammar"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
@@ -80,6 +82,7 @@ type ClusterReconciler struct {
 
 	mu             sync.Mutex
 	unhealthySince map[string]time.Time
+	fullSince      map[string]time.Time
 	// switchoverSince is when a planned switchover started waiting for its
 	// target to catch up, per group.
 	switchoverSince map[string]time.Time
@@ -136,16 +139,19 @@ type memberInfo struct {
 
 // groupObservation is what one reconcile pass learned about a group.
 type groupObservation struct {
-	group        Group
-	state        groupState
-	podsRunning  int
-	podsReady    int
-	primaryOK    bool
-	primaryErr   string
-	streaming    map[string]bool
-	syncApplied  bool
-	members      []pgshardv1alpha1.MemberStatus
-	replicasWant int
+	group       Group
+	state       groupState
+	podsRunning int
+	podsReady   int
+	primaryOK   bool
+	primaryErr  string
+	// primaryFullFor is how long the primary has been refusing the control
+	// plane a connection slot (53300) while running; zero when it is not.
+	primaryFullFor time.Duration
+	streaming      map[string]bool
+	syncApplied    bool
+	members        []pgshardv1alpha1.MemberStatus
+	replicasWant   int
 	// nodes names the node each running member landed on, in member order.
 	// A group with two members on one node has fewer failure domains than
 	// replicas, whatever the replica count says.
@@ -201,6 +207,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !cluster.DeletionTimestamp.IsZero() {
+		if r.Metrics != nil {
+			r.Metrics.PrimaryConnectionSlotsFull.DeletePartialMatch(prometheus.Labels{"cluster": cluster.Namespace + "/" + cluster.Name})
+		}
 		return ctrl.Result{}, nil
 	}
 	if cluster.Spec.UnsafeSingleReplica {
@@ -1057,6 +1066,9 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	}
 
 	if target := c.Annotations[AnnotationSwitchover]; target != "" && g.HasMember(target) {
+		// The clock belongs to the group, not the member: the primary it
+		// timed is being replaced.
+		r.fullFor(c, g, false)
 		return r.switchover(ctx, c, g, obs, members, password, target)
 	}
 
@@ -1085,7 +1097,13 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 
 	healthy := primaryHealthy(primary.pod, primary.ready, st, stErr)
 	unhealthyFor := r.unhealthyFor(c, g, !healthy)
+	// Recorded once per pass, from the agent and, when it gets that far, the
+	// probe: recorded twice, the second answer would restart the first's
+	// clock whenever only one of them was refused.
+	agentFull := primary.pod != nil && runningButFull(st, stErr) && st.Primary
+	recordFull := func(full bool) { obs.primaryFullFor = r.fullFor(c, g, full) }
 	if !healthy {
+		recordFull(false)
 		obs.failing = true
 		obs.primaryErr = "primary unhealthy"
 		if stErr != nil {
@@ -1127,6 +1145,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	}
 	obs = r.finishGroup(ctx, c, g, obs, members)
 	if refused != "" {
+		recordFull(agentFull)
 		obs.failing, obs.primaryErr = true, refused
 		return obs, nil
 	}
@@ -1135,8 +1154,12 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	pstate, err := r.Prober.Probe(ctx, dsn)
 	if err != nil {
 		obs.primaryErr = err.Error()
+		// The agent may have got a slot this pass while the probe did not:
+		// the same server, and just as full.
+		recordFull(agentFull || agent.ConnectionSlotsFull(err))
 		return obs, nil
 	}
+	recordFull(agentFull)
 	obs.primaryOK = true
 	obs.writesPaused = pstate.WritesPaused
 	// CREATE ROLE, ALTER ROLE and GRANT are all writes, and a paused
@@ -1633,7 +1656,41 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 		})
 	}
 	set(pgshardv1alpha1.ConditionReady, ready, boolReason(ready, "Ready", "NotReady"), msg)
-	set(pgshardv1alpha1.ConditionPrimaryHealthy, primaryOK, boolReason(primaryOK, "AcceptingSQL", "ProbeFailed"), "")
+	primaryReason, primaryMsg := boolReason(primaryOK, "AcceptingSQL", "ProbeFailed"), ""
+	var full []string
+	downElsewhere := false
+	if r.Metrics != nil {
+		// Reset per pass, so a group that is gone -- retired by a reshard or
+		// an upgrade -- does not keep its last value, and its alert, for good.
+		r.Metrics.PrimaryConnectionSlotsFull.DeletePartialMatch(prometheus.Labels{"cluster": c.Namespace + "/" + c.Name})
+	}
+	for _, o := range obs {
+		reported := o.primaryFullFor >= primaryFullReportAfter
+		if reported {
+			full = append(full, fmt.Sprintf("%s for %s", o.group.Name(), o.primaryFullFor.Round(time.Second)))
+		} else if !o.primaryOK {
+			downElsewhere = true
+		}
+		if r.Metrics != nil {
+			r.Metrics.PrimaryConnectionSlotsFull.WithLabelValues(c.Namespace+"/"+c.Name, o.group.Name()).Set(o.primaryFullFor.Seconds())
+		}
+	}
+	if !primaryOK && len(full) > 0 && downElsewhere {
+		// A group that is down for another reason must not hide behind the
+		// full one: the reason stays the generic one, and the message still
+		// names the full groups.
+		primaryMsg = "primary running with no connection slot left for the control plane (SQLSTATE 53300): " + strings.Join(full, ", ")
+	}
+	if !primaryOK && len(full) > 0 && !downElsewhere {
+		// Not a primary that is down: one that is running and has no
+		// connection slot left for the control plane. It is not failed over
+		// for that (PGS-819), so nothing else ends it, and "ProbeFailed"
+		// sent whoever looked after the wrong thing (PGS-832).
+		primaryReason = "ConnectionSlotsExhausted"
+		primaryMsg = "primary running with no connection slot left for the control plane (SQLSTATE 53300): " + strings.Join(full, ", ") +
+			"; find the sessions holding them, or switch over"
+	}
+	set(pgshardv1alpha1.ConditionPrimaryHealthy, primaryOK, primaryReason, primaryMsg)
 	set(pgshardv1alpha1.ConditionReplicationHealthy, replOK, boolReason(replOK, "AllStreaming", "ReplicasMissing"), "")
 	set(pgshardv1alpha1.ConditionProgressing, !ready, boolReason(!ready, "Reconciling", "Stable"), "")
 	var crowded []string

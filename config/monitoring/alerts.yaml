@@ -91,6 +91,19 @@ spec:
           annotations:
             summary: The operator is failing to reconcile
             description: controller-runtime reconcile errors are persistent; check the operator logs.
+        - alert: PgshardPrimaryConnectionSlotsExhausted
+          expr: max by (cluster, group) (pgshard_operator_primary_connection_slots_full_seconds) > 300
+          labels:
+            severity: critical
+          annotations:
+            summary: A primary has had no connection slot for the control plane for five minutes
+            description: >-
+              The {{ $labels.group }} primary of {{ $labels.cluster }} is running
+              but refuses the agent and the operator a connection (SQLSTATE
+              53300). It is not failed over for that, so nothing ends it:
+              backups, slot and sync-standby maintenance and the controller's
+              loops against it all stop. Find the sessions holding the slots
+              (pg_stat_activity), or switch the group over.
         - alert: PgshardCutoverStepStalled
           expr: max by (kind, id, stage, step) (pgshard_controller_workflow_step_age_seconds) > 900
           for: 5m

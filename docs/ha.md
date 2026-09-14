@@ -60,7 +60,11 @@ unhealthy: `Status` reports it running with that error, and `/readyz` passes.
 The superuser reserve (`superuser_reserved_connections`) is shared by every
 superuser connection the control plane opens — agent, operator, controller,
 backups — so a busy but healthy primary can run out of it, and failing over
-from that server would fence it without freeing a slot. After
+from that server would fence it without freeing a slot. Nothing ends it
+automatically either: a primary that stays full for a minute turns the
+cluster's `PrimaryHealthy` condition to reason `ConnectionSlotsExhausted`
+(naming the group and for how long) instead of `ProbeFailed`, and
+`pgshard_operator_primary_connection_slots_full_seconds` carries it. After
 `DefaultFailoverDelay` (10s) of continuous unhealthiness the operator, inside
 one reconcile:
 
