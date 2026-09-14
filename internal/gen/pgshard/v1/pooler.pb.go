@@ -978,7 +978,13 @@ func (x *CopyFail) GetMessage() string {
 type CancelRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Router session whose statement is cancelled.
-	SessionId     string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	SessionId string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// Statement being cancelled, numbered as on ExecuteRequest. A cancel is
+	// delivered asynchronously, so it can arrive after its statement ended
+	// and the next one began; the pooler ignores it once it has seen a later
+	// statement on the session. Zero cancels whatever the session is running,
+	// which is what a router that does not number statements gets.
+	Statement     uint64 `protobuf:"varint,2,opt,name=statement,proto3" json:"statement,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1018,6 +1024,13 @@ func (x *CancelRequest) GetSessionId() string {
 		return x.SessionId
 	}
 	return ""
+}
+
+func (x *CancelRequest) GetStatement() uint64 {
+	if x != nil {
+		return x.Statement
+	}
+	return 0
 }
 
 // CancelResponse acknowledges a cancel; delivery is best effort.
@@ -1081,6 +1094,13 @@ type ExecuteRequest struct {
 	// the same way packed_rows is, so a pooler that predates the field
 	// answers the old way and the two roll independently.
 	BatchedRows bool `protobuf:"varint,6,opt,name=batched_rows,json=batchedRows,proto3" json:"batched_rows,omitempty"`
+	// Statement numbers what the router was handling when it sent this
+	// message -- a simple query, or one extended-protocol message such as the
+	// Sync that runs a batch -- counting up within the router session and not
+	// necessarily by one. The pooler keeps the highest it has seen, which is what lets it tell a Cancel or Release sent for an
+	// earlier statement from one for the statement running now. Zero means
+	// the router does not number its statements.
+	Statement uint64 `protobuf:"varint,7,opt,name=statement,proto3" json:"statement,omitempty"`
 	// Exactly one pgwire-shaped message.
 	//
 	// Types that are valid to be assigned to Message:
@@ -1172,6 +1192,13 @@ func (x *ExecuteRequest) GetBatchedRows() bool {
 		return x.BatchedRows
 	}
 	return false
+}
+
+func (x *ExecuteRequest) GetStatement() uint64 {
+	if x != nil {
+		return x.Statement
+	}
+	return 0
 }
 
 func (x *ExecuteRequest) GetMessage() isExecuteRequest_Message {
@@ -2684,9 +2711,11 @@ func (*ExecuteResponse_DataRows) isExecuteResponse_Message() {}
 
 // ReserveRequest pins a backend to a session.
 type ReserveRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	Generation    *Generation            `protobuf:"bytes,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	SessionId  string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Generation *Generation            `protobuf:"bytes,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	// Statement making the reservation, numbered as on ExecuteRequest.
+	Statement     uint64 `protobuf:"varint,3,opt,name=statement,proto3" json:"statement,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2733,6 +2762,13 @@ func (x *ReserveRequest) GetGeneration() *Generation {
 		return x.Generation
 	}
 	return nil
+}
+
+func (x *ReserveRequest) GetStatement() uint64 {
+	if x != nil {
+		return x.Statement
+	}
+	return 0
 }
 
 // ReserveResponse reports the pinned backend.
@@ -2792,8 +2828,13 @@ func (x *ReserveResponse) GetError() *Error {
 
 // ReleaseRequest unpins the session's backend.
 type ReleaseRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// Statement the release is for, numbered as on ExecuteRequest. A release
+	// older than the reservation it would end belongs to an earlier
+	// reservation and is ignored, so a late one cannot unpin the backend a
+	// later statement reserved. Zero releases unconditionally.
+	Statement     uint64 `protobuf:"varint,2,opt,name=statement,proto3" json:"statement,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2833,6 +2874,13 @@ func (x *ReleaseRequest) GetSessionId() string {
 		return x.SessionId
 	}
 	return ""
+}
+
+func (x *ReleaseRequest) GetStatement() uint64 {
+	if x != nil {
+		return x.Statement
+	}
+	return 0
 }
 
 // ReleaseResponse acknowledges the release.
@@ -5434,11 +5482,12 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\n" +
 	"\bCopyDone\"$\n" +
 	"\bCopyFail\x12\x18\n" +
-	"\amessage\x18\x01 \x01(\tR\amessage\".\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"L\n" +
 	"\rCancelRequest\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x01 \x01(\tR\tsessionId\"\x10\n" +
-	"\x0eCancelResponse\"\xce\x06\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1c\n" +
+	"\tstatement\x18\x02 \x01(\x04R\tstatement\"\x10\n" +
+	"\x0eCancelResponse\"\xec\x06\n" +
 	"\x0eExecuteRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x126\n" +
@@ -5449,7 +5498,8 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\bdatabase\x18\x04 \x01(\tR\bdatabase\x12\x1f\n" +
 	"\vpacked_rows\x18\x05 \x01(\bR\n" +
 	"packedRows\x12!\n" +
-	"\fbatched_rows\x18\x06 \x01(\bR\vbatchedRows\x12<\n" +
+	"\fbatched_rows\x18\x06 \x01(\bR\vbatchedRows\x12\x1c\n" +
+	"\tstatement\x18\a \x01(\x04R\tstatement\x12<\n" +
 	"\fsimple_query\x18\n" +
 	" \x01(\v2\x17.pgshard.v1.SimpleQueryH\x00R\vsimpleQuery\x12)\n" +
 	"\x05parse\x18\v \x01(\v2\x11.pgshard.v1.ParseH\x00R\x05parse\x12&\n" +
@@ -5543,20 +5593,22 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\x10portal_suspended\x18\x1b \x01(\v2\x1b.pgshard.v1.PortalSuspendedH\x00R\x0fportalSuspended\x12B\n" +
 	"\x0eflush_complete\x18\x1c \x01(\v2\x19.pgshard.v1.FlushCompleteH\x00R\rflushComplete\x123\n" +
 	"\tdata_rows\x18\x1d \x01(\v2\x14.pgshard.v1.DataRowsH\x00R\bdataRowsB\t\n" +
-	"\amessage\"g\n" +
+	"\amessage\"\x85\x01\n" +
 	"\x0eReserveRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x126\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\v2\x16.pgshard.v1.GenerationR\n" +
-	"generation\"[\n" +
+	"generation\x12\x1c\n" +
+	"\tstatement\x18\x03 \x01(\x04R\tstatement\"[\n" +
 	"\x0fReserveResponse\x12\x1f\n" +
 	"\vbackend_pid\x18\x01 \x01(\x05R\n" +
 	"backendPid\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"/\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"M\n" +
 	"\x0eReleaseRequest\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x01 \x01(\tR\tsessionId\"\x1e\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1c\n" +
+	"\tstatement\x18\x02 \x01(\x04R\tstatement\"\x1e\n" +
 	"\x0fReleaseResponseJ\x04\b\x01\x10\x02R\x05error\"\x0f\n" +
 	"\rHealthRequest\"\x97\x02\n" +
 	"\fHealthStatus\x121\n" +

@@ -414,9 +414,10 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 	// A participant is running this statement too, and a cancel that never
 	// reaches it leaves its half going.
 	e.noteCancelTarget(p.ps.client)
-	onCancel := func() { e.cancelBackend(context.Background()) }
+	n := e.statement.Load()
+	onCancel := func() { e.cancelStatement(context.Background(), n) }
 	for _, req := range reqs {
-		if err := p.ps.send(perShard(req), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident, e.info.Database); err != nil {
+		if err := p.ps.send(perShard(req), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident, e.info.Database, n); err != nil {
 			return poolerTransportError(fmt.Sprintf("shard %s/%d", p.shard.Set, p.shard.ID), err)
 		}
 	}
@@ -824,7 +825,7 @@ func (e *Executor) dropParked() {
 		}
 		if p.pinned {
 			if client, err := e.r.cfg.Poolers.Client(p.shard); err == nil {
-				if err := releaseRPC(context.Background(), client, e.sid); err != nil {
+				if err := releaseRPC(context.Background(), client, e.sid, e.statement.Load()); err != nil {
 					e.r.cfg.Logger.Warn("releasing a transaction participant failed", "session", e.sid, "shard", p.shard, "err", err)
 				}
 			}
@@ -936,7 +937,7 @@ func (e *Executor) preparePart(ctx context.Context, sh Shard) (*txnPart, error) 
 	}
 	p := &txnPart{shard: sh, ps: ps, tx: pgwire.TxIdle, known: map[string]bool{}}
 	if e.needsPin() {
-		resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.r.cfg.Poolers.Generation(sh)})
+		resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.r.cfg.Poolers.Generation(sh), Statement: e.statement.Load()})
 		if pe := resp.GetError(); pe != nil {
 			// See scatter.go: a pooler from before the refusal moved to
 			// the status channel.

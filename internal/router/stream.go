@@ -130,9 +130,10 @@ func (ps *poolerStream) reader() {
 
 // send stamps req and writes it; the identity and database travel on the
 // first message.
-func (ps *poolerStream) send(req *pgshardv1.ExecuteRequest, sid string, gen *pgshardv1.Generation, ident *pgshardv1.UserIdentity, database string) error {
+func (ps *poolerStream) send(req *pgshardv1.ExecuteRequest, sid string, gen *pgshardv1.Generation, ident *pgshardv1.UserIdentity, database string, statement uint64) error {
 	req.SessionId = sid
 	req.Generation = gen
+	req.Statement = statement
 	// Always: the packed shape carries the same columns with no object per
 	// column on either side, and a pooler that predates the field ignores
 	// it and answers the old way, which the router still reads.

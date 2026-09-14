@@ -22,9 +22,16 @@ func TestACancelOnceEveryParticipantHasPreparedIsNotSent(t *testing.T) {
 	e := newExecutor(h.r, pgwire.SessionInfo{ID: 1, Database: "app", User: "app",
 		Auth: &pgwire.AuthResult{SCRAM: &pgwire.SCRAMKeys{}}}, Shard{Set: DefaultShardSet, ID: 0})
 
+	// A cancel with no pooler to reach is not sent at all, so give it one.
+	client, err := e.client()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.noteCancelTarget(client)
+
 	// Before the decision a cancel is sent, which is the behaviour every
 	// other phase relies on.
-	e.cancelBackend(context.Background())
+	e.cancelStatement(context.Background(), e.statement.Load())
 	if !e.cancelSent.Load() {
 		t.Fatal("a cancel before the decision must still be sent")
 	}
@@ -32,7 +39,7 @@ func TestACancelOnceEveryParticipantHasPreparedIsNotSent(t *testing.T) {
 	// After it, nothing is sent -- even for a fresh statement context.
 	e.cancelSent.Store(false)
 	e.uncancellable.Store(true)
-	e.cancelBackend(context.Background())
+	e.cancelStatement(context.Background(), e.statement.Load())
 	if e.cancelSent.Load() {
 		t.Fatal("a cancel was sent after the commit decision; it can only interrupt a COMMIT PREPARED whose outcome is already durable")
 	}
@@ -53,7 +60,8 @@ func TestACancelOnceEveryParticipantHasPreparedIsNotSent(t *testing.T) {
 		t.Fatal("a recovered panic left the session uncancellable; every later cancel on it waits out the grace and ends 08006")
 	}
 	e.cancelSent.Store(false)
-	e.cancelBackend(context.Background())
+	e.noteCancelTarget(client)
+	e.cancelStatement(context.Background(), e.statement.Load())
 	if !e.cancelSent.Load() {
 		t.Fatal("a cancel after the recovered panic was not sent")
 	}

@@ -42,6 +42,10 @@ type fakePooler struct {
 	legacyRefusal atomic.Bool
 	releases      []string
 	cancels       []string
+	// cancelNumbers and statements record the statement number each
+	// Cancel and each simple query carried, in arrival order.
+	cancelNumbers []uint64
+	statements    []numberedQuery
 	users         []string
 	sleeping      map[string]chan struct{}
 	attached      map[string]chan struct{}
@@ -386,6 +390,7 @@ func (f *fakePooler) Release(ctx context.Context, req *pgshardv1.ReleaseRequest)
 func (f *fakePooler) Cancel(_ context.Context, req *pgshardv1.CancelRequest) (*pgshardv1.CancelResponse, error) {
 	f.mu.Lock()
 	f.cancels = append(f.cancels, req.SessionId)
+	f.cancelNumbers = append(f.cancelNumbers, req.Statement)
 	ch := f.sleeping[req.SessionId]
 	delete(f.sleeping, req.SessionId)
 	f.mu.Unlock()
@@ -548,6 +553,17 @@ func (f *fakePooler) sessionsSeen() map[string]int {
 }
 
 // cancelled reports the session ids cancelled so far.
+type numberedQuery struct {
+	sql       string
+	statement uint64
+}
+
+func (f *fakePooler) numbered() ([]numberedQuery, []uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]numberedQuery(nil), f.statements...), append([]uint64(nil), f.cancelNumbers...)
+}
+
 func (f *fakePooler) cancelled() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -843,6 +859,11 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 }
 
 func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error {
+	if q := req.GetSimpleQuery(); q != nil {
+		s.f.mu.Lock()
+		s.f.statements = append(s.f.statements, numberedQuery{sql: q.Sql, statement: req.Statement})
+		s.f.mu.Unlock()
+	}
 	if e := s.f.fence(req.Generation); e != nil {
 		s.f.mu.Lock()
 		if s.f.fenced != nil {

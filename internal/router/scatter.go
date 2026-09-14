@@ -362,7 +362,7 @@ func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup st
 			return p, pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, rerr)
 		}
 		p.reserved = true
-		if err := ps.send(simpleQuery(setup), p.sid, gen, e.ident, e.info.Database); err != nil {
+		if err := ps.send(simpleQuery(setup), p.sid, gen, e.ident, e.info.Database, e.statement.Load()); err != nil {
 			return p, poolerTransportError("pooler stream", err)
 		}
 		if err := p.drain(ctx); err != nil {
@@ -370,7 +370,7 @@ func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup st
 		}
 	}
 	for _, req := range reqs {
-		if err := ps.send(perShard(req), p.sid, gen, e.ident, e.info.Database); err != nil {
+		if err := ps.send(perShard(req), p.sid, gen, e.ident, e.info.Database, e.statement.Load()); err != nil {
 			return p, poolerTransportError("pooler stream", err)
 		}
 	}

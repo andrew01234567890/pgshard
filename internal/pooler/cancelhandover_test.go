@@ -55,7 +55,7 @@ func TestACancelIsAbandonedWhenTheBackendHasMovedOn(t *testing.T) {
 
 	// The backend has been handed to somebody else by the time the
 	// connection is up: nothing may be sent.
-	if err := b.cancel(context.Background(), d, func() bool { return false }); err != nil {
+	if err := b.cancel(context.Background(), d, nil, func() bool { return false }); err != nil {
 		t.Fatalf("abandoning a cancel is not an error: %v", err)
 	}
 	select {
@@ -65,7 +65,7 @@ func TestACancelIsAbandonedWhenTheBackendHasMovedOn(t *testing.T) {
 	}
 
 	// And when it is still the right backend, the cancel goes.
-	if err := b.cancel(context.Background(), d, func() bool { return true }); err != nil {
+	if err := b.cancel(context.Background(), d, nil, func() bool { return true }); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 	select {

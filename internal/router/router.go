@@ -134,6 +134,12 @@ type Router struct {
 	// prepared caches whether a shard's PostgreSQL accepts prepared
 	// transactions.
 	prepared map[Shard]bool
+
+	// localCancelled, when set, runs after a cancel request has cancelled a
+	// session's statement and before the backend cancel is sent. Tests use
+	// it to let the statement end first, which is the race a cancel must
+	// survive.
+	localCancelled func()
 }
 
 // New validates cfg and returns a Router.
@@ -358,14 +364,25 @@ func (r *Router) CancelHandler(srv *pgwire.Server) pgwire.CancelHandler {
 // CancelLocal cancels the local session key names, if any, and reports
 // whether one matched. Peer routers call this for forwarded keys.
 func (r *Router) CancelLocal(ctx context.Context, srv *pgwire.Server, key pgwire.CancelKey) bool {
+	r.mu.Lock()
+	e := r.sessions[uint64(key.PID)]
+	localCancelled := r.localCancelled
+	r.mu.Unlock()
+	// The number is read BEFORE the statement is cancelled. Read after, it
+	// could belong to a statement that began since, and the cancel would be
+	// forwarded to that one.
+	var n uint64
+	if e != nil {
+		n = e.statement.Load()
+	}
 	if !srv.CancelLocal(key) {
 		return false
 	}
-	r.mu.Lock()
-	e := r.sessions[uint64(key.PID)]
-	r.mu.Unlock()
+	if localCancelled != nil {
+		localCancelled()
+	}
 	if e != nil {
-		e.cancelBackend(ctx)
+		e.cancelStatement(ctx, n)
 	}
 	return true
 }

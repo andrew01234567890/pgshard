@@ -147,6 +147,14 @@ type Executor struct {
 	// land on whatever that backend is running by the time it arrives.
 	cancelSent atomic.Bool
 	cancelFor  context.Context
+	// statement numbers the pgwire message cancelFor belongs to, counting
+	// up: a simple query gets one number, and so does each extended-protocol
+	// message, so the numbers a batch's requests carry can skip. It travels
+	// on every request, Cancel, Reserve and Release the session sends. A cancel is sent from other goroutines and can outlive
+	// the statement it was fired for; the number is how the router, and
+	// then the pooler, tell it from a cancel for the statement running now.
+	// Written under cancelMu.
+	statement atomic.Uint64
 	// uncancellable is set once every participant of a two-phase commit
 	// has PREPARED. Past that point a forwarded cancel has nothing
 	// legitimate to interrupt: the participants are idle backends holding
@@ -834,6 +842,7 @@ func (e *Executor) asWritePause(err error) error {
 
 // SimpleQuery implements pgwire.Executor.
 func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
+	e.enterStatement(ctx)
 	return e.guard("SimpleQuery", func() error { return e.simpleQuery(ctx, sql, w) })
 }
 
@@ -879,6 +888,7 @@ func (e *Executor) refuseTxnControlInBatch(class StmtClass) error {
 // same way -- what differs is that the client never sent it, so nothing it
 // answers reaches the client.
 func (e *Executor) BeginImplicit(ctx context.Context) error {
+	e.enterStatement(ctx)
 	if err := e.guard("BeginImplicit", func() error {
 		return e.simpleQuery(ctx, "BEGIN", discardWriter{})
 	}); err != nil {
@@ -890,6 +900,7 @@ func (e *Executor) BeginImplicit(ctx context.Context) error {
 
 // EndImplicit implements pgwire.Executor.
 func (e *Executor) EndImplicit(ctx context.Context, commit bool) error {
+	e.enterStatement(ctx)
 	sql := "ROLLBACK"
 	if commit {
 		sql = "COMMIT"
@@ -1279,12 +1290,13 @@ func (e *Executor) releaseOnShard(client pgshardv1.PoolerClient, sh Shard) {
 	done := make(chan struct{})
 	prev := e.releasing[sh]
 	e.releasing[sh] = done
+	n := e.statement.Load()
 	go func() {
 		defer close(done)
 		if prev != nil {
 			<-prev
 		}
-		_ = releaseRPC(context.Background(), client, e.sid)
+		_ = releaseRPC(context.Background(), client, e.sid, n)
 	}()
 }
 
@@ -1310,6 +1322,7 @@ func (e *Executor) awaitReleaseOf(ctx context.Context, sh Shard) error {
 
 // Parse implements pgwire.Executor: the message is buffered until Sync.
 func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint32) error {
+	e.enterStatement(ctx)
 	return e.guard("Parse", func() error { return e.parse(ctx, name, sql, paramOIDs) })
 }
 
@@ -1429,6 +1442,7 @@ func (e *Executor) currentSnapshot() *snapshot.Snapshot {
 // the shard key parameters are known. A statement prepared against an
 // older snapshot is planned again first.
 func (e *Executor) Bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error {
+	e.enterStatement(ctx)
 	return e.guard("Bind", func() error { return e.bind(ctx, portal, statement, paramFormats, params, resultFormats) })
 }
 
@@ -1646,6 +1660,7 @@ func (e *Executor) failBatch() {
 // Sync implements pgwire.Executor: it ships the buffered batch followed by
 // Sync and relays every response.
 func (e *Executor) Sync(ctx context.Context) error {
+	e.enterStatement(ctx)
 	return e.guard("Sync", func() error { return e.sync(ctx) })
 }
 
@@ -1660,6 +1675,7 @@ func (e *Executor) Sync(ctx context.Context) error {
 // the client's answers arriving at Sync as before. That is not a
 // regression, and a wrong guess here is a hung session.
 func (e *Executor) Flush(ctx context.Context, w pgwire.ResultWriter) error {
+	e.enterStatement(ctx)
 	return e.guard("Flush", func() error { return e.flush(ctx, w) })
 }
 
@@ -2087,7 +2103,7 @@ func (e *Executor) ensurePinned(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.generation()})
+	resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.generation(), Statement: e.statement.Load()})
 	if pe := resp.GetError(); pe != nil {
 		// See scatter.go: a pooler from before the refusal moved to the
 		// status channel.
@@ -2177,7 +2193,7 @@ func (e *Executor) replayStatements(ctx context.Context, skip map[string]bool) e
 }
 
 func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
-	if err := e.conn.send(req, e.sid, e.generation(), e.ident, e.backendDatabase()); err != nil {
+	if err := e.conn.send(req, e.sid, e.generation(), e.ident, e.backendDatabase(), e.statement.Load()); err != nil {
 		return e.poolerLost(err)
 	}
 	return nil
@@ -2265,8 +2281,8 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 	e.statements.Inc()
 	defer func() { observer.Observe(time.Since(start).Seconds()) }()
 	var firstErr error
-	e.beginStatement(ctx)
-	onCancel := func() { e.cancelBackend(context.Background()) }
+	n := e.beginStatement(ctx)
+	onCancel := func() { e.cancelStatement(context.Background(), n) }
 	for {
 		resp, err := e.conn.recv(ctx, onCancel)
 		if err != nil {
@@ -2432,43 +2448,67 @@ func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse)
 	}
 }
 
-// cancelBackend asks the pooler to interrupt the statement running for this
-// session.
-// beginStatement arms the backend cancel for a statement, once. A
-// statement pumps more than once -- the backend is acquired, the session
-// state replayed, the transaction prelude reopened, and only then the
-// statement runs -- and arming on each of those let one cancellation send
-// a second Cancel. The context is an identity here, never waited on: it
-// says which statement a pump belongs to.
-func (e *Executor) beginStatement(ctx context.Context) {
+// beginStatement arms the backend cancel for a statement, once, and returns
+// the statement's number. A statement pumps more than once -- the backend is
+// acquired, the session state replayed, the transaction prelude reopened,
+// and only then the statement runs -- and arming on each of those let one
+// cancellation send a second Cancel. The context is an identity here, never
+// waited on: it says which statement a pump belongs to.
+func (e *Executor) beginStatement(ctx context.Context) uint64 {
 	e.cancelMu.Lock()
 	defer e.cancelMu.Unlock()
-	if e.cancelFor != ctx {
-		e.cancelFor = ctx
-		e.cancelSent.Store(false)
-	}
+	n := e.enterStatementLocked(ctx)
 	if e.conn != nil {
 		e.noteCancelTargetLocked(e.conn.client)
 	}
+	return n
 }
 
-func (e *Executor) cancelBackend(ctx context.Context) {
+// enterStatement numbers the statement ctx belongs to. Every executor entry
+// that can reach a pooler calls it first, so the requests a statement sends
+// before its first pump already carry its number.
+func (e *Executor) enterStatement(ctx context.Context) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	e.enterStatementLocked(ctx)
+}
+
+func (e *Executor) enterStatementLocked(ctx context.Context) uint64 {
+	if e.cancelFor != ctx {
+		e.cancelFor = ctx
+		e.statement.Add(1)
+		e.cancelSent.Store(false)
+	}
+	return e.statement.Load()
+}
+
+// cancelStatement asks the poolers to interrupt statement n. A cancel for a
+// statement that has already ended is dropped here, and one that ends while
+// the Cancel is on its way is dropped by the pooler, which has by then seen
+// the next statement's number: without either, the cancel landed on
+// whatever the session ran next.
+func (e *Executor) cancelStatement(ctx context.Context, n uint64) {
 	// A cancel that arrives once every participant has prepared has nothing
 	// left to act on. Sending it anyway can interrupt the COMMIT PREPARED or
 	// ROLLBACK PREPARED that follows.
 	if e.uncancellable.Load() {
 		return
 	}
-	if !e.cancelSent.CompareAndSwap(false, true) {
+	e.cancelMu.Lock()
+	// With no pooler to send to yet -- the statement's request is on its
+	// way but its pump has not recorded the stream -- nothing is sent, and
+	// the statement's one cancel must not be spent on it: the pump's own
+	// cancel, a moment later, is the one that can reach the backend.
+	if n != e.statement.Load() || len(e.cancelTo) == 0 || !e.cancelSent.CompareAndSwap(false, true) {
+		e.cancelMu.Unlock()
 		return
 	}
-	e.cancelMu.Lock()
 	targets := append([]pgshardv1.PoolerClient(nil), e.cancelTo...)
 	e.cancelMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, releaseTimeout)
 	defer cancel()
 	for _, client := range targets {
-		if _, err := client.Cancel(cctx, &pgshardv1.CancelRequest{SessionId: e.sid}); err != nil {
+		if _, err := client.Cancel(cctx, &pgshardv1.CancelRequest{SessionId: e.sid, Statement: n}); err != nil {
 			e.r.cfg.Logger.Warn("cancel failed", "session", e.sid, "err", err)
 		}
 	}
@@ -2485,10 +2525,10 @@ func (e *Executor) release(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return releaseRPC(ctx, client, e.sid)
+	return releaseRPC(ctx, client, e.sid, e.statement.Load())
 }
 
-func releaseRPC(ctx context.Context, client pgshardv1.PoolerClient, sid string) error {
+func releaseRPC(ctx context.Context, client pgshardv1.PoolerClient, sid string, statement uint64) error {
 	rctx, cancel := context.WithTimeout(ctx, releaseTimeout)
 	defer cancel()
 	// One channel. Release reports nothing in its response -- a session the
@@ -2496,7 +2536,7 @@ func releaseRPC(ctx context.Context, client pgshardv1.PoolerClient, sid string) 
 	// call itself, and it arrives as a gRPC status. The branch that used to
 	// read an embedded error could never run, which made the release path
 	// look like it handled a case it did not.
-	if _, err := client.Release(rctx, &pgshardv1.ReleaseRequest{SessionId: sid}); err != nil {
+	if _, err := client.Release(rctx, &pgshardv1.ReleaseRequest{SessionId: sid, Statement: statement}); err != nil {
 		return pgwire.Errorf(codeConnectionFailure, "pooler release failed: %v", err)
 	}
 	return nil
@@ -2513,7 +2553,9 @@ func (e *Executor) Release() {
 	}
 	if pinned {
 		if client, err := e.client(); err == nil {
-			_ = releaseRPC(context.Background(), client, e.sid)
+			// Unnumbered: the session is over, so there is no later
+			// reservation this could be mistaken for.
+			_ = releaseRPC(context.Background(), client, e.sid, 0)
 		}
 	}
 	e.cancel()

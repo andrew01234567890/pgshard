@@ -712,8 +712,7 @@ func TestOneCancelPerStatementAcrossPumps(t *testing.T) {
 	defer cancel()
 	// Every pump of one statement arms it once between them.
 	for range 4 {
-		e.beginStatement(stmt)
-		e.cancelBackend(context.Background())
+		e.cancelStatement(context.Background(), e.beginStatement(stmt))
 	}
 	if n := len(fp.cancelled()); n != 1 {
 		t.Errorf("one statement sent %d cancels; the pooler cancels by session, so the extras land on the next statement", n)
@@ -722,8 +721,7 @@ func TestOneCancelPerStatementAcrossPumps(t *testing.T) {
 	// The next statement is cancellable in its own right.
 	next, cancelNext := context.WithCancel(context.Background())
 	defer cancelNext()
-	e.beginStatement(next)
-	e.cancelBackend(context.Background())
+	e.cancelStatement(context.Background(), e.beginStatement(next))
 	if n := len(fp.cancelled()); n != 2 {
 		t.Errorf("after a second statement: %d cancels, want 2", n)
 	}
