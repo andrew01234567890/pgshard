@@ -169,6 +169,25 @@ func TestAnUnidentifiableSourceIsRewoundRatherThanTrusted(t *testing.T) {
 	}
 }
 
+// TestAnUnreadableMarkerIsRewoundRather: a marker that cannot be read is no
+// better evidence than none, and failing the rejoin over it would fail every
+// retry the same way.
+func TestAnUnreadableMarkerIsRewoundRather(t *testing.T) {
+	in := newTestInstance(t)
+	if err := os.Mkdir(filepath.Join(in.cfg.PGData, rewoundMarker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	in.sourceIdentityFn = func(context.Context, string) (string, error) { return "7384/00000002", nil }
+	rewinds := 0
+	in.rewindFn = func(context.Context, string) error { rewinds++; return nil }
+	if err := in.follow(context.Background(), "host=pg-rw"); err != nil && rewinds == 0 {
+		t.Fatalf("an unreadable marker failed the rejoin before it rewound: %v", err)
+	}
+	if rewinds != 1 {
+		t.Fatalf("pg_rewind ran %d times; an unreadable marker must mean rewind", rewinds)
+	}
+}
+
 // TestAFailedStartKeepsTheRewindMarker: the marker is spent only once
 // postgres has come up on the rewound directory. A start that fails leaves
 // nothing run on it, so the retry must still skip the rewind.

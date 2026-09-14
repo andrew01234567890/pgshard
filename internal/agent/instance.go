@@ -575,12 +575,21 @@ func (in *Instance) sourceIdentity(ctx context.Context, source string) (string, 
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	var id string
-	if err := conn.QueryRow(ctx, `SELECT (SELECT system_identifier FROM pg_control_system())::text || '/' ||
-		substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)`).Scan(&id); err != nil {
+	if err := conn.QueryRow(ctx, sourceIdentityQuery).Scan(&id); err != nil {
 		return "", err
 	}
 	return id, nil
 }
+
+// sourceIdentityQuery and msgUnidentifiedSource are shared with the
+// integration test, which checks the query against a real primary and fails
+// a real rejoin that logged the message: a copy of either in the test would
+// drift from the one that runs and keep passing.
+const (
+	sourceIdentityQuery = `SELECT (SELECT system_identifier FROM pg_control_system())::text || '/' ||
+		substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)`
+	msgUnidentifiedSource = "could not identify the rejoin source; rewinding rather than trusting a marker"
+)
 
 func (in *Instance) clearRewound() error {
 	err := os.Remove(filepath.Join(in.cfg.PGData, rewoundMarker))
@@ -691,17 +700,28 @@ func (in *Instance) follow(ctx context.Context, source string) error {
 	// was on, read just before the rewind, and a retry reuses the rewind
 	// only if the server behind the Service still reports both. A promotion
 	// always moves the timeline.
+	//
+	// The identity is read before pg_rewind, which dials the Service itself.
+	// A failover between the two leaves the marker naming the older server,
+	// and the retry then rewinds again: the safe direction. The reverse --
+	// the marker naming a newer server than pg_rewind used -- needs the
+	// Service to route two consecutive dials to two live primaries, which
+	// fencing already exists to prevent and which a bare pg_rewind would be
+	// exposed to just the same.
 	identity, err := in.sourceIdentityFn(ctx, source)
 	if err != nil {
 		// Not knowing is not a reason to skip the rewind. pg_rewind needs
 		// the same source, and its failure path is the one that is safe.
-		in.log.Warn("could not identify the rejoin source; rewinding rather than trusting a marker", "err", err)
+		in.log.Warn(msgUnidentifiedSource, "err", err)
 		identity = ""
 	}
 	rewound := false
 	if identity != "" {
 		if rewound, err = in.rewoundAgainst(identity); err != nil {
-			return err
+			// Likewise: a marker that cannot be read is not one to trust,
+			// and failing the rejoin over it would fail every retry too.
+			in.log.Warn("could not read the rewind marker; rewinding", "err", err)
+			rewound = false
 		}
 	}
 	recloned := false

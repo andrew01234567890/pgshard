@@ -419,7 +419,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	// The identity a rewind marker is keyed on, asked of a real primary: a
 	// query that stopped working would turn every marker into a rewind
 	// quietly rather than fail anything.
-	if id := s.psql(`SELECT (SELECT system_identifier FROM pg_control_system())::text || '/' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)`); !regexp.MustCompile(`^[0-9]+/[0-9A-F]{8}$`).MatchString(id) {
+	if id := s.psql(sourceIdentityQuery); !regexp.MustCompile(`^[0-9]+/[0-9A-F]{8}$`).MatchString(id) {
 		t.Fatalf("source identity %q is not system_identifier/timeline", id)
 	}
 	if resp.GetEpoch() != 1 || resp.GetTimeline() != 2 {
@@ -490,7 +490,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if strings.Contains(p.logs(), "pg_rewind failed") {
 		t.Fatalf("demote fell back to reclone; expected rewind\n%s", p.logs())
 	}
-	if full, _ := exec.Command("docker", "logs", p.container).CombinedOutput(); strings.Contains(string(full), "could not identify the rejoin source") {
+	if strings.Contains(docker(t, "logs", p.container), msgUnidentifiedSource) {
 		t.Fatalf("the rejoin could not identify its source, so a retry would never reuse a completed rewind\n%s", p.logs())
 	}
 	// p.status() below is an RPC, and the agent restarted to rewind.
