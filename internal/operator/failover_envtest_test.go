@@ -488,6 +488,14 @@ func TestFailoverDoesNotPromoteBesideAPrimaryThatIsOnlyFull(t *testing.T) {
 	if h := ptr.Deref(lease.Spec.HolderIdentity, ""); h == FenceHolder {
 		t.Fatalf("an abandoned failover left the fence on a live primary's Lease, holder %q", h)
 	}
+	// And the failover delay starts over, rather than letting the next pass
+	// that catches the primary's Status at a bad moment fence it at once.
+	r.mu.Lock()
+	_, stillTiming := r.unhealthySince[Groups(c)[1].Prefix()]
+	r.mu.Unlock()
+	if stillTiming {
+		t.Fatal("the failover delay was left running after the failover was abandoned for a live primary")
+	}
 	fa.mu.Lock()
 	defer fa.mu.Unlock()
 	if len(fa.promotes) != before {
