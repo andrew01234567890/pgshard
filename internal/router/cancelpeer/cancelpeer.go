@@ -145,10 +145,11 @@ func (f *Forwarder) discovered(ctx context.Context) []string {
 
 // Forward delivers key to its targets, best effort and rate limited.
 func (f *Forwarder) Forward(ctx context.Context, key pgwire.CancelKey) {
-	targets := f.Targets(ctx, key)
-	if len(targets) == 0 {
+	if id, ok := InstanceOf(key); ok && id == f.cfg.Self {
 		return
 	}
+	// The token first: finding the peers can resolve DNS, and a flood of
+	// keys that match nothing must not buy one lookup each.
 	if !f.limiter.take(time.Now()) {
 		f.mu.Lock()
 		f.dropped++
@@ -156,6 +157,7 @@ func (f *Forwarder) Forward(ctx context.Context, key pgwire.CancelKey) {
 		f.cfg.Logger.Warn("peer cancel dropped by rate limit", "pid", key.PID)
 		return
 	}
+	targets := f.Targets(ctx, key)
 	req := &pgshardv1.RouterCancelRequest{Pid: key.PID, Secret: key.Secret}
 	for _, addr := range targets {
 		client, err := f.cfg.Dial(addr)

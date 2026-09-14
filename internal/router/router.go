@@ -364,13 +364,18 @@ func (r *Router) CancelHandler(srv *pgwire.Server) pgwire.CancelHandler {
 // CancelLocal cancels the local session key names, if any, and reports
 // whether one matched. Peer routers call this for forwarded keys.
 func (r *Router) CancelLocal(ctx context.Context, srv *pgwire.Server, key pgwire.CancelKey) bool {
+	// The session is found by its key first, without cancelling anything:
+	// the statement number has to be read BEFORE the statement is
+	// cancelled. Read after, it could belong to a statement that began
+	// since, and the cancel would be forwarded to that one.
+	id, ok := srv.SessionForCancelKey(key)
+	if !ok {
+		return false
+	}
 	r.mu.Lock()
-	e := r.sessions[uint64(key.PID)]
+	e := r.sessions[id]
 	localCancelled := r.localCancelled
 	r.mu.Unlock()
-	// The number is read BEFORE the statement is cancelled. Read after, it
-	// could belong to a statement that began since, and the cancel would be
-	// forwarded to that one.
 	var n uint64
 	if e != nil {
 		n = e.statement.Load()

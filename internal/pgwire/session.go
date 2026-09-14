@@ -746,7 +746,7 @@ func (s *session) startup(ctx context.Context) error {
 		s.terminate(Errorf(CodeInvalidPassword, "password authentication failed"))
 		return errors.New("session revoked during authentication")
 	}
-	key, err := s.server.newCancelKey(s.id, s.protocolVersion)
+	key, err := s.server.newCancelKey(s, s.protocolVersion)
 	if err != nil {
 		return err
 	}
