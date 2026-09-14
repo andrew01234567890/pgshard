@@ -147,9 +147,10 @@ type Executor struct {
 	// land on whatever that backend is running by the time it arrives.
 	cancelSent atomic.Bool
 	cancelFor  context.Context
-	// statement numbers the client statement cancelFor belongs to, counting
-	// up. It travels on every request, Cancel, Reserve and Release the
-	// session sends. A cancel is sent from other goroutines and can outlive
+	// statement numbers the pgwire message cancelFor belongs to, counting
+	// up: a simple query gets one number, and so does each extended-protocol
+	// message, so the numbers a batch's requests carry can skip. It travels
+	// on every request, Cancel, Reserve and Release the session sends. A cancel is sent from other goroutines and can outlive
 	// the statement it was fired for; the number is how the router, and
 	// then the pooler, tell it from a cancel for the statement running now.
 	// Written under cancelMu.
@@ -2494,7 +2495,11 @@ func (e *Executor) cancelStatement(ctx context.Context, n uint64) {
 		return
 	}
 	e.cancelMu.Lock()
-	if n != e.statement.Load() || !e.cancelSent.CompareAndSwap(false, true) {
+	// With no pooler to send to yet -- the statement's request is on its
+	// way but its pump has not recorded the stream -- nothing is sent, and
+	// the statement's one cancel must not be spent on it: the pump's own
+	// cancel, a moment later, is the one that can reach the backend.
+	if n != e.statement.Load() || len(e.cancelTo) == 0 || !e.cancelSent.CompareAndSwap(false, true) {
 		e.cancelMu.Unlock()
 		return
 	}

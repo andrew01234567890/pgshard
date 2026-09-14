@@ -129,3 +129,46 @@ func TestStatementsAreNumberedOnTheWire(t *testing.T) {
 		t.Fatalf("Cancel carried %v, want the number of the statement it cancelled, %d", cancels, sleep)
 	}
 }
+
+// TestACancelBeforeAnyPoolerDoesNotSpendTheStatementsCancel: a statement
+// gets one Cancel. A cancel request that lands after the statement's request
+// has been sent but before its pump recorded the pooler has nowhere to send
+// it -- and if that still counted as the statement's cancel, the pump's own,
+// which could reach the backend, was refused as a duplicate and the statement
+// ran on until the cancel grace gave up on it.
+func TestACancelBeforeAnyPoolerDoesNotSpendTheStatementsCancel(t *testing.T) {
+	fp := newFakePooler()
+	h := newHarnessWith(t, fp, startFakePooler(t, fp), nil)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	if _, err := conn.Exec(context.Background(), "select 1"); err != nil {
+		t.Fatal(err)
+	}
+	h.r.mu.Lock()
+	var e *Executor
+	for _, live := range h.r.sessions {
+		e = live
+		break
+	}
+	h.r.mu.Unlock()
+	if e == nil {
+		t.Fatal("no executor for the session")
+	}
+
+	e.forgetCancelTargets()
+	stmt, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.enterStatement(stmt)
+	n := e.statement.Load()
+	before := len(fp.cancelled())
+	e.cancelStatement(context.Background(), n)
+
+	client, err := e.client()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.noteCancelTarget(client)
+	e.cancelStatement(context.Background(), n)
+	if got := len(fp.cancelled()) - before; got != 1 {
+		t.Fatalf("%d Cancel(s) once the pooler was known, want 1: the cancel that had nowhere to go used up the statement's one", got)
+	}
+}

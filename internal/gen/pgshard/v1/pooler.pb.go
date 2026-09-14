@@ -1094,9 +1094,10 @@ type ExecuteRequest struct {
 	// the same way packed_rows is, so a pooler that predates the field
 	// answers the old way and the two roll independently.
 	BatchedRows bool `protobuf:"varint,6,opt,name=batched_rows,json=batchedRows,proto3" json:"batched_rows,omitempty"`
-	// Statement numbers the client statement this message belongs to,
-	// counting up within the router session. The pooler keeps the highest it
-	// has seen, which is what lets it tell a Cancel or Release sent for an
+	// Statement numbers what the router was handling when it sent this
+	// message -- a simple query, or one extended-protocol message such as the
+	// Sync that runs a batch -- counting up within the router session and not
+	// necessarily by one. The pooler keeps the highest it has seen, which is what lets it tell a Cancel or Release sent for an
 	// earlier statement from one for the statement running now. Zero means
 	// the router does not number its statements.
 	Statement uint64 `protobuf:"varint,7,opt,name=statement,proto3" json:"statement,omitempty"`

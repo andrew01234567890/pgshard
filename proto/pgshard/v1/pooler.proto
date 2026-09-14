@@ -188,9 +188,10 @@ message ExecuteRequest {
   // the same way packed_rows is, so a pooler that predates the field
   // answers the old way and the two roll independently.
   bool batched_rows = 6;
-  // Statement numbers the client statement this message belongs to,
-  // counting up within the router session. The pooler keeps the highest it
-  // has seen, which is what lets it tell a Cancel or Release sent for an
+  // Statement numbers what the router was handling when it sent this
+  // message -- a simple query, or one extended-protocol message such as the
+  // Sync that runs a batch -- counting up within the router session and not
+  // necessarily by one. The pooler keeps the highest it has seen, which is what lets it tell a Cancel or Release sent for an
   // earlier statement from one for the statement running now. Zero means
   // the router does not number its statements.
   uint64 statement = 7;
