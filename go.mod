@@ -1,13 +1,12 @@
 module github.com/andrew01234567890/pgshard
 
-go 1.26.0
+go 1.27.0
 
-toolchain go1.26.6
-
-require github.com/jackc/pgx/v5 v5.11.0
+toolchain go1.27.1
 
 require (
 	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/robfig/cron/v3 v3.0.1
@@ -19,6 +18,7 @@ require (
 	k8s.io/apiextensions-apiserver v0.37.0
 	k8s.io/apimachinery v0.37.0
 	k8s.io/client-go v0.37.0
+	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 	sigs.k8s.io/controller-runtime v0.25.0
 	sigs.k8s.io/yaml v1.6.0
 )
@@ -29,10 +29,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/evanphx/json-patch/v5 v5.9.11 // indirect
-	k8s.io/utils v0.0.0-20260626114624-be93311217bd
-)
-
-require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
