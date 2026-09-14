@@ -35,7 +35,22 @@ jobs:
   benchstat:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The comparison runs the whole suite TWICE -- once on a worktree of
+    # the base ref, once on HEAD -- at PERF_COUNT=10, over four package
+    # trees. That is about 29 minutes on a hosted runner, and it used to
+    # sit under a 30 minute limit: the two most recent successful runs
+    # finished with 17 and 31 seconds to spare, and one PR timed out at
+    # 30m08s having found nothing. A gate whose normal duration IS its
+    # timeout reports "fail" for reasons that have nothing to do with the
+    # benchmarks.
+    #
+    # Doubled rather than trimmed because the run is the right size: the
+    # package list beside benchstat.sh was widened on purpose, to cover
+    # the twelve benchmarks that live next to the code they measure
+    # rather than only the fourteen in ./test/perf. Cutting PERF_COUNT
+    # instead would buy the time back out of the statistical power the
+    # comparison rests on.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
