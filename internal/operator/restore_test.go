@@ -624,8 +624,8 @@ func TestRestoreRefusesABarrierWithoutEveryGroup(t *testing.T) {
 	cl := restoreClient(t, source, newPolicy(), b, rs, superuserSecret("old"))
 	r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Barriers: &fakeCertifier{certified: true, groups: []string{"catalog", "shard-0"}},
 		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
-	if _, got := reconcileRestore(t, r, "r1"); got.Status.Phase == pgshardv1alpha1.RestorePhaseFailed {
-		t.Fatalf("an upgraded catalog's restore was refused: %s", got.Status.Error)
+	if _, got := reconcileRestore(t, r, "r1"); got.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
+		t.Fatalf("an upgraded catalog's restore did not start: phase %q, %s", got.Status.Phase, got.Status.Error)
 	}
 }
 
