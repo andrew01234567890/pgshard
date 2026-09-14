@@ -368,6 +368,15 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 		return err
 	}
 	if state == catalog.ShardSetServing {
+		// Resuming a rollback that already flipped back. Its pause is
+		// normally still standing -- ALTER SYSTEM persists -- but not always:
+		// a flip back whose commit landed and whose acknowledgement did not
+		// took the deferred unpause on the way out. The targets are the
+		// retired set now, so raising the pause again costs nothing and
+		// keeps it up until Complete's tail replaces it.
+		if err := o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, true); err != nil {
+			return err
+		}
 		return o.releaseRollback(ctx)
 	}
 	// Claim the fence on both sets, as the forward cutover does: a fence

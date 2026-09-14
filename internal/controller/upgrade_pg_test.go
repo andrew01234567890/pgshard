@@ -540,6 +540,30 @@ func TestARollbackLeavesTheTargetsPausedForComplete(t *testing.T) {
 		}
 	}
 
+	// A resume after the flip back: the controller's flip-back commit landed
+	// and its acknowledgement did not, so the deferred unpause ran and the
+	// next pass takes Rollback's already-serving path. That path has to put
+	// the pause back, or Complete runs with the targets writable.
+	if err := ops.pauseSetClaimed(ctx, ops.wf.set, ops.wf.ids, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, func() bool { return write() == nil }, "the simulated lost acknowledgement did not leave the targets writable")
+	if err := ops.Rollback(ctx); err != nil {
+		t.Fatalf("resumed rollback: %v", err)
+	}
+	{
+		var pgErr *pgconn.PgError
+		if err := write(); !errors.As(err, &pgErr) || pgErr.Code != "25006" {
+			t.Fatalf("a resumed rollback left the targets writable going into Complete (err %v)", err)
+		}
+	}
+
+	// The pause is this run's, claimed, going into Complete -- so the claim
+	// being gone afterwards shows Complete abandoned it, not that there never
+	// was one.
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'g2' AND write_paused_by = $1::uuid`, id); n == 0 {
+		t.Fatal("the targets carry no pause claim from this run before Complete, so the check after it proves nothing")
+	}
 	if err := ops.Complete(ctx); err != nil {
 		t.Fatal(err)
 	}
