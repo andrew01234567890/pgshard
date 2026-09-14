@@ -794,8 +794,10 @@ func tableExists(ctx context.Context, conn ShardConn, schema, name string) (bool
 // this workflow's own artifact. Including the workflow id makes it unguessable,
 // so a user table that merely shares the __pgshard_new / __pgshard_old name (or
 // even carries the bare prefix) is never adopted, overwritten or dropped.
+const placementMarkerPrefix = "pgshard:placement:"
+
 func (wf *placementWorkflow) placementMarker() string {
-	return "pgshard:placement:" + wf.id
+	return placementMarkerPrefix + wf.id
 }
 
 // ensureShadows creates the shadow table on every shard of the new
@@ -882,6 +884,25 @@ func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker
 	return true, nil
 }
 
+// finishedPlacementOf returns the state of the finished placement workflow
+// of wf's table that a marker comment names, or "" when it names none -- a
+// comment that only looks like a marker says nothing about who left the
+// table.
+func (p *Placer) finishedPlacementOf(ctx context.Context, wf *placementWorkflow, comment *string) (string, error) {
+	if comment == nil || !strings.HasPrefix(*comment, placementMarkerPrefix) {
+		return "", nil
+	}
+	var state string
+	err := p.Pool.QueryRow(ctx, `SELECT state FROM pgshard.workflows
+		WHERE id::text = $1 AND kind = $2 AND spec->>'database' = $3 AND spec->>'schema_name' = $4 AND spec->>'table_name' = $5
+		  AND NOT (state = ANY($6))`,
+		strings.TrimPrefix(*comment, placementMarkerPrefix), KindTablePlacement, wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName, activeStates).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return state, err
+}
+
 func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error {
 	var ddl []string
 	for _, t := range wf.rt.Holders() {
@@ -903,11 +924,18 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 				// it; a same-named user table, or an artifact left by another
 				// workflow, does not match the marker and must not be written
 				// into.
-				ours, err := isPlacementArtifact(ctx, conn, wf.spec.SchemaName, wf.shadow(), marker)
+				comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.shadow())
 				if err != nil {
 					return err
 				}
-				if !ours {
+				if comment == nil || *comment != marker {
+					if left, err := p.finishedPlacementOf(ctx, wf, comment); err != nil {
+						return err
+					} else if left != "" {
+						return fatal("a table named %s was left by placement workflow %s of %s, which ended %s without dropping it; "+
+							"drop it, then save %s's row in pgshard.tables again to retry the move",
+							wf.shape.qualified(wf.shadow()), strings.TrimPrefix(*comment, placementMarkerPrefix), wf.spec.table(), left, wf.spec.table())
+					}
 					// The marker is how a shadow is known to be this
 					// workflow's. A table without one is either a user's,
 					// or -- for a workflow that was already running when

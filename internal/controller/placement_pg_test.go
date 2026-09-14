@@ -550,6 +550,96 @@ func TestPlacementBackslashKeysAndLateWriteOnPostgres(t *testing.T) {
 	f.driveUntil("notes", time.Minute, StagePlacementRetiring)
 }
 
+// TestAFailedMoveDropsItsShadowsSoTheNextMoveStarts: a move that fails after
+// building its shadows, before any shard began its swap, drops them. Saving
+// the table's row again then moves the table; before, the new workflow
+// refused to build over a shadow the failed one had marked, and only
+// dropping a pgshard artifact by hand let it start (PGS-839).
+func TestAFailedMoveDropsItsShadowsSoTheNextMoveStarts(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE ledger (id bigint PRIMARY KEY, v text)`)
+	mustExec(t, home, `INSERT INTO ledger SELECT g, 'v' || g FROM generate_series(1, 50) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'ledger', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'id' WHERE table_name = 'ledger'`)
+	f.reconcile()
+	failed, _ := f.driveUntil("ledger", 2*time.Minute, StagePlacementSwapping)
+
+	shadows := func() int64 {
+		var n int64
+		for s := range int32(2) {
+			n += queryOne[int64](t, f.app(s), `SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = $1`, "ledger"+ShadowSuffix)
+		}
+		return n
+	}
+	if shadows() != 2 {
+		t.Fatalf("%d shadows before the failure, want one per shard", shadows())
+	}
+	// A shadow short of a row fails the verification that precedes the
+	// first swap.
+	mustExec(t, f.app(f.shardOf(int64(7))), `DELETE FROM ledger`+ShadowSuffix+` WHERE id = 7`)
+	if _, err := f.placer.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if id, state, _, msg := f.workflow("ledger"); id != failed || state != StateFailed || !strings.Contains(msg, "verification") {
+		t.Fatalf("workflow %s is %s (%q), want %s failed by the verification", id, state, msg, failed)
+	}
+	if n := shadows(); n != 0 {
+		t.Fatalf("%d shadow(s) left behind by the failed move", n)
+	}
+
+	retry := func() string {
+		t.Helper()
+		mustExec(t, f.catalog, `UPDATE pgshard.tables SET shard_key = 'id' WHERE table_name = 'ledger'`)
+		if res := f.reconcile(); res.WorkflowsCreated != 1 {
+			t.Fatalf("saving the row again did not start a move: %+v", res)
+		}
+		id, _, _, _ := f.workflow("ledger")
+		return id
+	}
+
+	// A shard the failed move could not reach keeps that move's shadow. The
+	// next move refuses to build over it, and says which workflow left it
+	// instead of suggesting it may be the user's.
+	other := f.app(1)
+	mustExec(t, other, `CREATE TABLE ledger`+ShadowSuffix+` (id bigint)`)
+	mustExec(t, other, `COMMENT ON TABLE ledger`+ShadowSuffix+` IS 'pgshard:placement:`+failed+`'`)
+	refused := retry()
+	for range 20 {
+		if _, err := f.placer.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if _, state, _, _ := f.workflow("ledger"); state == StateFailed {
+			break
+		}
+	}
+	if id, state, _, msg := f.workflow("ledger"); id != refused || state != StateFailed ||
+		!strings.Contains(msg, "left by placement workflow "+failed+" of app.public.ledger, which ended failed") || !strings.Contains(msg, "row in pgshard.tables again") {
+		t.Fatalf("workflow %s is %s (%q), want %s refused naming %s", id, state, msg, refused, failed)
+	}
+	if n := queryOne[int64](t, other, `SELECT count(*) FROM pg_tables WHERE tablename = $1`, "ledger"+ShadowSuffix); n != 1 {
+		t.Fatalf("the refused move dropped a shadow it did not mark: %d left", n)
+	}
+	if n := shadows(); n != 1 {
+		t.Fatalf("%d shadows after the refused move, want only the one it did not mark", n)
+	}
+
+	mustExec(t, other, `DROP TABLE ledger`+ShadowSuffix)
+	if id := retry(); id == failed || id == refused {
+		t.Fatal("a finished workflow was driven again instead of a new one")
+	}
+	f.driveUntil("ledger", 2*time.Minute, StagePlacementRetiring)
+	var rows int64
+	for s := range int32(2) {
+		rows += queryOne[int64](t, f.app(s), `SELECT count(*) FROM ledger`)
+	}
+	if rows != 50 {
+		t.Fatalf("the retried move placed %d of 50 rows", rows)
+	}
+}
+
 // TestPlacementVerifyHolderShadowsOnPostgres: verification is keyed to the
 // holders of the new placement, not the sources. A sharded-to-unsharded
 // move (where a source holds no shadow) must still verify and flag a
