@@ -161,6 +161,20 @@ type Executor struct {
 	// the decision-log write itself -- a catalog fsync and a synchronous
 	// standby round trip -- as a window where the cancel was forwarded and
 	// could land on the COMMIT PREPARED that followed.
+	//
+	// This narrows that window and does not close it. A cancel that read
+	// the flag as false during PREPARE and is still in flight when it goes
+	// up is delivered anyway: the pooler checks only that the backend is
+	// still this session's, and PostgreSQL acts on the signal if it arrives
+	// once COMMIT PREPARED is running. Closing it needs the pooler to scope
+	// a cancel to a statement.
+	//
+	// It also suppresses the cancel that the decision deadline itself fires
+	// through onCancel. For COMMIT PREPARED that was already the behaviour;
+	// for a ROLLBACK PREPARED stuck behind a departed synchronous standby it
+	// is new, and the pooler backend then waits for PostgreSQL rather than
+	// being signalled. The router side stays bounded by the deadline plus
+	// the cancel grace.
 	uncancellable atomic.Bool
 
 	// cancelMu guards cancelTo, the poolers a cancel must reach: the streams
@@ -749,6 +763,13 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.staged, e.stagedMark = nil, 0
 		e.txnPrelude, e.txnTouched = nil, false
 		e.txnOnBackend, e.txnPreFence = false, false
+		// finishTxn is what lowers uncancellable, and a panic skips it. Left
+		// up, every later cancel on this session would be swallowed: the
+		// client waits out the cancel grace and gets 08006 instead of 57014,
+		// for the rest of the session and with nothing logged. The cancel
+		// targets are the dropped stream's, so they go too.
+		e.uncancellable.Store(false)
+		e.forgetCancelTargets()
 		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
 	}()
 	return e.nameFence(e.asWritePause(run()))

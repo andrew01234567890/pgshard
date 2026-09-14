@@ -13,6 +13,8 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/controller"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // fakeDecisionLog records the coordinator's decision-log calls together
@@ -1020,6 +1022,37 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	// context -- the defect -- the wait ends as soon as the cancel lands.
 	// Handed a detached one -- the fix -- nothing cancels it and the wait
 	// times out, which is the point.
+	// The positive control first, on this same connection: without it the
+	// absence asserted below would also hold if this connection's cancel
+	// request were a no-op in the harness -- wrong key, wrong listener,
+	// routed to a peer. A keyed statement runs on one shard through the
+	// executor's own path, so its cancel is forwarded by cancelBackend, the
+	// function under test.
+	sleeper := h.poolers[h.shardOf(t, a)]
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			sleeper.mu.Lock()
+			asleep := len(sleeper.sleeping)
+			sleeper.mu.Unlock()
+			if asleep > 0 {
+				_ = conn.PgConn().CancelRequest(ctx)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	if _, err := conn.Exec(ctx, "select pg_sleep(10) from orders where tenant_id = $1::int8", pgx.QueryExecModeSimpleProtocol, a); sqlstate(err) != "57014" {
+		t.Fatalf("the control statement was not cancelled: %v", err)
+	}
+	baseline := map[int64]int{}
+	for _, sh := range []int64{a, b} {
+		baseline[sh] = len(h.poolers[h.shardOf(t, sh)].cancelled())
+	}
+	if baseline[a] == 0 {
+		t.Fatal("this connection's cancel request reached no participant, so the absence asserted below would prove nothing")
+	}
+
 	var cancelLanded atomic.Bool
 	h.log.onCommit = func(cctx context.Context) {
 		if err := conn.PgConn().CancelRequest(context.Background()); err != nil {
@@ -1045,9 +1078,10 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
 		t.Fatal(err)
 	}
-	// The client is told COMMIT: runQuery returns the step's nil, and the
-	// step succeeded. What matters is what the coordinator did with the
-	// transaction.
+	// The commit's own return is not asserted: the transaction commits, but
+	// the client is told 08006 because the release after it runs on the
+	// cancelled statement context (PGS-814). What this test is about is
+	// what the coordinator did with the transaction.
 	_ = tx.Commit(ctx)
 	if cancelLanded.Load() {
 		t.Error("the decision was written on the statement's own context: a cancel arriving between PREPARE and the decision reaches it")
@@ -1058,7 +1092,7 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	// transaction -- and the hook above held the window open for a second
 	// after the request, far longer than forwarding takes (PGS-794).
 	for _, sh := range []int64{a, b} {
-		if n := len(h.poolers[h.shardOf(t, sh)].cancelled()); n != 0 {
+		if n := len(h.poolers[h.shardOf(t, sh)].cancelled()) - baseline[sh]; n != 0 {
 			t.Errorf("shard %d was sent %d cancel(s) between PREPARE and the decision; one landing on the COMMIT PREPARED that follows leaves the transaction in doubt", h.shardOf(t, sh), n)
 		}
 	}
@@ -1076,28 +1110,4 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	}
 	waitFor(t, 10*time.Second, func() bool { return h.log.preparedCount() == 0 },
 		"participants left prepared after the decision")
-
-	// The positive control, without which the absence above would also
-	// hold if the cancel request were a no-op in this harness -- wrong
-	// listener, routed to a peer, never forwarded. Outside the window a
-	// cancel request must reach a participant.
-	//
-	// On its own connection: the client above is told 08006 for a commit
-	// that succeeded (PGS-814), and the next statement it sends is refused,
-	// which is a separate defect and not what this control is for.
-	shard := h.shardOf(t, a)
-	conn2 := h.connect(t, h.dsn())
-	tx2, err := conn2.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx2.Rollback(ctx) }()
-	if _, err := tx2.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 3)", a); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn2.PgConn().CancelRequest(context.Background()); err != nil {
-		t.Fatalf("cancel request: %v", err)
-	}
-	waitFor(t, 10*time.Second, func() bool { return len(h.poolers[shard].cancelled()) > 0 },
-		"a cancel outside the two-phase window never reached a participant, so the absence asserted above proves nothing")
 }
