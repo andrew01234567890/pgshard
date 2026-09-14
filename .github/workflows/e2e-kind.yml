@@ -244,6 +244,13 @@ jobs:
         id: load_target
         if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true'
         run: hack/kind/load-images.sh "ghcr.io/andrew01234567890/pgshard-postgres:19"
+      - name: Load the object-store images into kind
+        id: load_stores
+        if: matrix.suite == 'backup' && needs.changes.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(hack/ci/objectstore-images.sh)
+          hack/kind/load-registry-images.sh "${images[@]}"
       - name: Run e2e suite
         if: needs.changes.outputs.code == 'true'
         id: run_suite
@@ -286,6 +293,7 @@ jobs:
             load images into kind=${{ steps.load_images.outcome }}
             load controller image into kind=${{ steps.load_controller.outcome }}
             load the target-major image into kind=${{ steps.load_target.outcome }}
+            load the object-store images into kind=${{ steps.load_stores.outcome }}
         # A cell that never reached its tests and one whose tests failed are
         # different findings, and the gate reports both as a red cell. An
         # image registry answering 403, or a module proxy dropping a stream,
