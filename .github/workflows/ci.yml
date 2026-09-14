@@ -161,6 +161,13 @@ jobs:
           load: true
         env:
           CI: "true"
+      - name: Pull the MinIO image the backup suites run
+        # With retries, before the suites: their docker run pulls it once,
+        # and one 502 from quay.io failed the job (PGS-842).
+        run: |
+          set -euo pipefail
+          minio="$(hack/ci/objectstore-images.sh | grep '^quay.io/minio/minio:')"
+          hack/ci/retry.sh -n 5 -d 30 -- docker pull "$minio"
       - run: make integration
 
   secret-scan:

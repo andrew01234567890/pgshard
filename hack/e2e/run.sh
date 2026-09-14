@@ -29,7 +29,7 @@ case "$suite" in
 # rather than filtering by test name keeps that from recurring.
 smoke)         args=(./test/e2e/); needs="" ;;
 operator)      args=(-timeout 70m ./test/e2e/operator/...); needs="base controller" ;;
-backup)        args=(-timeout 70m ./test/e2e/backup/...); needs="base controller" ;;
+backup)        args=(-timeout 70m ./test/e2e/backup/...); needs="base controller stores" ;;
 reshard)       args=(-timeout 50m -skip 'TestReshardSplitUnderLoad|TestReshardMergeUnderLoad' ./test/e2e/reshard/...); needs="base controller" ;;
 reshard-split) args=(-timeout 110m -run TestReshardSplitUnderLoad ./test/e2e/reshard/...); needs="base controller" ;;
 reshard-merge) args=(-timeout 110m -run TestReshardMergeUnderLoad ./test/e2e/reshard/...); needs="base controller" ;;
@@ -66,6 +66,10 @@ if [[ "$needs" == *controller* ]]; then
 fi
 if [[ "$needs" == *target-major* ]]; then
 	hack/kind/load-images.sh ghcr.io/andrew01234567890/pgshard-postgres:19
+fi
+if [[ "$needs" == *stores* ]]; then
+	mapfile -t stores < <(hack/ci/objectstore-images.sh)
+	hack/kind/load-registry-images.sh "${stores[@]}"
 fi
 
 echo "==> $suite"
