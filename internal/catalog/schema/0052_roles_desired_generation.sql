@@ -18,7 +18,11 @@
 --
 -- Written as a standard SQL body (RETURN, not a quoted string) so the four
 -- tables are recorded in pg_depend: the function then cannot outlive a
--- table it reads, and a test can ask what it reads.
+-- table it reads, and a test can ask what it reads. That has a price a
+-- later migration pays and should know about: ALTER COLUMN desired_generation
+-- TYPE on any of the four is refused while this function exists, and a
+-- CASCADE drop of one of them takes the function with it under a NOTICE.
+-- Either way, drop and recreate the function in the same migration.
 
 SET LOCAL ROLE pgshard_system;
 

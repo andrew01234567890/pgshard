@@ -44,7 +44,7 @@ func TestTheRolesGenerationCountsEveryRolesTable(t *testing.T) {
 		  FROM pg_class c
 		  JOIN pg_namespace n ON n.oid = c.relnamespace
 		  JOIN pg_attribute a ON a.attrelid = c.oid
-		 WHERE n.nspname = 'pgshard' AND c.relkind = 'r'
+		 WHERE n.nspname = 'pgshard' AND c.relkind IN ('r', 'p')
 		   AND a.attname = 'desired_generation' AND NOT a.attisdropped
 		 ORDER BY c.relname`)
 	if err != nil {

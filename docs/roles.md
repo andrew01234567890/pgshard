@@ -73,6 +73,11 @@ materializes it.
 `--verify-roles-interval` (15s) on the leader and before the applier's
 passes between migrations:
 
+The desired generation here is `pgshard.roles_desired_generation()`: the
+max of `desired_generation` over all four tables the materializer reads
+(`roles`, `role_members`, `grants`, `role_settings`), which one sequence
+stamps.
+
 1. **Groups behind the desired generation** — a new shard in
    `pgshard.shard_status` (a resharding target), the catalog, or every group
    after a role migration completed — are *materialized*:
