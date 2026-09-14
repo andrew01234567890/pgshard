@@ -53,7 +53,15 @@ ARG DATE=unknown
 ENV LDFLAGS="-s -w -X github.com/andrew01234567890/pgshard/internal/buildinfo.Version=${VERSION} -X github.com/andrew01234567890/pgshard/internal/buildinfo.Commit=${COMMIT} -X github.com/andrew01234567890/pgshard/internal/buildinfo.Date=${DATE}"
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# Retried, as Dockerfile.router and Dockerfile.control are: one module-proxy
+# stream error otherwise fails every suite that builds this image.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    for attempt in 1 2 3; do \
+        go mod download && exit 0; \
+        echo "go mod download failed (attempt $attempt), retrying" >&2; \
+        sleep 5; \
+    done; \
+    exit 1
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o /out/pgshard-agent ./cmd/pgshard-agent \
