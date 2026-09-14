@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -95,6 +97,20 @@ func (m *StreamMonitor) Sweep(ctx context.Context) (int, error) {
 				}
 				continue
 			}
+			// Asked once per shard rather than per slot, because a slot
+			// that is missing returns no row to carry it on. A standby's
+			// answer is recorded like any other but may not condemn the
+			// stream: slotsync drops and recreates a synced slot, and its
+			// worker's nap reaches thirty seconds on a quiet cluster, so
+			// "no such slot" from a standby says nothing about the slot.
+			inRecovery, rerr := inRecoveryOn(ctx, conn)
+			if rerr != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("shard %s/%d: %w", sh.Set, sh.ID, rerr)
+				}
+				_ = conn.Close(ctx)
+				continue
+			}
 			for _, st := range inSet {
 				slot := catalog.StreamSlotName(st.Name, groups[sh])
 				row, err := slotStatus(ctx, conn, slot)
@@ -105,7 +121,7 @@ func (m *StreamMonitor) Sweep(ctx context.Context) (int, error) {
 					continue
 				}
 				row.Stream, row.ShardSet, row.ShardID = st.Name, sh.Set, sh.ID
-				if err := catalog.UpsertStreamStatus(ctx, m.Pool, row); err != nil {
+				if err := catalog.UpsertStreamStatus(ctx, m.Pool, row, !inRecovery); err != nil {
 					_ = conn.Close(ctx)
 					return written, err
 				}
@@ -133,6 +149,18 @@ func (m *StreamMonitor) groupNames(ctx context.Context) (map[ShardRef]string, er
 		out[ref] = group
 	}
 	return out, rows.Err()
+}
+
+// inRecoveryOn reports whether the member this connection reached is a
+// standby. Read separately from slotStatus because a slot that is missing
+// returns no row to carry it on, and that is precisely the reading whose
+// trustworthiness this decides.
+func inRecoveryOn(ctx context.Context, conn ShardConn) (bool, error) {
+	rows, err := conn.Query(ctx, `SELECT pg_is_in_recovery()`)
+	if err != nil {
+		return false, err
+	}
+	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
 }
 
 // slotStatus reads one slot; a missing slot reports wal_status "missing".

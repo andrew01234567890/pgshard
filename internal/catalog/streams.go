@@ -118,8 +118,10 @@ func DeleteStream(ctx context.Context, q Execer, name string) error {
 // UpsertStreamStatus records the slot state of a stream on one shard. A
 // slot that cannot be resumed from -- invalidated, or gone -- also marks
 // the stream lost, on the second consecutive sighting: see markStreamLost.
-func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
-	if Unresumable(st.WALStatus) {
+// authoritative says the reading came from a member that is NOT in
+// recovery. Only a primary may condemn a stream: see markStreamLost.
+func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus, authoritative bool) error {
+	if authoritative && Unresumable(st.WALStatus) {
 		if err := markStreamLost(ctx, q, st); err != nil {
 			return err
 		}
@@ -154,15 +156,24 @@ func Unresumable(walStatus string) bool { return walStatus == "lost" || walStatu
 // markStreamLost moves a stream to lost. Called BEFORE the upsert that
 // overwrites this shard's last report, because that report is the evidence.
 //
-// TWO consecutive sightings, for "lost" as well as "missing", and the
-// stored row is the first. Both can be transient on a standby: a -rw
-// Service flip can land a sweep on a member whose synced copy of the slot
-// has not caught up ("missing"), and slotsync can invalidate a synced slot
-// on the standby -- its own max_slot_wal_keep_size, or primary_slot_name
-// reset -- while the slot is perfectly valid on the primary ("lost"), then
-// drop and recreate it on the next cycle. So "the slot is there and says
-// its WAL is gone" is true of a primary and not of a standby, and a sweep
-// cannot tell which member answered it.
+// Only a reading from a member that is NOT in recovery counts, and then
+// only twice in a row.
+//
+// The recovery check is the one that matters. slotsync invalidates a
+// synced slot on a standby -- its own max_slot_wal_keep_size, or
+// primary_slot_name reset -- while the slot is perfectly valid on the
+// primary, then drops and recreates it on its next cycle. That cycle is
+// not prompt: wait_for_slot_activity doubles its nap from 200ms to
+// MAX_SLOTSYNC_WORKER_NAPTIME_MS, 30 SECONDS, whenever no slot was
+// updated, which is the resting state of a quiet standby. So the window in
+// which a standby has no row for a live slot reaches half a minute, and a
+// sweep that reaches one through a -rw flip sees "missing" for all of it.
+//
+// Two sightings at resolve-interval -- five seconds by default -- sit
+// comfortably inside that. The debounce alone does not survive the case it
+// was written for, which is why the reading has to come from the primary
+// before it counts at all. The second sighting still guards a flip that
+// lands mid-promotion, when recovery has already ended.
 //
 // Making a stream lost is not reversible -- only Create writes active, and
 // CreateStream refuses a duplicate name, so recovery costs the consumer

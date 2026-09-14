@@ -52,7 +52,7 @@ func TestAVanishedSlotMarksTheStreamLost(t *testing.T) {
 	sweep := func(name, walStatus string) {
 		t.Helper()
 		if err := UpsertStreamStatus(ctx, conn, StreamStatus{
-			Stream: name, ShardSet: "default", ShardID: 0, Slot: "s0", WALStatus: walStatus}); err != nil {
+			Stream: name, ShardSet: "default", ShardID: 0, Slot: "s0", WALStatus: walStatus}, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -140,6 +140,29 @@ func TestAVanishedSlotMarksTheStreamLost(t *testing.T) {
 	sweep("half_made", "missing")
 	if got := state("half_made"); got != StreamLost {
 		t.Errorf("two sightings after activation left the stream %q, want %q", got, StreamLost)
+	}
+
+	// A standby's reading never condemns, however many times it is seen.
+	// slotsync drops and recreates a synced slot, and its worker's nap
+	// doubles to 30s on a quiet cluster (MAX_SLOTSYNC_WORKER_NAPTIME_MS),
+	// so a sweep reaching a standby through a -rw flip can see "missing"
+	// for half a minute -- six consecutive sweeps at the default interval,
+	// which the two-sighting debounce does not survive on its own.
+	active("on_a_standby")
+	for range 6 {
+		if err := UpsertStreamStatus(ctx, conn, StreamStatus{
+			Stream: "on_a_standby", ShardSet: "default", ShardID: 0, Slot: "s0", WALStatus: "missing"}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := state("on_a_standby"); got != StreamActive {
+		t.Errorf("a standby's readings condemned the stream (%q); slotsync's own recreate window is longer than the debounce", got)
+	}
+	// The same slot, once the reading comes from the primary twice.
+	sweep("on_a_standby", "missing")
+	sweep("on_a_standby", "missing")
+	if got := state("on_a_standby"); got != StreamLost {
+		t.Errorf("the primary reported it missing twice and the stream is %q, want %q", got, StreamLost)
 	}
 
 	// Still creating: its slots do not exist yet by definition.

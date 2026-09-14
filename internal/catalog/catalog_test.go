@@ -1798,7 +1798,7 @@ func runSuite(t *testing.T, img pgImage) {
 		t.Cleanup(func() { _ = DeleteStream(ctx, conn, "health") })
 		want := StreamStatus{Stream: "health", ShardSet: "default", ShardID: 3, Slot: "pgshard_health_shard3", WALStatus: "reserved",
 			ConfirmedFlushLSN: 0x100000020, RestartLSN: 0x100000010, RetainedBytes: 123456, Active: true, Synced: true, Failover: true}
-		if err := UpsertStreamStatus(ctx, conn, want); err != nil {
+		if err := UpsertStreamStatus(ctx, conn, want, true); err != nil {
 			t.Fatal(err)
 		}
 		rows, err := ListStreamStatus(ctx, conn, "health")
@@ -1814,7 +1814,7 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatalf("round trip\n got %+v\nwant %+v", got, want)
 		}
 		want.RetainedBytes, want.Synced, want.Failover = 0, false, false
-		if err := UpsertStreamStatus(ctx, conn, want); err != nil {
+		if err := UpsertStreamStatus(ctx, conn, want, true); err != nil {
 			t.Fatal(err)
 		}
 		rows, _ = ListStreamStatus(ctx, conn, "health")
