@@ -172,6 +172,74 @@ func TestAcksAreHeldForShardsStillCopying(t *testing.T) {
 	}
 }
 
+// TestAUnaryAckIsHeldForAShardStillCopying: the in-stream ack skips a shard
+// in its copy phase, and the unary Ack did not. The copy's snapshot unit
+// carries its consistent point, so a stream copying from nothing has
+// already advanced its emitted position when the copy starts, and the clamp
+// alone sent a unary ack on to the pooler mid-copy (PGS-792). A real pooler
+// has no reader on the slot during a copy and refuses it Unavailable, so
+// the consumer's unary Ack failed for the whole copy where the same ack in
+// the stream was quietly held; this fake records every ack, which is what
+// makes the two rules' disagreement observable here.
+func TestAUnaryAckIsHeldForAShardStillCopying(t *testing.T) {
+	h := newHarness(t, 1)
+	h.pool[0].copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		return copyScript{msgs: []*pgshardv1.CopyTablesResponse{cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["1"]`, "1")}, failAfter: 3, err: errors.New("hang up")}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, copyStart(nil))
+	recvN(t, st, 4, 5*time.Second)
+	// Confirm the precondition rather than assume it: without a delivered
+	// position the clamp would drop the ack and this test would pass for
+	// that reason instead.
+	waitFor(t, func() bool {
+		d, _ := h.server.liveStream("plain").at(shard0)
+		return d == 1000
+	})
+
+	if _, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{
+		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 1000}}}}); err != nil {
+		t.Fatalf("unary ack: %v", err)
+	}
+	// No wait needed: Server.Ack calls the pooler synchronously, so by the
+	// time it returns any ack it was going to send has been recorded.
+	if acks := h.pool[0].ackedLSNs(); len(acks) != 0 {
+		t.Fatalf("a unary ack reached the pooler at %v while the shard was still copying", acks)
+	}
+}
+
+// TestAUnaryAckReachesTheShardOnceItsCopyIsDone is the other side: the
+// copying flag has to come down when the copy completes, or every unary ack
+// for that shard is dropped for the life of the stream and its slot never
+// advances -- the WAL it holds grows without bound, silently.
+func TestAUnaryAckReachesTheShardOnceItsCopyIsDone(t *testing.T) {
+	h := newHarness(t, 1)
+	h.pool[0].copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		return script(cpSnapshot(1000, true), cpTable("t", "id", "v"), cpRows(`["2"]`, "1", "2"), cpRows(`["3"]`, "3"), cpTableDone("t"),
+			cpTable("u", "id"), cpTableDone("u"), cpDone())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, copyStart(nil))
+	h.pool[0].feed("plain", batch(0, evRelation(1, "t", "id", "v")))
+	h.pool[0].feed("plain", txn(1, 1, 1, 1100, "4", "x"))
+	recvN(t, st, 21, 5*time.Second)
+	waitFor(t, func() bool {
+		d, _ := h.server.liveStream("plain").at(shard0)
+		return d == 1100
+	})
+
+	if _, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{
+		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 1100}}}}); err != nil {
+		t.Fatalf("unary ack: %v", err)
+	}
+	waitFor(t, func() bool {
+		a := h.pool[0].ackedLSNs()
+		return len(a) == 1 && a[0] == 1100
+	})
+}
+
 func TestCopyPhaseStateRoundTrip(t *testing.T) {
 	sh := router.Shard{Set: "default", ID: 3}
 	st := &pgshardv1.VCopyState{Shard: shardRef(sh), Done: []string{"public.a", "public.b"}, Current: &pgshardv1.VCopyState_Table{Schema: "public", Table: "c", Lastpk: []byte(`["7","x"]`)}}

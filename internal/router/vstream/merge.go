@@ -404,17 +404,24 @@ func (m *merger) emit(u *unit) error {
 	if u.commitTS != 0 {
 		m.lastCommit[u.shard] = u.commitTS
 	}
+	// A copy's snapshot unit carries its consistent point, so the shard is
+	// marked copying before the position it publishes moves, and unmarked
+	// only after. That order is half of the guarantee: Server.Ack reads the
+	// two from another goroutine, and it holds only because Server.Ack reads
+	// the position first and the flag second.
+	if u.copy != nil {
+		m.copying[u.shard] = u.copy
+		m.emitted.setCopying(u.shard, true)
+	}
 	if u.position && u.endLSN > m.position[u.shard] {
 		m.position[u.shard] = u.endLSN
 		if m.emitted != nil {
 			m.emitted.advance(u.shard, u.endLSN)
 		}
 	}
-	if u.copy != nil {
-		m.copying[u.shard] = u.copy
-	}
 	if u.copyDone {
 		delete(m.copying, u.shard)
+		m.emitted.setCopying(u.shard, false)
 	}
 	if !u.position && u.copy == nil && !u.copyDone || len(u.events) == 0 {
 		return nil
