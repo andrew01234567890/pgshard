@@ -115,9 +115,15 @@ func DeleteStream(ctx context.Context, q Execer, name string) error {
 	return err
 }
 
-// UpsertStreamStatus records the slot state of a stream on one shard; a
-// lost slot also marks the stream lost.
+// UpsertStreamStatus records the slot state of a stream on one shard. A
+// slot that cannot be resumed from -- invalidated, or gone -- also marks
+// the stream lost, on the second consecutive sighting: see markStreamLost.
 func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
+	if Unresumable(st.WALStatus) {
+		if err := markStreamLost(ctx, q, st); err != nil {
+			return err
+		}
+	}
 	_, err := q.Exec(ctx, `INSERT INTO pgshard.stream_status
 		(stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn, retained_bytes, active, synced, failover, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
@@ -130,10 +136,64 @@ func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
 	if err != nil {
 		return err
 	}
-	if st.WALStatus == "lost" {
-		return SetStreamState(ctx, q, st.Stream, StreamLost)
-	}
 	return nil
+}
+
+// Unresumable reports whether a slot's wal_status leaves its stream nothing
+// to resume from.
+//
+// "lost" is PostgreSQL's: the slot is there and the WAL it needed is gone.
+// "missing" is ours, written by the monitor when pg_replication_slots has
+// no row -- a slot dropped, or one that did not survive a promotion
+// because it was never synchronised to the member that got promoted. That
+// is strictly worse than invalidated: an invalidated slot at least records
+// why it died, where a vanished one leaves nothing to read a position
+// from. Both mean the consumer must re-baseline.
+func Unresumable(walStatus string) bool { return walStatus == "lost" || walStatus == "missing" }
+
+// markStreamLost moves a stream to lost. Called BEFORE the upsert that
+// overwrites this shard's last report, because that report is the evidence.
+//
+// TWO consecutive sightings, for "lost" as well as "missing", and the
+// stored row is the first. Both can be transient on a standby: a -rw
+// Service flip can land a sweep on a member whose synced copy of the slot
+// has not caught up ("missing"), and slotsync can invalidate a synced slot
+// on the standby -- its own max_slot_wal_keep_size, or primary_slot_name
+// reset -- while the slot is perfectly valid on the primary ("lost"), then
+// drop and recreate it on the next cycle. So "the slot is there and says
+// its WAL is gone" is true of a primary and not of a standby, and a sweep
+// cannot tell which member answered it.
+//
+// Making a stream lost is not reversible -- only Create writes active, and
+// CreateStream refuses a duplicate name, so recovery costs the consumer
+// its position. One glimpse is not evidence enough for that.
+//
+// A stream still being created is exempt: its slots do not exist until
+// CreateStream has made them. Create clears the rows that phase leaves
+// behind, so they cannot serve as the first sighting afterwards.
+func markStreamLost(ctx context.Context, q Execer, st StreamStatus) error {
+	_, err := q.Exec(ctx, `UPDATE pgshard.streams SET state = $4
+		WHERE name = $1 AND state <> $5
+		  AND EXISTS (SELECT 1 FROM pgshard.stream_status
+		        WHERE stream = $1 AND shard_set = $2 AND shard_id = $3
+		          AND wal_status IN ('missing', 'lost'))`,
+		st.Stream, st.ShardSet, st.ShardID, StreamLost, StreamCreating)
+	return err
+}
+
+// ClearUnresumableStatus forgets the unresumable rows a stream accumulated
+// before it was fully created.
+//
+// The sweep runs while Create is still making slots, so it records every
+// shard it has not reached yet as "missing". Those rows are suppressed as
+// a reason to condemn the stream while it is creating -- but they stay in
+// the table, and once the stream goes active they would serve as the first
+// of the two sightings the debounce needs. One real sighting would then be
+// enough, which is the thing the debounce exists to prevent.
+func ClearUnresumableStatus(ctx context.Context, q Execer, stream string) error {
+	_, err := q.Exec(ctx, `DELETE FROM pgshard.stream_status
+		WHERE stream = $1 AND wal_status IN ('missing', 'lost')`, stream)
+	return err
 }
 
 // ListStreamStatus returns the per-shard rows of one stream ("" for all).
