@@ -1574,10 +1574,11 @@ func (o *pgCutover) DropJournal(ctx context.Context, id string) error {
 //
 // Sources need it too. A set another workflow retired carries the
 // permanent retirement pause, and so does this run's own source set once a
-// Complete has reached its tail and a later pass runs Complete again. The
-// journal rows and the replication objects on it are this workflow's to
-// clean up, and without this every attempt failed with 25006 and the
-// workflow was retried for ever, holding its slots (PGS-816).
+// Complete has reached its tail -- where a later pass still has objects to
+// drop on any source the first one skipped as unreachable. The journal rows
+// and the replication objects on it are this workflow's to clean up, and
+// without this every attempt failed with 25006 and the workflow was
+// retried for ever, holding its slots (PGS-816).
 //
 // It is a SESSION setting, in a statement of its own, because the pause
 // is read when a transaction starts: set inside the transaction that then
