@@ -29,41 +29,89 @@ func (m *StreamMonitor) Sweep(ctx context.Context) (int, error) {
 	if len(streams) == 0 {
 		return 0, nil
 	}
-	shards, err := (&Resolver{Pool: m.Pool}).listShards(ctx, "")
-	if err != nil {
-		return 0, err
-	}
+	// Per shard SET, not every shard in the cluster. A stream's slots are
+	// made on one set and nowhere else, so sweeping the rest reported a
+	// row per stream per foreign shard with no slot behind it -- which is
+	// what a reshard's freshly provisioned targets look like, and is
+	// indistinguishable in the result from a slot that has gone.
 	var groups map[ShardRef]string
 	if groups, err = m.groupNames(ctx); err != nil {
 		return 0, err
 	}
+	bySet := map[string][]catalog.Stream{}
+	for _, st := range streams {
+		bySet[st.ShardSet] = append(bySet[st.ShardSet], st)
+	}
 	written := 0
 	var firstErr error
-	for _, sh := range shards {
-		conn, err := m.Shards.Dial(ctx, sh.Set, sh.ID)
+	for set, inSet := range bySet {
+		if set == "" {
+			// listShards("") is every shard in the cluster, which is the
+			// behaviour this is replacing -- so an unset row must not
+			// reach it. The migration backfills and CreateStream always
+			// records one, so this is a row written by something that
+			// forgot; it is resolved rather than skipped so the stream
+			// keeps being reported, and said out loud because nothing
+			// else would ever mention it.
+			serving, err := catalog.ServingShardSet(ctx, m.Pool)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			if m.Logger != nil {
+				m.Logger.Warn("stream has no shard set recorded; sweeping the serving set",
+					"streams", len(inSet), "serving", serving)
+			}
+			set = serving
+		}
+		shards, err := (&Resolver{Pool: m.Pool}).listShards(ctx, set)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		for _, st := range streams {
-			slot := catalog.StreamSlotName(st.Name, groups[sh])
-			row, err := slotStatus(ctx, conn, slot)
+		if len(shards) == 0 {
+			// The set was dropped under the stream -- a cancelled reshard,
+			// or a retired set finally removed. Sweeping nothing leaves
+			// every stream_status row frozen at whatever it last said,
+			// which for a monitor is worse than saying nothing at all:
+			// the rows go on looking current. Nothing here can repair it,
+			// so it is reported rather than hidden.
+			if m.Logger != nil {
+				m.Logger.Warn("stream's shard set has no shards; its status will not be updated",
+					"shard_set", set, "streams", len(inSet))
+			}
+			continue
+		}
+		for _, sh := range shards {
+			conn, err := m.Shards.Dial(ctx, sh.Set, sh.ID)
 			if err != nil {
 				if firstErr == nil {
-					firstErr = fmt.Errorf("shard %s/%d slot %s: %w", sh.Set, sh.ID, slot, err)
+					firstErr = err
 				}
 				continue
 			}
-			row.Stream, row.ShardSet, row.ShardID = st.Name, sh.Set, sh.ID
-			if err := catalog.UpsertStreamStatus(ctx, m.Pool, row); err != nil {
-				_ = conn.Close(ctx)
-				return written, err
+			for _, st := range inSet {
+				slot := catalog.StreamSlotName(st.Name, groups[sh])
+				row, err := slotStatus(ctx, conn, slot)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("shard %s/%d slot %s: %w", sh.Set, sh.ID, slot, err)
+					}
+					continue
+				}
+				row.Stream, row.ShardSet, row.ShardID = st.Name, sh.Set, sh.ID
+				if err := catalog.UpsertStreamStatus(ctx, m.Pool, row); err != nil {
+					_ = conn.Close(ctx)
+					return written, err
+				}
+				written++
 			}
-			written++
+			_ = conn.Close(ctx)
 		}
-		_ = conn.Close(ctx)
 	}
 	return written, firstErr
 }

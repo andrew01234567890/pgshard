@@ -36,13 +36,25 @@ type StreamSlot struct {
 // slots that already exist. The stream becomes active once every shard has
 // its slot; a failure leaves it creating with the slots made so far.
 func (a *StreamAdmin) Create(ctx context.Context, name, database string, twoPhase bool, shardSet string) ([]StreamSlot, error) {
-	if shardSet == "" {
-		shardSet = "default"
-	}
 	if database == "" {
 		return nil, errors.New("database is required")
 	}
-	if err := catalog.CreateStream(ctx, a.Pool, catalog.Stream{Name: name, Database: database, TwoPhase: twoPhase}); err != nil {
+	// An unnamed set is the one serving now, not the literal "default".
+	// vstream.proto says so of the read side -- "empty means whichever set
+	// is serving... a consumer that names no set follows that rather than
+	// staying on the shards nothing writes to any more" -- and a stream
+	// whose slots were made somewhere the read side will not look is a
+	// stream that reads nothing.
+	if shardSet == "" {
+		var err error
+		if shardSet, err = catalog.ServingShardSet(ctx, a.Pool); err != nil {
+			return nil, err
+		}
+	}
+	// Recorded, not just used: the monitor has to know which shards this
+	// stream has slots on, or it asks every shard in the cluster and reads
+	// the answer from sets the stream was never created on.
+	if err := catalog.CreateStream(ctx, a.Pool, catalog.Stream{Name: name, Database: database, TwoPhase: twoPhase, ShardSet: shardSet}); err != nil {
 		return nil, err
 	}
 	shards, err := (&Resolver{Pool: a.Pool}).listShards(ctx, shardSet)

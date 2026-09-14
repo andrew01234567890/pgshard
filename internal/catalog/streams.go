@@ -48,6 +48,12 @@ type Stream struct {
 	TwoPhase  bool
 	State     string
 	CreatedAt time.Time
+	// ShardSet is where this stream's slots were made. The set a stream
+	// READS is decided per call and follows the serving topology when it
+	// is not named; this is the durable half, and it is what lets the
+	// monitor ask the shards a stream actually has slots on instead of
+	// every shard in the cluster.
+	ShardSet string
 }
 
 // Stream states.
@@ -83,14 +89,14 @@ func CreateStream(ctx context.Context, q Execer, s Stream) error {
 	if state == "" {
 		state = StreamCreating
 	}
-	_, err := q.Exec(ctx, `INSERT INTO pgshard.streams (name, database, two_phase, state) VALUES ($1, $2, $3, $4)`,
-		s.Name, s.Database, s.TwoPhase, state)
+	_, err := q.Exec(ctx, `INSERT INTO pgshard.streams (name, database, two_phase, state, shard_set) VALUES ($1, $2, $3, $4, $5)`,
+		s.Name, s.Database, s.TwoPhase, state, s.ShardSet)
 	return err
 }
 
 // ListStreams returns every stream by name.
 func ListStreams(ctx context.Context, q Querier) ([]Stream, error) {
-	rows, err := q.Query(ctx, `SELECT name, database, two_phase, state, created_at FROM pgshard.streams ORDER BY name`)
+	rows, err := q.Query(ctx, `SELECT name, database, two_phase, state, created_at, shard_set FROM pgshard.streams ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}

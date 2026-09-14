@@ -156,3 +156,46 @@ func TestStreamAdminCreatesAndDropsSlotsOnEveryShard(t *testing.T) {
 		t.Fatalf("streams left: %+v", streams)
 	}
 }
+
+// TestSweepAsksOnlyTheSetAStreamHasSlotsOn: the monitor used to enumerate
+// every shard set, so a reshard provisioning its targets gave every stream
+// a stream_status row per new shard with no slot behind it. Those rows are
+// indistinguishable from a slot that has gone, and reading them as one is
+// what closed PR #899 (PGS-807).
+//
+// A stream's slots are made on ONE set and nowhere else, so the sweep asks
+// that set and no other.
+func TestSweepAsksOnlyTheSetAStreamHasSlotsOn(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	m := &StreamMonitor{Pool: f.pool, Shards: f.dialer}
+
+	// A second set, the way a reshard's targets appear: shard_status rows
+	// exist well before anything creates stream slots on them.
+	if _, err := f.pool.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
+		VALUES ('g2', 0, 'g2_0', 'provisioning', 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := catalog.CreateStream(ctx, f.pool, catalog.Stream{Name: "orders", Database: "postgres", ShardSet: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, connect(t, f.shardDSN(0)), "SELECT pg_create_logical_replication_slot('pgshard_orders_g0', 'pgoutput', false, true, true)")
+	if _, err := m.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := catalog.ListStreamStatus(ctx, f.pool, "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.ShardSet != "default" {
+			t.Errorf("the sweep reported %s on set %q, which this stream has no slots on; a reshard's targets would read as lost slots", r.Slot, r.ShardSet)
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatal("the sweep reported nothing at all, so the assertion above proves nothing")
+	}
+}
