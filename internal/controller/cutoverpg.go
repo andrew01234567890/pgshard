@@ -1555,7 +1555,10 @@ func (o *pgCutover) Unwind(ctx context.Context) error {
 				o.c.logger().Info("reshard cancel: source unreachable, skipping its reverse subscriptions", "workflow", o.wf.id, "source", s, "err", err)
 				continue
 			}
-			err = dropSubscriptionsLike(ctx, conn, o.reversePattern(s))
+			err = writeThroughPause(ctx, conn)
+			if err == nil {
+				err = dropSubscriptionsLike(ctx, conn, o.reversePattern(s))
+			}
 			_ = conn.Close(ctx)
 			if err != nil {
 				return err
