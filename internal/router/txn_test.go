@@ -746,8 +746,7 @@ func TestACancelReachesEveryParticipant(t *testing.T) {
 
 	stmt, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	e.beginStatement(stmt)
-	e.cancelBackend(context.Background())
+	e.cancelStatement(context.Background(), e.beginStatement(stmt))
 
 	for _, shard := range []int{sa, sb} {
 		if len(h.poolers[shard].cancelled()) == 0 {
@@ -1026,7 +1025,7 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	// absence asserted below would also hold if this connection's cancel
 	// request were a no-op in the harness -- wrong key, wrong listener,
 	// routed to a peer. A keyed statement runs on one shard through the
-	// executor's own path, so its cancel is forwarded by cancelBackend, the
+	// executor's own path, so its cancel is forwarded by cancelStatement, the
 	// function under test.
 	sleeper := h.poolers[h.shardOf(t, a)]
 	go func() {

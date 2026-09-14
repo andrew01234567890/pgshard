@@ -154,6 +154,12 @@ message CopyFail {
 message CancelRequest {
   // Router session whose statement is cancelled.
   string session_id = 1;
+  // Statement being cancelled, numbered as on ExecuteRequest. A cancel is
+  // delivered asynchronously, so it can arrive after its statement ended
+  // and the next one began; the pooler ignores it once it has seen a later
+  // statement on the session. Zero cancels whatever the session is running,
+  // which is what a router that does not number statements gets.
+  uint64 statement = 2;
 }
 
 // CancelResponse acknowledges a cancel; delivery is best effort.
@@ -182,6 +188,12 @@ message ExecuteRequest {
   // the same way packed_rows is, so a pooler that predates the field
   // answers the old way and the two roll independently.
   bool batched_rows = 6;
+  // Statement numbers the client statement this message belongs to,
+  // counting up within the router session. The pooler keeps the highest it
+  // has seen, which is what lets it tell a Cancel or Release sent for an
+  // earlier statement from one for the statement running now. Zero means
+  // the router does not number its statements.
+  uint64 statement = 7;
   // Exactly one pgwire-shaped message.
   oneof message {
     SimpleQuery simple_query = 10;
@@ -368,6 +380,8 @@ message ExecuteResponse {
 message ReserveRequest {
   string session_id = 1;
   Generation generation = 2;
+  // Statement making the reservation, numbered as on ExecuteRequest.
+  uint64 statement = 3;
 }
 
 // ReserveResponse reports the pinned backend.
@@ -381,6 +395,11 @@ message ReserveResponse {
 // ReleaseRequest unpins the session's backend.
 message ReleaseRequest {
   string session_id = 1;
+  // Statement the release is for, numbered as on ExecuteRequest. A release
+  // older than the reservation it would end belongs to an earlier
+  // reservation and is ignored, so a late one cannot unpin the backend a
+  // later statement reserved. Zero releases unconditionally.
+  uint64 statement = 2;
 }
 
 // ReleaseResponse acknowledges the release.

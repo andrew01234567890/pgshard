@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -372,7 +373,12 @@ func (b *Backend) runSimpleQuery(sql string) error {
 // handover without holding the pooler's lock across a socket write --
 // which would stall every session on this pooler if the write blocked.
 // PostgreSQL's own cancellation is best-effort for the same reason.
-func (b *Backend) cancel(ctx context.Context, d Dialer, still func() bool) error {
+//
+// hold, when set, is one session's lock -- never the pooler's -- held from
+// still until PostgreSQL closes the cancellation connection. The session's
+// relay takes it before starting a later statement, so the signal cannot
+// arrive after that statement's messages.
+func (b *Backend) cancel(ctx context.Context, d Dialer, hold sync.Locker, still func() bool) error {
 	conn, err := d.dial(ctx)
 	if err != nil {
 		return err
@@ -381,6 +387,10 @@ func (b *Backend) cancel(ctx context.Context, d Dialer, still func() bool) error
 	buf, err := (&pgproto3.CancelRequest{ProcessID: b.pid, SecretKey: b.secret}).Encode(nil)
 	if err != nil {
 		return err
+	}
+	if hold != nil {
+		hold.Lock()
+		defer hold.Unlock()
 	}
 	if still != nil && !still() {
 		return nil

@@ -113,6 +113,25 @@ type session struct {
 	// running -- a credential mismatch. The stream owns the backend, so it
 	// is the one that must get rid of it.
 	evicted bool
+	// statement is the highest ExecuteRequest.statement the session's
+	// stream has carried. A Cancel for a lower one was fired for a
+	// statement that has since ended.
+	statement atomic.Uint64
+	// cancelMu is held while a cancel is delivered to PostgreSQL, and taken
+	// by the relay before it moves the session on to a later statement.
+	// Without it the later statement's messages could reach the backend
+	// ahead of the cancel's signal, and the cancel would interrupt them.
+	cancelMu sync.Mutex
+	// reservedFor is the statement that made the current reservation; a
+	// Release numbered below it was meant for an earlier one. Guarded by
+	// Server.mu.
+	reservedFor uint64
+}
+
+// staleStatement reports whether a Cancel or Release numbered n was sent for
+// a statement older than the latest the session has carried.
+func (se *session) staleStatement(n uint64) bool {
+	return n != 0 && n < se.statement.Load()
 }
 
 // NewServer builds a Server; Register attaches it to a gRPC server.
@@ -578,6 +597,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	if req.SessionId != r.se.id {
 		return status.Error(codes.InvalidArgument, "session_id changed mid-stream")
 	}
+	r.moveToStatement(req.Statement)
 	// Latched rather than read per message: the router sets it on the
 	// messages it originates, and a row can arrive while the relay is
 	// answering something else.
@@ -606,7 +626,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 				defer r.srv.mu.Unlock()
 				return r.se.b == b && !b.released
 			}
-			if err := b.cancel(ctx, r.srv.cfg.Dialer, still); err != nil {
+			if err := b.cancel(ctx, r.srv.cfg.Dialer, nil, still); err != nil {
 				r.srv.cfg.Logger.Warn("cancel failed", "session", r.se.id, "err", err)
 			}
 		}
@@ -692,6 +712,18 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		return r.backendLost(b, err)
 	}
 	return r.pump(b)
+}
+
+// moveToStatement records that the session's stream has reached statement
+// n. A cancel for an earlier statement that is being delivered right now
+// finishes first, so it cannot land on this statement's messages.
+func (r *relay) moveToStatement(n uint64) {
+	if n <= r.se.statement.Load() {
+		return
+	}
+	r.se.cancelMu.Lock()
+	r.se.statement.Store(n)
+	r.se.cancelMu.Unlock()
 }
 
 // stopWatch ends the deadline watcher for the message in flight, if one is
@@ -932,6 +964,7 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 	var pid int32
 	s.session(req.SessionId, func(se *session) {
 		se.reserved = true
+		se.reservedFor = max(se.reservedFor, req.Statement)
 		if !se.attached {
 			se.detachedAt = time.Now()
 			s.noteExpiry(se.detachedAt)
@@ -951,6 +984,12 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 		return &pgshardv1.ReleaseResponse{}, nil
 	}
 	s.mu.Lock()
+	if req.Statement != 0 && req.Statement < se.reservedFor {
+		// A later statement has reserved the session since; the backend is
+		// its to release now.
+		s.mu.Unlock()
+		return &pgshardv1.ReleaseResponse{}, nil
+	}
 	if se.attached {
 		// The router tore its stream down without waiting; the backend is
 		// recycled when that stream detaches, and the caller waits for it
@@ -1075,22 +1114,23 @@ func (s *Server) takeDiscarded(id string, now time.Time) bool {
 // Cancel interrupts the statement running on the session's backend.
 func (s *Server) Cancel(ctx context.Context, req *pgshardv1.CancelRequest) (*pgshardv1.CancelResponse, error) {
 	se := s.lookup(req.SessionId)
-	if se == nil {
+	if se == nil || se.staleStatement(req.Statement) {
 		return &pgshardv1.CancelResponse{}, nil
 	}
 	s.mu.Lock()
 	b := se.b
 	s.mu.Unlock()
 	if b != nil {
-		// Still this session's backend, asked again once the cancellation
-		// connection is up: by then the statement may have finished and
-		// the backend been handed to somebody else.
+		// Still this session's backend and still its statement, asked
+		// again once the cancellation connection is up: by then the
+		// statement may have finished, and the backend been handed to
+		// somebody else or the session moved on to its next statement.
 		still := func() bool {
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			return se.b == b && !b.released
+			return se.b == b && !b.released && !se.staleStatement(req.Statement)
 		}
-		if err := b.cancel(ctx, s.cfg.Dialer, still); err != nil {
+		if err := b.cancel(ctx, s.cfg.Dialer, &se.cancelMu, still); err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
 	}

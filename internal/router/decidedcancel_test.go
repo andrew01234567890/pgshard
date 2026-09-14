@@ -24,7 +24,7 @@ func TestACancelOnceEveryParticipantHasPreparedIsNotSent(t *testing.T) {
 
 	// Before the decision a cancel is sent, which is the behaviour every
 	// other phase relies on.
-	e.cancelBackend(context.Background())
+	e.cancelStatement(context.Background(), e.statement.Load())
 	if !e.cancelSent.Load() {
 		t.Fatal("a cancel before the decision must still be sent")
 	}
@@ -32,7 +32,7 @@ func TestACancelOnceEveryParticipantHasPreparedIsNotSent(t *testing.T) {
 	// After it, nothing is sent -- even for a fresh statement context.
 	e.cancelSent.Store(false)
 	e.uncancellable.Store(true)
-	e.cancelBackend(context.Background())
+	e.cancelStatement(context.Background(), e.statement.Load())
 	if e.cancelSent.Load() {
 		t.Fatal("a cancel was sent after the commit decision; it can only interrupt a COMMIT PREPARED whose outcome is already durable")
 	}
@@ -53,7 +53,7 @@ func TestACancelOnceEveryParticipantHasPreparedIsNotSent(t *testing.T) {
 		t.Fatal("a recovered panic left the session uncancellable; every later cancel on it waits out the grace and ends 08006")
 	}
 	e.cancelSent.Store(false)
-	e.cancelBackend(context.Background())
+	e.cancelStatement(context.Background(), e.statement.Load())
 	if !e.cancelSent.Load() {
 		t.Fatal("a cancel after the recovered panic was not sent")
 	}

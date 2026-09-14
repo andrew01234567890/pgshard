@@ -199,10 +199,16 @@ type harness struct {
 
 func startHarness(t testing.TB, cfg PoolConfig) *harness {
 	t.Helper()
+	return startHarnessWithCancels(t, cfg, Dialer{})
+}
+
+// startHarnessWithCancels is startHarness with cancels dialled at d.
+func startHarnessWithCancels(t testing.TB, cfg PoolConfig, d Dialer) *harness {
+	t.Helper()
 	pg := newFakePG()
 	src := NewStaticSource(View{Generation: 7, Epoch: 3, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true})
 	logs := &strings.Builder{}
-	srv := NewServer(Config{Pool: newPool(cfg, pg.dial), Source: src, Database: "app",
+	srv := NewServer(Config{Pool: newPool(cfg, pg.dial), Source: src, Database: "app", Dialer: d,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})), HealthInterval: 20 * time.Millisecond})
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
