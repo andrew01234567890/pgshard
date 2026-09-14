@@ -44,10 +44,11 @@ type RestoreReconciler struct {
 	Now      func() time.Time
 }
 
-// BarrierCertifier reports whether a barrier of that name was certified,
-// and lifts the fence a restored catalog came back holding.
+// BarrierCertifier reports whether a barrier of that name was certified and
+// which groups it holds a restore point on, and lifts the fence a restored
+// catalog came back holding.
 type BarrierCertifier interface {
-	CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, error)
+	CertifiedBarrier(ctx context.Context, dsn, password, name string) (certified bool, groups []string, err error)
 	ClearWriteFenceAfterRestore(ctx context.Context, dsn, password string) error
 }
 
@@ -212,12 +213,23 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// pgshard.restore_points is keyed by the barrier's own name; the
 		// pgshard- prefix belongs to the WAL restore point the recovery
 		// target names, not to the catalog row.
-		ok, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), password, name)
+		ok, recorded, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), password, name)
 		if cerr != nil {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
 		}
 		if !ok {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q is not certified on %s; restoring to it would land on a point that is not two-phase consistent", name, source.Name))
+		}
+		// Certified says the barrier held on the groups it was taken on,
+		// not on the groups this restore recovers: those are the source's
+		// serving groups NOW. One without the restore point runs recovery
+		// to the end of its WAL, fails with "recovery ended before
+		// configured recovery target was reached", and the restore only
+		// finds out after it has created the cluster and watched that
+		// member crash-loop.
+		if missing := groupsWithoutBarrier(Groups(&source), recorded); len(missing) > 0 {
+			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q on %s has no restore point on group(s) %s, which this restore would recover to it; take a new barrier that covers every serving group",
+				name, source.Name, strings.Join(missing, ", ")))
 		}
 	}
 	// The group count and major are already checked equal above, so the
@@ -665,4 +677,22 @@ func (r *RestoreReconciler) fail(ctx context.Context, rs *pgshardv1alpha1.PgShar
 	rs.Status.CompletedAt = ptrTime(r.now())
 	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: metav1.ConditionFalse, Reason: "Failed", Message: msg, ObservedGeneration: rs.Generation})
 	return r.Status().Patch(ctx, rs, client.MergeFrom(base))
+}
+
+// groupsWithoutBarrier names the groups of want that a barrier's manifest
+// has no restore point for. The manifest keys a shard group by the name
+// shard_status carries, which is Group.Name(), and the catalog as "catalog"
+// whatever its generation.
+func groupsWithoutBarrier(want []Group, recorded []string) []string {
+	var missing []string
+	for _, g := range want {
+		key := g.Name()
+		if g.Kind == "catalog" {
+			key = "catalog"
+		}
+		if !slices.Contains(recorded, key) {
+			missing = append(missing, g.Name())
+		}
+	}
+	return missing
 }

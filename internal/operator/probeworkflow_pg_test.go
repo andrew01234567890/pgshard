@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -253,26 +254,27 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustProbeExec(t, conn, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, per_group, certified)
-		VALUES (gen_random_uuid(), 'nightly', 7, '{}'::jsonb, true),
+		VALUES (gen_random_uuid(), 'nightly', 7, '{"catalog": {"group": "catalog"}, "shard-0": {"group": "shard-0"}}'::jsonb, true),
 		       (gen_random_uuid(), 'aborted', 7, '{}'::jsonb, false)`)
 
 	for _, c := range []struct {
-		name string
-		want bool
+		name   string
+		want   bool
+		groups []string
 	}{
-		{"nightly", true},
-		{"aborted", false},
-		{"never-taken", false},
+		{"nightly", true, []string{"catalog", "shard-0"}},
+		{"aborted", false, []string{}},
+		{"never-taken", false, nil},
 		// The name the recovery target uses, which is not what the row is
 		// keyed by. This is the case the fake could never fail on.
-		{BarrierRestorePoint("nightly"), false},
+		{BarrierRestorePoint("nightly"), false, nil},
 	} {
-		got, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
+		got, groups, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		if got != c.want {
-			t.Errorf("CertifiedBarrier(%q) = %v, want %v", c.name, got, c.want)
+		if got != c.want || !slices.Equal(groups, c.groups) {
+			t.Errorf("CertifiedBarrier(%q) = %v %v, want %v %v", c.name, got, groups, c.want, c.groups)
 		}
 	}
 }
