@@ -350,7 +350,24 @@ func (d *DesiredRoles) Role(name string) (DesiredRole, bool) {
 
 // LoadDesiredRoles reads roles, memberships, grants and settings with the
 // generation the newest of them carries.
-func LoadDesiredRoles(ctx context.Context, q Querier) (*DesiredRoles, error) {
+//
+// It takes a Beginner rather than a Querier because the five reads are one
+// answer and have to come from one snapshot. READ COMMITTED -- what a pool,
+// a connection, or a transaction at the default isolation level gives --
+// takes a new snapshot per statement, so a desired-state write landing
+// between the first read and the generation read returns the NEWER
+// generation with the OLDER data. MaterializeRoles then applies the older
+// desired state and records the group in pgshard.role_group_status at a
+// generation whose change it never received, which reads as up to date; the
+// repair falls to the verifier's drift check, which is the slow path and
+// not what the generation is for.
+func LoadDesiredRoles(ctx context.Context, db Beginner) (*DesiredRoles, error) {
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("catalog: desired roles: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := Querier(tx)
 	d := &DesiredRoles{}
 	rows, err := q.Query(ctx, `SELECT rolname, coalesce(verifier, ''), login, createdb, createrole, inherit, connection_limit, valid_until FROM pgshard.roles ORDER BY rolname`)
 	if err != nil {
