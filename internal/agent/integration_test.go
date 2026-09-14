@@ -128,11 +128,16 @@ func (h *harness) containerName(member string) string {
 // run with.
 const integrationShutdownTimeout = 20 * time.Second
 
+const integrationEpochFile = "/var/lib/postgresql/pgshard-epoch"
+
 func (h *harness) writeConfig(member string, role Role, source string, peers []string) string {
 	h.t.Helper()
 	cfg := map[string]any{
 		"cluster": "it", "shard": "s0", "member": member, "role": string(role),
 		"pgdata": "/var/lib/postgresql/data", "passwordFile": "/cfg/pw", "authTokenFile": "/cfg/token",
+		// Outside PGDATA, as the operator renders it, so a reclone below
+		// cannot take the fence with it.
+		"epochFile":       integrationEpochFile,
 		"primaryConninfo": "host=" + h.containerName(source) + " port=5432 user=postgres",
 		"podCIDR":         "0.0.0.0/0", "peerFailsafeURLs": peers, "isolationGrace": "5s",
 		"lease":           map[string]any{"enabled": false},
@@ -398,6 +403,12 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	st := s.status()
 	if st.GetRole() != pgshardv1.StatusResponse_ROLE_PRIMARY || st.GetEpoch() != 1 || st.GetTimeline() != 2 {
 		t.Fatalf("status after promote: %v", st)
+	}
+	// The epoch the agent accepted is on disk where the configuration says,
+	// not inside PGDATA: that is Run wiring epochFile through, which no unit
+	// test reaches.
+	if got := docker(t, "exec", s.container, "cat", integrationEpochFile); got != "1" {
+		t.Fatalf("epoch file %s holds %q after accepting epoch 1", integrationEpochFile, got)
 	}
 	s.waitHTTP("/readyz", 200, 30*time.Second)
 	if s.psql("SELECT pg_is_in_recovery()") != "f" {

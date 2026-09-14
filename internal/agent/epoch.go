@@ -15,7 +15,8 @@ import (
 // accepted one.
 var ErrStaleEpoch = errors.New("stale epoch")
 
-// EpochStore persists the last accepted fencing epoch under PGDATA/pgshard/epoch.
+// EpochStore persists the last accepted fencing epoch: in the file
+// Config.EpochFile names, or under PGDATA/pgshard/epoch when that is unset.
 type EpochStore struct {
 	mu   sync.Mutex
 	path string
@@ -29,22 +30,67 @@ type EpochStore struct {
 	termCancel context.CancelFunc
 }
 
-// OpenEpochStore loads the stored epoch, treating a missing file as 0.
-func OpenEpochStore(pgdata string) (*EpochStore, error) {
-	s := &EpochStore{path: filepath.Join(pgdata, "pgshard", "epoch")}
-	b, err := os.ReadFile(s.path)
+// OpenEpochStore loads the epoch from its legacy place inside PGDATA,
+// treating a missing file as 0.
+func OpenEpochStore(pgdata string) (*EpochStore, error) { return OpenEpochStoreAt(pgdata, "") }
+
+// OpenEpochStoreAt loads the epoch from file, or from inside PGDATA when
+// file is empty.
+//
+// Inside PGDATA is the wrong place for a fence, which is why file exists. A
+// reclone empties PGDATA before pg_basebackup copies the primary's in --
+// its epoch file included -- and pg_rewind replaces the file with the
+// source's. The running agent keeps its epoch in memory, but one that dies
+// part-way through a clone restarts with no file, loads 0, and treats any
+// epoch at all as newer: a delayed Promote from a term long over included.
+//
+// A member upgrading onto a configured file carries its epoch across: the
+// configured file wins once it exists, and until then the legacy one is
+// read and copied into it. After that the legacy file is ignored, because
+// what a clone copies into it is another member's fence, not this one's.
+func OpenEpochStoreAt(pgdata, file string) (*EpochStore, error) {
+	legacy := filepath.Join(pgdata, "pgshard", "epoch")
+	if file == "" {
+		file = legacy
+	}
+	s := &EpochStore{path: file}
+	v, found, err := readEpochFile(file)
+	if err != nil {
+		return nil, err
+	}
+	if found || file == legacy {
+		s.cur = v
+		return s, nil
+	}
+	old, found, err := readEpochFile(legacy)
+	if err != nil {
+		return nil, err
+	}
+	if found && old > 0 {
+		if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+			return nil, err
+		}
+		if err := writeFileSync(file, []byte(strconv.FormatUint(old, 10)+"\n")); err != nil {
+			return nil, fmt.Errorf("carry the epoch from %s to %s: %w", legacy, file, err)
+		}
+		s.cur = old
+	}
+	return s, nil
+}
+
+func readEpochFile(path string) (uint64, bool, error) {
+	b, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return s, nil
+		return 0, false, nil
 	case err != nil:
-		return nil, err
+		return 0, false, err
 	}
 	v, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("corrupt epoch file %s: %w", s.path, err)
+		return 0, false, fmt.Errorf("corrupt epoch file %s: %w", path, err)
 	}
-	s.cur = v
-	return s, nil
+	return v, true, nil
 }
 
 // Current returns the last accepted epoch.

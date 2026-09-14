@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -136,5 +137,76 @@ func TestATermEndsWhenTheNextEpochIsAccepted(t *testing.T) {
 		t.Fatalf("the term did not survive one operation ending: %v %v", err, again.Err())
 	} else {
 		rel()
+	}
+}
+
+// TestTheEpochSurvivesAReclonesClearOfPGDATA: a reclone empties PGDATA
+// before pg_basebackup fills it again, and an agent that dies in between
+// used to restart with no epoch file, loaded 0, and treated any epoch at all
+// as newer -- a delayed Promote from a term long over included. Kept beside
+// PGDATA, the clear does not reach it.
+func TestTheEpochSurvivesAReclonesClearOfPGDATA(t *testing.T) {
+	vol := t.TempDir()
+	pgdata := filepath.Join(vol, "pgdata")
+	file := filepath.Join(vol, "pgshard-epoch")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Accept(5); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearDir(pgdata); err != nil {
+		t.Fatal(err)
+	}
+	again, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.Current(); got != 5 {
+		t.Fatalf("epoch %d after the clear, want 5: an agent restarting mid-clone would accept any epoch", got)
+	}
+}
+
+// TestAnUpgradedMemberCarriesItsEpochAcross: a member that has only ever
+// kept its epoch inside PGDATA must not start at 0 the first time it is
+// told where the file now lives. And once carried, the legacy file is
+// ignored: what a clone copies into it is the primary's fence, not this
+// member's.
+func TestAnUpgradedMemberCarriesItsEpochAcross(t *testing.T) {
+	vol := t.TempDir()
+	pgdata := filepath.Join(vol, "pgdata")
+	file := filepath.Join(vol, "pgshard-epoch")
+	legacy, err := OpenEpochStore(pgdata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Accept(7); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Current(); got != 7 {
+		t.Fatalf("epoch %d on first open of the configured file, want the 7 accepted before it existed", got)
+	}
+	if b, err := os.ReadFile(file); err != nil || strings.TrimSpace(string(b)) != "7" {
+		t.Fatalf("configured file holds %q (err %v), want the carried 7", b, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(pgdata, "pgshard", "epoch"), []byte("9\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again, err := OpenEpochStoreAt(pgdata, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.Current(); got != 7 {
+		t.Fatalf("epoch %d: the legacy file, which a clone overwrote, was read over the configured one", got)
 	}
 }

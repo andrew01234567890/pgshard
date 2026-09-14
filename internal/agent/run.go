@@ -32,7 +32,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	sup := NewSupervisor(cfg.BinDir, cfg.PGData, log)
 	go sup.ReapOrphans(ctx)
 
-	epoch, err := OpenEpochStore(cfg.PGData)
+	epoch, err := OpenEpochStoreAt(cfg.PGData, cfg.EpochFile)
 	if err != nil {
 		return err
 	}
