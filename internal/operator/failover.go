@@ -18,6 +18,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agent"
 )
 
 const (
@@ -463,10 +464,16 @@ func agentAddr(ip string) string { return fmt.Sprintf("%s:%d", ip, agentGRPCPort
 // It has to be non-zero for the wait below to mean anything: a delete with
 // grace zero is a force delete, which removes the object from the API server
 // without the kubelet confirming anything, so "the Pod is gone" would be
-// observed while the container was still running. Ten seconds is enough for
-// the kubelet to signal the agent and stop PostgreSQL, and short enough that
-// a failover on a healthy node is not held up by it.
-const podFenceGrace = 10 * time.Second
+// observed while the container was still running.
+//
+// It is a ceiling, not a wait: the Pod goes once the agent has exited and the
+// pooler sidecar has drained, which a fast shutdown's ending of sessions
+// lets it do at once. So it caps how long a slow shutdown can hold up the
+// promotion, and it is derived from what the agent is told to spend: its
+// fast shutdown plus the agent's own overhead. It used to be ten seconds
+// against a stop that spent the first five in a smart shutdown the pooler's
+// connections never let finish, leaving a fast shutdown five.
+const podFenceGrace = agentShutdownTimeout + agent.TerminationOverhead
 
 // fencePod deletes the old primary's Pod and waits for the kubelet to confirm
 // it is gone, so a primary that is alive but unreachable to the operator is

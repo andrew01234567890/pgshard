@@ -271,19 +271,46 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		}
 	}
 	grpcSrv.Stop()
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), terminationHTTPTimeout)
 	_ = httpSrv.Shutdown(shutCtx)
 	shutCancel()
 
-	mode := ShutdownSmart
-	if runErr != nil {
-		mode = ShutdownFast
-	}
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Duration(cfg.ShutdownTimeout))
+	// Fast, straight away, for ShutdownTimeout. A smart shutdown waits for
+	// every client to disconnect, and a member always has clients -- the
+	// pooler's -- so the smart phase preserved nothing and only spent time
+	// the Pod's grace could have given a fast shutdown instead. Fast ends the
+	// sessions (prepared transactions stay prepared, and walsenders still
+	// drain to their standbys) and writes the shutdown checkpoint that lets
+	// the member rejoin by pg_rewind without crash recovery.
+	//
+	// When ShutdownTimeout runs out the stop gives up and the agent exits;
+	// whatever of postgres is still running dies with the container. There
+	// is no immediate phase worth budgeting for: a checkpointer stuck in
+	// fsync -- the usual reason a fast shutdown overruns -- cannot act on
+	// SIGQUIT either, and the postmaster itself waits seconds for children.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeout))
 	defer stopCancel()
-	if err := sup.Stop(stopCtx, mode, time.Duration(cfg.ShutdownTimeout)); err != nil {
+	if err := sup.Stop(stopCtx, ShutdownFast, time.Duration(cfg.ShutdownTimeout)); err != nil {
+		log.Warn("postgres did not finish a fast shutdown in time; exiting, which kills it", "err", err)
+		// The Lease is left for the operator, which fences it itself when it
+		// promotes; releasing it here would only race that.
 		return errors.Join(runErr, err)
 	}
-	srv.releaseLease(stopCtx)
+	leaseCtx, leaseCancel := context.WithTimeout(context.Background(), terminationLeaseTimeout)
+	defer leaseCancel()
+	srv.releaseLease(leaseCtx)
 	return runErr
 }
+
+// terminationHTTPTimeout and terminationLeaseTimeout are the parts of the
+// SIGTERM stop that are not postgres's; TerminationOverhead is their sum.
+const (
+	terminationHTTPTimeout  = 1 * time.Second
+	terminationLeaseTimeout = 1 * time.Second
+)
+
+// TerminationOverhead is what the agent's stop on SIGTERM takes beyond the
+// fast shutdown itself. The longest the agent takes to exit is
+// ShutdownTimeout plus this, and whoever deletes its Pod has to allow that
+// much grace or the shutdown is SIGKILLed partway through.
+const TerminationOverhead = terminationHTTPTimeout + terminationLeaseTimeout

@@ -124,6 +124,10 @@ func (h *harness) containerName(member string) string {
 	return "pgshard-agent-" + h.suffix + "-" + member
 }
 
+// integrationShutdownTimeout is the fast-shutdown bound the harness's agents
+// run with.
+const integrationShutdownTimeout = 20 * time.Second
+
 func (h *harness) writeConfig(member string, role Role, source string, peers []string) string {
 	h.t.Helper()
 	cfg := map[string]any{
@@ -132,7 +136,7 @@ func (h *harness) writeConfig(member string, role Role, source string, peers []s
 		"primaryConninfo": "host=" + h.containerName(source) + " port=5432 user=postgres",
 		"podCIDR":         "0.0.0.0/0", "peerFailsafeURLs": peers, "isolationGrace": "5s",
 		"lease":           map[string]any{"enabled": false},
-		"shutdownTimeout": "20s",
+		"shutdownTimeout": integrationShutdownTimeout.String(),
 	}
 	for k, v := range h.extra {
 		cfg[k] = v
@@ -586,8 +590,40 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	}
 	s.waitHTTP("/readyz", 200, 60*time.Second)
 
+	t.Log("a member answers SIGTERM with a fast shutdown, inside its grace")
+	// A session that stays open is what a smart shutdown waits on, and a
+	// member always has one: the pooler's. The agent used to spend its first
+	// ShutdownTimeout in exactly that wait, which only ate into the grace a
+	// fast shutdown needed (PGS-800). PostgreSQL logs which kind it was
+	// asked for, which is the assertion that tells the two apart; the exit
+	// code shows the agent left on its own rather than being killed.
+	docker(t, "exec", "-d", "-e", "PGPASSWORD=pgshard-test", p.container,
+		"psql", "-h", "/tmp", "-U", "postgres", "-c", "SELECT pg_sleep(600)")
+	heldBy := time.Now().Add(15 * time.Second)
+	for p.psql("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(600)%'") != "1" {
+		if time.Now().After(heldBy) {
+			t.Fatal("the held session never appeared, so the stop below would not wait on anything")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	grace := fmt.Sprint(int((integrationShutdownTimeout+TerminationOverhead)/time.Second) + 1)
+	stoppedFrom := time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano)
+	docker(t, "stop", "-t", grace, p.container)
+	if code := docker(t, "inspect", "-f", "{{.State.ExitCode}}", p.container); code != "0" {
+		t.Fatalf("the agent exited %s after a %ss grace with a client connected, not 0 on its own\n%s", code, grace, p.logs())
+	}
+	// Both, and in that direction. A smart shutdown that times out escalates
+	// to fast, so "received fast shutdown request" alone is logged on the
+	// path this test exists to rule out as well.
+	stopLogs := docker(t, "logs", "--since", stoppedFrom, p.container)
+	if strings.Contains(stopLogs, "received smart shutdown request") {
+		t.Fatalf("SIGTERM reached postgres as a smart shutdown, which waits on the pooler's sessions\n%s", stopLogs)
+	}
+	if !strings.Contains(stopLogs, "received fast shutdown request") {
+		t.Fatalf("SIGTERM did not reach postgres as a fast shutdown\n%s", stopLogs)
+	}
+
 	t.Log("isolated primary without kube API self-fences")
-	docker(t, "stop", "-t", "30", p.container)
 	s.waitHTTP("/livez", 500, 30*time.Second)
 	deadline = time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {

@@ -66,7 +66,8 @@ type Config struct {
 	// IsolationGrace is how long a primary must reach neither the kube API
 	// nor any peer before it self-fences; zero means 30s.
 	IsolationGrace Duration `json:"isolationGrace"`
-	// ShutdownTimeout bounds a smart shutdown before falling back to fast.
+	// ShutdownTimeout bounds the fast shutdown the agent runs on SIGTERM. The
+	// agent exits within ShutdownTimeout + TerminationOverhead of the signal.
 	ShutdownTimeout Duration `json:"shutdownTimeout"`
 	// OverrideFile is a rendered postgresql.conf fragment (the operator's
 	// derived tuning) copied into PGDATA as pgshard.override.conf.
