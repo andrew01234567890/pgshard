@@ -81,7 +81,8 @@ func TestMain(m *testing.M) {
 
 type fakeProber struct {
 	mu sync.Mutex
-	// standbyProbes counts ProbeStandby calls, which only a failover makes.
+	// standbyProbes counts ProbeStandby calls: a failover's, and also a
+	// switchover's or an admission check's.
 	standbyProbes int
 	err           error
 	streaming     map[string]bool
@@ -522,6 +523,11 @@ func (f *fakeAgents) Status(_ context.Context, addr string) (AgentStatus, error)
 		if st, err, ok := f.statusHook(addr); ok {
 			return st, err
 		}
+	}
+	// An error the agent embedded comes with the rest of its answer, as
+	// GRPCAgentClient.Status returns it.
+	if se := (*AgentStatusError)(nil); errors.As(f.errs[addr], &se) {
+		return f.status[addr], se
 	}
 	if err := f.errs[addr]; err != nil {
 		return AgentStatus{}, err

@@ -573,6 +573,13 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 	}
 
 	views, err := r.quiesce(ctx, c, g, old, members, password)
+	if errors.Is(err, errPrimaryStillLive) {
+		// Abandoned because the old primary is still running, so it must be
+		// able to keep its Lease: a fence left behind makes its agent stop
+		// PostgreSQL at its next renewal, which is the failover this just
+		// decided against.
+		return state, errors.Join(err, r.releaseLease(ctx, c, g))
+	}
 	if err != nil {
 		return state, err
 	}
@@ -933,11 +940,18 @@ func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgS
 			continue
 		}
 		st, err := r.Agents.Status(ctx, agentAddr(m.ip))
-		if err != nil || !st.Running {
+		// A member with no connection slot left is running and says what it
+		// is, which is enough to relabel it or to demote it -- neither needs
+		// SQL on it -- but not to promote it, whose setup does.
+		full := runningButFull(st, err)
+		if (err != nil && !full) || !st.Running {
 			continue
 		}
 		switch {
 		case name == state.primary && (!st.Primary || st.PromotionPending):
+			if full {
+				continue
+			}
 			// A designated primary that is still a standby must be promoted;
 			// one that promoted but whose post-promotion setup failed reports
 			// PromotionPending and is re-promoted (the agent's Promote is

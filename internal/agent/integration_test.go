@@ -485,7 +485,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	// delay (PGS-819).
 	slots := s.psql("SHOW max_connections")
 	docker(t, "exec", "-d", "-e", "PGPASSWORD=pgshard-test", s.container, "bash", "-c",
-		`for i in $(seq `+slots+`); do psql -h /tmp -U postgres -Atc "SELECT pg_sleep(15)" >/dev/null 2>&1 & done; wait`)
+		// Five more than there are slots, so a connection of the agent's
+		// own that takes one while they fill does not leave one free.
+		`for i in $(seq $((`+slots+` + 5))); do psql -h /tmp -U postgres -Atc "SELECT pg_sleep(15)" >/dev/null 2>&1 & done; wait`)
 	full := func() bool {
 		out, err := exec.Command("docker", "exec", "-e", "PGPASSWORD=pgshard-test", s.container,
 			"psql", "-h", "/tmp", "-U", "postgres", "-Atc", "SELECT 1").CombinedOutput()
