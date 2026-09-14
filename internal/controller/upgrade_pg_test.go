@@ -671,3 +671,82 @@ func TestCleanupWritesThroughARetiredSourcesPause(t *testing.T) {
 		t.Fatalf("%d reverse subscriptions left on the sources", n)
 	}
 }
+
+// TestCompleteLeavesARetiredSetWritableWhileAnotherWorkflowReplicatesIntoIt
+// (PGS-837): a switch abandoned because another workflow retired its sources
+// completes with that workflow's retired set as its own source set, and
+// Complete's tail paused it. The other workflow keeps reverse subscriptions
+// into the set for its rollback window; paused, their apply fails with 25006
+// and its rollback never finishes. A subscription of another generation on
+// the set stands in for that workflow here.
+func TestCompleteLeavesARetiredSetWritableWhileAnotherWorkflowReplicatesIntoIt(t *testing.T) {
+	parallelPG(t)
+	f := newUpgradeFixture(t)
+	id := f.startWorkflowKind(KindUpgrade)
+	ctx := context.Background()
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var state, stage, msg string
+	for {
+		f.pass()
+		state, stage, msg = f.workflow(id)
+		if stage == StageSwitched || state == StateFailed || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if stage != StageSwitched {
+		t.Fatalf("upgrade did not switch: %s %s %q", state, stage, msg)
+	}
+	wfs, err := f.copier.listCopyWorkflows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := slices.IndexFunc(wfs, func(w copyWorkflow) bool { return w.id == id })
+	if idx < 0 {
+		t.Fatalf("workflow %s not listed", id)
+	}
+	wf := &wfs[idx]
+	var held bool
+	if wf.owner, held, err = claimWorkflow(ctx, f.pool, f.copier.Replica, wf.id, f.copier.OwnerLease); err != nil || !held {
+		t.Fatalf("claim: held=%v err=%v", held, err)
+	}
+	wf.fence = wf.state
+	ops, err := f.copier.pgCutover(ctx, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused := func() int {
+		t.Helper()
+		n := 0
+		for _, s := range ops.srcIDs {
+			if queryOne[string](t, connect(t, f.appDSN(ops.srcSet, s)), `SHOW default_transaction_read_only`) == "on" {
+				n++
+			}
+		}
+		return n
+	}
+
+	other := fmt.Sprintf("pgshard_reshard_g%d_rev_s0_t0", wf.gen+7)
+	home := connect(t, f.appDSN(ops.srcSet, ops.srcIDs[0]))
+	mustExec(t, home, `CREATE SUBSCRIPTION `+other+` CONNECTION 'host=elsewhere dbname=app' PUBLICATION elsewhere WITH (connect = false, slot_name = NONE)`)
+	if err := ops.Complete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := paused(); n != 0 {
+		t.Fatalf("%d source(s) paused while another workflow still replicates into the set", n)
+	}
+
+	mustExec(t, home, `DROP SUBSCRIPTION `+other)
+	// A forward subscription of another generation is not a way back into
+	// the set, and must not keep it writable.
+	forward := fmt.Sprintf("pgshard_reshard_g%d_t0_s0", wf.gen+7)
+	mustExec(t, home, `CREATE SUBSCRIPTION `+forward+` CONNECTION 'host=elsewhere dbname=app' PUBLICATION elsewhere WITH (connect = false, slot_name = NONE)`)
+	t.Cleanup(func() { _, _ = home.Exec(context.Background(), `DROP SUBSCRIPTION IF EXISTS `+forward) })
+	if err := ops.Complete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := paused(); n != len(ops.srcIDs) {
+		t.Fatalf("%d of %d sources paused once nothing else replicates into the retired set", n, len(ops.srcIDs))
+	}
+}
