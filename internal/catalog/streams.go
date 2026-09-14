@@ -118,6 +118,11 @@ func DeleteStream(ctx context.Context, q Execer, name string) error {
 // UpsertStreamStatus records the slot state of a stream on one shard; a
 // lost slot also marks the stream lost.
 func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
+	if Unresumable(st.WALStatus) {
+		if err := markStreamLost(ctx, q, st); err != nil {
+			return err
+		}
+	}
 	_, err := q.Exec(ctx, `INSERT INTO pgshard.stream_status
 		(stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn, retained_bytes, active, synced, failover, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
@@ -130,10 +135,42 @@ func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
 	if err != nil {
 		return err
 	}
-	if st.WALStatus == "lost" {
-		return SetStreamState(ctx, q, st.Stream, StreamLost)
-	}
 	return nil
+}
+
+// Unresumable reports whether a slot's wal_status leaves its stream nothing
+// to resume from.
+//
+// "lost" is PostgreSQL's: the slot is there and the WAL it needed is gone.
+// "missing" is ours, written by the monitor when pg_replication_slots has
+// no row -- a slot dropped, or one that did not survive a promotion
+// because it was never synchronised to the member that got promoted. That
+// is strictly worse than invalidated: an invalidated slot at least records
+// why it died, where a vanished one leaves nothing to read a position
+// from. Both mean the consumer must re-baseline.
+func Unresumable(walStatus string) bool { return walStatus == "lost" || walStatus == "missing" }
+
+// markStreamLost moves a stream to lost. Called BEFORE the upsert that
+// overwrites this shard's last report, because that report is the evidence.
+//
+// "lost" is acted on at once. "missing" needs TWO consecutive sightings,
+// and the stored row is the first one: a -rw Service flip during a
+// failover can land a sweep on a member whose synced copy of the slot has
+// not caught up, and that resolves itself by the next tick. One sighting
+// is a glimpse; two is a slot that is not coming back. Making a stream
+// lost is not reversible -- only Create writes active, and CreateStream
+// refuses a duplicate name -- so the bar is the higher one.
+//
+// A stream still being created is exempt from both: its slots do not
+// exist until CreateStream has made them, and the sweep reports every one
+// of them missing in the meantime.
+func markStreamLost(ctx context.Context, q Execer, st StreamStatus) error {
+	_, err := q.Exec(ctx, `UPDATE pgshard.streams SET state = $4
+		WHERE name = $1 AND state <> $5
+		  AND ($6 OR EXISTS (SELECT 1 FROM pgshard.stream_status
+		        WHERE stream = $1 AND shard_set = $2 AND shard_id = $3 AND wal_status = 'missing'))`,
+		st.Stream, st.ShardSet, st.ShardID, StreamLost, StreamCreating, st.WALStatus == "lost")
+	return err
 }
 
 // ListStreamStatus returns the per-shard rows of one stream ("" for all).
