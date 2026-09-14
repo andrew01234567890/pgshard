@@ -158,11 +158,11 @@ var cutoverStages = []string{StageCatchUpDone, StageAwaitingSwitch, StageSwitchi
 // subscriptions and moves data, so two replicas doing it at once produce
 // half-built replication and failed cutovers.
 func (c *Copier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, c.logger, "reshard copy", func(ctx context.Context) {
+	runLoopHoldingClaims(ctx, interval, leader, c.logger, "reshard copy", func(ctx context.Context) {
 		if _, err := c.Pass(ctx); err != nil {
 			c.logger().Warn("copy pass failed", "err", err)
 		}
-	})
+	}, func(ctx context.Context) (int64, error) { return ReleaseClaims(ctx, c.Pool, c.Replica) })
 }
 
 func (c *Copier) logger() *slog.Logger {

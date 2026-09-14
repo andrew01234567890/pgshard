@@ -19,43 +19,81 @@ const stallAfter = time.Minute
 // is the one a handover opens.
 const leaderCheck = time.Second
 
-// runLoop drives pass on every tick while leader() holds, and reports a
-// pass that stops making progress. pass logs its own outcome.
+// runLoopHoldingClaims drives pass on every tick while leader() holds,
+// for the loops that take a workflow claim, and hands those claims back
+// once the term is lost.
 //
-// The pass is NOT abandoned when the term drops, which is right only for
-// a loop that holds a workflow CLAIM -- the copier and the placer.
-// Nothing releases a claim: claimWorkflow lets a successor in only once
-// owned_at is DefaultOwnerLease old, and there is no site anywhere that
-// sets owner back to NULL. So abandoning one of those partway leaves the
-// claim, and any write pause it had raised, standing for five minutes --
-// where letting the pass finish clears it inside the cutover's own
-// timeout. That is a worse outage than the one being avoided, and during
-// the same event.
+// The pass is NOT abandoned when the term drops, unlike runLoopStoppable:
+// the claim is what keeps a successor off a workflow this pass is still
+// driving, so the pass has to be allowed to finish.
 //
-// Everything else uses runLoopStoppable.
-func runLoop(ctx context.Context, interval time.Duration, leader func() bool, log func() *slog.Logger, name string, pass func(context.Context)) {
-	loop(ctx, interval, leader, nil, log, name, pass)
+// The order is the whole point. A claim is otherwise surrendered only by
+// expiry, so a successor waits out DefaultOwnerLease before touching a
+// workflow -- five minutes of a reshard standing still. But releasing it
+// the moment leadership ends would be worse: these passes are deliberately
+// not cancelled (see runLoop), so the old leader is still inside
+// driveCutover, and a successor that claimed then would drive the same
+// reshard beside it. ownedExec stops the old pass at its next catalog
+// write, which is not the same as having stopped -- the shard-side
+// statements in between reach no fence at all.
+//
+// So the release happens HERE, after the pass has returned: the old driver
+// has finished, and only then does the workflow become claimable.
+func runLoopHoldingClaims(ctx context.Context, interval time.Duration, leader func() bool, log func() *slog.Logger, name string, pass func(context.Context), release func(context.Context) (int64, error)) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	held := false
+	for {
+		select {
+		case <-ctx.Done():
+			// Shutdown, and the pass is not running: this select is
+			// between ticks. Handing back here rather than from the
+			// leadership callback keeps the release sequenced after the
+			// pass in every case, and does not depend on that goroutine
+			// winning a race against pool.Close and process exit.
+			if held {
+				handBack(ctx, log, name, release)
+			}
+			return
+		case <-t.C:
+		}
+		if leader != nil && !leader() {
+			if held {
+				held = false
+				handBack(ctx, log, name, release)
+			}
+			continue
+		}
+		held = true
+		watchPass(ctx, stallAfter, nil, log, name, pass)
+		if leader != nil && !leader() {
+			held = false
+			handBack(ctx, log, name, release)
+		}
+	}
 }
 
-// runLoopStoppable is runLoop for a pass that is abandoned partway
-// through when its loop stops being the leader.
-//
-// Leadership is otherwise only a gate on STARTING a pass: one that began
-// as leader runs to completion on the loop's own context, so during a
-// handover a demoted leader goes on working beside the new one. For the
-// resolver that means committing and rolling back prepared transactions;
-// for the applier, DDL statements on shards; for the stream monitor,
-// status rows a new leader is writing too.
-//
-// Catalog fences do not cover this. The applier stamps its writes with
-// the term it latched, so its CATALOG writes are refused -- but the
-// statement already in flight on a shard is not a catalog write, and no
-// fence reaches it. The resolver fences nothing at all.
-//
-// Safe because these passes hold no claim and persist their progress
-// before each side effect: a cancelled pass is one that stopped early,
-// which the next leader resumes from the row. It is the same property
-// their recovery from process death rests on.
+// handBack releases on a context of its own: the usual reason it runs is
+// that the loop's context has just been cancelled, and a shutdown must not
+// wait on the catalog.
+func handBack(ctx context.Context, log func() *slog.Logger, name string, release func(context.Context) (int64, error)) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	switch n, err := release(rctx); {
+	case err != nil:
+		if l := log(); l != nil {
+			l.Warn(name+": could not hand back its workflows; a successor waits out the lease", "err", err)
+		}
+	case n > 0:
+		if l := log(); l != nil {
+			l.Info(name+" handed its workflows back", "workflows", n)
+		}
+	}
+}
+
+// releaseTimeout bounds that hand-back.
+const releaseTimeout = 5 * time.Second
+
 func runLoopStoppable(ctx context.Context, interval time.Duration, leader func() bool, log func() *slog.Logger, name string, pass func(context.Context)) {
 	loop(ctx, interval, leader, leader, log, name, pass)
 }

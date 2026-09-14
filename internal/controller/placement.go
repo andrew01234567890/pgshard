@@ -191,11 +191,11 @@ type PlacementOutcome struct {
 // leader. Only the leader may run one: a pass builds shadow tables and
 // renames them into place.
 func (p *Placer) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, p.logger, "placement", func(ctx context.Context) {
+	runLoopHoldingClaims(ctx, interval, leader, p.logger, "placement", func(ctx context.Context) {
 		if _, err := p.Pass(ctx); err != nil {
 			p.logger().Warn("placement pass failed", "err", err)
 		}
-	})
+	}, func(ctx context.Context) (int64, error) { return ReleaseClaims(ctx, p.Pool, p.Replica) })
 }
 
 func (p *Placer) logger() *slog.Logger {

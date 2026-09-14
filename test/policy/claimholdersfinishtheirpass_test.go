@@ -12,8 +12,8 @@ import (
 )
 
 // TestOnlyClaimHoldersFinishTheirPass keeps one rule visible: a controller
-// loop that takes a workflow CLAIM must use runLoop, and every other loop
-// must use runLoopStoppable.
+// loop that takes a workflow CLAIM must use runLoopHoldingClaims, and every
+// other loop must use runLoopStoppable.
 //
 // Nothing releases a claim -- claimWorkflow admits a successor only once
 // owned_at is DefaultOwnerLease old, and no site sets owner back to NULL.
@@ -54,7 +54,7 @@ func TestOnlyClaimHoldersFinishTheirPass(t *testing.T) {
 			}
 			if id, ok := call.Fun.(*ast.Ident); ok {
 				switch id.Name {
-				case "runLoop":
+				case "runLoopHoldingClaims":
 					usesRunLoop = true
 				case "runLoopStoppable":
 					usesStoppable = true
@@ -73,7 +73,7 @@ func TestOnlyClaimHoldersFinishTheirPass(t *testing.T) {
 	slices.Sort(finishes)
 	slices.Sort(stops)
 	if len(finishes) > 0 {
-		t.Errorf("these hold no workflow claim but use runLoop, so a demoted leader keeps working beside the new one: %s\n"+
+		t.Errorf("these hold no workflow claim but use runLoopHoldingClaims, so a demoted leader keeps working beside the new one: %s\n"+
 			"Use runLoopStoppable, or say here why this loop must finish.", strings.Join(finishes, ", "))
 	}
 	if len(stops) > 0 {

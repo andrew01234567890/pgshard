@@ -170,29 +170,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var term atomic.Int64
 	leader := func() bool { return term.Load() != 0 }
 	rec := &controller.Reconciler{DSN: *catalogDSN, Logger: logger, LockKey: *lockKey, Interval: *interval, RetryInterval: *retry,
-		OnLeader: func(isLeader bool, t int64) {
-			term.Store(t)
-			if isLeader {
-				return
-			}
-			// Handing the workflows back rather than letting them time
-			// out. Nothing else releases a claim, so a successor would
-			// otherwise skip them until owned_at aged past the lease --
-			// five minutes of a reshard standing still, and any write
-			// pause the pass had raised standing with it.
-			//
-			// Detached from ctx because the usual reason this runs is
-			// that ctx has just been cancelled, and bounded because a
-			// shutdown must not wait on the catalog.
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			switch n, err := controller.ReleaseClaims(rctx, pool, ""); {
-			case err != nil:
-				logger.Warn("could not release workflow claims; a successor waits out the lease", "err", err)
-			case n > 0:
-				logger.Info("released workflow claims", "workflows", n)
-			}
-		}}
+		OnLeader: func(_ bool, t int64) { term.Store(t) }}
 	go func() { _ = rec.Run(ctx) }()
 	var resolver *controller.Resolver
 	var barrier *controller.Barrier

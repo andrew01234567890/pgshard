@@ -50,6 +50,12 @@ func replicaToken() (string, error) {
 // shutting down -- and turns that from a five-minute stall into a handover
 // on the successor's next tick.
 //
+// WHEN it is called is the load-bearing part, and is not this function's
+// to decide: see runLoopHoldingClaims. Releasing while the pass that took
+// the claim is still running would hand a successor a workflow the old
+// leader is mid-step on, and ownedExec only stops that pass at its NEXT
+// catalog write -- the shard-side statements before it reach no fence.
+//
 // Scoped to this replica's own claims by the WHERE, so a controller that
 // is wrong about having lost leadership cannot take anyone else's.
 func ReleaseClaims(ctx context.Context, pool *pgxpool.Pool, me string) (int64, error) {
