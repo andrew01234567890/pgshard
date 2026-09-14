@@ -406,7 +406,17 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if err := o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, true); err != nil {
 		return err
 	}
-	defer func() { _ = o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false) }()
+	// Lifted here only when the rollback stops short of the flip back and
+	// will be retried. Once serving has flipped back the pause has to
+	// outlive this call, because what makes a late write on a target safe
+	// is the reverse subscription, and Complete drops it after this
+	// returns: ReleaseRolledBackTargets lifts the pause after that.
+	flippedBack := false
+	defer func() {
+		if !flippedBack {
+			_ = o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false)
+		}
+	}()
 	if err := o.drainWriters(ctx, o.wf.set, o.wf.ids); err != nil {
 		return err
 	}
@@ -431,7 +441,16 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if err := o.flipBack(ctx); err != nil {
 		return err
 	}
+	flippedBack = true
 	return o.releaseRollback(ctx)
+}
+
+// ReleaseRolledBackTargets implements cutoverOps. It is also what lifts a
+// pause left standing by a controller that died between the flip back and
+// Complete: the resume takes Rollback's already-serving path, which never
+// touches the pause, so this is the only place it comes down.
+func (o *pgCutover) ReleaseRolledBackTargets(ctx context.Context) error {
+	return o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false)
 }
 
 // reverseBehind lists the reverse subscriptions whose confirmed flush

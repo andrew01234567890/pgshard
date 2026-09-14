@@ -96,8 +96,68 @@ func TestUpgradeRollbackWaitsForReverseThenCancels(t *testing.T) {
 	if !strings.HasPrefix(h.store.finished, StateCancelled) || !strings.Contains(h.store.finished, "rolled back") {
 		t.Fatalf("finished %q", h.store.finished)
 	}
-	if h.ops.calls[len(h.ops.calls)-1] != "complete" {
+	if !slices.Contains(h.ops.calls, "complete") {
 		t.Fatalf("replication objects not dropped: %v", h.ops.calls)
+	}
+}
+
+// TestARolledBackTargetStaysPausedUntilItsReplicationIsGone: Rollback
+// fences and pauses the targets, waits for reverse replication, and flips
+// serving back to the sources. A router still holding the snapshot from
+// before that flip can commit on a target -- the reload budget after a
+// burst is one per second, with a 30s periodic -- and the row reaches the
+// source only through the reverse subscription. Complete drops it. So a
+// target that is writable before Complete finishes turns that commit into
+// an acknowledged write carried nowhere.
+//
+// The pause used to come off when Rollback returned, which is before
+// Complete runs.
+func TestARolledBackTargetStaysPausedUntilItsReplicationIsGone(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitched)
+	h.wf.spec.Rollback = true
+	h.pass(t)
+	h.ops.reverseCaughtUp = true
+	h.pass(t)
+	if h.wf.stage != StageRolledBack {
+		t.Fatalf("stage %s", h.wf.stage)
+	}
+	if h.ops.completeWhileTargetsWritable {
+		t.Fatalf("Complete dropped the reverse subscriptions with the targets writable: %v", h.ops.calls)
+	}
+	complete := slices.Index(h.ops.calls, "complete")
+	release := slices.Index(h.ops.calls, "release_rolled_back_targets")
+	if release < 0 {
+		t.Fatalf("the targets were never released, so a rolled-back run strands them read-only: %v", h.ops.calls)
+	}
+	if release < complete {
+		t.Fatalf("the targets were released before Complete: %v", h.ops.calls)
+	}
+	if h.ops.targetsPaused {
+		t.Fatal("the rollback finished with the targets still paused")
+	}
+}
+
+// TestARollbackStillBehindLeavesTheTargetsWritable is the other side: a
+// rollback that stops short of the flip back is retried from scratch, and
+// the targets are still the serving set in the meantime, so the pause
+// holding would be an outage rather than a safeguard.
+func TestARollbackStillBehindLeavesTheTargetsWritable(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitched)
+	h.wf.spec.Rollback = true
+	h.pass(t)
+	h.pass(t)
+	if h.wf.stage != StageRollingBack {
+		t.Fatalf("stage %s", h.wf.stage)
+	}
+	if h.ops.targetsPaused {
+		t.Fatal("a rollback waiting on reverse replication left the serving targets paused")
+	}
+	for _, c := range []string{"complete", "release_rolled_back_targets"} {
+		if slices.Contains(h.ops.calls, c) {
+			t.Fatalf("%s ran before the rollback flipped back: %v", c, h.ops.calls)
+		}
 	}
 }
 
