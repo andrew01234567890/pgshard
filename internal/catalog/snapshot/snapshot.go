@@ -269,6 +269,10 @@ func (s *Snapshot) index() {
 // that nothing depends on costs a replan nobody notices. Only LoadedAt is
 // excluded, because it is when the catalog was read rather than what it
 // said.
+//
+// TestAReloadOfAnUnchangedCatalogPlansTheSame names every field here. A
+// field added to Snapshot and not to both is the stale plan this exists to
+// prevent -- Views was exactly that until PGS-811.
 func (s *Snapshot) fingerprint() uint64 {
 	h := fnv.New64a()
 	num := func(v int64) { _ = binary.Write(h, binary.LittleEndian, v) }
@@ -343,6 +347,24 @@ func (s *Snapshot) fingerprint() uint64 {
 		flag(t.ShardKeyChecked)
 		str(t.ShardKeyError)
 		str(t.ShardKeyType)
+	}
+	// The planner routes a view by this map (plan/planner.go), so a view
+	// redefined under a prepared statement -- a column remapped onto another
+	// base column, or a simple view turned opaque -- is a plan made against
+	// a shape that no longer exists.
+	for _, k := range slices.SortedFunc(maps.Keys(s.Views), compareTableKeys) {
+		str(k.Database)
+		str(k.SchemaName)
+		str(k.TableName)
+		v := s.Views[k]
+		str(v.Base.Database)
+		str(v.Base.SchemaName)
+		str(v.Base.TableName)
+		flag(v.Simple)
+		for _, col := range slices.Sorted(maps.Keys(v.Columns)) {
+			str(col)
+			str(v.Columns[col])
+		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(s.Sequences)) {
 		str(name)

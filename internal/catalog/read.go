@@ -343,11 +343,13 @@ var ErrNoShardMapGeneration = errors.New(
 // That is five of the nine tables carrying the column -- it omits
 // role_members, role_settings, functions and shard_sets -- and the number
 // is therefore a lower bound on "something in desired state changed", not
-// the maximum over all of it. Nothing depends on it being the maximum: its
-// only consumer is the snapshot, which publishes a change whenever the
-// snapshot's fingerprint moves and uses this pair only as a cheap first
-// test (PGS-811). Widen it if a caller ever needs the real maximum, and say
-// so here.
+// the maximum over all of it. Nothing depends on it being the maximum. The
+// snapshot is the only caller that reads the desired half at all, and it
+// publishes a change whenever the snapshot's fingerprint moves, using this
+// pair only as a cheap first test (PGS-811); controller/barrier.go and
+// operator/probecatalog.go call it for the shard-map half and for whether
+// it answers. Widen it if a caller ever needs the real maximum, and say so
+// here.
 func Generations(ctx context.Context, q Querier) (shardMap, desired int64, err error) {
 	rows, err := q.Query(ctx, `
 		SELECT (SELECT generation FROM pgshard.shard_map_generation),

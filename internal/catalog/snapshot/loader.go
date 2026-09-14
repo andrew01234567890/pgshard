@@ -62,6 +62,10 @@ func LoadServing(ctx context.Context, db Beginner) (*Snapshot, error) {
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("snapshot: commit: %w", err)
 	}
+	// A partial snapshot is compared like any other: without this its
+	// fingerprint is zero, SamePlanning reads that as "assume they differ",
+	// and a pooler's watcher publishes a change on every reload for ever.
+	s.rev = s.fingerprint()
 	return s, nil
 }
 
