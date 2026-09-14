@@ -104,7 +104,7 @@ func (r *ReferenceCheck) logger() *slog.Logger {
 // Run re-inspects on a ticker while this process is the leader.
 func (r *ReferenceCheck) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	nextSweep := r.now()
-	runLoop(ctx, interval, leader, r.logger, "reference check", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, r.logger, "reference check", func(ctx context.Context) {
 		if _, err := r.Pass(ctx); err != nil {
 			r.logger().Warn("reference check pass failed", "err", err)
 		}

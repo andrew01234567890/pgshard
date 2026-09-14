@@ -42,7 +42,7 @@ func (c *ShardKeyCheck) logger() *slog.Logger {
 
 // Run re-checks on a ticker while this process is the leader.
 func (c *ShardKeyCheck) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, c.logger, "shard key check", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, c.logger, "shard key check", func(ctx context.Context) {
 		if _, err := c.Pass(ctx); err != nil {
 			c.logger().Warn("shard key check pass failed", "err", err)
 		}

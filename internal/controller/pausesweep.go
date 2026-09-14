@@ -51,7 +51,7 @@ func (s *WritePauseSweep) logger() *slog.Logger {
 
 // Run sweeps on a ticker while this process is the leader.
 func (s *WritePauseSweep) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, s.logger, "write pause sweep", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, s.logger, "write pause sweep", func(ctx context.Context) {
 		if _, err := s.Pass(ctx); err != nil {
 			s.logger().Warn("write pause sweep failed", "err", err)
 		}

@@ -159,7 +159,7 @@ func slotStatus(ctx context.Context, conn ShardConn, slot string) (catalog.Strea
 
 // Run sweeps stream status on every tick while this replica is the leader.
 func (m *StreamMonitor) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	runLoop(ctx, interval, leader, func() *slog.Logger { return m.Logger }, "stream status sweep", func(ctx context.Context) {
+	runLoopStoppable(ctx, interval, leader, func() *slog.Logger { return m.Logger }, "stream status sweep", func(ctx context.Context) {
 		if _, err := m.Sweep(ctx); err != nil && m.Logger != nil {
 			m.Logger.Warn("stream status sweep failed", "err", err)
 		}
