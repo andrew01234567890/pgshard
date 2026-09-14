@@ -636,6 +636,16 @@ func TestAUnaryAckCannotOutrunWhatTheConsumerWasSent(t *testing.T) {
 	h.pool[0].feed("plain", batch(0, evRelation(16384, "t", "id")))
 	h.pool[0].feed("plain", txn(16384, 7, 1000, 2000, "1"))
 	recvN(t, st, 4, 5*time.Second)
+	// The merger sends a transaction's events and only then publishes its
+	// end as delivered -- the safe order, since publishing first would let an
+	// ack confirm something a failed send never delivered. So the client can
+	// hold all four events while the delivered position still reads 0, and an
+	// ack in that instant is correctly clamped to nothing. Wait for the
+	// position rather than race it.
+	waitFor(t, func() bool {
+		d, _ := h.server.liveStream("plain").at(shard0)
+		return d == 2000
+	})
 
 	ack, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{
 		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 999999}}}})
