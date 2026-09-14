@@ -79,6 +79,7 @@ actionlint:
 	hack/ci/test-retry.sh
 	hack/ci/test-base-images.sh
 	hack/ci/test-mirror-args.sh
+	hack/ci/test-module-downloads.sh
 	hack/tools/test-install-retry.sh
 	hack/e2e/test-suites.sh
 
