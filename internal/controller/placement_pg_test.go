@@ -945,6 +945,14 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 		{`CREATE TABLE ruled (id bigint PRIMARY KEY); CREATE RULE r1 AS ON DELETE TO ruled DO INSTEAD NOTHING`, "ruled", "rule r1"},
 		{`CREATE TABLE base (id bigint PRIMARY KEY); CREATE TABLE inh (x int) INHERITS (base)`, "inh", "inheritance/partition membership"},
 		{`CREATE TABLE ri (id bigint PRIMARY KEY); ALTER TABLE ri REPLICA IDENTITY FULL`, "ri", "replica identity FULL"},
+		// Bound by OID from outside the table, so the swap leaves each of
+		// them on the retired table with no error (PGS-790).
+		{`CREATE TABLE viewed (id bigint PRIMARY KEY); CREATE VIEW viewed_ids AS SELECT id FROM viewed`, "viewed", "view public.viewed_ids"},
+		{`CREATE TABLE mviewed (id bigint PRIMARY KEY); CREATE MATERIALIZED VIEW mviewed_ids AS SELECT id FROM mviewed`, "mviewed", "materialized view public.mviewed_ids"},
+		{`CREATE TABLE audited (id bigint PRIMARY KEY); CREATE TABLE audit_feed (id bigint);
+			CREATE RULE feed_audited AS ON INSERT TO audit_feed DO ALSO INSERT INTO audited VALUES (NEW.id)`, "audited", "rule feed_audited on public.audit_feed"},
+		{`CREATE TABLE counted (id bigint PRIMARY KEY);
+			CREATE FUNCTION count_counted() RETURNS bigint LANGUAGE sql STABLE RETURN (SELECT count(*) FROM counted)`, "counted", "function count_counted()"},
 	} {
 		mustExec(t, home, c.ddl)
 		got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", c.table)
@@ -952,6 +960,29 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			t.Fatalf("%s: unsupported = %v (%v), want %q", c.table, got, err, c.want)
 		}
 	}
+	// A subscription applying into the table. It needs a publication to
+	// list the table, so another database on the same server publishes it;
+	// the slot is made first because CREATE SUBSCRIPTION making its own
+	// against its own server waits on itself.
+	mustExec(t, home, `CREATE DATABASE pubsrc`)
+	pub := connect(t, strings.Replace(f.dsns[ShardRef{Set: "default", ID: 0}], "/postgres?", "/pubsrc?", 1))
+	mustExec(t, pub, `CREATE TABLE subbed (id bigint PRIMARY KEY)`)
+	mustExec(t, pub, `CREATE PUBLICATION subbed_pub FOR TABLE subbed`)
+	mustExec(t, pub, `SELECT pg_create_logical_replication_slot('subbed_sub', 'pgoutput')`)
+	mustExec(t, home, `CREATE TABLE subbed (id bigint PRIMARY KEY)`)
+	mustExec(t, home, `CREATE SUBSCRIPTION subbed_sub CONNECTION 'host=/tmp user=postgres dbname=pubsrc' PUBLICATION subbed_pub
+		WITH (create_slot = false, slot_name = 'subbed_sub', enabled = false, copy_data = false)`)
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "subbed"); err != nil || !slices.Contains(got, "subscription subbed_sub") {
+		t.Fatalf("subbed: unsupported = %v (%v), want %q", got, err, "subscription subbed_sub")
+	}
+	// A plpgsql function names the table only as text in its body, resolved
+	// when it runs, so it follows the swap and is not refused.
+	mustExec(t, home, `CREATE TABLE lookedup (id bigint PRIMARY KEY)`)
+	mustExec(t, home, `CREATE FUNCTION look_up() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM lookedup); END $$`)
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "lookedup"); err != nil || len(got) != 0 {
+		t.Fatalf("a function that names the table only in text follows the swap and must not be refused: %v %v", got, err)
+	}
+
 	// And what is no longer refused: row-level security and user triggers
 	// are reproduced, so the feature detector reports neither.
 	mustExec(t, home, `CREATE TABLE rlsonly (id bigint PRIMARY KEY, owner text)`)

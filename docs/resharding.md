@@ -460,6 +460,15 @@ that ended within a day).
   (a constraint on another table points at this one by OID, and the swap
   leaves it aimed at the retired table), rules, a non-default replica
   identity, inheritance or partition membership, and publication membership.
+  So is anything outside the table bound to it by OID, which the swap leaves
+  on the retired table with no error: a **view** or **materialized view**
+  over it (it goes on reading the retired rows), another table's **rule**
+  that reads or writes it, a **subscription** applying into it (the apply
+  worker goes on writing into the retired table and the live one stops
+  receiving), and a function with a **SQL-standard body** (`BEGIN ATOMIC` or
+  `RETURN`) that queries it. A function written in PL/pgSQL or as a quoted
+  SQL string names the table in text resolved when it runs, so it follows
+  the swap and is not refused. The refusal names each object.
 - **A table's own foreign keys are reproduced when they can hold**, which is
   when the referenced table is a **reference** table: every shard has all of
   its rows, so the key holds wherever the moved table lands. A key pointing
