@@ -8,9 +8,13 @@ derived value with its reason under `status.tuning.derived` (`DerivedSetting`).
 
 The operator feeds `Derive` with the memory and CPU of `spec.resources`
 (limits, else requests), the group's `storage.size`, `spec.postgresql.profile`
-and `spec.postgresql.parameters` as overrides. Without a memory request nothing
-is derived (`TuningApplied=False/NoMemoryBudget`) and the agent's fixed
-configuration stands alone; a derivation error surfaces as
+and `spec.postgresql.parameters` as overrides. Without a memory request only the
+connection limits are set — `max_connections` (the pooler's budget of 100 plus
+8) and `superuser_reserved_connections` (8), which depend on nothing else; left
+to PostgreSQL's defaults (100, 3 reserved) non-superusers would get fewer slots
+than the pooler's budget and the control plane a reserve of three. Nothing
+memory-shaped is derived (`TuningApplied=False/NoMemoryBudget`) and the agent's
+fixed configuration stands for the rest; a derivation error surfaces as
 `TuningApplied=False/DeriveFailed`. Settings the agent fixes itself in
 `postgresql.conf` (`ssl`, `wal_level`, slot and sender counts,
 `max_prepared_transactions`, `synchronous_commit`, ...) are dropped from the

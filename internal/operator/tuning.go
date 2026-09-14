@@ -33,14 +33,14 @@ func logicalSlotsFor(c *pgshardv1alpha1.PgShardCluster) int {
 }
 
 // Tuning derives the pgtune settings for one group from the pod resources
-// (limits, else requests) and spec.postgresql. It returns nil settings when
-// no memory is requested: without a budget nothing can be derived and the
-// agent's fixed configuration stands alone.
+// (limits, else requests) and spec.postgresql. Without a memory budget only
+// the connection limits are set: nothing memory-shaped can be derived, and
+// the agent's fixed configuration stands for the rest.
 func Tuning(c *pgshardv1alpha1.PgShardCluster, g Group) (pgtune.Settings, error) {
-	mem := resourceOf(c.Spec.Resources, corev1.ResourceMemory)
-	if mem.IsZero() {
-		return nil, nil
+	if !hasMemoryBudget(c) {
+		return pgtune.Connections(defaultMaxBackends, c.Spec.PostgreSQL.Parameters), nil
 	}
+	mem := resourceOf(c.Spec.Resources, corev1.ResourceMemory)
 	cpu := resourceOf(c.Spec.Resources, corev1.ResourceCPU)
 	in := pgtune.Input{
 		Major:         c.Spec.PostgreSQL.Major,
@@ -66,6 +66,12 @@ func Tuning(c *pgshardv1alpha1.PgShardCluster, g Group) (pgtune.Settings, error)
 		return nil, err
 	}
 	return dropAgentOwned(settings), nil
+}
+
+// hasMemoryBudget reports whether spec.resources names memory to derive
+// settings from.
+func hasMemoryBudget(c *pgshardv1alpha1.PgShardCluster) bool {
+	return !resourceOf(c.Spec.Resources, corev1.ResourceMemory).IsZero()
 }
 
 func resourceOf(r corev1.ResourceRequirements, name corev1.ResourceName) *resource.Quantity {

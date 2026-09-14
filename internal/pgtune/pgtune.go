@@ -124,20 +124,7 @@ func Derive(in Input) (Settings, error) {
 		s = append(s, Setting{Name: name, Value: value, Reason: reason, Mandatory: true})
 	}
 
-	add("max_connections", itoa(maxConns), fmt.Sprintf("pooler backend budget %d plus %d reserved for superuser and the agent", in.MaxBackends, reservedConnections))
-	// The headroom above is only headroom until PostgreSQL is told to keep
-	// it: without this, superuser_reserved_connections is the default 3 and
-	// the other five are handed to whoever asks first. The control plane is
-	// what asks last -- the resolver reaches a shard when something has
-	// already gone wrong -- and an in-doubt prepared transaction it cannot
-	// reach pins WAL and blocks logical slot creation, so a resolver locked
-	// out of a busy shard makes the busy shard worse.
-	//
-	// Set to the same constant max_connections is derived from, so
-	// non-superusers get exactly the pooler's budget and the reservation
-	// cannot drift from the headroom that was sized for it.
-	add("superuser_reserved_connections", itoa(int64(reservedConnections)),
-		fmt.Sprintf("keep the %d connections above the pooler budget for the control plane, rather than the default 3", reservedConnections))
+	s = append(s, connectionSettings(in.MaxBackends)...)
 	add("shared_buffers", human(sharedBuffers), "25% of the memory limit, capped at 16GiB")
 	add("effective_cache_size", human(alignMiB(mem*3/4)), "75% of the memory limit; the kernel page cache is counted")
 	add("work_mem", human(workMem), fmt.Sprintf("(memory - shared_buffers - maintenance - decoding - overhead) / (%d backends × 4 sorts)", in.MaxBackends))
@@ -229,6 +216,47 @@ func Derive(in Input) (Settings, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// connectionSettings are the connection limit and the superuser reserve
+// inside it. They depend on the pooler's budget and nothing else, so they
+// are set whether or not there is a memory budget to derive the rest from.
+func connectionSettings(maxBackends int) Settings {
+	var s Settings
+	add := func(name, value, reason string) { s = append(s, Setting{Name: name, Value: value, Reason: reason}) }
+	add("max_connections", itoa(int64(maxBackends+reservedConnections)), fmt.Sprintf("pooler backend budget %d plus %d reserved for superuser and the agent", maxBackends, reservedConnections))
+	// The headroom above is only headroom until PostgreSQL is told to keep
+	// it: without this, superuser_reserved_connections is the default 3 and
+	// the other five are handed to whoever asks first. The control plane is
+	// what asks last -- the resolver reaches a shard when something has
+	// already gone wrong -- and an in-doubt prepared transaction it cannot
+	// reach pins WAL and blocks logical slot creation, so a resolver locked
+	// out of a busy shard makes the busy shard worse.
+	//
+	// Set to the same constant max_connections is derived from, so
+	// non-superusers get exactly the pooler's budget and the reservation
+	// cannot drift from the headroom that was sized for it.
+	add("superuser_reserved_connections", itoa(int64(reservedConnections)),
+		fmt.Sprintf("keep the %d connections above the pooler budget for the control plane, rather than the default 3", reservedConnections))
+	return s
+}
+
+// Connections is what Derive sets without a memory budget: the connection
+// limit and the superuser reserve. Left to PostgreSQL's defaults (100, of
+// which 3 reserved) they give non-superusers fewer slots than the pooler's
+// budget and the control plane a reserve of three. An override naming either
+// setting is kept, as Derive keeps it.
+func Connections(maxBackends int, overrides map[string]string) Settings {
+	s := connectionSettings(maxBackends)
+	for name, value := range overrides {
+		key := strings.ToLower(strings.TrimSpace(name))
+		for i := range s {
+			if s[i].Name == key {
+				s[i].Value, s[i].Reason = value, "operator override"
+			}
+		}
+	}
+	return s
 }
 
 func validate(in *Input) error {

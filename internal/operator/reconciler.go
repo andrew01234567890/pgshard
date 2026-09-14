@@ -1810,8 +1810,8 @@ func (r *ClusterReconciler) setRolloutStatus(c *pgshardv1alpha1.PgShardCluster, 
 	switch {
 	case tuningErr != "":
 		set(pgshardv1alpha1.ConditionTuningApplied, false, "DeriveFailed", tuningErr)
-	case len(tuned) == 0:
-		set(pgshardv1alpha1.ConditionTuningApplied, false, "NoMemoryBudget", "spec.resources sets no memory; nothing was derived")
+	case !hasMemoryBudget(c):
+		set(pgshardv1alpha1.ConditionTuningApplied, false, "NoMemoryBudget", "spec.resources sets no memory; only the connection limits were set")
 	default:
 		set(pgshardv1alpha1.ConditionTuningApplied, true, "Derived", fmt.Sprintf("%d settings derived from the pod resources", len(tuned)))
 	}
