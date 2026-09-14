@@ -988,8 +988,23 @@ type SQLBarrierGroups struct {
 }
 
 // List implements BarrierGroups.
+// List leaves out the groups of a retired shard set. A retired set keeps a
+// permanent, unclaimed write pause from the cutover that retired it, which
+// is all that stops a router still on an old snapshot committing on a set
+// nothing replicates from any more; and the barrier resumes every group it
+// lists, so listing one lifted that pause for good -- after every run, and
+// again from Recover, which reads the pause a retired set always carries as
+// one an interrupted run left behind. Nor is a retired set anything a
+// barrier should certify: it is going to be deleted, and a restore point on
+// it restores nothing anyone routes to.
+//
+// A set with no shard_sets row is kept: that is not a set anyone retired.
 func (s *SQLBarrierGroups) List(ctx context.Context) ([]GroupRef, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT group_name, shard_set, shard_id FROM pgshard.shard_status ORDER BY shard_set, shard_id`)
+	rows, err := s.Pool.Query(ctx, `SELECT st.group_name, st.shard_set, st.shard_id
+		  FROM pgshard.shard_status st
+		  LEFT JOIN pgshard.shard_sets ss ON ss.shard_set = st.shard_set
+		 WHERE ss.state IS DISTINCT FROM 'retired'
+		 ORDER BY st.shard_set, st.shard_id`)
 	if err != nil {
 		return nil, err
 	}

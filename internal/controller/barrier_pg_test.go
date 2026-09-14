@@ -12,6 +12,8 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // TestBarrierOnPostgres drives a barrier over a real catalog and two shards
@@ -378,5 +380,74 @@ func TestAnUnownedWriteCannotDisturbABarriersFence(t *testing.T) {
 	}
 	if err := catalog.SetWriteFence(ctx, f.pool, true, "restore"); err != nil {
 		t.Fatalf("after the owner released it: %v", err)
+	}
+}
+
+// TestABarrierLeavesARetiredSetPaused: a retired shard set keeps the
+// permanent write pause its cutover left on it, and that pause is all that
+// stops a router still on an old snapshot committing on a set nothing
+// replicates from any more. The barrier listed every group in shard_status
+// and resumed every group it listed, so the first barrier after any
+// completed or rolled-back cutover made every retired set writable for good
+// (PGS-817).
+func TestABarrierLeavesARetiredSetPaused(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixtureWith(t, "-c archive_mode=on", "-c archive_command=/bin/true")
+	ctx := context.Background()
+
+	// A retired set on a server of its own, carrying the retirement pause.
+	oldDSN := startPostgresWith(t, "-c wal_level=logical", "-c archive_mode=on", "-c archive_command=/bin/true")
+	f.dialer.inner.DSNs[ShardRef{Set: "old", ID: 0}] = oldDSN
+	cat, err := f.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Retirement is reached through a whole lifecycle of triggers; the state
+	// is what this test is about, so it is written directly.
+	for _, stmt := range []string{
+		`SET session_replication_role = replica`,
+		`INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('old', 99, 'retired')`,
+		`INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch) VALUES ('old', 0, 'o0', 'retired', 1)`,
+		`RESET session_replication_role`,
+	} {
+		if _, err := cat.Exec(ctx, stmt); err != nil {
+			cat.Release()
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	cat.Release()
+	old := connect(t, oldDSN)
+	mustExec(t, old, `CREATE TABLE t (v text)`)
+	mustExec(t, old, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, old, `SELECT pg_reload_conf()`)
+	write := func() error {
+		c, err := pgx.Connect(ctx, oldDSN)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close(ctx) }()
+		_, err = c.Exec(ctx, `INSERT INTO t VALUES ('after the barrier')`)
+		return err
+	}
+	waitFor(t, 30*time.Second, func() bool {
+		var pgErr *pgconn.PgError
+		return errors.As(write(), &pgErr) && pgErr.Code == "25006"
+	}, "the retirement pause never took, so the barrier below has nothing to lift")
+
+	b := &Barrier{Store: &PGBarrierStore{Pool: f.pool}, Groups: &SQLBarrierGroups{Pool: f.pool, Shards: f.dialer}, Resolver: f.res, Poll: 50 * time.Millisecond}
+	srv := &Server{Pool: f.pool, Barrier: b, Resolver: f.res}
+	resp, err := srv.CreateBarrier(ctx, &pgshardv1.CreateBarrierRequest{Name: "past-a-retired-set"})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreateBarrier: %v %v", err, resp.GetError())
+	}
+	for _, g := range resp.GetBarrier().GetGroups() {
+		if g.GetGroup() == "o0" {
+			t.Errorf("the barrier certified a restore point on the retired set: %v", g)
+		}
+	}
+
+	var pgErr *pgconn.PgError
+	if err := write(); !errors.As(err, &pgErr) || pgErr.Code != "25006" {
+		t.Fatalf("the retired set took a write after the barrier (err %v): its retirement pause was lifted", err)
 	}
 }
