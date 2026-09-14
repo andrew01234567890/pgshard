@@ -15,6 +15,12 @@ type Querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
+// Beginner starts transactions; *pgx.Conn and *pgxpool.Pool satisfy it,
+// and pgx.Tx deliberately does not.
+type Beginner interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
+}
+
 // Execer is satisfied by *pgx.Conn, pgx.Tx and *pgxpool.Pool.
 type Execer interface {
 	Querier
