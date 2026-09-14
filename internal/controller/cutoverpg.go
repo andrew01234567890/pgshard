@@ -1555,6 +1555,7 @@ func (o *pgCutover) Unwind(ctx context.Context) error {
 				o.c.logger().Info("reshard cancel: source unreachable, skipping its reverse subscriptions", "workflow", o.wf.id, "source", s, "err", err)
 				continue
 			}
+			// A source another workflow retired since refuses writes.
 			err = writeThroughPause(ctx, conn)
 			if err == nil {
 				err = dropSubscriptionsLike(ctx, conn, o.reversePattern(s))
@@ -1616,7 +1617,9 @@ func (o *pgCutover) DropJournal(ctx context.Context, id string) error {
 // drop on any source the first one skipped as unreachable. The journal rows
 // and the replication objects on it are this workflow's to clean up, and
 // without this every attempt failed with 25006 and the workflow was
-// retried for ever, holding its slots (PGS-816).
+// retried for ever, holding its slots (PGS-816). A cancel's cleanup of its
+// sources -- the cancel pass's publications, Unwind's reverse subscriptions
+// -- meets the same pause and does the same (PGS-836).
 //
 // It is a SESSION setting, in a statement of its own, because the pause
 // is read when a transaction starts: set inside the transaction that then

@@ -705,6 +705,16 @@ func TestCancelDropsItsPublicationsOnARetiredSource(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 	}
 
+	slots := func() int64 {
+		var n int64
+		for s := range int32(2) {
+			n += queryOne[int64](t, connect(t, f.dsns[ShardRef{Set: "default", ID: s}]), `SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgshard_reshard_%'`)
+		}
+		return n
+	}
+	if slots() == 0 {
+		t.Fatal("the workflow holds no slots on its sources, so the check after the cancel proves nothing")
+	}
 	for s := range int32(2) {
 		admin := connect(t, f.dsns[ShardRef{Set: "default", ID: s}])
 		mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
@@ -736,5 +746,8 @@ func TestCancelDropsItsPublicationsOnARetiredSource(t *testing.T) {
 	}
 	if n := pubs(); n != 0 {
 		t.Fatalf("%d publications left on the sources after the cancel", n)
+	}
+	if n := slots(); n != 0 {
+		t.Fatalf("%d reshard slots left on the sources after the cancel", n)
 	}
 }
