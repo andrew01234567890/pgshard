@@ -97,13 +97,22 @@ func (m *StreamMonitor) Sweep(ctx context.Context) (int, error) {
 				}
 				continue
 			}
-			// Asked once per shard rather than per slot, because a slot
-			// that is missing returns no row to carry it on. A standby's
-			// answer is recorded like any other but may not condemn the
-			// stream: slotsync drops and recreates a synced slot, and its
-			// worker's nap reaches thirty seconds on a quiet cluster, so
-			// "no such slot" from a standby says nothing about the slot.
+			// Asked once per shard rather than per slot, because the
+			// reading whose trustworthiness this decides is the one where
+			// the slot is MISSING, and that returns no row to carry it on.
+			// A standby's answer is recorded like any other but may not
+			// condemn a stream, and may not stand as evidence for one:
+			// see markStreamLost.
 			inRecovery, rerr := inRecoveryOn(ctx, conn)
+			if inRecovery && m.Logger != nil {
+				// Said out loud once per shard per sweep, because the
+				// alternative failure is silent: a -rw Service stuck on a
+				// standby makes every reading untrusted, so a slot that
+				// really is gone is never reported and the stream stays
+				// active for ever with nothing saying why.
+				m.Logger.Warn("stream sweep reached a member in recovery; its readings cannot condemn a stream",
+					"shard_set", sh.Set, "shard", sh.ID)
+			}
 			if rerr != nil {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("shard %s/%d: %w", sh.Set, sh.ID, rerr)

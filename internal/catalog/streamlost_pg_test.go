@@ -142,12 +142,15 @@ func TestAVanishedSlotMarksTheStreamLost(t *testing.T) {
 		t.Errorf("two sightings after activation left the stream %q, want %q", got, StreamLost)
 	}
 
-	// A standby's reading never condemns, however many times it is seen.
-	// slotsync drops and recreates a synced slot, and its worker's nap
-	// doubles to 30s on a quiet cluster (MAX_SLOTSYNC_WORKER_NAPTIME_MS),
-	// so a sweep reaching a standby through a -rw flip can see "missing"
-	// for half a minute -- six consecutive sweeps at the default interval,
-	// which the two-sighting debounce does not survive on its own.
+	// A standby's reading neither condemns NOR counts as the first of the
+	// two sightings. Gating only the condemning reading left the first
+	// ungated, so a standby's stored "missing" plus one primary look was
+	// enough -- which is the single-sighting condemnation the debounce
+	// exists to prevent.
+	//
+	// A standby's copy of a slot is synchronised, not owned: slotsync can
+	// leave it invalidated until its next cycle, and that cycle naps up to
+	// 30 seconds on a quiet cluster.
 	active("on_a_standby")
 	for range 6 {
 		if err := UpsertStreamStatus(ctx, conn, StreamStatus{
@@ -156,10 +159,13 @@ func TestAVanishedSlotMarksTheStreamLost(t *testing.T) {
 		}
 	}
 	if got := state("on_a_standby"); got != StreamActive {
-		t.Errorf("a standby's readings condemned the stream (%q); slotsync's own recreate window is longer than the debounce", got)
+		t.Errorf("a standby's readings condemned the stream (%q)", got)
 	}
-	// The same slot, once the reading comes from the primary twice.
+	// One primary sighting on top of all that must still not be enough.
 	sweep("on_a_standby", "missing")
+	if got := state("on_a_standby"); got != StreamActive {
+		t.Errorf("a standby's stored reading counted as the first sighting: one primary look made the stream %q", got)
+	}
 	sweep("on_a_standby", "missing")
 	if got := state("on_a_standby"); got != StreamLost {
 		t.Errorf("the primary reported it missing twice and the stream is %q, want %q", got, StreamLost)
