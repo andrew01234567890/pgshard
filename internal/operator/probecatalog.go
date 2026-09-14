@@ -342,6 +342,9 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, source, target CatalogSid
 	if err := carryHashVersions(ctx, src, tgt); err != nil {
 		return err
 	}
+	if err := carryRolesGeneration(ctx, src, tgt); err != nil {
+		return err
+	}
 	if err := catalogTargetIsReadable(ctx, tgt); err != nil {
 		return err
 	}
@@ -395,6 +398,33 @@ func carryShardMapGeneration(ctx context.Context, src, tgt *pgx.Conn) error {
 		 VALUES (true, $1, $2, $3, $4) ON CONFLICT (singleton) DO NOTHING`,
 		generation, fence, reason, owner); err != nil {
 		return fmt.Errorf("restore shard map generation on the catalog target: %w", err)
+	}
+	return nil
+}
+
+// carryRolesGeneration restores the target's roles_generation row, for the
+// same reason carryShardMapGeneration restores the shard-map one: it is a
+// singleton seeded by the schema migration (0053) and clearCatalogSchema
+// TRUNCATEs it off the target before the copy.
+//
+// It fails the way the shard-map row does, silently and completely. The
+// row is only ever UPDATEd afterwards -- by the trigger on the four roles
+// tables -- and an UPDATE over no rows affects nothing and raises nothing,
+// so the generation simply stops moving. Every LoadDesiredRoles then fails
+// scanning NULL, which stops role verification and materialization on the
+// new catalog, and every waiter on the generation waits forever.
+//
+// Repair, not overwrite: a target that already has its row keeps it.
+func carryRolesGeneration(ctx context.Context, src, tgt *pgx.Conn) error {
+	var generation int64
+	if err := src.QueryRow(ctx,
+		`SELECT generation FROM pgshard.roles_generation`).Scan(&generation); err != nil {
+		return fmt.Errorf("read roles generation from the catalog source: %w", err)
+	}
+	if _, err := tgt.Exec(ctx,
+		`INSERT INTO pgshard.roles_generation (only_row, generation) VALUES (true, $1)
+		 ON CONFLICT (only_row) DO NOTHING`, generation); err != nil {
+		return fmt.Errorf("restore roles generation on the catalog target: %w", err)
 	}
 	return nil
 }
@@ -453,6 +483,14 @@ func carryHashVersions(ctx context.Context, src, tgt *pgx.Conn) error {
 func catalogTargetIsReadable(ctx context.Context, tgt *pgx.Conn) error {
 	if _, _, err := catalog.Generations(ctx, tgt); err != nil {
 		return fmt.Errorf("catalog target is not readable, so the cutover onto it is refused: %w", err)
+	}
+	// The roles generation is the same shape of singleton and strands the
+	// control plane rather than the routers: without it the controller
+	// cannot load desired roles at all, so nothing is materialized on any
+	// group and every waiter on the generation waits forever.
+	var roles int64
+	if err := tgt.QueryRow(ctx, `SELECT pgshard.roles_desired_generation()`).Scan(&roles); err != nil {
+		return fmt.Errorf("catalog target has no roles generation, so the cutover onto it is refused: %w", err)
 	}
 	return nil
 }

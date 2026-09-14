@@ -13,18 +13,21 @@ import (
 // what the planner may push down (functions).
 var nonRolesDesiredTables = []string{"databases", "functions", "shard_ranges", "shard_sets", "tables"}
 
-// TestTheRolesGenerationCountsEveryRolesTable: the generation is the max
-// over the desired-state tables roles materialization reads, and the whole
-// reason it is a catalog function is that the expression had diverged in
-// three of the four places that spelled it. A fifth roles table would
-// reintroduce exactly that -- silently, because a generation that is merely
-// too LOW still looks like a number and every waiter on it returns early.
+// TestEveryRolesTableBumpsTheGeneration: the generation is the max over the
+// desired-state tables roles materialization reads, and the whole reason it
+// is defined in the catalog is that the expression had diverged in three of
+// the four places that spelled it (0052). Since 0053 it is a singleton
+// counter and the four tables carry a trigger that bumps it, so the way to
+// leave a table out is now to forget the trigger -- silently, because a
+// generation that is merely too LOW still looks like a number and every
+// waiter on it returns early.
 //
 // So every table in the schema carrying a desired_generation column has to
-// be classified: counted by the function, or named here as state roles
-// materialization does not read. Adding one without doing either fails
-// this test, which is the property the single definition is for.
-func TestTheRolesGenerationCountsEveryRolesTable(t *testing.T) {
+// be classified: it bumps the roles generation, or it is named here as
+// state roles materialization does not read. Adding one without doing
+// either fails this test, which is the property the single definition is
+// for.
+func TestEveryRolesTableBumpsTheGeneration(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 	conn := connect(t, startPostgres(t, candidateImages[0]))
@@ -32,15 +35,11 @@ func TestTheRolesGenerationCountsEveryRolesTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// pg_depend answers this only because 0052 writes the function with a
-	// standard SQL body; a quoted body records no dependencies at all.
 	rows, err := conn.Query(ctx, `
 		SELECT c.relname, EXISTS (
-		           SELECT 1 FROM pg_depend d
-		            WHERE d.classid = 'pg_proc'::regclass
-		              AND d.objid = 'pgshard.roles_desired_generation'::regproc
-		              AND d.refclassid = 'pg_class'::regclass
-		              AND d.refobjid = c.oid)
+		           SELECT 1 FROM pg_trigger g
+		            WHERE g.tgrelid = c.oid AND NOT g.tgisinternal
+		              AND g.tgfoid = 'pgshard.bump_roles_generation'::regproc)
 		  FROM pg_class c
 		  JOIN pg_namespace n ON n.oid = c.relnamespace
 		  JOIN pg_attribute a ON a.attrelid = c.oid
@@ -51,12 +50,12 @@ func TestTheRolesGenerationCountsEveryRolesTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	type table struct {
-		name    string
-		counted bool
+		name  string
+		bumps bool
 	}
 	tables, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (table, error) {
 		var tb table
-		err := row.Scan(&tb.name, &tb.counted)
+		err := row.Scan(&tb.name, &tb.bumps)
 		return tb, err
 	})
 	if err != nil {
@@ -73,14 +72,14 @@ func TestTheRolesGenerationCountsEveryRolesTable(t *testing.T) {
 	var counted []string
 	for _, tb := range tables {
 		switch {
-		case tb.counted && nonRoles[tb.name]:
-			t.Errorf("pgshard.%s is counted by roles_desired_generation and also listed as a table roles materialization does not read; one of the two is wrong", tb.name)
-		case tb.counted:
+		case tb.bumps && nonRoles[tb.name]:
+			t.Errorf("pgshard.%s bumps the roles generation and is also listed as a table roles materialization does not read; one of the two is wrong", tb.name)
+		case tb.bumps:
 			counted = append(counted, tb.name)
 		case nonRoles[tb.name]:
 		default:
-			t.Errorf("pgshard.%s carries desired_generation but roles_desired_generation does not count it: "+
-				"either add it to the function in a migration, or add it to nonRolesDesiredTables if roles "+
+			t.Errorf("pgshard.%s carries desired_generation but has no bump_roles_generation trigger: "+
+				"either add the trigger in a migration, or add it to nonRolesDesiredTables if roles "+
 				"materialization does not read it", tb.name)
 		}
 	}
@@ -94,6 +93,6 @@ func TestTheRolesGenerationCountsEveryRolesTable(t *testing.T) {
 		}
 	}
 	if len(counted) < 4 {
-		t.Errorf("roles_desired_generation counts only %v; it is the max over all four roles tables", counted)
+		t.Errorf("only %v bump the roles generation; all four roles tables must", counted)
 	}
 }
