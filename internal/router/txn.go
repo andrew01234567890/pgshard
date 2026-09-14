@@ -723,6 +723,11 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		return nameFenceInTxn(err)
 	}
 	crashpoint.Hit("after_prepare")
+	// Every participant is prepared, so from here a cancel can only
+	// interrupt the COMMIT PREPARED or ROLLBACK PREPARED that ends it -- and
+	// the decision-log write below takes tens of milliseconds, which is long
+	// enough for one to arrive and be forwarded in time to do exactly that.
+	e.uncancellable.Store(true)
 	decided, err := log.Commit(decide, gid)
 	if err != nil {
 		e.r.inDoubt.Add(1)
@@ -748,11 +753,6 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		return err
 	}
 	crashpoint.Hit("after_decision")
-	// The outcome is durable now, so a client cancel must stop reaching the
-	// participants: interrupting COMMIT PREPARED leaves those rows prepared
-	// until the resolver finishes them, and the client has already been
-	// told COMMIT.
-	e.decided.Store(true)
 	e.r.metrics.TwoPCCommits.Inc()
 	commitPrepared := func(p *txnPart) error {
 		return e.runOn(decide, p, "COMMIT PREPARED "+quoteLiteral(gid), discardWriter{})
@@ -802,7 +802,7 @@ func heartbeatUntilDecided(ctx context.Context, log DecisionLog, gid string) {
 
 // finishTxn marks the multi-shard transaction over on the current stream.
 func (e *Executor) finishTxn(tag string) {
-	e.decided.Store(false)
+	e.uncancellable.Store(false)
 	e.forgetCancelTargets()
 	e.tx = pgwire.TxIdle
 	e.txnOnBackend, e.txnPreFence = false, false

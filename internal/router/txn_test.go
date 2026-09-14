@@ -13,6 +13,8 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/controller"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // fakeDecisionLog records the coordinator's decision-log calls together
@@ -1020,6 +1022,37 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	// context -- the defect -- the wait ends as soon as the cancel lands.
 	// Handed a detached one -- the fix -- nothing cancels it and the wait
 	// times out, which is the point.
+	// The positive control first, on this same connection: without it the
+	// absence asserted below would also hold if this connection's cancel
+	// request were a no-op in the harness -- wrong key, wrong listener,
+	// routed to a peer. A keyed statement runs on one shard through the
+	// executor's own path, so its cancel is forwarded by cancelBackend, the
+	// function under test.
+	sleeper := h.poolers[h.shardOf(t, a)]
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			sleeper.mu.Lock()
+			asleep := len(sleeper.sleeping)
+			sleeper.mu.Unlock()
+			if asleep > 0 {
+				_ = conn.PgConn().CancelRequest(ctx)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	if _, err := conn.Exec(ctx, "select pg_sleep(10) from orders where tenant_id = $1::int8", pgx.QueryExecModeSimpleProtocol, a); sqlstate(err) != "57014" {
+		t.Fatalf("the control statement was not cancelled: %v", err)
+	}
+	baseline := map[int64]int{}
+	for _, sh := range []int64{a, b} {
+		baseline[sh] = len(h.poolers[h.shardOf(t, sh)].cancelled())
+	}
+	if baseline[a] == 0 {
+		t.Fatal("this connection's cancel request reached no participant, so the absence asserted below would prove nothing")
+	}
+
 	var cancelLanded atomic.Bool
 	h.log.onCommit = func(cctx context.Context) {
 		if err := conn.PgConn().CancelRequest(context.Background()); err != nil {
@@ -1045,27 +1078,24 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
 		t.Fatal(err)
 	}
-	// The client is told COMMIT: runQuery returns the step's nil, and the
-	// step succeeded. What matters is what the coordinator did with the
-	// transaction.
+	// The commit's own return is not asserted: the transaction commits, but
+	// the client is told 08006 because the release after it runs on the
+	// cancelled statement context (PGS-814). What this test is about is
+	// what the coordinator did with the transaction.
 	_ = tx.Commit(ctx)
 	if cancelLanded.Load() {
 		t.Error("the decision was written on the statement's own context: a cancel arriving between PREPARE and the decision reaches it")
 	}
-	// The positive control, without which this test would also pass if the
-	// cancel request were a no-op in this harness -- wrong key, wrong
-	// listener, routed to a peer. The router forwards a cancel to the
-	// participants while the transaction is undecided, so seeing one there
-	// proves the request reached THIS session's executor and that the only
-	// thing keeping the decision context alive was the detach.
-	waitFor(t, 10*time.Second, func() bool {
-		for _, sh := range []int64{a, b} {
-			if len(h.poolers[h.shardOf(t, sh)].cancelled()) > 0 {
-				return true
-			}
+	// Nor was it forwarded. Every participant had prepared before the
+	// decision-log write began, so the only things a cancel could still
+	// reach are the COMMIT PREPARED or ROLLBACK PREPARED that end the
+	// transaction -- and the hook above held the window open for a second
+	// after the request, far longer than forwarding takes (PGS-794).
+	for _, sh := range []int64{a, b} {
+		if n := len(h.poolers[h.shardOf(t, sh)].cancelled()) - baseline[sh]; n != 0 {
+			t.Errorf("shard %d was sent %d cancel(s) between PREPARE and the decision; one landing on the COMMIT PREPARED that follows leaves the transaction in doubt", h.shardOf(t, sh), n)
 		}
-		return false
-	}, "no participant saw the cancel: the request never reached this session, so the assertion above proves nothing")
+	}
 
 	waitFor(t, 10*time.Second, func() bool {
 		for _, ev := range h.log.log() {
