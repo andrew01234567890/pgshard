@@ -267,7 +267,11 @@ first, then rebuilt as a standby.
 - A postgres crash inside a running pod is a container restart, not a failover,
   until the pod stops being Ready and `Status` fails for the failover delay.
 - `synchronous_standby_names` set via `ALTER SYSTEM` is dropped by an agent
-  `Reload`/`Promote` and re-applied by the operator on its next probe. What
+  `Promote` — and by bootstrap and restore, the other paths that scrub
+  `postgresql.auto.conf` after a clone tool has written to it — then
+  re-applied by the operator on its next probe. A `Reload` leaves it alone,
+  along with the barrier's write pause, because a running cluster is nobody's
+  clone. What
   the agent falls back to is the member's own rendered list — every other
   member of the group, which is the correct list for it as a primary — so the
   window costs the ordering the operator computed from what is streaming, not

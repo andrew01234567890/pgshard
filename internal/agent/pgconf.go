@@ -273,15 +273,18 @@ func hostKeyword(h string) string {
 	return h
 }
 
-// autoConfHeader replaces whatever postgresql.auto.conf held. The control
-// plane does use ALTER SYSTEM at runtime -- the barrier pauses writes with
-// default_transaction_read_only, the operator probes the catalog the same
-// way -- and those settings live here until the agent next writes
-// configuration, which it does on bootstrap, on promotion and after a
-// restore. A setting that has to outlive any of those belongs in the
-// rendered postgresql.conf instead, or with an owner that reapplies it: the
-// write pause is held by the catalog write fence, which the operator reads
-// on every pass and before a promoted member serves.
+// autoConfHeader replaces whatever postgresql.auto.conf held. It is there
+// to neutralise what a CLONE TOOL left behind -- pg_basebackup and
+// pgBackRest both write into this file -- which is why it is written on
+// bootstrap, on promotion and after a restore, and nowhere else.
+//
+// The control plane also uses ALTER SYSTEM at runtime: the barrier pauses
+// writes with default_transaction_read_only, and the operator probes the
+// catalog the same way. Those settings live here, so anything that rewrites
+// this file drops them. A setting that has to outlive a clone belongs in
+// the rendered postgresql.conf instead, or with an owner that reapplies it:
+// the write pause is held by the catalog write fence, which the operator
+// reads on every pass and before a promoted member serves.
 const autoConfHeader = "# Managed by pgshard-agent: rewritten on bootstrap, promotion and restore.\n" +
 	"# A runtime ALTER SYSTEM lasts only until then; anything that must survive\n" +
 	"# belongs in postgresql.conf, which pgshard renders.\n"
@@ -289,17 +292,45 @@ const autoConfHeader = "# Managed by pgshard-agent: rewritten on bootstrap, prom
 // WriteConfig writes postgresql.conf and pg_hba.conf into PGDATA and clears
 // any settings a clone tool left in postgresql.auto.conf so the rendered
 // file is authoritative.
-func WriteConfig(c *Config, standby bool) error { return writeConfig(c, standby, false) }
+func WriteConfig(c *Config, standby bool) error { return writeConfig(c, standby, false, resetAutoConf) }
 
 // WriteRecoveryConfig writes the configuration for the recovery that follows
 // a restore from the repository.
-func WriteRecoveryConfig(c *Config) error { return writeConfig(c, false, true) }
+func WriteRecoveryConfig(c *Config) error { return writeConfig(c, false, true, resetAutoConf) }
 
-func writeConfig(c *Config, standby, recovering bool) error {
+// WriteConfigKeepingRuntimeSettings renders the configuration without
+// touching postgresql.auto.conf, for a reload of a cluster that is already
+// running and is nobody's clone.
+//
+// A reload rewriting that file drops whatever ALTER SYSTEM the control plane
+// has in flight, and the reload then makes the loss take effect at once. The
+// one that matters is the barrier's write pause: a rollout pass whose
+// settings hash moved during a cutover would unpause the shard, which then
+// accepts writes until the operator's next reconcile notices the raised
+// fence and reapplies it.
+func WriteConfigKeepingRuntimeSettings(c *Config, standby bool) error {
+	return writeConfig(c, standby, false, keepAutoConf)
+}
+
+// autoConfPolicy says what a write does with postgresql.auto.conf.
+type autoConfPolicy int
+
+const (
+	// resetAutoConf truncates it to the header: the cluster has just been
+	// cloned, promoted or restored, and anything in there is a clone tool's.
+	resetAutoConf autoConfPolicy = iota
+	// keepAutoConf leaves it alone: the cluster is running, and what is in
+	// there is the control plane's.
+	keepAutoConf
+)
+
+func writeConfig(c *Config, standby, recovering bool, auto autoConfPolicy) error {
 	files := map[string]string{
 		postgresqlConf: renderPostgresqlConf(c, standby, recovering),
 		pgHBAConf:      RenderPgHBAConf(c),
-		autoConf:       autoConfHeader,
+	}
+	if auto == resetAutoConf {
+		files[autoConf] = autoConfHeader
 	}
 	if c.OverrideFile != "" {
 		body, err := os.ReadFile(c.OverrideFile)
