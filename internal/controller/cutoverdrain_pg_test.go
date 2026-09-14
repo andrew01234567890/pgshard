@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,7 +69,7 @@ func TestTheDrainCountsATransactionThatCouldStillWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if busy == 0 {
+	if len(busy) == 0 {
 		t.Fatal("the drain reported the set quiet while a transaction that began before the pause was still open and still read-write")
 	}
 
@@ -91,7 +92,49 @@ func TestTheDrainCountsATransactionThatCouldStillWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if busy != 0 {
-		t.Fatalf("%d backends counted: a read started after the pause cannot write and must not hold the drain", busy)
+	if len(busy) != 0 {
+		t.Fatalf("%v counted: a read started after the pause cannot write and must not hold the drain", busy)
+	}
+}
+
+// TestADrainStopsAtTheCutoverBudgetAndNamesItsWriters (PGS-845): before the
+// journal the switch is undone once the fence has stood for the cutover
+// timeout, so a drain that went on to its own 30s held the fence past an undo
+// already due. And "N transactions still open" gave the operator nothing to
+// find them by.
+func TestADrainStopsAtTheCutoverBudgetAndNamesItsWriters(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	fenced := time.Now()
+	o := &pgCutover{c: &Copier{Shards: realShards{dsn}, CutoverTimeout: 2 * time.Second}, srcSet: "default", srcIDs: []int32{0},
+		wf: &copyWorkflow{cutover: cutoverState{FencedAt: &fenced}}}
+
+	writer := connect(t, strings.Replace(dsn, "?", "?application_name=ledger-batch&", 1))
+	tx, err := writer.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var one int
+	if err := tx.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		t.Fatal(err)
+	}
+	at, err := o.shardNow(ctx, "default", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.pausedAt = map[pausedShard]time.Time{{"default", 0}: at}
+
+	start := time.Now()
+	err = o.drainWriters(ctx, "default", []int32{0})
+	if err == nil {
+		t.Fatal("the drain finished with a transaction from before the pause still open")
+	}
+	if took := time.Since(start); took > 10*time.Second || took < time.Second {
+		t.Fatalf("the drain waited %s with a %s cutover budget; it should wait out what is left of it", took.Round(100*time.Millisecond), o.c.CutoverTimeout)
+	}
+	if !strings.Contains(err.Error(), "ledger-batch") || !strings.Contains(err.Error(), "pid ") {
+		t.Fatalf("the drain did not name the transaction it waited for: %v", err)
 	}
 }

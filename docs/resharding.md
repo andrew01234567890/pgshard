@@ -330,7 +330,10 @@ idempotent, so a controller crash anywhere repeats at most one step:
 
    It comes before the journal so that a transaction that will not end
    cannot hold the write fence for good: a drain that does not finish
-   within the writer-drain timeout lifts the pause and retries, and past
+   within the writer-drain timeout (30s, or what is left of
+   `--cutover-timeout` if that is less) lifts the pause and retries,
+   naming the transactions it waited for — pid, application, state and
+   how long each has been open — and past
    `--cutover-timeout` the switch is undone like any step before the
    journal — fence released, pause lifted. A long transaction open on a
    source at cutover time can therefore cost attempts, and after
@@ -360,7 +363,8 @@ idempotent, so a controller crash anywhere repeats at most one step:
 12. `release` — `migrating=false`, lock row removed. Routers replay the
     buffered writes against the new map.
 
-The pause (`fence` raised to `flip` committed) is written to
+The pause (`fence` raised to `flip` committed) includes `quiesce`'s wait
+for open writers, and is written to
 `status.cutover.pause_ms` and mirrored to
 `PgShardReshard.status.cutoverPause`. A switch that has not reached the
 journal within `--cutover-timeout` (default 60s) is undone (fence
