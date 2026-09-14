@@ -52,7 +52,7 @@ func TestAVanishedSlotMarksTheStreamLost(t *testing.T) {
 	sweep := func(name, walStatus string) {
 		t.Helper()
 		if err := UpsertStreamStatus(ctx, conn, StreamStatus{
-			Stream: name, ShardSet: "default", ShardID: 0, Slot: "s0", WALStatus: walStatus}); err != nil {
+			Stream: name, ShardSet: "default", ShardID: 0, Slot: "s0", WALStatus: walStatus}, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -140,6 +140,35 @@ func TestAVanishedSlotMarksTheStreamLost(t *testing.T) {
 	sweep("half_made", "missing")
 	if got := state("half_made"); got != StreamLost {
 		t.Errorf("two sightings after activation left the stream %q, want %q", got, StreamLost)
+	}
+
+	// A standby's reading neither condemns NOR counts as the first of the
+	// two sightings. Gating only the condemning reading left the first
+	// ungated, so a standby's stored "missing" plus one primary look was
+	// enough -- which is the single-sighting condemnation the debounce
+	// exists to prevent.
+	//
+	// A standby's copy of a slot is synchronised, not owned: slotsync can
+	// leave it invalidated until its next cycle, and that cycle naps up to
+	// 30 seconds on a quiet cluster.
+	active("on_a_standby")
+	for range 6 {
+		if err := UpsertStreamStatus(ctx, conn, StreamStatus{
+			Stream: "on_a_standby", ShardSet: "default", ShardID: 0, Slot: "s0", WALStatus: "missing"}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := state("on_a_standby"); got != StreamActive {
+		t.Errorf("a standby's readings condemned the stream (%q)", got)
+	}
+	// One primary sighting on top of all that must still not be enough.
+	sweep("on_a_standby", "missing")
+	if got := state("on_a_standby"); got != StreamActive {
+		t.Errorf("a standby's stored reading counted as the first sighting: one primary look made the stream %q", got)
+	}
+	sweep("on_a_standby", "missing")
+	if got := state("on_a_standby"); got != StreamLost {
+		t.Errorf("the primary reported it missing twice and the stream is %q, want %q", got, StreamLost)
 	}
 
 	// Still creating: its slots do not exist yet by definition.

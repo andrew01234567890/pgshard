@@ -61,7 +61,7 @@ func TestStreamMonitor(t *testing.T) {
 	}
 	f.dialer.down = -1
 
-	if err := catalog.UpsertStreamStatus(ctx, f.pool, catalog.StreamStatus{Stream: "orders", ShardSet: "default", ShardID: 1, Slot: "pgshard_orders_g1", WALStatus: "lost", InvalidationReason: "wal_removed"}); err != nil {
+	if err := catalog.UpsertStreamStatus(ctx, f.pool, catalog.StreamStatus{Stream: "orders", ShardSet: "default", ShardID: 1, Slot: "pgshard_orders_g1", WALStatus: "lost", InvalidationReason: "wal_removed"}, true); err != nil {
 		t.Fatal(err)
 	}
 	streams, _ = catalog.ListStreams(ctx, f.pool)

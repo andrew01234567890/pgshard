@@ -118,21 +118,23 @@ func DeleteStream(ctx context.Context, q Execer, name string) error {
 // UpsertStreamStatus records the slot state of a stream on one shard. A
 // slot that cannot be resumed from -- invalidated, or gone -- also marks
 // the stream lost, on the second consecutive sighting: see markStreamLost.
-func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
-	if Unresumable(st.WALStatus) {
+// authoritative says the reading came from a member that is NOT in
+// recovery. Only a primary may condemn a stream: see markStreamLost.
+func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus, authoritative bool) error {
+	if authoritative && Unresumable(st.WALStatus) {
 		if err := markStreamLost(ctx, q, st); err != nil {
 			return err
 		}
 	}
 	_, err := q.Exec(ctx, `INSERT INTO pgshard.stream_status
-		(stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn, retained_bytes, active, synced, failover, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+		(stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn, retained_bytes, active, synced, failover, authoritative, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
 		ON CONFLICT (stream, shard_set, shard_id) DO UPDATE SET slot = EXCLUDED.slot, wal_status = EXCLUDED.wal_status,
 		invalidation_reason = EXCLUDED.invalidation_reason, confirmed_flush_lsn = EXCLUDED.confirmed_flush_lsn,
 		restart_lsn = EXCLUDED.restart_lsn, retained_bytes = EXCLUDED.retained_bytes, active = EXCLUDED.active,
-		synced = EXCLUDED.synced, failover = EXCLUDED.failover, updated_at = now()`,
+		synced = EXCLUDED.synced, failover = EXCLUDED.failover, authoritative = EXCLUDED.authoritative, updated_at = now()`,
 		st.Stream, st.ShardSet, st.ShardID, st.Slot, st.WALStatus, st.InvalidationReason, int64(st.ConfirmedFlushLSN), int64(st.RestartLSN),
-		st.RetainedBytes, st.Active, st.Synced, st.Failover)
+		st.RetainedBytes, st.Active, st.Synced, st.Failover, authoritative)
 	if err != nil {
 		return err
 	}
@@ -154,19 +156,25 @@ func Unresumable(walStatus string) bool { return walStatus == "lost" || walStatu
 // markStreamLost moves a stream to lost. Called BEFORE the upsert that
 // overwrites this shard's last report, because that report is the evidence.
 //
-// TWO consecutive sightings, for "lost" as well as "missing", and the
-// stored row is the first. Both can be transient on a standby: a -rw
-// Service flip can land a sweep on a member whose synced copy of the slot
-// has not caught up ("missing"), and slotsync can invalidate a synced slot
-// on the standby -- its own max_slot_wal_keep_size, or primary_slot_name
-// reset -- while the slot is perfectly valid on the primary ("lost"), then
-// drop and recreate it on the next cycle. So "the slot is there and says
-// its WAL is gone" is true of a primary and not of a standby, and a sweep
-// cannot tell which member answered it.
+// Only a reading from a member that is NOT in recovery counts -- and both
+// of the two, which is why stream_status records which member answered.
+// Gating just the condemning reading left the first one ungated: a standby
+// reports missing, it is stored, and the next primary look condemns on a
+// single primary sighting.
 //
-// Making a stream lost is not reversible -- only Create writes active, and
-// CreateStream refuses a duplicate name, so recovery costs the consumer
-// its position. One glimpse is not evidence enough for that.
+// Why a standby's answer cannot be trusted: its copy of a slot is
+// synchronised, not owned. slotsync invalidates one whose WAL the standby
+// no longer keeps -- its own max_slot_wal_keep_size, or primary_slot_name
+// reset -- while the slot is perfectly valid on the primary, and it stays
+// invalidated ("lost") until the next sync cycle notices. That cycle is
+// not prompt: wait_for_slot_activity doubles its nap up to 30 seconds
+// whenever nothing was updated, which is a quiet standby's resting state.
+// A synced copy can also simply be absent -- slot sync switched off on
+// that member, the worker restarted (its slots are temporary until the
+// remote catches up), or the slot not yet synchronised at all.
+//
+// The two sightings then guard what remains: a slot that reads unresumable
+// on the primary once and not twice.
 //
 // A stream still being created is exempt: its slots do not exist until
 // CreateStream has made them. Create clears the rows that phase leaves
@@ -176,7 +184,7 @@ func markStreamLost(ctx context.Context, q Execer, st StreamStatus) error {
 		WHERE name = $1 AND state <> $5
 		  AND EXISTS (SELECT 1 FROM pgshard.stream_status
 		        WHERE stream = $1 AND shard_set = $2 AND shard_id = $3
-		          AND wal_status IN ('missing', 'lost'))`,
+		          AND authoritative AND wal_status IN ('missing', 'lost'))`,
 		st.Stream, st.ShardSet, st.ShardID, StreamLost, StreamCreating)
 	return err
 }
