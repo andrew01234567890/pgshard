@@ -271,19 +271,42 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		}
 	}
 	grpcSrv.Stop()
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), terminationHTTPTimeout)
 	_ = httpSrv.Shutdown(shutCtx)
 	shutCancel()
 
-	mode := ShutdownSmart
-	if runErr != nil {
-		mode = ShutdownFast
-	}
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Duration(cfg.ShutdownTimeout))
+	// Fast, always, and inside TerminationBudget. The operator fences an old
+	// primary by deleting its Pod with a grace of only a few seconds, and a
+	// smart shutdown -- which waits for clients to disconnect, and a primary
+	// with a pooler in front of it always has clients -- never finished
+	// inside it: every fenced primary was SIGKILLed mid-shutdown, crashed,
+	// and rejoined through a full crash recovery inside pg_rewind. A fast
+	// shutdown ends the sessions and writes a shutdown checkpoint; if even
+	// that has not finished when its time is up the stop escalates to
+	// immediate, which is still an exit this process chose.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), terminationStopTimeout)
 	defer stopCancel()
-	if err := sup.Stop(stopCtx, mode, time.Duration(cfg.ShutdownTimeout)); err != nil {
+	if err := sup.Stop(stopCtx, ShutdownFast, terminationFastTimeout); err != nil {
+		// postgres may still be running, so the Lease is not given back:
+		// another member promoting over a live primary is worse than waiting
+		// for the Lease to expire.
 		return errors.Join(runErr, err)
 	}
-	srv.releaseLease(stopCtx)
+	leaseCtx, leaseCancel := context.WithTimeout(context.Background(), terminationLeaseTimeout)
+	defer leaseCancel()
+	srv.releaseLease(leaseCtx)
 	return runErr
 }
+
+// The agent's stop on SIGTERM, phase by phase. They add up to
+// TerminationBudget, which the operator must give every Pod it deletes: a
+// grace shorter than the budget is a SIGKILL partway through a stop.
+const (
+	terminationHTTPTimeout  = 1 * time.Second
+	terminationFastTimeout  = 6 * time.Second
+	terminationStopTimeout  = 7 * time.Second // fast, then immediate for what is left
+	terminationLeaseTimeout = 1 * time.Second
+)
+
+// TerminationBudget is the longest the agent takes to exit after SIGTERM.
+const TerminationBudget = terminationHTTPTimeout + terminationStopTimeout + terminationLeaseTimeout

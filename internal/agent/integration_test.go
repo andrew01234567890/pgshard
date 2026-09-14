@@ -586,8 +586,29 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	}
 	s.waitHTTP("/readyz", 200, 60*time.Second)
 
+	t.Log("a member stops inside the grace the operator fences it with")
+	// A session that stays open is what a smart shutdown waits for, and a
+	// member always has one: the pooler. The agent used to spend its first
+	// thirty seconds in exactly that wait, so every Pod the operator fenced
+	// with a ten-second grace was SIGKILLed mid-shutdown and crashed
+	// (PGS-800). docker stop's timeout plays the grace; exit code 137 is the
+	// kill.
+	docker(t, "exec", "-d", "-e", "PGPASSWORD=pgshard-test", p.container,
+		"psql", "-h", "/tmp", "-U", "postgres", "-c", "SELECT pg_sleep(600)")
+	heldBy := time.Now().Add(15 * time.Second)
+	for p.psql("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(600)%'") != "1" {
+		if time.Now().After(heldBy) {
+			t.Fatal("the held session never appeared, so the stop below would not wait on anything")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	grace := fmt.Sprint(int(TerminationBudget/time.Second) + 1)
+	docker(t, "stop", "-t", grace, p.container)
+	if code := docker(t, "inspect", "-f", "{{.State.ExitCode}}", p.container); code == "137" {
+		t.Fatalf("the agent was SIGKILLed after a %ss grace with a client connected: its stop does not fit the grace\n%s", grace, p.logs())
+	}
+
 	t.Log("isolated primary without kube API self-fences")
-	docker(t, "stop", "-t", "30", p.container)
 	s.waitHTTP("/livez", 500, 30*time.Second)
 	deadline = time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
