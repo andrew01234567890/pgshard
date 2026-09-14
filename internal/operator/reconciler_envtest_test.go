@@ -80,11 +80,13 @@ func TestMain(m *testing.M) {
 }
 
 type fakeProber struct {
-	mu        sync.Mutex
-	err       error
-	streaming map[string]bool
-	syncNames map[string]string
-	setCalls  []string
+	mu sync.Mutex
+	// standbyProbes counts ProbeStandby calls, which only a failover makes.
+	standbyProbes int
+	err           error
+	streaming     map[string]bool
+	syncNames     map[string]string
+	setCalls      []string
 	// fenced is the catalog write fence the operator reads; paused records
 	// the DSNs it made refuse writes, and pausedDSN those already paused.
 	fenced    bool
@@ -377,6 +379,7 @@ func (f *fakeProber) setStandby(ip string, st StandbyState) {
 func (f *fakeProber) ProbeStandby(_ context.Context, dsn string) (StandbyState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.standbyProbes++
 	for ip, st := range f.standbys {
 		if strings.Contains(dsn, "@"+ip+":") {
 			return st, nil
@@ -423,12 +426,14 @@ func (f *fakeProber) DropSlot(_ context.Context, dsn, name string) error {
 }
 
 type fakeAgents struct {
-	mu       sync.Mutex
-	status   map[string]AgentStatus
-	errs     map[string]error
-	promotes []string
-	demotes  []string
-	journal  *[]string
+	mu     sync.Mutex
+	status map[string]AgentStatus
+	errs   map[string]error
+	// statusHook, when set and answering, replaces what Status returns.
+	statusHook func(addr string) (AgentStatus, error, bool)
+	promotes   []string
+	demotes    []string
+	journal    *[]string
 	// reloadHash is what Reload reports per addr; reloads records calls.
 	reloadHash map[string]string
 	reloads    []string
@@ -513,6 +518,11 @@ func (f *fakeAgents) set(ip string, st AgentStatus, err error) {
 func (f *fakeAgents) Status(_ context.Context, addr string) (AgentStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.statusHook != nil {
+		if st, err, ok := f.statusHook(addr); ok {
+			return st, err
+		}
+	}
 	if err := f.errs[addr]; err != nil {
 		return AgentStatus{}, err
 	}

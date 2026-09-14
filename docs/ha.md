@@ -54,8 +54,15 @@ cannot be probed and gates whether a failover may start at all.
 ## Failover
 
 The primary is unhealthy when its pod is missing, or the pod is not Ready and
-`Agent.Status` fails or answers as a standby. After `DefaultFailoverDelay`
-(10s) of continuous unhealthiness the operator, inside one reconcile:
+`Agent.Status` fails or answers as a standby. A primary that refuses the agent
+only for want of a connection slot (SQLSTATE 53300, "too many clients") is not
+unhealthy: `Status` reports it running with that error, and `/readyz` passes.
+The superuser reserve (`superuser_reserved_connections`) is shared by every
+superuser connection the control plane opens — agent, operator, controller,
+backups — so a busy but healthy primary can run out of it, and failing over
+from that server would fence it without freeing a slot. After
+`DefaultFailoverDelay` (10s) of continuous unhealthiness the operator, inside
+one reconcile:
 
 1. relabels the old primary pod `role=unhealthy` (out of `-rw`) and **fences the
    Lease**: holder `pgshard-operator`, annotations
@@ -65,8 +72,9 @@ The primary is unhealthy when its pod is missing, or the pod is not Ready and
    foreign holder on its next renewal and self-fences (fast shutdown, exit).
 2. waits (30s bound, 1s poll, and the fence Lease renewed on every poll so
    the wait cannot outlive it) until the old primary no longer answers
-   `Status` as a running primary and every other reachable member reports no
-   streaming WAL receiver; on timeout it proceeds only if the old primary is gone.
+   `Status` as a running primary (a full one counts as running) and every other
+   reachable member reports no streaming WAL receiver; on timeout it proceeds
+   only if the old primary is gone.
 3. picks the candidate: highest `pg_last_wal_receive_lsn()` among **all**
    reachable in-recovery members — every non-primary member is in
    `synchronous_standby_names`, so even a lagging or not-yet-Ready standby may

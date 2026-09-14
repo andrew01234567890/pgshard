@@ -263,12 +263,13 @@ func promotionEpoch(groupEpoch int64, agentEpoch uint64) int64 {
 
 // primaryHealthy is the readiness signal for the failover timer: the pod
 // exists and either the kubelet reports it Ready or the agent still answers
-// Status as a running primary.
+// Status as a running primary -- including one whose only failure is that
+// it has no connection slot left for the agent.
 func primaryHealthy(pod *corev1.Pod, ready bool, st AgentStatus, stErr error) bool {
 	if pod == nil {
 		return false
 	}
-	return ready || (stErr == nil && st.Running && st.Primary)
+	return ready || ((stErr == nil || runningButFull(st, stErr)) && st.Running && st.Primary)
 }
 
 // leaseFenceable reports whether the operator may write the group Lease
@@ -723,7 +724,7 @@ func (r *ClusterReconciler) quiesce(ctx context.Context, c *pgshardv1alpha1.PgSh
 		}
 		oldGone := true
 		if m := members[old]; m != nil && m.pod != nil && m.ip != "" {
-			if st, err := r.Agents.Status(ctx, agentAddr(m.ip)); err == nil && st.Running && st.Primary {
+			if st, err := r.Agents.Status(ctx, agentAddr(m.ip)); (err == nil || runningButFull(st, err)) && st.Running && st.Primary {
 				oldGone = false
 			}
 		}

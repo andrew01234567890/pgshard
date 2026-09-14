@@ -478,6 +478,36 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	s.psql("ALTER SYSTEM RESET default_transaction_read_only")
 	s.psql("SELECT pg_reload_conf()")
 
+	t.Log("a primary with no connection slot left is still running and ready")
+	// The superuser reserve is shared by every superuser connection the
+	// control plane opens, so a healthy primary can refuse its own agent a
+	// slot. Reported as down, the operator fenced it after the failover
+	// delay (PGS-819).
+	slots := s.psql("SHOW max_connections")
+	docker(t, "exec", "-d", "-e", "PGPASSWORD=pgshard-test", s.container, "bash", "-c",
+		`for i in $(seq `+slots+`); do psql -h /tmp -U postgres -Atc "SELECT pg_sleep(15)" >/dev/null 2>&1 & done; wait`)
+	full := func() bool {
+		out, err := exec.Command("docker", "exec", "-e", "PGPASSWORD=pgshard-test", s.container,
+			"psql", "-h", "/tmp", "-U", "postgres", "-Atc", "SELECT 1").CombinedOutput()
+		return err != nil && strings.Contains(string(out), "too many clients")
+	}
+	for deadline := time.Now().Add(10 * time.Second); !full(); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the server never ran out of connection slots, so the rest of this proves nothing\n%s", s.logs())
+		}
+	}
+	if st := s.status(); !st.GetRunning() || st.GetError().GetSqlstate() != "53300" {
+		t.Fatalf("a primary refusing the agent only for want of a slot reported running=%v error=%v; the operator fails over from that", st.GetRunning(), st.GetError())
+	}
+	if code := s.httpCode("/readyz"); code != http.StatusOK {
+		t.Fatalf("readiness of a full primary = %d; unready takes it out of its Service without freeing a slot", code)
+	}
+	for deadline := time.Now().Add(30 * time.Second); full(); time.Sleep(250 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the connection slots never came back")
+		}
+	}
+
 	t.Log("old primary diverges, then demotes via pg_rewind")
 	p.psql("INSERT INTO t VALUES (100, 'diverged')")
 	p.psql("CHECKPOINT")
