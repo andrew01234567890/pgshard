@@ -30,8 +30,17 @@
 -- row is deleted, which the max could.)
 --
 -- The cost is that writes to the four tables serialise on one row. They are
--- rare -- role and grant edits, which the applier already serialises -- and
--- a lost materialization is worth more than their concurrency.
+-- rare: role and grant edits from the applier, which already serialises
+-- them, plus the operator's catalog probe and the router's bootstrap, which
+-- write single autocommit statements.
+--
+-- The sharp edge is a human one. An operator who leaves `BEGIN; INSERT INTO
+-- pgshard.roles ...` open now blocks every other writer of these four
+-- tables for as long as the session sits there -- previously it blocked
+-- nothing. On a catalog the operator tunes that is bounded by
+-- idle_in_transaction_session_timeout (10min from pgtune); on an external
+-- one it is not bounded at all. A lost materialization is still worth more
+-- than that, but it is a real change in what an idle session costs.
 --
 -- desired_generation stays exactly as it is. It still stamps every row,
 -- still drives NOTIFY payloads, and is still what catalog.Generations reads;

@@ -106,8 +106,8 @@ func TestTheRolesGenerationAdvancesInCommitOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	if w1 >= w2 {
-		t.Skipf("W1 stamped %d and W2 %d, so this run did not reproduce the out-of-order stamp; "+
-			"the singleton is still what makes the generation safe", w1, w2)
+		t.Fatalf("W1 stamped %d and W2 %d: W1 wrote first, so it must carry the LOWER stamp. "+
+			"If it does not, this test is no longer constructing the case it is named for", w1, w2)
 	}
 	t.Logf("as before: W1 stamped %d and committed second, W2 stamped %d and committed first -- "+
 		"the max over stamps would have been %d, which W1 never exceeds", w1, w2, w2)
@@ -134,4 +134,50 @@ func waitForLockWaiter(ctx context.Context, t *testing.T, conn Querier) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("no backend ever waited on a lock: W2 was not blocked by W1, so the generation bump does not serialise")
+}
+
+// TestDeletingTheNewestRowRaisesTheGeneration: the property the singleton
+// buys OVER the max of desired_generation, and the one that says which of
+// the two the function should read.
+//
+// The lock alone makes the max safe against out-of-order commits, so
+// reverting roles_desired_generation() to that max passes
+// TestTheRolesGenerationAdvancesInCommitOrder -- I checked, which is how
+// this gap was found. It does not survive a DELETE: stamps live on the rows,
+// so removing the newest-stamped row takes its number with it and the max
+// drops. A group recorded above the new max then reads as ahead of desired
+// and the deletion is never materialized on it.
+func TestDeletingTheNewestRowRaisesTheGeneration(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	conn := connect(t, startPostgres(t, candidateImages[0]))
+	if err := Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	gen := func() int64 {
+		t.Helper()
+		rows, err := conn.Query(ctx, `SELECT pgshard.roles_desired_generation()`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		g, err := pgx.CollectOneRow(rows, pgx.RowTo[int64])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+
+	for _, name := range []string{"keeper", "doomed"} {
+		if _, err := conn.Exec(ctx, `INSERT INTO pgshard.roles (rolname, login) VALUES ($1, true)`, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := gen()
+	if _, err := conn.Exec(ctx, `DELETE FROM pgshard.roles WHERE rolname = 'doomed'`); err != nil {
+		t.Fatal(err)
+	}
+	if after := gen(); after <= before {
+		t.Fatalf("the generation was %d before the delete and %d after: a group recorded at %d now reads "+
+			"as up to date and never drops the role", before, after, before)
+	}
 }

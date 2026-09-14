@@ -72,6 +72,64 @@ func TestCutoverCarriesTheShardMapGeneration(t *testing.T) {
 	}
 }
 
+// TestCutoverCarriesTheRolesGeneration: the roles generation is the same
+// class of migration-seeded singleton as the shard-map one, and loses the
+// same way -- TRUNCATEd off the target by EnsureCatalogCopy, and only ever
+// UPDATEd afterwards, so an absent row makes the trigger a no-op and the
+// generation stop moving. That strands the control plane rather than the
+// routers: LoadDesiredRoles fails scanning NULL, so nothing is materialized
+// on any group.
+func TestCutoverCarriesTheRolesGeneration(t *testing.T) {
+	ctx := context.Background()
+	src, tgt := startCatalogPair(t, "ghcr.io/andrew01234567890/pgshard-postgres:18")
+	for _, n := range []catalogNode{src, tgt} {
+		conn := dialCatalog(t, n.side.DSN)
+		err := catalog.Migrate(ctx, conn)
+		_ = conn.Close(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	execOn(t, src.side.DSN, `INSERT INTO pgshard.databases (name) VALUES ('before-cutover')`)
+
+	p := PgxProber{}
+	if err := p.EnsureCatalogCopy(ctx, src.side, tgt.side); err != nil {
+		t.Fatalf("ensure copy: %v", err)
+	}
+	waitCatalogRow(t, tgt.side.DSN, "before-cutover", "the copy never reached the target, so the carry is not what is being tested")
+	for deadline := time.Now().Add(60 * time.Second); ; {
+		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the copy never reported caught up")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// A role edit on the source moves its generation past the seed.
+	execOn(t, src.side.DSN, `INSERT INTO pgshard.roles (rolname, login) VALUES ('carried', true)`)
+	want := queryOn[int64](t, src.side.DSN, `SELECT pgshard.roles_desired_generation()`)
+	// The state the copy leaves behind when it does not deliver the row.
+	execOn(t, tgt.side.DSN, `DELETE FROM pgshard.roles_generation`)
+
+	if err := p.CutoverCatalog(ctx, src.side, tgt.side); err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+	if got := queryOn[int64](t, tgt.side.DSN, `SELECT pgshard.roles_desired_generation()`); got != want {
+		t.Errorf("the new catalog came up at roles generation %d, not the %d the old one served", got, want)
+	}
+	// And the trigger has something to move again.
+	execOn(t, tgt.side.DSN, `INSERT INTO pgshard.roles (rolname, login) VALUES ('after', true)`)
+	if got := queryOn[int64](t, tgt.side.DSN, `SELECT pgshard.roles_desired_generation()`); got <= want {
+		t.Errorf("a write on the new catalog left the generation at %d; the trigger is updating no rows", got)
+	}
+}
+
 // TestCutoverRefusesACatalogItCannotRepair: the repair reads the source, so a
 // source that cannot answer leaves the target unreadable -- and the cutover
 // must refuse rather than flip onto it. Belt and braces for the case the
