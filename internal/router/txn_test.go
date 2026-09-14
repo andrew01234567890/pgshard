@@ -1052,20 +1052,16 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	if cancelLanded.Load() {
 		t.Error("the decision was written on the statement's own context: a cancel arriving between PREPARE and the decision reaches it")
 	}
-	// The positive control, without which this test would also pass if the
-	// cancel request were a no-op in this harness -- wrong key, wrong
-	// listener, routed to a peer. The router forwards a cancel to the
-	// participants while the transaction is undecided, so seeing one there
-	// proves the request reached THIS session's executor and that the only
-	// thing keeping the decision context alive was the detach.
-	waitFor(t, 10*time.Second, func() bool {
-		for _, sh := range []int64{a, b} {
-			if len(h.poolers[h.shardOf(t, sh)].cancelled()) > 0 {
-				return true
-			}
+	// Nor was it forwarded. Every participant had prepared before the
+	// decision-log write began, so the only things a cancel could still
+	// reach are the COMMIT PREPARED or ROLLBACK PREPARED that end the
+	// transaction -- and the hook above held the window open for a second
+	// after the request, far longer than forwarding takes (PGS-794).
+	for _, sh := range []int64{a, b} {
+		if n := len(h.poolers[h.shardOf(t, sh)].cancelled()); n != 0 {
+			t.Errorf("shard %d was sent %d cancel(s) between PREPARE and the decision; one landing on the COMMIT PREPARED that follows leaves the transaction in doubt", h.shardOf(t, sh), n)
 		}
-		return false
-	}, "no participant saw the cancel: the request never reached this session, so the assertion above proves nothing")
+	}
 
 	waitFor(t, 10*time.Second, func() bool {
 		for _, ev := range h.log.log() {
@@ -1080,4 +1076,28 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	}
 	waitFor(t, 10*time.Second, func() bool { return h.log.preparedCount() == 0 },
 		"participants left prepared after the decision")
+
+	// The positive control, without which the absence above would also
+	// hold if the cancel request were a no-op in this harness -- wrong
+	// listener, routed to a peer, never forwarded. Outside the window a
+	// cancel request must reach a participant.
+	//
+	// On its own connection: the client above is told 08006 for a commit
+	// that succeeded (PGS-814), and the next statement it sends is refused,
+	// which is a separate defect and not what this control is for.
+	shard := h.shardOf(t, a)
+	conn2 := h.connect(t, h.dsn())
+	tx2, err := conn2.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx2.Rollback(ctx) }()
+	if _, err := tx2.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 3)", a); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn2.PgConn().CancelRequest(context.Background()); err != nil {
+		t.Fatalf("cancel request: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool { return len(h.poolers[shard].cancelled()) > 0 },
+		"a cancel outside the two-phase window never reached a participant, so the absence asserted above proves nothing")
 }
