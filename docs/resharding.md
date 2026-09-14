@@ -274,11 +274,13 @@ idempotent, so a controller crash anywhere repeats at most one step:
 
    Dropping it is what makes the step terminate: the recorded positions
    are a *fixed* boundary, so a source that keeps writing cannot run away
-   from the targets. Making the sources stand still first is not an option
-   here — `default_transaction_read_only` before the journal fails the
-   writes of the clients the fence deliberately lets finish, with `25006`
-   — which is why `swap_replication` is where they are stopped, after the
-   flip, and why it re-reads and re-checks the positions there.
+   from the targets. Making the sources stand still here is not an option
+   — an attempt that paused them milliseconds after the fence failed
+   transfers with `25006`, most likely from routers that had not yet seen
+   the fence —
+   which is why `quiesce` is where they are stopped, after `verify` and
+   `reverse`, and
+   why it re-reads and re-checks the positions there.
 6. `verify` — per table, range and target: `count(*)`, `sum(h)` and
    `bit_xor(h)` where `h = hashtextextended(row::text, 0)`, under the source
    position vs the target. A mismatch is asked again before it is believed:
@@ -307,32 +309,55 @@ idempotent, so a controller crash anywhere repeats at most one step:
    same row filters, target -> source direction) and disabled subscriptions
    on the sources (`origin=none, copy_data=false, create_slot=true`),
    created while the targets are still non-serving.
-8. `journal` — the point of no return. A row keyed by a uuid allocated
+8. `quiesce` — the sources stop taking new writing transactions
+   (`default_transaction_read_only`), **the writers already open are waited
+   out**, prepared transactions are asked for again, and the final
+   positions are sampled and confirmed applied on the targets. The pause
+   stands from here until `swap_replication` has disabled forward
+   replication; the sequences are carried under it.
+
+   The wait is what keeps an older write from landing on a newer one. The
+   router deliberately lets a transaction that opened before the fence
+   carry on writing, and `default_transaction_read_only` is read when a
+   transaction *starts*, so the pause alone does not end it. If it could
+   commit after the flip, the forward subscription would carry its row
+   onto a target that is already serving — over a write the target
+   committed meanwhile, or into a duplicate key that stalls the apply. On
+   one PostgreSQL the target's statement would have waited for it
+   (PGS-750). Prepared transactions are asked for again because they have
+   no backend for the drain to see and `COMMIT PREPARED` runs in a
+   read-only transaction.
+
+   It comes before the journal so that a transaction that will not end
+   cannot hold the write fence for good: a drain that does not finish
+   within the writer-drain timeout lifts the pause and retries, and past
+   `--cutover-timeout` the switch is undone like any step before the
+   journal — fence released, pause lifted. A long transaction open on a
+   source at cutover time can therefore cost attempts, and after
+   `--cutover-attempts` fail the workflow, rather than hold writes down.
+9. `journal` — the point of no return, written through the pause. A row keyed by a uuid allocated
    before the first attempt goes into
    `pgshard_journal.resharding_journal` in every user database of every
    source (the replicated stream) and into the catalog's
    `pgshard.resharding_journal`; `workflows.journal_ids` records it.
    Stream consumers following JOURNAL rows are wired in a follow-up task.
-9. `flip` — one catalog transaction: targets `serving`, sources `retired`,
-   `pgshard.serving` published for the new set, database home shards
-   moved, `shard_map_generation` bumped so poolers reject the old
-   generation.
-10. `swap_replication` — the sources stop taking new writing transactions
-    (`default_transaction_read_only`), **the writers already open are waited
-    out**, the final positions are sampled and confirmed applied on the
-    targets, forward subscriptions are disabled (dropped on complete), the
+10. `flip` — one catalog transaction: targets `serving`, sources
+    `retired`, `pgshard.serving` published for the new set, database home
+    shards moved, `shard_map_generation` bumped so poolers reject the old
+    generation. Before it, the positions are confirmed applied once more;
+    if the pause did not stand since `quiesce` (lifted by hand, or a
+    controller upgraded mid-switch), the sources are paused and drained
+    again first.
+11. `swap_replication` — with the sources still paused, anything that
+    wrote under a transaction of its own that overrode the pause is
+    drained, the positions confirmed applied and the sequences carried once
+    more; forward subscriptions are disabled (dropped on complete), the
     sources are made writable again and reverse subscriptions are enabled.
-
-    The drain is not belt and braces. `default_transaction_read_only` is
-    read when a transaction *starts*, so the pause stops new writers and
-    nothing else — and the router deliberately lets a transaction that
-    opened before the fence carry on writing. Without the wait, such a
-    commit lands after the positions were sampled and after forward
-    replication is gone, acknowledged on a source that is about to be
-    retired and replicated nowhere. A drain that does not finish within
-    the writer-drain timeout retries the step with the sources writable
-    again, rather than failing the workflow or holding writes down.
-11. `release` — `migrating=false`, lock row removed. Routers replay the
+    A step that has to wait keeps the pause: the sources are retired, and
+    one made writable between attempts is one a router that has not
+    reloaded can commit on while its forward subscription is being
+    disabled.
+12. `release` — `migrating=false`, lock row removed. Routers replay the
     buffered writes against the new map.
 
 The pause (`fence` raised to `flip` committed) is written to

@@ -76,11 +76,6 @@ type fakeOps struct {
 	// onwards, so a test can park the run at a chosen check.
 	caughtUpUntil int
 	caughtUpCalls int
-	// seqFP is what the sequence carry reports carrying; seqAdvances is how
-	// many more times a sequence moves before the flip's check, as a source
-	// still handing out values does.
-	seqFP       string
-	seqAdvances int
 	// openWriters are transactions that were already writing when the
 	// pause went up. The pause cannot stop them --
 	// default_transaction_read_only is read at transaction start -- so
@@ -90,7 +85,23 @@ type fakeOps struct {
 	// sampled and after forward replication was disabled: an acknowledged
 	// write on a source that is about to be retired, replicated nowhere.
 	lostWrite bool
-	drains    int
+	// writeAfterFlip records one of them still open when the targets began
+	// serving: its commit reaches a target that may already hold a newer
+	// write to the same row (PGS-750).
+	writeAfterFlip bool
+	// preparedWhilePaused is how many more times Drain finds a prepared
+	// transaction once the sources are paused: one prepared by a writer
+	// the pause let finish, which no backend drain can see.
+	preparedWhilePaused int
+	// pauseLifted stands in for the pause being lifted behind the run's
+	// back -- by hand, or by a controller that resumed past a quiesce it
+	// never ran -- while the fake still believes it raised it.
+	pauseLifted bool
+	// disableDone is DisableForward having finished; unpausedHalfDisabled
+	// records the sources made writable while it had only got part way.
+	disableDone          bool
+	unpausedHalfDisabled bool
+	drains               int
 	// targetsPaused stands in for the pause Rollback raises on the targets.
 	// completeWhileTargetsWritable records Complete dropping the reverse
 	// subscriptions with the targets taking writes: a stale router's commit
@@ -119,6 +130,10 @@ func (f *fakeOps) GateOpen(context.Context) (bool, string, error) {
 }
 func (f *fakeOps) Fence(context.Context) error { f.fenced = true; return f.step(StepFence) }
 func (f *fakeOps) Drain(context.Context) ([]string, error) {
+	if f.paused && f.preparedWhilePaused > 0 {
+		f.preparedWhilePaused--
+		return []string{"default/0:pgshard-late"}, f.step(StepDrain)
+	}
 	return f.drain, f.step(StepDrain)
 }
 func (f *fakeOps) Sweep(context.Context) error {
@@ -178,18 +193,8 @@ func (f *fakeOps) Verify(context.Context) (VerifyReport, error) {
 	}
 	return report, f.step(StepVerify)
 }
-func (f *fakeOps) Sequences(context.Context) (string, error) {
-	return f.seqFP, f.step(StepSequences)
-}
-
-// SequenceFingerprint answers what the carry carried, unless the test asked
-// for advances still to come.
-func (f *fakeOps) SequenceFingerprint(context.Context) (string, error) {
-	if f.seqAdvances > 0 {
-		f.seqAdvances--
-		return fmt.Sprintf("%s-moved-%d", f.seqFP, f.seqAdvances), nil
-	}
-	return f.seqFP, nil
+func (f *fakeOps) Sequences(context.Context) error {
+	return f.step(StepSequences)
 }
 func (f *fakeOps) Reverse(context.Context) error { return f.step(StepReverse) }
 func (f *fakeOps) SchemaFingerprints(context.Context) (map[string]string, error) {
@@ -203,6 +208,9 @@ func (f *fakeOps) Journal(_ context.Context, id string) error {
 	return f.step(StepJournal)
 }
 func (f *fakeOps) Flip(context.Context, string) error {
+	if f.openWriters > 0 {
+		f.writeAfterFlip = true
+	}
 	if f.outsideDisable {
 		f.forwardDisabled = true
 		f.caughtUp = false
@@ -231,6 +239,7 @@ func (f *fakeOps) DisableForward(context.Context) error {
 	// confirmed_flush_lsn stands still and the source's WAL does not.
 	f.forwardDisabled = true
 	f.caughtUp = false
+	f.disableDone = true
 	if f.crashAfterDisable {
 		f.crashAfterDisable = false
 		f.fail["pause_sources"] = errors.New("controller crashed after disabling forward replication")
@@ -250,11 +259,20 @@ func (f *fakeOps) PauseSources(_ context.Context, pause bool) error {
 	if err := f.step("pause_sources"); err != nil {
 		return err
 	}
+	if pause {
+		f.pauseLifted = false
+	}
+	if !pause && f.forwardDisabled && !f.disableDone {
+		f.unpausedHalfDisabled = true
+	}
 	f.paused = pause
 	if pause {
 		f.pauses++
 	}
 	return nil
+}
+func (f *fakeOps) SourcesPaused(context.Context) (bool, error) {
+	return f.paused && !f.pauseLifted, nil
 }
 func (f *fakeOps) DropJournal(_ context.Context, id string) error {
 	delete(f.journaled, id)
@@ -320,6 +338,35 @@ func (h *cutoverHarness) pass(t *testing.T) bool {
 	return advanced
 }
 
+// waitAt drives passes until the run has saved a wait at step, which is how
+// a step before the journal reports one.
+func (h *cutoverHarness) waitAt(t *testing.T, step string) string {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err != nil {
+			t.Fatalf("pass: %v", err)
+		}
+		if last := h.store.saves[len(h.store.saves)-1]; h.wf.cutover.Step == step && strings.HasPrefix(last, "switching: waiting at step "+step) {
+			return last
+		}
+	}
+	t.Fatalf("never waited at %s; at %s", step, h.wf.cutover.Step)
+	return ""
+}
+
+// parkAt drives passes until the run reports an error at step.
+func (h *cutoverHarness) parkAt(t *testing.T, step string) error {
+	t.Helper()
+	var err error
+	for i := 0; h.wf.cutover.Step != step || err == nil; i++ {
+		if i > 50 {
+			t.Fatalf("never parked at %s; at %s (%v)", step, h.wf.cutover.Step, err)
+		}
+		_, err = h.c.cutover(context.Background(), h.wf, h.ops)
+	}
+	return err
+}
+
 func (h *cutoverHarness) runUntil(t *testing.T, stage string) {
 	t.Helper()
 	for i := 0; i < 50; i++ {
@@ -334,9 +381,10 @@ func (h *cutoverHarness) runUntil(t *testing.T, stage string) {
 func TestCutoverHappyPath(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitched)
-	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepSequences, StepReverse, StepJournal,
-		StepPositions, StepCatchUp, StepFlip,
-		"forward_disabled", "pause_sources", "drain_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
+	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepReverse,
+		"pause_sources", "drain_sources", StepDrain, StepPositions, StepCatchUp, StepSequences, StepJournal,
+		"drain_sources", StepPositions, StepCatchUp, StepFlip,
+		"forward_disabled", "drain_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
 		t.Fatalf("calls %s", got)
 	}
@@ -564,13 +612,22 @@ func TestCutoverAfterJournalRetriesForever(t *testing.T) {
 	}
 }
 
+// opOf is the fake operation a switch step is seen by: quiesce is the one
+// step that is not an operation of its own.
+func opOf(step string) string {
+	if step == StepQuiesce {
+		return "pause_sources"
+	}
+	return step
+}
+
 func TestCutoverCrashAtEveryStepResumesIdempotently(t *testing.T) {
 	for _, crashAt := range switchSteps {
 		t.Run(crashAt, func(t *testing.T) {
 			h := newCutoverHarness(t)
 			h.runUntil(t, StageSwitching)
 			crashed := errors.New("crash")
-			h.ops.fail[crashAt] = crashed
+			h.ops.fail[opOf(crashAt)] = crashed
 			_, err := h.c.cutover(context.Background(), h.wf, h.ops)
 			if !errors.Is(err, crashed) {
 				t.Fatalf("err %v", err)
@@ -594,7 +651,7 @@ func TestCutoverCrashAtEveryStepResumesIdempotently(t *testing.T) {
 				t.Fatal("fence left raised")
 			}
 			for _, step := range switchSteps {
-				if !strings.Contains(strings.Join(h.ops.calls, ","), step) {
+				if !strings.Contains(strings.Join(h.ops.calls, ","), opOf(step)) {
 					t.Fatalf("step %s never ran", step)
 				}
 			}
@@ -619,74 +676,6 @@ func TestCutoverSpecDefaults(t *testing.T) {
 	s = cutoverSpec{PauseBefore: PauseComplete, RetireAfterSeconds: 5}
 	if !s.paused(PauseComplete) || s.paused(PauseSwitchWrites) || s.retireAfter() != 5*time.Second {
 		t.Fatal("spec")
-	}
-}
-
-// TestCutoverFlipRecarriesSequencesThenFlipsAnyway: movement at the flip
-// sends the switch back to re-carry sequences, but only so many times. A
-// source is never obliged to stand still -- a checkpoint or an autovacuum
-// moves pg_current_wal_lsn with no user write behind it -- and after the
-// journal there is no timeout to end the wait, so requiring stillness is
-// requiring something the source may never do. A real 18-to-19 upgrade sat
-// in exactly this state for the whole 30-minute e2e budget, reporting
-// "sources advanced past the recorded positions before the flip".
-func TestCutoverFlipRecarriesSequencesThenFlipsAnyway(t *testing.T) {
-	h := newCutoverHarness(t)
-	h.runUntil(t, StageSwitching)
-	boom := errors.New("boom")
-	h.ops.fail[StepJournal] = boom
-	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); !errors.Is(err, boom) {
-		t.Fatalf("err %v", err)
-	}
-	// A source whose SEQUENCES keep moving, not merely whose WAL does.
-	h.ops.seqAdvances = maxSeqRecarries + 5
-	for i := range maxSeqRecarries {
-		_, err := h.c.cutover(context.Background(), h.wf, h.ops)
-		if err == nil || isFatal(err) {
-			t.Fatalf("pass %d: err %v", i, err)
-		}
-		if h.wf.cutover.Step != StepSequences || strings.Contains(strings.Join(h.ops.calls, ","), StepFlip) {
-			t.Fatalf("pass %d: movement at the flip must jump back to the sequence carry (step %s, calls %v)", i, h.wf.cutover.Step, h.ops.calls)
-		}
-	}
-	sequenceRuns := strings.Count(strings.Join(h.ops.calls, ","), StepSequences)
-	h.runUntil(t, StageSwitched)
-	if got := strings.Count(strings.Join(h.ops.calls, ","), StepSequences); got <= sequenceRuns {
-		t.Fatalf("sequences must be re-carried after the sources moved: %d runs before settling, %d after", sequenceRuns, got)
-	}
-	if h.wf.cutover.Recarries != maxSeqRecarries {
-		t.Fatalf("re-carries %d, want the bound %d", h.wf.cutover.Recarries, maxSeqRecarries)
-	}
-}
-
-// TestCutoverFlipDoesNotRecarryForWALMovementAlone: the check used to ask
-// whether pg_current_wal_lsn had moved, which is a far wider question than
-// the one it needs. A checkpoint or an autovacuum moves it with no user
-// write behind it, so the answer was yes on every cutover -- twice, until
-// the bound stopped it -- and each re-carry cost a full pass over every
-// source and target INSIDE THE WRITE FENCE while writing nothing, because
-// the carry takes the greater of the two positions. Measured at rest, that
-// was about 500ms of a 1.2s pause.
-//
-// Safety does not rest on this check: StepSwap carries the sequences again
-// with the sources PAUSED, which is what nothing can consume a value after.
-func TestCutoverFlipDoesNotRecarryForWALMovementAlone(t *testing.T) {
-	h := newCutoverHarness(t)
-	h.runUntil(t, StageSwitching)
-	boom := errors.New("boom")
-	h.ops.fail[StepJournal] = boom
-	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); !errors.Is(err, boom) {
-		t.Fatalf("err %v", err)
-	}
-	// From here the source never stops moving, and no sequence advances
-	// with it -- which is every cutover, because a checkpoint is enough.
-	h.ops.advance = 10
-	h.runUntil(t, StageSwitched)
-	if h.wf.cutover.Recarries != 0 {
-		t.Fatalf("re-carried %d times for WAL movement with no sequence behind it", h.wf.cutover.Recarries)
-	}
-	if !strings.Contains(strings.Join(h.ops.calls, ","), StepFlip) {
-		t.Fatalf("the flip must happen: %v", h.ops.calls)
 	}
 }
 
@@ -903,39 +892,191 @@ func TestSwapWaitsOutTheWritersThePauseCannotStop(t *testing.T) {
 	}
 }
 
-// A drain that does not finish is a long transaction, not a broken cutover:
-// the sources go back to writable and the step retries rather than failing
-// the workflow or holding writes down for ever.
-func TestASlowWriterRetriesTheSwapRatherThanFailingIt(t *testing.T) {
+// TestQuiesceWaitsOutTheWritersThePauseCannotStop (PGS-750): a writer the
+// fence let carry on must be finished before the journal, and so before the
+// targets serve. Committing after the flip, its row is carried onto a target
+// that may already hold a newer write to it.
+func TestQuiesceWaitsOutTheWritersThePauseCannotStop(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.ops.openWriters = 1
-	h.runUntil(t, StageSwitching)
-	h.ops.fail["drain_sources"] = errors.New("2 write transactions on default still open after 30s")
-	var err error
-	for i := 0; h.wf.cutover.Step != StepSwap || err == nil; i++ {
-		if i > 50 {
-			t.Fatalf("never parked at %s; at %s (%v)", StepSwap, h.wf.cutover.Step, err)
+	h.runUntil(t, StageSwitched)
+	if h.ops.writeAfterFlip {
+		t.Fatal("a writer open before the pause was still open when the targets began serving")
+	}
+	calls := strings.Join(h.ops.calls, ",")
+	window := calls[strings.Index(calls, StepReverse):strings.Index(calls, StepJournal)]
+	order := []string{"pause_sources", "drain_sources", StepDrain, StepPositions, StepCatchUp}
+	at := 0
+	for _, c := range order {
+		next := strings.Index(window[at:], c)
+		if next < 0 {
+			t.Fatalf("between reverse and the journal, want %v in order: %s", order, window)
 		}
-		_, err = h.c.cutover(context.Background(), h.wf, h.ops)
-	}
-	if !errors.Is(err, errRetry) {
-		t.Fatalf("a drain that timed out gave up with %v, want a retry", err)
-	}
-	if h.ops.paused {
-		t.Fatal("a swap that could not drain must leave the sources writable")
-	}
-	if h.ops.lostWrite {
-		t.Fatal("the attempt that could not drain must not have disabled forward replication")
+		at += next + len(c)
 	}
 }
 
-// TestSwapLeavesTheSourcesWritableWhenItCannotFinish: a workflow that stops
-// at the swap must not leave the sources refusing writes for good.
-func TestSwapLeavesTheSourcesWritableWhenItCannotFinish(t *testing.T) {
+// TestQuiesceWaitsForATransactionPreparedUnderThePause: a prepared
+// transaction has no backend for the writer drain to see, and COMMIT
+// PREPARED runs in a read-only transaction, so quiesce asks for prepared
+// transactions again once the sources are paused.
+func TestQuiesceWaitsForATransactionPreparedUnderThePause(t *testing.T) {
 	h := newCutoverHarness(t)
-	// The catch-up step and the flip ask first; the swap's own check is the
-	// third, and that is the one this parks on.
-	h.ops.caughtUpUntil = 2
+	h.runUntil(t, StageSwitching)
+	h.ops.preparedWhilePaused = 1
+	if msg := h.waitAt(t, StepQuiesce); !strings.Contains(msg, "pgshard-late") {
+		t.Fatalf("quiesce waited with %q, want the prepared transaction named", msg)
+	}
+	if h.wf.cutover.JournalID != "" {
+		t.Fatal("the journal was written with a prepared transaction on a source")
+	}
+	h.runUntil(t, StageSwitched)
+}
+
+// TestASlowWriterUndoesTheSwitchInsteadOfHoldingTheFence: a transaction that
+// will not end cannot hold the write fence for good. Quiesce lifts its pause
+// whenever it has to wait, and past the cutover timeout the switch is
+// undone -- fence released, sources writable -- as any step before the
+// journal is.
+func TestASlowWriterUndoesTheSwitchInsteadOfHoldingTheFence(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	h.ops.fail["drain_sources"] = errors.New("1 write transactions on default still open after 30s")
+	if msg := h.waitAt(t, StepQuiesce); !strings.Contains(msg, "still open") {
+		t.Fatalf("quiesce waited with %q, want the open writers named", msg)
+	}
+	if h.ops.paused {
+		t.Fatal("quiesce kept the pause while it waited")
+	}
+	h.clock = h.clock.Add(2 * DefaultCutoverTimeout)
+	h.ops.fail["drain_sources"] = errors.New("1 write transactions on default still open after 30s")
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err != nil {
+		t.Fatalf("the undo reported %v", err)
+	}
+	if h.wf.stage != StageAwaitingSwitch || len(h.wf.cutover.Aborts) != 1 {
+		t.Fatalf("stage %s aborts %v, want the switch undone once", h.wf.stage, h.wf.cutover.Aborts)
+	}
+	if h.ops.fenced || h.ops.paused {
+		t.Fatalf("after the undo: fenced %v, paused %v", h.ops.fenced, h.ops.paused)
+	}
+	h.runUntil(t, StageSwitched)
+}
+
+// TestAnUndoAfterQuiesceLiftsItsPause: quiesce succeeded and a later step
+// before the journal fails past the cutover timeout. The switch is undone
+// with the pause standing, on sources that still serve; the undo has to
+// lift it, or they refuse writes with nothing left to give them back.
+func TestAnUndoAfterQuiesceLiftsItsPause(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	h.ops.fail[StepSequences] = errors.New("target unreachable")
+	if err := h.parkAt(t, StepSequences); err == nil {
+		t.Fatal("the failing step must surface its error")
+	}
+	if !h.ops.paused {
+		t.Fatal("quiesce's pause did not stand into the next step, so this does not test the undo")
+	}
+	h.clock = h.clock.Add(2 * DefaultCutoverTimeout)
+	h.ops.fail[StepSequences] = errors.New("target unreachable")
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err != nil {
+		t.Fatalf("the undo reported %v", err)
+	}
+	if h.wf.stage != StageAwaitingSwitch || len(h.wf.cutover.Aborts) != 1 {
+		t.Fatalf("stage %s aborts %v, want the switch undone once", h.wf.stage, h.wf.cutover.Aborts)
+	}
+	if h.ops.fenced || h.ops.paused {
+		t.Fatalf("after the undo: fenced %v, paused %v", h.ops.fenced, h.ops.paused)
+	}
+	// Pause first: routers that see the fence drop send writes at once.
+	if indexOfLast(t, h.ops.calls, "pause_sources") > indexOfLast(t, h.ops.calls, StepRelease) {
+		t.Fatalf("the fence was released before the pause was lifted: %s", strings.Join(h.ops.calls, ","))
+	}
+}
+
+// TestASwitchSavedBeforeReverseRanDoesNotSkipIt: a controller that ran
+// reverse after the sequence carry may have saved a switch at "sequences".
+// Resumed under the order that runs reverse first, going on would complete
+// the switch with no reverse replication, and so no rollback.
+func TestASwitchSavedBeforeReverseRanDoesNotSkipIt(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	h.ops.fail[StepVerify] = errors.New("boom")
+	if err := h.parkAt(t, StepVerify); err == nil {
+		t.Fatal("the verify step must surface its error")
+	}
+	h.wf.cutover.Step, h.wf.cutover.Schema = StepSequences, nil
+	before := len(h.ops.calls)
+	h.runUntil(t, StageSwitched)
+	calls := strings.Join(h.ops.calls[before:], ",")
+	journal := strings.Index(calls, StepJournal)
+	if journal < 0 || !strings.Contains(calls[:journal], StepReverse) || !strings.Contains(calls[:journal], "pause_sources") {
+		t.Fatalf("a switch resumed at the sequences before reverse ran must run reverse and quiesce before the journal: %s", calls)
+	}
+	if h.wf.cutover.Schema == nil {
+		t.Fatal("no schema fingerprints were taken, so a rollback could not check drift")
+	}
+}
+
+// TestASwapThatRaisedAPauseItCouldNotDrainLiftsIt: when the pause did not
+// stand into the swap, the swap raises its own; if that one cannot drain,
+// the next pass must not take it for a pause that stood and skip the wait.
+func TestASwapThatRaisedAPauseItCouldNotDrainLiftsIt(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	h.ops.fail[StepSwap] = errors.New("boom")
+	if err := h.parkAt(t, StepSwap); err == nil {
+		t.Fatal("the swap step must surface its error")
+	}
+	h.ops.pauseLifted, h.ops.paused = true, false
+	h.ops.openWriters = 1
+	h.ops.fail["drain_sources"] = errors.New("1 write transactions on default still open after 30s")
+	if err := h.parkAt(t, StepSwap); !errors.Is(err, errRetry) {
+		t.Fatalf("a swap that could not drain gave up with %v, want a retry", err)
+	}
+	if h.ops.paused {
+		t.Fatal("a pause the swap raised and could not drain was left standing for the next pass to trust")
+	}
+	h.runUntil(t, StageSwitched)
+	if h.ops.lostWrite {
+		t.Fatal("a writer was still open when forward replication went away")
+	}
+}
+
+// TestAFlipWhosePauseDidNotStandQuiescesAgain: the drain at quiesce speaks
+// for a pause that has stood since. One lifted in between -- by hand, or by a
+// controller that resumed past a quiesce it never ran -- is raised and
+// drained again before the targets serve.
+func TestAFlipWhosePauseDidNotStandQuiescesAgain(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	h.ops.fail[StepJournal] = errors.New("boom")
+	if err := h.parkAt(t, StepJournal); err == nil {
+		t.Fatal("the journal step must surface its error")
+	}
+	h.ops.pauseLifted = true
+	h.ops.openWriters = 1
+	before := len(h.ops.calls)
+	h.runUntil(t, StageSwitched)
+	calls := strings.Join(h.ops.calls[before:], ",")
+	flip := strings.Index(calls, StepFlip)
+	if flip < 0 || !strings.Contains(calls[:flip], "pause_sources,drain_sources") {
+		t.Fatalf("a flip whose pause did not stand must pause and drain again first: %s", calls)
+	}
+	if h.ops.writeAfterFlip {
+		t.Fatal("a writer begun while the pause was down was still open at the flip")
+	}
+}
+
+// TestSwapKeepsTheSourcesPausedWhenItCannotFinish: the sources are retired
+// once the flip is published, and one made writable between attempts is one
+// a router that has not reloaded can commit on while its forward
+// subscription is being disabled. A run that stops here keeps them paused;
+// WritePauseSweep lifts the claimed pause once the workflow ends.
+func TestSwapKeepsTheSourcesPausedWhenItCannotFinish(t *testing.T) {
+	h := newCutoverHarness(t)
+	// The catch-up step, quiesce and the flip ask first; the swap's own
+	// check is the fourth, and that is the one this parks on.
+	h.ops.caughtUpUntil = 3
 	h.runUntil(t, StageSwitching)
 	var err error
 	for i := 0; h.wf.cutover.Step != StepSwap || err == nil; i++ {
@@ -944,16 +1085,11 @@ func TestSwapLeavesTheSourcesWritableWhenItCannotFinish(t *testing.T) {
 		}
 		_, err = h.c.cutover(context.Background(), h.wf, h.ops)
 	}
-	// After the journal a step that cannot finish is reported rather than
-	// silently retried, which is what parks the run here.
 	if !errors.Is(err, errRetry) {
 		t.Fatalf("swap gave up with %v, want a retry", err)
 	}
-	if h.ops.paused {
-		t.Fatal("the sources were left refusing writes after the swap gave up")
-	}
-	if h.ops.pauses == 0 {
-		t.Fatal("the swap must have paused them in the first place")
+	if !h.ops.paused {
+		t.Fatal("the swap lifted the pause on the retired sources while it could not finish")
 	}
 }
 
@@ -982,43 +1118,20 @@ func TestSwapCarriesSequencesInsideThePause(t *testing.T) {
 
 // TestNoAbortOnceTheJournalIsWritten: the journal is the point of no
 // return -- its rows tell every consumer of the change stream that the
-// cutover happened, and nothing retracts them. The abort was gated on the
-// step cursor, and StepFlip rewinds that cursor back to StepSequences when
-// the sources moved before the flip, so an error on the way forward again
-// found itself "before the journal" with the fence long past its timeout
-// and undid a switch the sources had already announced.
+// cutover happened, and nothing retracts them. A step after it that fails
+// with the fence long past its timeout is retried, never undone.
 func TestNoAbortOnceTheJournalIsWritten(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitching)
-	// Park the run at the journal, then let it through with the sources
-	// moving so the flip rewinds to the sequence carry.
-	h.ops.fail[StepJournal] = errors.New("boom")
-	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
-		t.Fatal("the journal step must surface its error")
-	}
-	delete(h.ops.fail, StepJournal)
-	h.ops.seqAdvances = 1
-	// The rewind reports itself as a retry, which pass would treat as
-	// fatal, so the pass is driven directly here.
-	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil || isFatal(err) {
-		t.Fatalf("a sequence advance at the flip must ask for a retry, got %v", err)
-	}
-	if h.wf.cutover.Step != StepSequences {
-		t.Fatalf("step %s, want the rewind to the sequence carry", h.wf.cutover.Step)
-	}
-	if h.wf.cutover.JournalID == "" {
-		t.Fatal("the journal was never written, so this does not test what it says")
-	}
-
-	// A step now fails with the fence well past its timeout: the old gate
-	// would have aborted here, because the cursor is before the journal.
-	h.ops.fail[StepSequences] = errors.New("target unreachable")
+	h.ops.fail[StepFlip] = errors.New("catalog unreachable")
 	h.clock = h.clock.Add(4 * DefaultCutoverTimeout)
-	aborts := len(h.wf.cutover.Aborts)
 	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
 		t.Fatal("the failing step must surface its error")
 	}
-	if len(h.wf.cutover.Aborts) != aborts {
+	if h.wf.cutover.JournalID == "" || h.wf.cutover.Step != StepFlip {
+		t.Fatalf("step %s journal %q: the run did not fail past the journal, so this does not test what it says", h.wf.cutover.Step, h.wf.cutover.JournalID)
+	}
+	if len(h.wf.cutover.Aborts) != 0 {
 		t.Fatalf("the switch was undone after the journal: %v", h.wf.cutover.Aborts)
 	}
 	if !h.ops.fenced {
@@ -1026,35 +1139,7 @@ func TestNoAbortOnceTheJournalIsWritten(t *testing.T) {
 	}
 
 	// It recovers by retrying, not by going back to the gate.
-	delete(h.ops.fail, StepSequences)
 	h.runUntil(t, StageSwitched)
-}
-
-// TestJournalRefreshesItsTargetsAfterARewind: the journal's targets are
-// where a consumer repositions to. A flip that rewinds to re-carry the
-// sequences comes back through the journal, and the row must describe the
-// attempt that actually flipped -- leaving the first attempt's positions
-// starts a consumer before the cutover it is repositioning to.
-func TestJournalRefreshesItsTargetsAfterARewind(t *testing.T) {
-	h := newCutoverHarness(t)
-	h.runUntil(t, StageSwitching)
-	h.ops.fail[StepJournal] = errors.New("boom")
-	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
-		t.Fatal("the journal step must surface its error")
-	}
-	delete(h.ops.fail, StepJournal)
-	h.ops.seqAdvances = 1
-	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil || isFatal(err) {
-		t.Fatalf("a sequence advance at the flip must ask for a retry, got %v", err)
-	}
-	first := h.ops.journaled[h.wf.cutover.JournalID]
-	if first == 0 {
-		t.Fatal("the journal was never written")
-	}
-	h.runUntil(t, StageSwitched)
-	if again := h.ops.journaled[h.wf.cutover.JournalID]; again <= first {
-		t.Errorf("the journal was written %d times and not again after the rewind", again)
-	}
 }
 
 // TestASwitchWhoseSourceWasRetiredEndsInsteadOfRetrying: after the journal
@@ -1353,18 +1438,17 @@ func indexOfLast(t *testing.T, calls []string, name string) int {
 	return -1
 }
 
-// TestCutoverPartialDisableResumesUnderAFreshPause is the other way into the
-// same window, and the one that decides whether the resume may skip the
-// write pause.
+// TestCutoverPartialDisableResumesUnderTheStandingPause is the other way
+// into the same window.
 //
-// DisableForward walks databases and targets one at a time. When a later one
-// fails, the step's error path unpauses the sources -- with forward
-// replication already half off. A resume that took "forward is disabled" to
-// mean "and the sources have been paused ever since" would then finish the
-// cutover across a window in which the sources were writable and undrained,
-// which is exactly where a stale router's commit is acknowledged into a slot
-// Complete is about to drop.
-func TestCutoverPartialDisableResumesUnderAFreshPause(t *testing.T) {
+// DisableForward walks databases and targets one at a time, and a later one
+// can fail with forward replication already half off. The sources must not
+// be writable at any point from there until it is all off: a stale router's
+// commit in that window is acknowledged into a slot Complete is about to
+// drop. The step's error path used to unpause them and rely on the resume
+// raising a fresh pause; it now keeps the pause, and the resume works under
+// it.
+func TestCutoverPartialDisableResumesUnderTheStandingPause(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.ops.partialDisable = true
 	var errs int
@@ -1379,17 +1463,14 @@ func TestCutoverPartialDisableResumesUnderAFreshPause(t *testing.T) {
 	if errs != 1 {
 		t.Fatalf("want the one injected failure, got %d", errs)
 	}
+	if h.ops.unpausedHalfDisabled {
+		t.Fatalf("the sources were made writable with forward replication half disabled: %s", strings.Join(h.ops.calls, ","))
+	}
 	after := h.ops.calls[indexOfLast(t, h.ops.calls, "forward_disabled"):]
 	for _, want := range []string{"drain_sources", StepSequences} {
 		if !slices.Contains(after, want) {
-			t.Fatalf("resume skipped %s, so the sources were left writable and undrained across the disable: %s", want, strings.Join(after, ","))
+			t.Fatalf("resume skipped %s: %s", want, strings.Join(after, ","))
 		}
-	}
-	// Two, not one: the resume has to raise the pause again as well as
-	// lift it at the end. Counting "any pause_sources call" would pass on
-	// the unpause alone, which is the bug rather than the fix.
-	if n := strings.Count(strings.Join(after, ","), "pause_sources"); n < 2 {
-		t.Fatalf("resume paused the sources %d time(s), want a pause and an unpause: %s", n, strings.Join(after, ","))
 	}
 	// The pair it may skip, and must: the disabled half has frozen.
 	if slices.Contains(after, StepCatchUp) {

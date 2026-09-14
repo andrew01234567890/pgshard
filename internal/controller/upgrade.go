@@ -2,8 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"maps"
 	"slices"
@@ -280,18 +278,8 @@ func (c *Copier) largeObjectCount(ctx context.Context, set string, id int32, dat
 // to the targets: max(last_value) across the sources, setval with is_called
 // on every target that holds the sequence. It runs inside the fence, after
 // the sweep, so no source nextval can race it.
-func (o *pgCutover) Sequences(ctx context.Context) (string, error) {
+func (o *pgCutover) Sequences(ctx context.Context) error {
 	return o.syncSequences(ctx, o.srcSet, o.srcIDs, o.wf.set, o.wf.ids)
-}
-
-// SequenceFingerprint reads the sources without writing anything, so the
-// flip can ask whether a sequence advanced since the carry.
-func (o *pgCutover) SequenceFingerprint(ctx context.Context) (string, error) {
-	values, err := o.sourceSequences(ctx, o.srcSet, o.srcIDs)
-	if err != nil {
-		return "", err
-	}
-	return sequenceFingerprint(values), nil
 }
 
 // sourceSequences is the merged sequence position of every source, per
@@ -317,25 +305,10 @@ func (o *pgCutover) sourceSequences(ctx context.Context, fromSet string, fromIDs
 	return out, nil
 }
 
-// sequenceFingerprint renders a sequence snapshot as one comparable string.
-// Every field the carry would apply is in it, so a value that would be
-// carried differently is a fingerprint that differs.
-func sequenceFingerprint(values map[string]map[string]pgsequence.Value) string {
-	h := sha256.New()
-	for _, db := range slices.Sorted(maps.Keys(values)) {
-		fmt.Fprintf(h, "%s\n", db)
-		for _, name := range slices.Sorted(maps.Keys(values[db])) {
-			v := values[db][name]
-			fmt.Fprintf(h, "%s=%d:%t\n", name, v.At, v.Ascending)
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs []int32, toSet string, toIDs []int32) (string, error) {
+func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs []int32, toSet string, toIDs []int32) error {
 	all, err := o.sourceSequences(ctx, fromSet, fromIDs)
 	if err != nil {
-		return "", err
+		return err
 	}
 	for _, db := range o.dbs {
 		values := all[db.name]
@@ -345,16 +318,16 @@ func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs [
 		for _, t := range toIDs {
 			conn, err := o.c.Shards.DialDatabase(ctx, toSet, t, db.name)
 			if err != nil {
-				return "", err
+				return err
 			}
 			err = pgsequence.Apply(ctx, conn, values)
 			_ = conn.Close(ctx)
 			if err != nil {
-				return "", fmt.Errorf("sequences of %s on %s/%d: %w", db.name, toSet, t, err)
+				return fmt.Errorf("sequences of %s on %s/%d: %w", db.name, toSet, t, err)
 			}
 		}
 	}
-	return sequenceFingerprint(all), nil
+	return nil
 }
 
 // Rollback returns serving to the source set of a switched run. It is
@@ -447,7 +420,7 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if len(behind) > 0 {
 		return retryf("reverse subscriptions behind the target position: %s", strings.Join(behind, ", "))
 	}
-	if _, err := o.syncSequences(ctx, o.wf.set, o.wf.ids, o.srcSet, o.srcIDs); err != nil {
+	if err := o.syncSequences(ctx, o.wf.set, o.wf.ids, o.srcSet, o.srcIDs); err != nil {
 		return err
 	}
 	if err := o.flipBack(ctx); err != nil {
