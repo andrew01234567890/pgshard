@@ -99,9 +99,20 @@ the change stream.
 
 ## Catalog
 
-`pgshard.streams` (`name`, `database`, `two_phase`, `state`, `created_at`)
-and `pgshard.stream_status` per `(stream, shard)` — see
+`pgshard.streams` (`name`, `database`, `two_phase`, `state`, `created_at`,
+`shard_set`) and `pgshard.stream_status` per `(stream, shard)` — see
 [catalog.md](catalog.md).
+
+`shard_set` is where the stream's slots were **made**, recorded at creation
+and fixed thereafter. It is not the set a `Stream` call reads, which is
+decided per call (below). The monitor needs it: a stream's slots exist on
+one set, so sweeping every set reported a row per stream per foreign shard
+with no slot behind it — a reshard's freshly provisioned targets look
+exactly like slots that have gone.
+
+`Create` resolves an unnamed set to whichever is serving at the time, for
+the same reason a `Stream` request does: slots made where the read side
+will not look are slots nothing reads.
 
 A `Stream` request that names no `shard_set` streams **whichever set is
 serving**, not the literal `default`. A reshard or a blue/green upgrade
