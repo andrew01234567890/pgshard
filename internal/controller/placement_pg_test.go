@@ -953,6 +953,13 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			CREATE RULE feed_audited AS ON INSERT TO audit_feed DO ALSO INSERT INTO audited VALUES (NEW.id)`, "audited", "rule feed_audited on public.audit_feed"},
 		{`CREATE TABLE counted (id bigint PRIMARY KEY);
 			CREATE FUNCTION count_counted() RETURNS bigint LANGUAGE sql STABLE RETURN (SELECT count(*) FROM counted)`, "counted", "function count_counted()"},
+		{`CREATE TABLE allowed (who text PRIMARY KEY); CREATE TABLE notes (who text, body text);
+			ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+			CREATE POLICY allowed_only ON notes USING (EXISTS (SELECT 1 FROM allowed a WHERE a.who = notes.who))`, "allowed", "policy allowed_only on public.notes"},
+		// A rule that writes into the table from a view is the rule, not
+		// the view: the view's own _RETURN rule does not touch this table.
+		{`CREATE TABLE sink (id bigint PRIMARY KEY); CREATE VIEW sink_entry AS SELECT 1::bigint AS id;
+			CREATE RULE into_sink AS ON INSERT TO sink_entry DO INSTEAD INSERT INTO sink VALUES (NEW.id)`, "sink", "rule into_sink on public.sink_entry"},
 	} {
 		mustExec(t, home, c.ddl)
 		got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", c.table)

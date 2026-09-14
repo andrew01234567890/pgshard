@@ -729,11 +729,13 @@ var triggerEnableWords = map[string]string{"O": "ENABLE", "D": "DISABLE", "R": "
 //
 // So is everything bound to the table by OID from outside it, which the swap
 // leaves on the retired table with no error: a view, a materialized view or
-// another table's rule goes on reading or writing it; a subscription's apply
-// worker goes on writing into it while the live table stops receiving; and a
-// function with a SQL-standard body (BEGIN ATOMIC or RETURN) goes on
-// querying it. Other function bodies are resolved by name when they run, so
-// they follow the swap, and they record no dependency to find.
+// another table's rule or row-level security policy goes on reading or
+// writing it; a subscription's apply worker goes on writing into it while the
+// live table stops receiving; and a function that captured its OID -- a
+// SQL-standard body (BEGIN ATOMIC or RETURN), or a 'name'::regclass argument
+// default in any language -- goes on using it. A body kept as text is
+// resolved by name when it runs and follows the swap, so it records no
+// dependency to find.
 //
 // Reproduced rather than refused, each with its own function: row-level
 // security, user triggers, and the owner and table/column privileges.
@@ -754,8 +756,8 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 				JOIN pg_publication p ON p.oid = pr.prpubid, t WHERE pr.prrelid = t.oid
 			UNION ALL SELECT 'subscription ' || s.subname FROM pg_subscription_rel sr
 				JOIN pg_subscription s ON s.oid = sr.srsubid, t WHERE sr.srrelid = t.oid
-			UNION ALL SELECT DISTINCT CASE v.relkind WHEN 'v' THEN 'view ' WHEN 'm' THEN 'materialized view '
-					ELSE 'rule ' || quote_ident(r.rulename) || ' on ' END
+			UNION ALL SELECT DISTINCT CASE WHEN r.rulename <> '_RETURN' THEN 'rule ' || quote_ident(r.rulename) || ' on '
+					WHEN v.relkind = 'm' THEN 'materialized view ' ELSE 'view ' END
 					|| quote_ident(vn.nspname) || '.' || quote_ident(v.relname)
 				FROM pg_depend d
 				JOIN pg_rewrite r ON d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid
@@ -765,6 +767,13 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 			UNION ALL SELECT DISTINCT 'function ' || p.oid::regprocedure::text FROM pg_depend d
 				JOIN pg_proc p ON d.classid = 'pg_proc'::regclass AND p.oid = d.objid, t
 				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid
+			UNION ALL SELECT DISTINCT 'policy ' || quote_ident(pol.polname) || ' on '
+					|| quote_ident(pn.nspname) || '.' || quote_ident(pc.relname)
+				FROM pg_depend d
+				JOIN pg_policy pol ON d.classid = 'pg_policy'::regclass AND pol.oid = d.objid
+				JOIN pg_class pc ON pc.oid = pol.polrelid
+				JOIN pg_namespace pn ON pn.oid = pc.relnamespace, t
+				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid AND pol.polrelid <> t.oid
 		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err

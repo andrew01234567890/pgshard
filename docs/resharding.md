@@ -465,10 +465,12 @@ that ended within a day).
   over it (it goes on reading the retired rows), another table's **rule**
   that reads or writes it, a **subscription** applying into it (the apply
   worker goes on writing into the retired table and the live one stops
-  receiving), and a function with a **SQL-standard body** (`BEGIN ATOMIC` or
-  `RETURN`) that queries it. A function written in PL/pgSQL or as a quoted
-  SQL string names the table in text resolved when it runs, so it follows
-  the swap and is not refused. The refusal names each object.
+  receiving), another table's **row-level security policy** that reads it,
+  and a **function** that captured the table's OID: a SQL-standard body
+  (`BEGIN ATOMIC` or `RETURN`) that queries it, or an argument default such
+  as `'orders'::regclass` in any language. A body kept as text -- PL/pgSQL, or
+  SQL in a quoted string -- names the table in text resolved when it runs, so
+  it follows the swap and is not refused. The refusal names each object.
 - **A table's own foreign keys are reproduced when they can hold**, which is
   when the referenced table is a **reference** table: every shard has all of
   its rows, so the key holds wherever the moved table lands. A key pointing
