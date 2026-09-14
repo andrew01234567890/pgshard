@@ -101,7 +101,7 @@ func TestTheDesiredRolesLoadIsOneSnapshot(t *testing.T) {
 		t.Helper()
 		was := n
 		writeErr = nil
-		before := generationNow(t, ctx, conn)
+		before := generationNow(ctx, t, conn)
 		sm := &seam{inner: conn, force: force, write: write}
 		d, err := LoadDesiredRoles(ctx, sm)
 		if err != nil {
@@ -116,7 +116,7 @@ func TestTheDesiredRolesLoadIsOneSnapshot(t *testing.T) {
 		if n != was+1 {
 			t.Fatalf("the interloping write ran %d times, not once; the seam counts the wrong read", n-was)
 		}
-		if got := generationNow(t, ctx, conn); got <= before {
+		if got := generationNow(ctx, t, conn); got <= before {
 			t.Fatalf("the interloping write did not move the generation (%d -> %d)", before, got)
 		}
 		return d, before, settingName(n)
@@ -167,7 +167,7 @@ func settingName(n int) string {
 	return names[n-1]
 }
 
-func generationNow(t *testing.T, ctx context.Context, conn Querier) int64 {
+func generationNow(ctx context.Context, t *testing.T, conn Querier) int64 {
 	t.Helper()
 	rows, err := conn.Query(ctx, `SELECT pgshard.roles_desired_generation()`)
 	if err != nil {
