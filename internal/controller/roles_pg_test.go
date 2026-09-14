@@ -176,11 +176,7 @@ func TestRoleVerifierWithPostgres(t *testing.T) {
 		if got := statuses()["newbie@catalog"]; got != "in_sync" {
 			t.Fatalf("%q", got)
 		}
-		if behind := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.role_group_status WHERE roles_generation < (SELECT coalesce(max(g), 0) FROM (
-			SELECT max(desired_generation) g FROM pgshard.roles
-			UNION ALL SELECT max(desired_generation) FROM pgshard.role_members
-			UNION ALL SELECT max(desired_generation) FROM pgshard.grants
-			UNION ALL SELECT max(desired_generation) FROM pgshard.role_settings) m)`); behind != 0 {
+		if behind := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.role_group_status WHERE roles_generation < pgshard.roles_desired_generation()`); behind != 0 {
 			t.Fatalf("%d groups were not materialized at the new generation", behind)
 		}
 	})
