@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
 // TestADrainDeadlineDoesNotCloseABackendUnderItsRelay: when Drain's deadline
@@ -36,23 +38,32 @@ func TestADrainDeadlineDoesNotCloseABackendUnderItsRelay(t *testing.T) {
 	if err := h.srv.Drain(dctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("drain with a statement still running: %v", err)
 	}
-	// The relay was inside a backend read; closing the backend makes that
-	// read fail, and the relay unwinds on its own goroutine. Wait for the
-	// stream to end rather than a fixed time, bounded, so a relay that never
-	// unwinds fails the test instead of hanging it.
-	recvDone := make(chan struct{})
+	// The relay was inside a backend read. Closing the backend makes that
+	// read fail, and the relay reports the loss on its own goroutine before
+	// the statement ends -- which a relay left wedged in the read never
+	// does. Ending the client stream alone would prove nothing: that makes
+	// Recv fail whatever the server is doing.
+	answered := make(chan []*pgshardv1.ExecuteResponse, 1)
 	go func() {
-		defer close(recvDone)
+		var out []*pgshardv1.ExecuteResponse
+		defer func() { answered <- out }()
 		for {
-			if _, err := stream.Recv(); err != nil {
+			resp, err := stream.Recv()
+			if err != nil {
+				return
+			}
+			out = append(out, resp)
+			if resp.GetReadyForQuery() != nil {
 				return
 			}
 		}
 	}()
-	cancel()
 	select {
-	case <-recvDone:
+	case rs := <-answered:
+		if e := firstError(rs); e.GetSqlstate() != "08006" {
+			t.Fatalf("the relay did not report its backend gone: first error %v in %s", e, kinds(rs))
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("the session's stream never ended after its backend was abandoned")
+		t.Fatal("the relay never reported its backend gone after the drain abandoned it")
 	}
 }
