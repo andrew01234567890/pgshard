@@ -224,6 +224,18 @@ func (n *node) psql(sql string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// psqlFails runs a statement that is expected to be refused and returns what
+// psql said. A statement that succeeds is the failure.
+func (n *node) psqlFails(sql string) string {
+	n.t.Helper()
+	out, err := exec.Command("docker", "exec", "-e", "PGPASSWORD=pgshard-test", n.container,
+		"psql", "-h", "/tmp", "-U", "postgres", "-At", "-c", sql).CombinedOutput()
+	if err == nil {
+		n.t.Fatalf("%s psql %q was accepted: %s", n.name, sql, out)
+	}
+	return string(out)
+}
+
 func (n *node) status() *pgshardv1.StatusResponse {
 	n.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -402,6 +414,29 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if _, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 1}); err != nil {
 		t.Fatalf("reload with the current epoch refused: %v", err)
 	}
+
+	t.Log("a reload keeps the write pause a barrier or cutover set")
+	// The pause is an ALTER SYSTEM, so it lives in postgresql.auto.conf,
+	// which postgres parses after postgresql.conf and which the agent
+	// rewrites on bootstrap, promotion and restore. A reload used to rewrite
+	// it too and then ask the postmaster to reread -- dropping the pause and
+	// applying the loss together, mid-cutover.
+	s.psql("ALTER SYSTEM SET default_transaction_read_only = on")
+	s.psql("SELECT pg_reload_conf()")
+	if got := s.psql("SHOW default_transaction_read_only"); got != "on" {
+		t.Fatalf("the pause did not take, so the rest of this proves nothing: %q", got)
+	}
+	if _, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 1}); err != nil {
+		t.Fatalf("reload under a write pause: %v", err)
+	}
+	if got := s.psql("SHOW default_transaction_read_only"); got != "on" {
+		t.Fatal("the agent's reload dropped the write pause; the shard serves writes mid-cutover")
+	}
+	if out := s.psqlFails("INSERT INTO t VALUES (3, 'during-pause')"); !strings.Contains(out, "read-only transaction") {
+		t.Fatalf("a write was accepted while paused: %s", out)
+	}
+	s.psql("ALTER SYSTEM RESET default_transaction_read_only")
+	s.psql("SELECT pg_reload_conf()")
 
 	t.Log("old primary diverges, then demotes via pg_rewind")
 	p.psql("INSERT INTO t VALUES (100, 'diverged')")

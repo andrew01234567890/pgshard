@@ -716,6 +716,11 @@ func (in *Instance) Restart(ctx context.Context, mode ShutdownMode) error {
 }
 
 // Reload asks the postmaster to reread its configuration.
+//
+// It leaves postgresql.auto.conf alone. A running cluster is nobody's clone,
+// and what is in that file is the control plane's -- the barrier's write
+// pause above all, which a reload would otherwise drop and apply in the same
+// breath.
 func (in *Instance) Reload(ctx context.Context) error {
 	if err := in.cfg.Refresh(); err != nil {
 		return err
@@ -724,7 +729,7 @@ func (in *Instance) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := WriteConfig(in.cfg, standby); err != nil {
+	if err := WriteConfigKeepingRuntimeSettings(in.cfg, standby); err != nil {
 		return err
 	}
 	_, err = in.sup.RunTracked(in.sup.Command(ctx, "pg_ctl", "reload", "-D", in.cfg.PGData))
