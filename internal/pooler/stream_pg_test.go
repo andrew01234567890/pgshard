@@ -7,10 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/pgrepl"
 )
 
 func (h *pgHarness) testStream(t *testing.T) {
@@ -159,6 +162,21 @@ func (h *pgHarness) testStream(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// The pooler's seat is free, but the server's is not until the old
+	// walsender exits; a reader started before then is refused with 55006
+	// (PGS-796). Wait for the server too.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		var active bool
+		if err := h.admin.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name = 'pgshard_orders_shard0'").Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if !active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the cancelled reader's walsender never let go of the slot")
+		}
+	}
 
 	// A restarted reader resumes after the ack: only the new transaction shows.
 	if _, err := h.admin.Exec(ctx, "INSERT INTO orders VALUES (4, 'after-ack')"); err != nil {
@@ -188,6 +206,40 @@ func (h *pgHarness) testStream(t *testing.T) {
 	}
 	if _, err := single.Recv(); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("StreamChanges must be refused while Stream holds the slot: %v", err)
+	}
+
+	// A slot a walsender still holds, with the pooler's own seat free: in
+	// production, this pooler's previous reader whose backend has not exited
+	// yet. That is a reader to wait for, and the router only waits for one
+	// the pooler names as such.
+	if _, err := h.admin.Exec(ctx, "SELECT pg_create_logical_replication_slot('pgshard_held_shard0', 'pgoutput')"); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := pgconn.ParseConfig(h.srv.cfg.Stream.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := pgrepl.ConnectConfig(ctx, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.StartReplication(ctx, "pgshard_held_shard0", 0, map[string]string{"proto_version": "4", "publication_names": "pgshard_all"}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Close(ctx) }()
+	held, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "pgshard_held_shard0", Generation: gen(3, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = held.Recv()
+	reasons := []string{}
+	for _, d := range status.Convert(err).Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok {
+			reasons = append(reasons, info.GetReason())
+		}
+	}
+	if status.Code(err) != codes.FailedPrecondition || len(reasons) != 1 || reasons[0] != ReasonReaderActive {
+		t.Fatalf("a slot held by another walsender: %v with reasons %v, want FailedPrecondition naming %s so the router reconnects", err, reasons, ReasonReaderActive)
 	}
 }
 
