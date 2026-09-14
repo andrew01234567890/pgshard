@@ -286,13 +286,20 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.VStreamAckRequest) (*pg
 			"stream %q is not open on this router, so an ack cannot be checked against what was delivered; ack inside the stream, or on the router serving it", req.GetStream())
 	}
 	for sh, lsn := range positionFrom(req.GetPosition()) {
-		// The same two rules as merger.forwardAck, in the same order: a
-		// shard still copying first, then the clamp.
-		if live.isCopying(sh) {
-			continue
-		}
+		// The same two rules as merger.forwardAck, but read in the opposite
+		// order, because this runs on another goroutine and forwardAck does
+		// not. The merger raises the copying flag before it moves the
+		// position, so reading the position FIRST means any delivered LSN
+		// seen here was published after the flag went up: the flag read
+		// that follows is then true unless the copy has since finished, and
+		// a finished copy is fine to ack. Read flag-then-position instead
+		// and a flag read just before the snapshot unit, followed by a
+		// position read just after it, lets the ack through mid-copy.
 		delivered, ok := live.at(sh)
 		if !ok {
+			continue
+		}
+		if live.isCopying(sh) {
 			continue
 		}
 		if lsn > delivered {

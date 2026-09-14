@@ -176,8 +176,11 @@ func TestAcksAreHeldForShardsStillCopying(t *testing.T) {
 // in its copy phase, and the unary Ack did not. The copy's snapshot unit
 // carries its consistent point, so a stream copying from nothing has
 // already advanced its emitted position when the copy starts, and the clamp
-// alone let a unary ack through to the pooler while the rows were still
-// arriving (PGS-792).
+// alone sent a unary ack on to the pooler mid-copy (PGS-792). A real pooler
+// has no reader on the slot during a copy and refuses it Unavailable, so
+// the consumer's unary Ack failed for the whole copy where the same ack in
+// the stream was quietly held; this fake records every ack, which is what
+// makes the two rules' disagreement observable here.
 func TestAUnaryAckIsHeldForAShardStillCopying(t *testing.T) {
 	h := newHarness(t, 1)
 	h.pool[0].copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
@@ -199,7 +202,8 @@ func TestAUnaryAckIsHeldForAShardStillCopying(t *testing.T) {
 		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 1000}}}}); err != nil {
 		t.Fatalf("unary ack: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	// No wait needed: Server.Ack calls the pooler synchronously, so by the
+	// time it returns any ack it was going to send has been recorded.
 	if acks := h.pool[0].ackedLSNs(); len(acks) != 0 {
 		t.Fatalf("a unary ack reached the pooler at %v while the shard was still copying", acks)
 	}

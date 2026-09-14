@@ -406,9 +406,9 @@ func (m *merger) emit(u *unit) error {
 	}
 	// A copy's snapshot unit carries its consistent point, so the shard is
 	// marked copying before the position it publishes moves, and unmarked
-	// only after: a unary ack reads the two from another goroutine, and in
-	// the other order it can catch a delivered LSN on a shard not yet known
-	// to be copying.
+	// only after. That order is half of the guarantee: Server.Ack reads the
+	// two from another goroutine, and it holds only because Server.Ack reads
+	// the position first and the flag second.
 	if u.copy != nil {
 		m.copying[u.shard] = u.copy
 		m.emitted.setCopying(u.shard, true)
