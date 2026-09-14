@@ -6,7 +6,7 @@ you can connect to with `psql`.
 ## Prerequisites
 
 - Kubernetes 1.29+ with a default StorageClass.
-- `kubectl` and, to build images locally, Docker and Go 1.26+.
+- `kubectl` and, to build images locally, Docker and Go 1.27+.
 - The container images. CI publishes only the PostgreSQL images
   (`ghcr.io/andrew01234567890/pgshard-postgres:{18,19}`); the router,
   operator and admin images are built locally, so `make dev-up` below builds

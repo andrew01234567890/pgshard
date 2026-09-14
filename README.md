@@ -69,7 +69,7 @@ make gates    # every check CI gates on, except the secret scan
 make build    # build only
 ```
 
-Go 1.26 or newer is required, along with a C compiler: the SQL parser is a cgo
+Go 1.27 or newer is required, along with a C compiler: the SQL parser is a cgo
 binding to libpg_query. `make verify` is deliberately the fast tier and says so
 when it finishes; the PostgreSQL-backed tests need Docker and the Kubernetes
 tests need envtest assets, and both **skip** when those are missing.
