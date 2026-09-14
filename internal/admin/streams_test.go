@@ -180,3 +180,40 @@ func TestFormatLSN(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// TestAVanishedSlotReadsAsLost: the console's verdict counted only
+// PostgreSQL's "lost", so a slot the monitor found no row for at all --
+// reported "missing" -- showed as an idle slot rather than a stream that
+// cannot be resumed.
+//
+// A slot goes missing when it is dropped, or when a promotion lands on a
+// member it was never synchronised to. That is worse than invalidation,
+// not better: an invalidated slot says why it died, a vanished one leaves
+// nothing to read a position from. Either way the consumer must
+// re-baseline, so either way the panel has to say so.
+func TestAVanishedSlotReadsAsLost(t *testing.T) {
+	active := catalog.Stream{Name: "s", Database: "app", State: catalog.StreamActive}
+	got := summarize(active, []catalog.StreamStatus{
+		{Stream: "s", ShardID: 0, WALStatus: "reserved", Active: true, Synced: true},
+		{Stream: "s", ShardID: 1, WALStatus: "missing", Synced: true},
+	})
+	if !got.Lost {
+		t.Error("a stream with a vanished slot is not reported lost, so nothing tells the operator to re-baseline")
+	}
+	if got.LostSlots != 1 {
+		t.Errorf("LostSlots = %d, want 1", got.LostSlots)
+	}
+
+	// PostgreSQL's own word still counts, unchanged.
+	if s := summarize(active, []catalog.StreamStatus{{Stream: "s", WALStatus: "lost"}}); !s.Lost || s.LostSlots != 1 {
+		t.Errorf("an invalidated slot stopped counting: %+v", s)
+	}
+
+	// A stream still being created has no slots yet, and the sweep reports
+	// every one of them missing until CreateStream has made them. Calling
+	// that lost would condemn a stream that is working.
+	creating := catalog.Stream{Name: "s", Database: "app", State: catalog.StreamCreating}
+	if s := summarize(creating, []catalog.StreamStatus{{Stream: "s", WALStatus: "missing"}}); s.Lost || s.LostSlots != 0 {
+		t.Errorf("a stream still being created was reported lost for slots that do not exist yet: %+v", s)
+	}
+}

@@ -85,7 +85,14 @@ func summarize(st catalog.Stream, rows []catalog.StreamStatus) StreamSummary {
 		} else {
 			s.InactiveSlots++
 		}
-		if r.WALStatus == "lost" {
+		// A slot the monitor found no row for is reported "missing", and
+		// it counts here for the same reason "lost" does: there is no
+		// position left to resume from. Counting only "lost" showed a
+		// stream whose slot had vanished -- the usual way being a
+		// promotion to a member it was never synchronised to -- as merely
+		// having an idle slot. Streams still being created are exempt:
+		// their slots do not exist yet by definition.
+		if catalog.Unresumable(r.WALStatus) && st.State != catalog.StreamCreating {
 			s.LostSlots++
 			s.Lost = true
 		}

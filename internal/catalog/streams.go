@@ -124,11 +124,31 @@ func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
 	if err != nil {
 		return err
 	}
-	if st.WALStatus == "lost" {
-		return SetStreamState(ctx, q, st.Stream, StreamLost)
+	if Unresumable(st.WALStatus) {
+		// Not SetStreamState: a stream still being created has no slots
+		// yet, and the sweep reports every one of them missing until
+		// CreateStream has made them. Marking it lost there would lose a
+		// stream that is working, so the transition is only out of a
+		// state the slots were supposed to exist in.
+		_, err := q.Exec(ctx, `UPDATE pgshard.streams SET state = $2 WHERE name = $1 AND state <> $3`,
+			st.Stream, StreamLost, StreamCreating)
+		return err
 	}
 	return nil
 }
+
+// Unresumable reports whether a slot's wal_status means its stream cannot
+// be resumed from where it left off.
+//
+// "lost" is PostgreSQL's: the WAL the slot needed has been removed.
+// "missing" is ours, written by the monitor when pg_replication_slots has
+// no row at all -- a slot that was dropped, or that did not survive a
+// promotion because it was never synchronised to the member that got
+// promoted. That is strictly worse than invalidated: an invalidated slot
+// at least says why it died, where a vanished one leaves nothing to read
+// a position from. Both mean the consumer has to re-baseline, so both say
+// so rather than only the one PostgreSQL has a word for.
+func Unresumable(walStatus string) bool { return walStatus == "lost" || walStatus == "missing" }
 
 // ListStreamStatus returns the per-shard rows of one stream ("" for all).
 func ListStreamStatus(ctx context.Context, q Querier, stream string) ([]StreamStatus, error) {
