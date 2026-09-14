@@ -543,13 +543,17 @@ func TestARollbackLeavesTheTargetsPausedForComplete(t *testing.T) {
 	if err := ops.Complete(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := ops.ReleaseRolledBackTargets(ctx); err != nil {
-		t.Fatal(err)
+	// And still refused afterwards. The targets are the retired set now,
+	// and Complete converts this run's claimed pause into the permanent,
+	// unclaimed one a retired set keeps until it is torn down. The first
+	// version of this fix lifted the pause here, which left the retired set
+	// writable for good -- and a stale router could then commit on it with
+	// no replication left to carry the row anywhere.
+	var pgErr *pgconn.PgError
+	if err := write(); !errors.As(err, &pgErr) || pgErr.Code != "25006" {
+		t.Fatalf("a retired target took a write after Complete (err %v)", err)
 	}
-	// And released afterwards: a rolled-back run must not leave its targets
-	// read-only for whoever tears them down or reuses them.
-	waitFor(t, 30*time.Second, func() bool { return write() == nil }, "the targets must take writes again once the rollback has released them")
 	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'g2' AND write_paused_by IS NOT NULL`); n != 0 {
-		t.Fatalf("%d target shards still carry this run's pause claim", n)
+		t.Fatalf("%d target shards still carry this run's pause claim; the sweep would lift the retirement pause behind it", n)
 	}
 }

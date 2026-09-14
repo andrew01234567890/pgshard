@@ -95,6 +95,8 @@ type fakeOps struct {
 	// completeWhileTargetsWritable records Complete dropping the reverse
 	// subscriptions with the targets taking writes: a stale router's commit
 	// on a target in that window reaches nothing that would carry it back.
+	// Complete then makes a rolled-back run's retired targets permanently
+	// read-only, which the fake models by leaving targetsPaused set.
 	targetsPaused                bool
 	completeWhileTargetsWritable bool
 }
@@ -263,8 +265,13 @@ func (f *fakeOps) Complete(context.Context) error {
 	if err := f.step("complete"); err != nil {
 		return err
 	}
-	if !f.targetsPaused && f.wasRolledBack() {
-		f.completeWhileTargetsWritable = true
+	if f.wasRolledBack() {
+		if !f.targetsPaused {
+			f.completeWhileTargetsWritable = true
+		}
+		// The tail of the real Complete: the targets are the retired set
+		// now, and their pause becomes the permanent, unclaimed one.
+		f.targetsPaused = true
 	}
 	return nil
 }
@@ -281,14 +288,6 @@ func (f *fakeOps) Rollback(context.Context) error {
 		f.targetsPaused = false
 		return retryf("reverse replication behind")
 	}
-	return nil
-}
-
-func (f *fakeOps) ReleaseRolledBackTargets(context.Context) error {
-	if err := f.step("release_rolled_back_targets"); err != nil {
-		return err
-	}
-	f.targetsPaused = false
 	return nil
 }
 

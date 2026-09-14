@@ -410,7 +410,10 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	// will be retried. Once serving has flipped back the pause has to
 	// outlive this call, because what makes a late write on a target safe
 	// is the reverse subscription, and Complete drops it after this
-	// returns: ReleaseRolledBackTargets lifts the pause after that.
+	// returns. Nothing lifts it afterwards: the targets are retired, and
+	// Complete converts this claimed pause into the retired set's
+	// permanent, unclaimed one. Lifting it after Complete, as the first
+	// version of this fix did, left a retired set writable for good.
 	flippedBack := false
 	defer func() {
 		if !flippedBack {
@@ -443,14 +446,6 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	}
 	flippedBack = true
 	return o.releaseRollback(ctx)
-}
-
-// ReleaseRolledBackTargets implements cutoverOps. It is also what lifts a
-// pause left standing by a controller that died between the flip back and
-// Complete: the resume takes Rollback's already-serving path, which never
-// touches the pause, so this is the only place it comes down.
-func (o *pgCutover) ReleaseRolledBackTargets(ctx context.Context) error {
-	return o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false)
 }
 
 // reverseBehind lists the reverse subscriptions whose confirmed flush

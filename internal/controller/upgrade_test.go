@@ -111,7 +111,9 @@ func TestUpgradeRollbackWaitsForReverseThenCancels(t *testing.T) {
 // an acknowledged write carried nowhere.
 //
 // The pause used to come off when Rollback returned, which is before
-// Complete runs.
+// Complete runs. And it must not come off after Complete either: the
+// targets are the retired set by then, and Complete has turned the pause
+// into the permanent one a retired set keeps.
 func TestARolledBackTargetStaysPausedUntilItsReplicationIsGone(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitched)
@@ -125,16 +127,8 @@ func TestARolledBackTargetStaysPausedUntilItsReplicationIsGone(t *testing.T) {
 	if h.ops.completeWhileTargetsWritable {
 		t.Fatalf("Complete dropped the reverse subscriptions with the targets writable: %v", h.ops.calls)
 	}
-	complete := slices.Index(h.ops.calls, "complete")
-	release := slices.Index(h.ops.calls, "release_rolled_back_targets")
-	if release < 0 {
-		t.Fatalf("the targets were never released, so a rolled-back run strands them read-only: %v", h.ops.calls)
-	}
-	if release < complete {
-		t.Fatalf("the targets were released before Complete: %v", h.ops.calls)
-	}
-	if h.ops.targetsPaused {
-		t.Fatal("the rollback finished with the targets still paused")
+	if !h.ops.targetsPaused {
+		t.Fatal("the rolled-back run finished with its retired targets writable")
 	}
 }
 
@@ -154,10 +148,8 @@ func TestARollbackStillBehindLeavesTheTargetsWritable(t *testing.T) {
 	if h.ops.targetsPaused {
 		t.Fatal("a rollback waiting on reverse replication left the serving targets paused")
 	}
-	for _, c := range []string{"complete", "release_rolled_back_targets"} {
-		if slices.Contains(h.ops.calls, c) {
-			t.Fatalf("%s ran before the rollback flipped back: %v", c, h.ops.calls)
-		}
+	if slices.Contains(h.ops.calls, "complete") {
+		t.Fatalf("Complete ran before the rollback flipped back: %v", h.ops.calls)
 	}
 }
 
