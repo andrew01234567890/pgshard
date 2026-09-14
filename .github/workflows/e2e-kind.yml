@@ -133,6 +133,7 @@ jobs:
         id: install_kind_go
         if: steps.install_kind_retry.outcome == 'failure' && needs.changes.outputs.code == 'true'
         run: |
+          set -euo pipefail
           hack/ci/retry.sh -- go install sigs.k8s.io/kind@v0.32.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
