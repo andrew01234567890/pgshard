@@ -177,6 +177,13 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 			Tables: map[TableKey]Placement{
 				{Database: "app", SchemaName: "public", TableName: "orders"}: {Placement: "sharded", ShardKey: "tenant_id", ShardKeyChecked: true, Generation: 3},
 			},
+			Views: map[TableKey]View{
+				{Database: "app", SchemaName: "public", TableName: "recent_orders"}: {
+					Base:    TableKey{Database: "app", SchemaName: "public", TableName: "orders"},
+					Simple:  true,
+					Columns: map[string]string{"tenant": "tenant_id"},
+				},
+			},
 			Sequences:       map[string]bool{"app.public.orders_id_seq": true},
 			ScalarFunctions: map[FunctionKey]bool{{Database: "app", Name: "declared"}: true},
 		}
@@ -249,6 +256,25 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 		},
 		"a withdrawn declaration": func(s *Snapshot) {
 			delete(s.ScalarFunctions, FunctionKey{Database: "app", Name: "declared"})
+		},
+		// A view is routed by its column map, so redefining one under a
+		// prepared statement -- a column remapped onto another base column,
+		// or a simple view turned opaque -- leaves a plan made against a
+		// shape that is gone.
+		"a view's column map": func(s *Snapshot) {
+			k := TableKey{Database: "app", SchemaName: "public", TableName: "recent_orders"}
+			v := s.Views[k]
+			v.Columns = map[string]string{"tenant": "customer_id"}
+			s.Views[k] = v
+		},
+		"a view turning opaque": func(s *Snapshot) {
+			k := TableKey{Database: "app", SchemaName: "public", TableName: "recent_orders"}
+			v := s.Views[k]
+			v.Simple = false
+			s.Views[k] = v
+		},
+		"a new view": func(s *Snapshot) {
+			s.Views[TableKey{Database: "app", SchemaName: "public", TableName: "new_view"}] = View{Simple: true}
 		},
 		"the write fence": func(s *Snapshot) { s.WriteFence = true },
 		// The major decides which grammar the cluster's SQL surface is, so a

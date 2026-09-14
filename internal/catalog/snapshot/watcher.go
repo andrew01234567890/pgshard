@@ -53,8 +53,9 @@ type budget struct {
 	lastRefill time.Time
 }
 
-// Change is published to subscribers whenever a reload observes a different
-// generation pair.
+// Change is published to subscribers whenever a reload observes a snapshot
+// that says anything different. Its fields are what the reload saw, not what
+// changed: subscribers use it as a wakeup and re-read the snapshot.
 type Change struct {
 	ShardMapGeneration int64
 	DesiredGeneration  int64
@@ -319,7 +320,22 @@ func (w *Watcher) reload(ctx context.Context) error {
 		return err
 	}
 	prev := w.current.Swap(s)
-	if prev == nil || prev.ShardMapGeneration != s.ShardMapGeneration || prev.DesiredGeneration != s.DesiredGeneration {
+	// The generation pair is not a complete change detector. It misses
+	// anything the snapshot holds that no desired_generation stamp covers --
+	// shard_status edits (epoch, serving state, migrating), which is what
+	// the buffering loops are waiting on, and the desired-state tables
+	// catalog.Generations leaves out. Subscribers only use a Change as a
+	// wakeup and re-read the snapshot themselves, so the honest test is
+	// whether the snapshot says anything different at all, which is what
+	// the fingerprint answers.
+	//
+	// The pair is still compared first so this can only ever publish MORE
+	// than it used to: the fingerprint covers both generations, but it is a
+	// 64-bit hash, and a missed wakeup is not worth a collision argument.
+	if prev == nil ||
+		prev.ShardMapGeneration != s.ShardMapGeneration ||
+		prev.DesiredGeneration != s.DesiredGeneration ||
+		!SamePlanning(prev, s) {
 		w.publish(Change{s.ShardMapGeneration, s.DesiredGeneration})
 	}
 	return nil

@@ -217,8 +217,8 @@ func (r *Router) awaitConsistent(ctx context.Context, sh Shard, afterError bool,
 		case <-changes:
 			changed = true
 		case <-poll.C:
-			// shard_status edits that keep the generation pair are not
-			// published as changes; a new snapshot pointer still counts.
+			// Belt and braces behind the change subscription, which does
+			// now cover shard_status edits that keep the generation pair.
 			changed = changed || r.cfg.Snapshot() != stale
 		case <-deadline.C:
 			return !r.blocking(sh), nil
