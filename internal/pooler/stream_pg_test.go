@@ -223,10 +223,10 @@ func (h *pgHarness) testStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = holder.Close(ctx) }()
 	if err := holder.StartReplication(ctx, "pgshard_held_shard0", 0, map[string]string{"proto_version": "4", "publication_names": "pgshard_all"}); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = holder.Close(ctx) }()
 	held, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "pgshard_held_shard0", Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
