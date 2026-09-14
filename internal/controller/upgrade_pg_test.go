@@ -2,9 +2,14 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/placement"
@@ -449,4 +454,130 @@ func TestRollbackWaitsForAWriterThatStartedBeforeTheFence(t *testing.T) {
 	waitFor(t, 30*time.Second, func() bool {
 		return queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'in-flight-on-19'`) == 1
 	}, "a write that was in flight when the rollback began must reach the source")
+}
+
+// TestARollbackLeavesTheTargetsPausedForComplete drives pgCutover.Rollback
+// on its own, which a pass never does -- Copier.rollback calls Complete
+// straight after it -- because the window between the two is the defect.
+// A router still holding the snapshot from before the flip back can commit
+// on a target there, and Complete drops the reverse subscription that
+// would carry that row to the source. The pause used to come off the
+// moment Rollback returned.
+func TestARollbackLeavesTheTargetsPausedForComplete(t *testing.T) {
+	parallelPG(t)
+	f := newUpgradeFixture(t)
+	id := f.startWorkflowKind(KindUpgrade)
+	ctx := context.Background()
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var state, stage, msg string
+	for {
+		f.pass()
+		state, stage, msg = f.workflow(id)
+		if stage == StageSwitched || state == StateFailed || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if stage != StageSwitched {
+		t.Fatalf("upgrade did not switch: %s %s %q", state, stage, msg)
+	}
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"rollback": true}' WHERE id = $1::uuid`, id)
+	f.pass()
+	if _, stage, _ = f.workflow(id); stage != StageRollingBack {
+		t.Fatalf("stage %s, want %s", stage, StageRollingBack)
+	}
+
+	wfs, err := f.copier.listCopyWorkflows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := slices.IndexFunc(wfs, func(w copyWorkflow) bool { return w.id == id })
+	if idx < 0 {
+		t.Fatalf("workflow %s not listed", id)
+	}
+	wf := &wfs[idx]
+	var held bool
+	if wf.owner, held, err = claimWorkflow(ctx, f.pool, f.copier.Replica, wf.id, f.copier.OwnerLease); err != nil || !held {
+		t.Fatalf("claim: held=%v err=%v", held, err)
+	}
+	wf.fence = wf.state
+	ops, err := f.copier.pgCutover(ctx, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		err = ops.Rollback(ctx)
+		if err == nil || !errors.Is(err, errRetry) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	tenant := int64(999_725)
+	tid, _ := placement.KeyspaceID(tenant)
+	tgtDSN := f.appDSN("g2", int32(f.tgtRng.Locate(tid)))
+	write := func() error {
+		c, err := pgx.Connect(ctx, tgtDSN)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close(ctx) }()
+		_, err = c.Exec(ctx, `INSERT INTO orders (tenant_id, note) VALUES ($1, 'stale-router-on-19')`, tenant)
+		return err
+	}
+	// Held for a while rather than sampled once: the old code lifted the
+	// pause on return, and a single write straight afterwards can land
+	// before that reload reaches a new backend and pass for the wrong
+	// reason.
+	for until := time.Now().Add(3 * time.Second); time.Now().Before(until); time.Sleep(200 * time.Millisecond) {
+		var pgErr *pgconn.PgError
+		if err := write(); !errors.As(err, &pgErr) || pgErr.Code != "25006" {
+			t.Fatalf("a target took a write between Rollback and Complete (err %v); Complete is about to drop the replication that would carry it back", err)
+		}
+	}
+
+	// A resume after the flip back: the controller's flip-back commit landed
+	// and its acknowledgement did not, so the deferred unpause ran and the
+	// next pass takes Rollback's already-serving path. That path has to put
+	// the pause back, or Complete runs with the targets writable.
+	if err := ops.pauseSetClaimed(ctx, ops.wf.set, ops.wf.ids, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, func() bool { return write() == nil }, "the simulated lost acknowledgement did not leave the targets writable")
+	if err := ops.Rollback(ctx); err != nil {
+		t.Fatalf("resumed rollback: %v", err)
+	}
+	{
+		var pgErr *pgconn.PgError
+		if err := write(); !errors.As(err, &pgErr) || pgErr.Code != "25006" {
+			t.Fatalf("a resumed rollback left the targets writable going into Complete (err %v)", err)
+		}
+	}
+
+	// The pause is this run's, claimed, going into Complete -- so the claim
+	// being gone afterwards shows Complete abandoned it, not that there never
+	// was one.
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'g2' AND write_paused_by = $1::uuid`, id); n == 0 {
+		t.Fatal("the targets carry no pause claim from this run before Complete, so the check after it proves nothing")
+	}
+	if err := ops.Complete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// And still refused afterwards. The targets are the retired set now,
+	// and Complete converts this run's claimed pause into the permanent,
+	// unclaimed one a retired set keeps until it is torn down. The first
+	// version of this fix lifted the pause here, which left the retired set
+	// writable for good -- and a stale router could then commit on it with
+	// no replication left to carry the row anywhere.
+	var pgErr *pgconn.PgError
+	if err := write(); !errors.As(err, &pgErr) || pgErr.Code != "25006" {
+		t.Fatalf("a retired target took a write after Complete (err %v)", err)
+	}
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'g2' AND write_paused_by IS NOT NULL`); n != 0 {
+		t.Fatalf("%d target shards still carry this run's pause claim; the sweep would lift the retirement pause behind it", n)
+	}
 }

@@ -91,6 +91,14 @@ type fakeOps struct {
 	// write on a source that is about to be retired, replicated nowhere.
 	lostWrite bool
 	drains    int
+	// targetsPaused stands in for the pause Rollback raises on the targets.
+	// completeWhileTargetsWritable records Complete dropping the reverse
+	// subscriptions with the targets taking writes: a stale router's commit
+	// on a target in that window reaches nothing that would carry it back.
+	// Complete then makes a rolled-back run's retired targets permanently
+	// read-only, which the fake models by leaving targetsPaused set.
+	targetsPaused                bool
+	completeWhileTargetsWritable bool
 }
 
 func newFakeOps() *fakeOps {
@@ -252,16 +260,39 @@ func (f *fakeOps) DropJournal(_ context.Context, id string) error {
 	delete(f.journaled, id)
 	return f.step("drop_journal")
 }
-func (f *fakeOps) Release(context.Context) error  { f.fenced = false; return f.step(StepRelease) }
-func (f *fakeOps) Complete(context.Context) error { return f.step("complete") }
+func (f *fakeOps) Release(context.Context) error { f.fenced = false; return f.step(StepRelease) }
+func (f *fakeOps) Complete(context.Context) error {
+	if err := f.step("complete"); err != nil {
+		return err
+	}
+	if f.wasRolledBack() {
+		if !f.targetsPaused {
+			f.completeWhileTargetsWritable = true
+		}
+		// The tail of the real Complete: the targets are the retired set
+		// now, and their pause becomes the permanent, unclaimed one.
+		f.targetsPaused = true
+	}
+	return nil
+}
+
+// Rollback mirrors pgCutover.Rollback's pause handling: raised first,
+// lifted again on every return that stops short of the flip back, and left
+// standing by one that gets there.
 func (f *fakeOps) Rollback(context.Context) error {
 	if err := f.step("rollback"); err != nil {
 		return err
 	}
+	f.targetsPaused = true
 	if !f.reverseCaughtUp {
+		f.targetsPaused = false
 		return retryf("reverse replication behind")
 	}
 	return nil
+}
+
+func (f *fakeOps) wasRolledBack() bool {
+	return slices.Contains(f.calls, "rollback")
 }
 
 type cutoverHarness struct {

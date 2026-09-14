@@ -368,6 +368,15 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 		return err
 	}
 	if state == catalog.ShardSetServing {
+		// Resuming a rollback that already flipped back. Its pause is
+		// normally still standing -- ALTER SYSTEM persists -- but not always:
+		// a flip back whose commit landed and whose acknowledgement did not
+		// took the deferred unpause on the way out. The targets are the
+		// retired set now, so raising the pause again costs nothing and
+		// keeps it up until Complete's tail replaces it.
+		if err := o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, true); err != nil {
+			return err
+		}
 		return o.releaseRollback(ctx)
 	}
 	// Claim the fence on both sets, as the forward cutover does: a fence
@@ -406,7 +415,20 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if err := o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, true); err != nil {
 		return err
 	}
-	defer func() { _ = o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false) }()
+	// Lifted here only when the rollback stops short of the flip back and
+	// will be retried. Once serving has flipped back the pause has to
+	// outlive this call, because what makes a late write on a target safe
+	// is the reverse subscription, and Complete drops it after this
+	// returns. Nothing lifts it afterwards: the targets are retired, and
+	// Complete converts this claimed pause into the retired set's
+	// permanent, unclaimed one. Lifting it after Complete, as the first
+	// version of this fix did, left a retired set writable for good.
+	flippedBack := false
+	defer func() {
+		if !flippedBack {
+			_ = o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false)
+		}
+	}()
 	if err := o.drainWriters(ctx, o.wf.set, o.wf.ids); err != nil {
 		return err
 	}
@@ -431,6 +453,7 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if err := o.flipBack(ctx); err != nil {
 		return err
 	}
+	flippedBack = true
 	return o.releaseRollback(ctx)
 }
 

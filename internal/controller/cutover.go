@@ -270,7 +270,13 @@ type cutoverOps interface {
 	Complete(ctx context.Context) error
 	// Rollback returns serving to the sources: fence the targets, wait for
 	// reverse replication (errRetry while behind), carry the sequences
-	// back and flip the serving map to the source set.
+	// back and flip the serving map to the source set. When it succeeds the
+	// targets are left paused, and nothing lifts that: a router still
+	// holding the snapshot from before the flip back can commit on a
+	// target, and the only thing that would carry the row to the source is
+	// the reverse subscription Complete drops. Complete then turns the
+	// pause into the retired set's permanent one. The forward path keeps
+	// its sources paused until DisableForward for the same reason.
 	Rollback(ctx context.Context) error
 	// DropJournal removes the journal rows this run wrote on its sources.
 	DropJournal(ctx context.Context, id string) error

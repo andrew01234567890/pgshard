@@ -1561,6 +1561,24 @@ func (o *pgCutover) DropJournal(ctx context.Context, id string) error {
 	return nil
 }
 
+// writeThroughPause lets this session write on a shard whose writes are
+// paused. A rolled-back run's targets stay paused through Complete, so that
+// a router still routing to them cannot commit a row after the reverse
+// subscription that would carry it back is gone -- but Complete's own work
+// on them drops subscriptions and publications, which is DDL, and the pause
+// refuses that with 25006 like any other write. Dropping a replication
+// slot is not refused, so the slot loop does not need it.
+//
+// It is a SESSION setting, in a statement of its own, because the pause
+// is read when a transaction starts: set inside the transaction that then
+// writes, it is already too late. It reaches no other session -- these are
+// dedicated connections, closed when the loop is done with them -- so the
+// routers the pause exists for stay refused.
+func writeThroughPause(ctx context.Context, conn ShardConn) error {
+	_, err := conn.Exec(ctx, `SET default_transaction_read_only = off`)
+	return err
+}
+
 func (o *pgCutover) Complete(ctx context.Context) error {
 	for _, db := range o.dbs {
 		for _, s := range o.srcIDs {
@@ -1580,7 +1598,10 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			err = dropSubscriptionsLike(ctx, conn, o.forwardPattern(t))
+			err = writeThroughPause(ctx, conn)
+			if err == nil {
+				err = dropSubscriptionsLike(ctx, conn, o.forwardPattern(t))
+			}
 			if err == nil {
 				err = dropPublications(ctx, conn, o.wf.gen)
 			}
