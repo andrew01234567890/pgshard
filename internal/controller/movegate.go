@@ -32,13 +32,14 @@ func activeCopies(ctx context.Context, q rowQuerier) (int, error) {
 
 // placementsHoldingTheSet counts the placements a copy must wait for: those
 // past prepare, running or paused, and those still cleaning up after a
-// cancel. A pending placement holds nothing yet and waits for the copy
-// itself, so counting it would leave each waiting for the other.
+// cancel. A placement still preparing holds nothing yet and waits for the
+// copy itself, so counting it would leave each waiting for the other --
+// including one paused while it was preparing.
 func placementsHoldingTheSet(ctx context.Context, q rowQuerier) (int, error) {
 	var n int
 	err := q.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflows
-		WHERE kind = $1 AND coalesce(status->>'stage', '') <> ''
+		WHERE kind = $1 AND coalesce(status->>'stage', '') <> ALL($4)
 		  AND (state = ANY($2) OR status->>'stage' = $3)`,
-		KindTablePlacement, []string{StateRunning, StatePaused}, StageCancelling).Scan(&n)
+		KindTablePlacement, []string{StateRunning, StatePaused}, StageCancelling, []string{"", StagePlacementPreparing}).Scan(&n)
 	return n, err
 }

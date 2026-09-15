@@ -117,13 +117,17 @@ func TestAPendingPlacementDoesNotWedgeAReshardWaitingForIt(t *testing.T) {
 		_, _ = g.placer.Pass(ctx)
 		time.Sleep(50 * time.Millisecond)
 	}
+	// Paused while it was still preparing, a placement holds nothing either.
+	mustExec(t, g.catalog, `UPDATE pgshard.workflows SET state = $2, status = status || '{"paused_from": "pending"}' WHERE id = $1::uuid`, g.placement, StatePaused)
+	mustExec(t, g.catalog, `UPDATE pgshard.workflows SET status = status || $2::jsonb WHERE id = $1::uuid`, g.reshard, mustJSON(map[string]any{"stage": StageReadyForCopy}))
+	_, _ = g.copier.Pass(ctx)
 	_, rstage, rmsg := g.state(g.reshard)
 	pstate, _, pmsg := g.state(g.placement)
 	if rstage == StageReadyForCopy {
 		t.Fatalf("the reshard is still at %s (%q) and the placement is %s (%q): they wait on each other", rstage, rmsg, pstate, pmsg)
 	}
-	if pstate != StatePending {
-		t.Fatalf("the placement started (%s, %q) while a reshard copies", pstate, pmsg)
+	if pstate == StateRunning {
+		t.Fatalf("the placement started (%q) while a reshard copies", pmsg)
 	}
 }
 
@@ -192,7 +196,8 @@ func TestACopyAndAPlacementDecidingTogetherDoNotBothStart(t *testing.T) {
 		}
 		<-done
 		if !blocked {
-			t.Fatal("the copier decided without waiting for the move gate")
+			_, stage, msg := g.state(g.reshard)
+			t.Fatalf("the copier decided without waiting for the move gate: reshard at %s (%q)", stage, msg)
 		}
 		if _, stage, msg := g.state(g.reshard); stage != StageReadyForCopy {
 			t.Fatalf("the reshard reached %s (%q) although a placement started while it decided", stage, msg)
@@ -216,7 +221,8 @@ func TestACopyAndAPlacementDecidingTogetherDoNotBothStart(t *testing.T) {
 		}
 		<-done
 		if !blocked {
-			t.Fatal("the placement decided without waiting for the move gate")
+			state, _, msg := g.state(g.placement)
+			t.Fatalf("the placement decided without waiting for the move gate: %s (%q)", state, msg)
 		}
 		if state, _, msg := g.state(g.placement); state != StatePending {
 			t.Fatalf("the placement is %s (%q) although a copy started while it decided", state, msg)
