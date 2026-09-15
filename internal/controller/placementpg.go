@@ -305,18 +305,6 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// unsupportedTableFeatures lists what a placement move cannot yet preserve
-// on the table. The shadow is rebuilt from columns, constraints and indexes,
-// so everything below would be silently lost at the swap: foreign keys in
-// either direction (inbound ones would keep pointing at the retired table's
-// OID), rewrite rules, inheritance/partition membership, user publications
-// (downstream subscribers would silently stop receiving), and a non-default
-// replica identity (the shadow is created with DEFAULT, so downstream
-// logical replication of UPDATE/DELETE would break after the move).
-//
-// Reproduced rather than refused, each with its own function below:
-// row-level security, user triggers, and the owner and table/column
-// privileges.
 // tableExtensions are the extensions the table's indexes and constraints
 // depend on: the owners of the operator classes its indexes use and of the
 // operators its exclusion constraints name.
@@ -730,6 +718,27 @@ func triggerStates(ctx context.Context, conn ShardConn, schema, table string) (m
 // runs, so even "as it was by default" has to be said.
 var triggerEnableWords = map[string]string{"O": "ENABLE", "D": "DISABLE", "R": "ENABLE REPLICA", "A": "ENABLE ALWAYS"}
 
+// unsupportedTableFeatures lists what a placement move cannot yet preserve
+// on the table. The shadow is rebuilt from columns, constraints and indexes,
+// so everything below would be silently lost at the swap: inbound foreign
+// keys (they keep pointing at the retired table's OID), rewrite rules,
+// inheritance/partition membership, user publications (downstream
+// subscribers would silently stop receiving), and a non-default replica
+// identity (the shadow is created with DEFAULT, so downstream logical
+// replication of UPDATE/DELETE would break after the move).
+//
+// So is everything bound to the table by OID from outside it, which the swap
+// leaves on the retired table with no error: a view, a materialized view or
+// another table's rule or row-level security policy goes on reading or
+// writing it; a subscription's apply worker goes on writing into it while the
+// live table stops receiving; and a function that captured its OID -- a
+// SQL-standard body (BEGIN ATOMIC or RETURN), or a 'name'::regclass argument
+// default in any language -- goes on using it. A body kept as text is
+// resolved by name when it runs and follows the swap, so it records no
+// dependency to find.
+//
+// Reproduced rather than refused, each with its own function: row-level
+// security, user triggers, and the owner and table/column privileges.
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `WITH t AS (
 			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
@@ -745,6 +754,26 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 				WHERE inhrelid = t.oid OR inhparent = t.oid
 			UNION ALL SELECT 'publication ' || p.pubname FROM pg_publication_rel pr
 				JOIN pg_publication p ON p.oid = pr.prpubid, t WHERE pr.prrelid = t.oid
+			UNION ALL SELECT 'subscription ' || s.subname FROM pg_subscription_rel sr
+				JOIN pg_subscription s ON s.oid = sr.srsubid, t WHERE sr.srrelid = t.oid
+			UNION ALL SELECT DISTINCT CASE WHEN r.rulename <> '_RETURN' THEN 'rule ' || quote_ident(r.rulename) || ' on '
+					WHEN v.relkind = 'm' THEN 'materialized view ' ELSE 'view ' END
+					|| quote_ident(vn.nspname) || '.' || quote_ident(v.relname)
+				FROM pg_depend d
+				JOIN pg_rewrite r ON d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid
+				JOIN pg_class v ON v.oid = r.ev_class
+				JOIN pg_namespace vn ON vn.oid = v.relnamespace, t
+				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid AND r.ev_class <> t.oid
+			UNION ALL SELECT DISTINCT 'function ' || p.oid::regprocedure::text FROM pg_depend d
+				JOIN pg_proc p ON d.classid = 'pg_proc'::regclass AND p.oid = d.objid, t
+				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid
+			UNION ALL SELECT DISTINCT 'policy ' || quote_ident(pol.polname) || ' on '
+					|| quote_ident(pn.nspname) || '.' || quote_ident(pc.relname)
+				FROM pg_depend d
+				JOIN pg_policy pol ON d.classid = 'pg_policy'::regclass AND pol.oid = d.objid
+				JOIN pg_class pc ON pc.oid = pol.polrelid
+				JOIN pg_namespace pn ON pn.oid = pc.relnamespace, t
+				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid AND pol.polrelid <> t.oid
 		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err
