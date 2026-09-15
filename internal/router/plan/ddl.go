@@ -338,6 +338,9 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 		return rewriteClass("SET TABLESPACE")
 	case pgquerypb.AlterTableType_AT_AddColumn:
 		col := c.GetDef().GetColumnDef()
+		if err := checkPgrollColumn(r, col.GetColname()); err != nil {
+			return err
+		}
 		if names := stringList(col.GetTypeName().GetNames()); len(names) > 0 && serialType(names[len(names)-1]) {
 			return rewriteClass("ADD COLUMN of a serial type")
 		}
@@ -466,6 +469,30 @@ func stableDefault(n *pgquerypb.Node) bool {
 func rewriteClass(form string) error {
 	return notYet("rewrite-class DDL is not available yet: "+form+" rewrites the table",
 		"column type changes and volatile-default ADD COLUMN run online; this form still needs a new table and a copy of the rows")
+}
+
+// pgrollColumnPrefix names the column pgroll builds beside one a migration
+// changes (pgroll's migrations.TemporaryName). Its complete step drops the
+// old column and renames this one into its place.
+const pgrollColumnPrefix = "_pgroll_new_"
+
+// checkPgrollColumn refuses, at pgroll's start, a migration pgshard cannot
+// complete. Refused at complete instead, pgroll would be left with a
+// migration it can neither finish nor start another beside.
+func checkPgrollColumn(r *rel, column string) error {
+	changed, ok := strings.CutPrefix(column, pgrollColumnPrefix)
+	if !ok || r == nil {
+		return nil
+	}
+	switch {
+	case r.kind == placeSharded && changed == r.shardKey:
+		return notYet("a pgroll migration of the shard key column \""+r.shardKey+"\" of sharded table \""+r.name+"\" is not available: completing it drops and renames the shard key",
+			"change the shard key with a rekey workflow (UPDATE pgshard.tables), not with pgroll")
+	case r.kind == placeReference:
+		return notYet("a pgroll migration of reference table \""+r.name+"\" is not available: its triggers would write each shard's copy separately",
+			"run the change as plain DDL through the router, or migrate the table with pgroll while it is unsharded")
+	}
+	return nil
 }
 
 func shardKeyChangeError(r *rel) error {
