@@ -69,7 +69,7 @@ func TestAPoolerMovingToTLSServesRoutersDiallingEitherWay(t *testing.T) {
 		t.Fatalf("the pooler never listened: %s", errb.String())
 	}
 
-	reached := func(creds credentials.TransportCredentials) bool {
+	reached := func(creds credentials.TransportCredentials) codes.Code {
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 		if err != nil {
 			t.Fatal(err)
@@ -78,7 +78,7 @@ func TestAPoolerMovingToTLSServesRoutersDiallingEitherWay(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, err = pgshardv1.NewPoolerClient(conn).Release(ctx, &pgshardv1.ReleaseRequest{})
-		return status.Code(err) != codes.Unavailable
+		return status.Code(err)
 	}
 	as := func(role string) credentials.TransportCredentials {
 		cert, key := issue(role)
@@ -88,13 +88,14 @@ func TestAPoolerMovingToTLSServesRoutersDiallingEitherWay(t *testing.T) {
 		}
 		return d
 	}
-	if !reached(insecure.NewCredentials()) {
-		t.Error("a router still dialling plaintext was refused")
+	// The pooler answers an empty Release itself, so both callers that get
+	// through see the same answer, and one refused at the handshake sees
+	// Unavailable.
+	plain, tlsRouter := reached(insecure.NewCredentials()), reached(as(pki.RoleRouter))
+	if plain == codes.Unavailable || plain != tlsRouter {
+		t.Errorf("a router dialling plaintext got %v and one dialling TLS %v; both should reach the service", plain, tlsRouter)
 	}
-	if !reached(as(pki.RoleRouter)) {
-		t.Error("a router dialling TLS was refused")
-	}
-	if reached(as(pki.RoleAgent)) {
-		t.Error("an agent's certificate reached the pooler over TLS")
+	if got := reached(as(pki.RoleAgent)); got != codes.Unavailable {
+		t.Errorf("an agent's certificate over TLS got %v, want it refused at the handshake", got)
 	}
 }

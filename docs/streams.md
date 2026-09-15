@@ -147,7 +147,10 @@ the cluster's controller Service. Consumers dial the router Service, which
 serves `pgshard.v1.VStream` with the router's server certificate
 (`--pooler-tls-*`, or plaintext with `--insecure-dev`) and, when
 `--tls-authorize-callers` is on, requires the caller to present a `consumer`
-certificate.
+certificate. While a cluster moves from plaintext to mutual TLS the router
+runs with `--tls-accept-plaintext`, and the listener also serves consumers
+still dialling plaintext, without an identity; once the move completes it
+refuses them, so move consumers to the consumer certificate before then.
 
 **A consumer needs the consumer certificate — the router's no longer works.**
 With `internalTLS.issue` the operator mints `<cluster>-tls-consumer`, a

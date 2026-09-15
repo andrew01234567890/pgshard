@@ -144,6 +144,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, "pgshard-router serve: --tls-cert and --tls-key must be given together")
 		return cli.ExitUsage
 	}
+	if *insecureDev && (*acceptPlaintext || *dialPlaintext) {
+		fmt.Fprintln(stderr, "pgshard-router serve: --tls-accept-plaintext and --tls-dial-plaintext are for a move to mutual TLS and need the --pooler-tls-* flags; --insecure-dev is plaintext already")
+		return cli.ExitUsage
+	}
 	if *catalogDSN == "" {
 		fmt.Fprintln(stderr, "pgshard-router serve: --catalog-dsn is required")
 		return cli.ExitUsage
@@ -320,7 +324,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		}})
 		serveAux(ctx, errc, "peer cancels", func() error { return g.Serve(pl) })
 		defer g.Stop()
-		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)\n", pl.Addr(), srv.InstanceID())
+		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)%s\n", pl.Addr(), srv.InstanceID(), alsoPlaintext(*acceptPlaintext))
 	}
 	if *vstreamListen != "" {
 		// The change stream's callers are the cluster's consumers, which
@@ -359,7 +363,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		pgshardv1.RegisterVStreamServer(g, vs)
 		serveAux(ctx, errc, "vstream", func() error { return g.Serve(vl) })
 		defer g.Stop()
-		fmt.Fprintf(stdout, "pgshard-router serve: vstream on %s\n", vl.Addr())
+		fmt.Fprintf(stdout, "pgshard-router serve: vstream on %s%s\n", vl.Addr(), alsoPlaintext(*acceptPlaintext))
 	}
 	if *pprofListen != "" {
 		pa, err := pprofserve.Serve(ctx, *pprofListen)
@@ -508,6 +512,13 @@ func peerCredentials(certFile, keyFile, caFile string, insecureDev, acceptPlaint
 		}
 	}
 	return grpccreds.Listener(certFile, keyFile, caFile, insecureDev, opts...)
+}
+
+func alsoPlaintext(accept bool) string {
+	if accept {
+		return " (mTLS, and plaintext while moving to mTLS)"
+	}
+	return ""
 }
 
 // dialCredentials are what the router dials one internal role with.
