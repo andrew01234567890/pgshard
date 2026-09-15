@@ -590,9 +590,9 @@ func (e *Executor) planSessionAt(snap *snapshot.Snapshot) plan.Session {
 		SearchPath: e.searchPath(), Snapshot: snap, PinnedShard: e.pinnedShard()}
 }
 
-// plan plans sql for this session. Sessions on the catalog shard set run
-// DDL directly on their home shard: the migration model covers the
-// databases of the default shard set only.
+// plan plans sql for this session. Sessions on the catalog database run
+// DDL directly on it: the migration model covers user databases, whichever
+// shard set serves them.
 func (e *Executor) plan(ctx context.Context, sql string) (plan.Plan, error) {
 	return e.planOp(ctx, sql, "simple")
 }
@@ -630,7 +630,7 @@ func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, e
 	// exists to refuse.
 	e.stmtSnap = e.currentSnapshot()
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSessionAt(e.stmtSnap), sql)
-	if err == nil && pl.Kind == plan.MigrationKind && e.home.Set != DefaultShardSet {
+	if err == nil && pl.Kind == plan.MigrationKind && e.catalogSession() {
 		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
 	}
 	if err != nil {

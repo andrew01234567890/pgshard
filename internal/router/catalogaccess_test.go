@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
 type controlPlane []string
@@ -84,4 +86,18 @@ func newCatalogRouter(t *testing.T, access controlPlane) *Router {
 
 func catalogSession(database, user string) pgwire.SessionInfo {
 	return pgwire.SessionInfo{ID: 1, User: user, Database: database, Auth: &pgwire.AuthResult{SCRAM: &pgwire.SCRAMKeys{}}}
+}
+
+// DDL in the catalog database runs on it directly: it is the control
+// plane's own schema, not a user database the applier fans out.
+func TestCatalogSessionDDLRunsOnTheCatalog(t *testing.T) {
+	r := newCatalogRouter(t, controlPlane{"postgres"})
+	e, err := r.NewExecutor(catalogSession("pgshard", "postgres"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl, err := e.(*Executor).planOp(context.Background(), "create table notes (id int primary key)", "simple")
+	if err != nil || pl.Kind != plan.Unsharded || pl.Migration != nil || len(pl.Shards) != 1 || pl.Shards[0] != 0 {
+		t.Fatalf("plan = %+v (%v), want the statement on the catalog shard", pl, err)
+	}
 }

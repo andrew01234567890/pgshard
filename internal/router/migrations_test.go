@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 // fakeQueue completes every migration with the outcome the test scripted,
@@ -121,6 +122,48 @@ func TestDDLIsQueuedAndAnsweredWhenComplete(t *testing.T) {
 		for _, sql := range h.poolers[i].ran() {
 			if strings.Contains(strings.ToLower(sql), "create table") || strings.Contains(strings.ToLower(sql), "grant") {
 				t.Fatalf("DDL reached shard %d: %q", i, sql)
+			}
+		}
+	}
+}
+
+// servingSetRenamed publishes the harness snapshot as a cutover leaves it:
+// the shards serve under a new set name and the database's home shard id
+// is the new set's.
+func (h *shardedHarness) servingSetRenamed(set string, home int32) {
+	s := *h.snap
+	s.ServingSet = set
+	s.ShardSets = map[string][]snapshot.Range{set: h.snap.ShardSets[DefaultShardSet]}
+	s.Serving = map[snapshot.ShardKey]snapshot.Serving{}
+	for k, v := range h.snap.Serving {
+		k.ShardSet = set
+		s.Serving[k] = v
+	}
+	s.Databases = map[string]catalog.Database{"app": {Name: "app", HomeShard: home, DefaultPlacement: "unsharded"}}
+	h.setSnap(&s)
+}
+
+func TestDDLAfterACutoverIsStillQueued(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	before := h.connect(t, h.dsn())
+	h.servingSetRenamed("g2", 1)
+	after := h.connect(t, h.dsn())
+	for _, conn := range []*pgx.Conn{before, after} {
+		for _, sql := range []string{"create index orders_note_idx on orders (note)", "create table notes (id int primary key)", "grant select on items to app"} {
+			if _, err := conn.Exec(ctx, sql); err != nil {
+				t.Fatalf("%s: %v", sql, err)
+			}
+			if m := q.last(t); !strings.HasPrefix(m.Statement, sql) || m.HomeShard != 1 {
+				t.Fatalf("%s: queued %+v, want it queued with the serving home shard 1", sql, m)
+			}
+		}
+	}
+	for i := range h.poolers {
+		for _, sql := range h.poolers[i].ran() {
+			if l := strings.ToLower(sql); strings.Contains(l, "create") || strings.Contains(l, "grant") {
+				t.Fatalf("DDL reached shard %d directly instead of the queue: %q", i, sql)
 			}
 		}
 	}
