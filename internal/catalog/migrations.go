@@ -225,6 +225,9 @@ type DDLMigration struct {
 	CreatedAt time.Time
 	// FinishedAt is set once the migration is complete or failed.
 	FinishedAt *time.Time
+	// DedupKey is MigrationDedupKey of the migration, written at enqueue
+	// only where the catalog has the operation queue.
+	DedupKey string
 }
 
 // RowQuerier is satisfied by *pgx.Conn, pgx.Tx and *pgxpool.Pool.
@@ -304,10 +307,15 @@ func EnqueueMigration(ctx context.Context, db RowQuerier, m DDLMigration) (strin
 	if err != nil {
 		return "", err
 	}
+	columns, values := "", ""
+	args := []any{m.Database, m.Statement, m.Kind, strategy, m.Scope, m.HomeShard, meta}
+	if m.DedupKey != "" {
+		columns, values = ", dedup_key", ", $8"
+		args = append(args, m.DedupKey)
+	}
 	var id string
-	err = db.QueryRow(ctx, `INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, home_shard, meta, state)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, 'queued') RETURNING id::text`,
-		m.Database, m.Statement, m.Kind, strategy, m.Scope, m.HomeShard, meta).Scan(&id)
+	err = db.QueryRow(ctx, `INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, home_shard, meta, state`+columns+`)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, 'queued'`+values+`) RETURNING id::text`, args...).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("catalog: enqueue migration: %w", err)
 	}
