@@ -85,11 +85,26 @@ func TestAnIssuedTLSClusterRoutesAndFailsOver(t *testing.T) {
 		}
 	})
 
+	// A database the router routes to shard 0, set up on the shard and
+	// registered in the catalog directly, so the statements below are the
+	// router's own.
+	const appDatabase = "tlsapp"
+	if _, err := psql(ctx, c, clusterName+"-shard-0-rw", "CREATE DATABASE "+appDatabase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := psqlOn(ctx, c, clusterName+"-shard-0-rw", appDatabase, "CREATE TABLE tls_probe (id int PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := psql(ctx, c, clusterName+"-catalog-rw", "INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('"+appDatabase+"', 'unsharded', 0)"); err != nil {
+		t.Fatal(err)
+	}
+
 	t.Run("StatementsReachAShardThroughTheRouter", func(t *testing.T) {
-		out, err := psqlRetryOn(ctx, c, router, "postgres",
-			"CREATE TABLE IF NOT EXISTS tls_probe (id int PRIMARY KEY); INSERT INTO tls_probe VALUES (1) ON CONFLICT DO NOTHING; SELECT count(*) FROM tls_probe", 5*time.Minute)
-		if err != nil || out != "1" {
-			t.Fatalf("a statement through the router of an issuing cluster: %q %v", out, err)
+		if out, err := psqlRetryOn(ctx, c, router, appDatabase, "INSERT INTO tls_probe VALUES (1) ON CONFLICT DO NOTHING", 5*time.Minute); err != nil {
+			t.Fatalf("a write through the router of an issuing cluster: %q %v", out, err)
+		}
+		if out, err := psqlOn(ctx, c, router, appDatabase, "SELECT count(*) FROM tls_probe"); err != nil || out != "1" {
+			t.Fatalf("a read through the router of an issuing cluster: %q %v", out, err)
 		}
 	})
 
@@ -105,9 +120,11 @@ func TestAnIssuedTLSClusterRoutesAndFailsOver(t *testing.T) {
 		waitFor(ctx, t, "promotion of a standby", 6*time.Minute, func() bool {
 			return primaryOf() != old && epochOf() == oldEpoch+1
 		})
-		out, err := psqlRetryOn(ctx, c, router, "postgres", "INSERT INTO tls_probe VALUES (2); SELECT count(*) FROM tls_probe", 5*time.Minute)
-		if err != nil || out != "2" {
+		if out, err := psqlRetryOn(ctx, c, router, appDatabase, "INSERT INTO tls_probe VALUES (2) ON CONFLICT DO NOTHING", 5*time.Minute); err != nil {
 			t.Fatalf("a write through the router after failover: %q %v", out, err)
+		}
+		if out, err := psqlOn(ctx, c, router, appDatabase, "SELECT count(*) FROM tls_probe"); err != nil || out != "2" {
+			t.Fatalf("the rows written before and after failover, read through the router: %q %v", out, err)
 		}
 		if err := waitCondition(ctx, c, "Ready", 10*time.Minute); err != nil {
 			gatherNamespace(ctx, c)
