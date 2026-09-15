@@ -1059,6 +1059,12 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 		{`CREATE TABLE allowed (who text PRIMARY KEY); CREATE TABLE notes (who text, body text);
 			ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
 			CREATE POLICY allowed_only ON notes USING (EXISTS (SELECT 1 FROM allowed a WHERE a.who = notes.who))`, "allowed", "policy allowed_only on public.notes"},
+		// Bound to the row type, which the rename takes with the table
+		// (PGS-885).
+		{`CREATE TABLE rowed (id bigint PRIMARY KEY);
+			CREATE FUNCTION rowed_all() RETURNS SETOF rowed LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY SELECT * FROM rowed; END $$`, "rowed", "row type used by function rowed_all()"},
+		{`CREATE TABLE snapshotted (id bigint PRIMARY KEY); CREATE TABLE snapshot_log (s snapshotted[])`, "snapshotted", "row type used by column s of table snapshot_log"},
+		{`CREATE TABLE casted (id bigint PRIMARY KEY); CREATE VIEW casted_null AS SELECT NULL::casted AS r`, "casted", "row type used by column r of view casted_null"},
 		// A rule that writes into the table from a view is the rule, not
 		// the view: the view's own _RETURN rule does not touch this table.
 		{`CREATE TABLE sink (id bigint PRIMARY KEY); CREATE VIEW sink_entry AS SELECT 1::bigint AS id;

@@ -877,11 +877,16 @@ var triggerEnableWords = map[string]string{"O": "ENABLE", "D": "DISABLE", "R": "
 // resolved by name when it runs and follows the swap, so it records no
 // dependency to find.
 //
+// So is anything bound to the table's row type, which the rename takes with
+// it: a function taking or returning the row, another table's or a
+// composite type's column of it, a view casting to it. They stay on the
+// retired table's type, and retiring it fails for as long as they exist.
+//
 // Reproduced rather than refused, each with its own function: row-level
 // security, user triggers, and the owner and table/column privileges.
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `WITH t AS (
-			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
+			SELECT c.oid, c.reltype, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
 			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = $1 AND c.relname = $2)
 		SELECT f FROM (
@@ -914,6 +919,10 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 				JOIN pg_class pc ON pc.oid = pol.polrelid
 				JOIN pg_namespace pn ON pn.oid = pc.relnamespace, t
 				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid AND pol.polrelid <> t.oid
+			UNION ALL SELECT DISTINCT 'row type used by ' || pg_describe_object(d.classid, d.objid, d.objsubid)
+				FROM pg_depend d, t
+				WHERE d.refclassid = 'pg_type'::regclass AND d.deptype = 'n'
+				  AND d.refobjid IN (t.reltype, (SELECT typarray FROM pg_type WHERE oid = t.reltype))
 		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err
