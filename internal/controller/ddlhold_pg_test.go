@@ -385,3 +385,83 @@ func TestTheCatalogHoldNamesTheStagesTheApplierHolds(t *testing.T) {
 		}
 	}
 }
+
+// servingStore is the real migration store with the serving set chosen by
+// the test, as a cutover would change it.
+type servingStore struct {
+	*PGMigrationStore
+	serving *string
+}
+
+func (s servingStore) ServingShardSet(context.Context) (string, error) { return *s.serving, nil }
+
+// TestARestartedApplierSeesTheSetAMigrationStartedOn (PGS-895): the start
+// pinned the shard set in memory only, so a controller that stopped part-way
+// and came back after a cutover read an empty set and resumed the remaining
+// shards against the new set's databases, reading the old set's progress as
+// theirs.
+func TestARestartedApplierSeesTheSetAMigrationStartedOn(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
+	mustExec(t, cat, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('default', 0, int8range(NULL, 0)), ('default', 1, int8range(0, NULL))`)
+	reconcile(t, cat)
+	id, err := catalog.EnqueueMigration(ctx, pool, catalog.DDLMigration{Database: "app", Statement: "CREATE TABLE notes (id int)",
+		Kind: "CREATE TABLE", Strategy: "direct", Scope: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serving := "default"
+	store := servingStore{&PGMigrationStore{Pool: pool}, &serving}
+	runCtx, stop := context.WithCancel(ctx)
+	shards := newFakeShards()
+	shards.exec = func(shard int32, _ string) error {
+		if shard == 1 {
+			stop()
+			return context.Canceled
+		}
+		return nil
+	}
+	first := &Applier{Store: store, Shards: shards, RewriteSettle: -1}
+	_, _ = first.RunOnce(runCtx)
+	m, err := catalog.LoadMigration(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.State != catalog.MigrationRunning || m.PerShard["0"].State != catalog.ShardApplied || m.Meta.ShardSet != "default" {
+		t.Fatalf("after the stop: state %s, shard 0 %s, pinned set %q; want running, applied, default", m.State, m.PerShard["0"].State, m.Meta.ShardSet)
+	}
+
+	unpinned := m
+	unpinned.Meta.ShardSet = ""
+	if err := catalog.SaveMigrationProgress(ctx, pool, unpinned, 0); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := catalog.LoadMigration(ctx, pool, id); err != nil || m.Meta.ShardSet != "default" {
+		t.Fatalf("a save carrying no set unpinned the migration: %q (%v)", m.Meta.ShardSet, err)
+	}
+
+	serving = "g2"
+	restarted := &Applier{Store: store, Shards: noDial{t}, RewriteSettle: -1}
+	if _, err := restarted.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m, err = catalog.LoadMigration(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "default") || !strings.Contains(m.Error, "g2") {
+		t.Fatalf("a migration part-applied on default resumed after a cutover to g2: state %s, error %q", m.State, m.Error)
+	}
+}
