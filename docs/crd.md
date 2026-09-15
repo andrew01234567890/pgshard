@@ -59,7 +59,8 @@ Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied), `
 the operator does not call, and on an agent old enough not to say),
 `effectiveShards` (shard count of the serving catalog shard set), `reshard{name, shardSet, generation, shards, phase}`
 (the run in flight), `placementWorkflows[]{workflowId, table, from, to, state, phase, message, pauseMs}`
-(table placement workflows active or ended within a day), `tuning.derived[]{name, value, reason}`. See
+(table placement workflows active or ended within a day), `tuning.derived[]{name, value, reason}`,
+`internalTLS{mode, move}` and the `InternalTLSMoving` condition (see below). See
 [resharding.md](resharding.md) for how `spec.shards` becomes a reshard and how a `pgshard.tables` edit
 becomes a placement workflow.
 
@@ -68,8 +69,10 @@ becomes a placement workflow.
 `status.internalTLS{mode, move{phase, target, startedAt}}` and the
 `InternalTLSMoving` condition track it. `mode` is the transport the cluster was
 last rendered with outside a move: `insecure`, `issued` or `secret:<name>`. A
-cluster created with TLS, or first seen by this operator, takes its spec's mode
-and never moves.
+cluster created with TLS takes its spec's mode and never moves. A cluster first
+seen by this operator also takes its spec's mode, unless its routers still run
+`--insecure-dev`. In that case the spec was changed while no operator staged the
+move, so it is recorded as `insecure` and the move starts.
 
 Changing `spec.internalTLS` on a cluster recorded as `insecure` to `issue: true`
 or a `secretRef` does not switch every process at once, because members roll one
@@ -84,7 +87,7 @@ at a time and routers roll as a Deployment. It moves in two steps:
    `pgshard.io/internal-tls-phase`.
 2. **Dialing**: once no member, router or controller pod from before Accepting
    is left, terminating ones included, routers dial TLS. Members are rendered
-   exactly as in Accepting and do not roll.
+   exactly as in Accepting and do not roll, and neither does the controller.
 
 Once no router pod from Accepting is left, the move completes. Listeners stop
 serving plaintext and members, routers and the controller roll once more.
@@ -92,7 +95,8 @@ serving plaintext and members, routers and the controller roll once more.
 - **Change of mind.** Setting the spec back to `insecure` during Accepting ends
   the move, because nothing depends on TLS yet. Any other change to
   `spec.internalTLS` during a move waits for the move to complete, and the
-  condition says so.
+  condition says so. The waiting change is then applied in one step, not staged.
+  In particular, going from TLS back to plaintext is not staged.
 - **External consumers.** A change-stream consumer dialling plaintext is served
   until the move completes; give it the `<cluster>-tls-consumer` certificate
   before then.

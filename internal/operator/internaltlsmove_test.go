@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -169,16 +170,22 @@ func TestASpecChangeDuringAMove(t *testing.T) {
 	accepting := insecureCluster("back-early")
 	accepting.Status.InternalTLS.Move = &pgshardv1alpha1.InternalTLSMove{Phase: pgshardv1alpha1.InternalTLSAccepting, Target: pgshardv1alpha1.InternalTLSSpec{Issue: true}}
 	r := moveReconciler(t, accepting)
-	if stored, rendered := pass(t, r, accepting); stored.Status.InternalTLS.Move != nil || !rendered.Spec.InternalTLS.Insecure {
-		t.Errorf("insecure again while Accepting: move %+v, rendering %+v; want the move ended and insecure rendered", stored.Status.InternalTLS.Move, rendered.Spec.InternalTLS)
+	if stored, _ := pass(t, r, accepting); stored.Status.InternalTLS.Move != nil || !internalTLS(stored).Insecure {
+		t.Errorf("insecure again while Accepting: move %+v, rendering %+v; want the move ended and insecure rendered", stored.Status.InternalTLS.Move, internalTLS(stored))
 	}
 
 	dialing := insecureCluster("back-late")
 	dialing.Status.InternalTLS.Move = &pgshardv1alpha1.InternalTLSMove{Phase: pgshardv1alpha1.InternalTLSDialing, Target: pgshardv1alpha1.InternalTLSSpec{Issue: true}}
 	r = moveReconciler(t, dialing, moveRouterPod(dialing, "back-late-router", pgshardv1alpha1.InternalTLSAccepting))
-	stored, rendered := pass(t, r, dialing)
-	if internalTLSPhase(stored) != pgshardv1alpha1.InternalTLSDialing || !rendered.Spec.InternalTLS.Issue || rendered.Spec.InternalTLS.Insecure {
-		t.Fatalf("insecure again while Dialing: phase %q, rendering %+v; want the move held and its target rendered", internalTLSPhase(stored), rendered.Spec.InternalTLS)
+	stored, _ := pass(t, r, dialing)
+	if internalTLSPhase(stored) != pgshardv1alpha1.InternalTLSDialing {
+		t.Fatalf("insecure again while Dialing: phase %q; want the move held", internalTLSPhase(stored))
+	}
+	// Rendered from the stored object, as a pass is after anything in it
+	// patches the cluster and reads the stored spec back.
+	args := Renderer{}.RouterDeployment(stored).Spec.Template.Spec.Containers[0].Args
+	if slices.Contains(args, "--insecure-dev") || !slices.Contains(args, "--tls-accept-plaintext") || !slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--pooler-tls-cert=") }) {
+		t.Fatalf("insecure again while Dialing: routers render %v; want the move's target, dialling TLS", args)
 	}
 	if cond := meta.FindStatusCondition(stored.Status.Conditions, pgshardv1alpha1.ConditionInternalTLSMoving); cond == nil || !strings.Contains(cond.Message, "changed during the move") {
 		t.Fatalf("the condition does not say the spec change waits: %+v", cond)
@@ -197,6 +204,7 @@ func TestASpecChangeDuringAMove(t *testing.T) {
 // dialling plaintext; Dialing only switches the routers' dials, so members
 // do not roll again; a finished move drops plaintext everywhere.
 func TestEachStepOfAMoveRendersWhatItsCallersNeed(t *testing.T) {
+	var controllers []corev1.PodTemplateSpec
 	render := func(phase string) (MemberTemplate, []string, []string, []string) {
 		c := issuingCluster("steps")
 		if phase != "" {
@@ -219,9 +227,14 @@ func TestEachStepOfAMoveRendersWhatItsCallersNeed(t *testing.T) {
 			t.Errorf("%q: router pods record phase %q", phase, got)
 		}
 		controller := Renderer{}.ControllerDeployment(c)
-		if got := controller.Spec.Template.Annotations[AnnotationInternalTLSPhase]; got != phase {
-			t.Errorf("%q: controller pods record phase %q", phase, got)
+		want := phase
+		if phase != "" {
+			want = pgshardv1alpha1.InternalTLSAccepting
 		}
+		if got := controller.Spec.Template.Annotations[AnnotationInternalTLSPhase]; got != want {
+			t.Errorf("%q: controller pods record phase %q, want %q", phase, got, want)
+		}
+		controllers = append(controllers, controller.Spec.Template)
 		if got := agentGRPCTLS(c).AcceptPlaintext; got != (phase != "") {
 			t.Errorf("%q: agent accepts plaintext = %v", phase, got)
 		}
@@ -241,7 +254,8 @@ func TestEachStepOfAMoveRendersWhatItsCallersNeed(t *testing.T) {
 	if !has(dialRouter, "--tls-accept-plaintext") || has(dialRouter, "--tls-dial-plaintext") {
 		t.Errorf("Dialing: router %v must dial TLS and still serve both", dialRouter)
 	}
-	if dialTpl.Hash() != accTpl.Hash() || !slices.Equal(dialPooler, accPooler) || !slices.Equal(dialController, accController) {
+	if dialTpl.Hash() != accTpl.Hash() || !slices.Equal(dialPooler, accPooler) || !slices.Equal(dialController, accController) ||
+		!equality.Semantic.DeepEqual(controllers[0], controllers[1]) {
 		t.Error("Dialing renders members or the controller differently from Accepting, so it rolls them again")
 	}
 
@@ -291,5 +305,20 @@ func TestTheOperatorTakesBarriersInPlaintextUntilTheControllerServesTLS(t *testi
 	}
 	if err := take(pgshardv1alpha1.InternalTLSDialing); err == nil {
 		t.Fatal("Dialing: the operator still dialled the controller in plaintext")
+	}
+}
+
+// TestAClusterFirstSeenMidwayRecordsWhatItRuns (PGS-236): a spec changed from
+// insecure to issue: true while no operator that stages the move was running
+// still has routers dialling plaintext. Taking the spec's word would record
+// it as issued and roll it in one step; it is recorded as insecure, so the
+// move starts.
+func TestAClusterFirstSeenMidwayRecordsWhatItRuns(t *testing.T) {
+	c := issuingCluster("midway")
+	running := newCluster("midway")
+	r := moveReconciler(t, c, Renderer{}.RouterDeployment(running))
+	stored, _ := pass(t, r, c)
+	if internalTLSPhase(stored) != pgshardv1alpha1.InternalTLSAccepting {
+		t.Fatalf("a cluster whose routers still run --insecure-dev under a spec saying issue: true recorded %+v; want the move started", stored.Status.InternalTLS)
 	}
 }

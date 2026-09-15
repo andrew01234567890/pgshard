@@ -3,11 +3,14 @@ package operator
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -20,6 +23,18 @@ import (
 // waits on: a pod rendered before a step still dials, or still refuses,
 // the way that step changed.
 const AnnotationInternalTLSPhase = "pgshard.io/internal-tls-phase"
+
+// internalTLS is the internal transport to render: the move's target for
+// the length of a move, whatever the spec has been changed to since, and the
+// spec otherwise. Read through here rather than substituted into the spec,
+// because a patch of the cluster object mid-pass reads the stored spec back
+// into it.
+func internalTLS(c *pgshardv1alpha1.PgShardCluster) pgshardv1alpha1.InternalTLSSpec {
+	if c.Status.InternalTLS != nil && c.Status.InternalTLS.Move != nil {
+		return c.Status.InternalTLS.Move.Target
+	}
+	return c.Spec.InternalTLS
+}
 
 // internalTLSPhase is the step of a move to mutual TLS the cluster is
 // rendered in, or empty outside one.
@@ -36,8 +51,7 @@ func tlsMode(mode string) bool {
 
 // reconcileInternalTLSMove advances a move from plaintext to mutual TLS by
 // one step when every pod of the step before has gone, records the result
-// in status before anything is rendered from it, and leaves c rendering
-// what the move requires.
+// in status before anything is rendered from it.
 //
 // A spec set back to insecure while callers still dial plaintext ends the
 // move: nothing depends on TLS yet. Any other change to spec.internalTLS
@@ -46,10 +60,14 @@ func tlsMode(mode string) bool {
 // and a pod's recorded step says nothing about which material it holds.
 func (r *ClusterReconciler) reconcileInternalTLSMove(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
 	base := c.DeepCopy()
-	specMode := internalTLSMode(c)
+	specMode := internalTLSModeOf(c.Namespace, c.Spec.InternalTLS)
 	st := c.Status.InternalTLS
 	if st == nil {
-		st = &pgshardv1alpha1.InternalTLSStatus{Mode: specMode}
+		mode, err := r.runningInternalTLSMode(ctx, c, specMode)
+		if err != nil {
+			return err
+		}
+		st = &pgshardv1alpha1.InternalTLSStatus{Mode: mode}
 		c.Status.InternalTLS = st
 	}
 	waiting := ""
@@ -106,10 +124,30 @@ func (r *ClusterReconciler) reconcileInternalTLSMove(ctx context.Context, c *pgs
 			return fmt.Errorf("internal TLS move: %w", err)
 		}
 	}
-	if st.Move != nil {
-		c.Spec.InternalTLS = *st.Move.Target.DeepCopy()
-	}
 	return nil
+}
+
+// runningInternalTLSMode is the transport a cluster first seen by this
+// operator actually runs. Usually its spec's; but a spec changed from
+// insecure to TLS while the operator that would have staged the move was not
+// running still has routers dialling plaintext, and taking the spec's word
+// would roll it in one step. The router Deployment says which.
+func (r *ClusterReconciler) runningInternalTLSMode(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, specMode string) (string, error) {
+	if !tlsMode(specMode) {
+		return specMode, nil
+	}
+	var dep appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: RouterName(c.Name)}, &dep); apierrors.IsNotFound(err) {
+		return specMode, nil
+	} else if err != nil {
+		return "", err
+	}
+	for _, ct := range dep.Spec.Template.Spec.Containers {
+		if slices.Contains(ct.Args, "--insecure-dev") {
+			return "insecure", nil
+		}
+	}
+	return specMode, nil
 }
 
 func internalTLSModeOf(namespace string, spec pgshardv1alpha1.InternalTLSSpec) string {

@@ -640,7 +640,7 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: internalTLSVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
 	}
-	if c.Spec.InternalTLS.Issue {
+	if internalTLS(c).Issue {
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: poolerTLSVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 				SecretName: RoleTLSSecretName(c.Name, pki.RolePooler)}}})
@@ -698,21 +698,21 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 	}
 	if internalTLSEnabled(c) {
 		dir, vol := internalTLSMountPath, internalTLSVolume
-		if c.Spec.InternalTLS.Issue {
+		if internalTLS(c).Issue {
 			dir, vol = poolerTLSMountPath, poolerTLSVolume
 		}
 		args = append(args,
 			"--tls-cert", dir+"/tls.crt",
 			"--tls-key", dir+"/tls.key",
 			"--tls-ca", dir+"/ca.crt")
-		if c.Spec.InternalTLS.Issue {
+		if internalTLS(c).Issue {
 			args = append(args, "--tls-authorize-callers")
 		}
 		if internalTLSPhase(c) != "" {
 			args = append(args, "--tls-accept-plaintext")
 		}
 		mounts = append(mounts, corev1.VolumeMount{Name: vol, MountPath: dir, ReadOnly: true})
-	} else if c.Spec.InternalTLS.Insecure {
+	} else if internalTLS(c).Insecure {
 		args = append(args, "--insecure-dev")
 	}
 	return corev1.Container{
@@ -742,13 +742,13 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 
 // internalTLSMode names the router<->pooler transport the spec asks for.
 func internalTLSMode(c *pgshardv1alpha1.PgShardCluster) string {
-	if c.Spec.InternalTLS.Issue {
+	if internalTLS(c).Issue {
 		return "issued"
 	}
 	if ref := internalTLSRef(c); ref != nil {
 		return "secret:" + ref.Name
 	}
-	if c.Spec.InternalTLS.Insecure {
+	if internalTLS(c).Insecure {
 		return "insecure"
 	}
 	return ""
@@ -793,13 +793,13 @@ func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
 	if !internalTLSEnabled(c) {
 		return agent.TLSFiles{}
 	}
-	if !c.Spec.InternalTLS.Issue && !c.Spec.InternalTLS.AgentMTLS {
+	if !internalTLS(c).Issue && !internalTLS(c).AgentMTLS {
 		return agent.TLSFiles{}
 	}
 	return agent.TLSFiles{
 		// Only when the operator issued them: supplied certificates carry
 		// no identity to authorise.
-		AuthorizeCallers: c.Spec.InternalTLS.Issue,
+		AuthorizeCallers: internalTLS(c).Issue,
 		// A caller that has not switched to TLS yet is still served while
 		// the cluster moves to it.
 		AcceptPlaintext: internalTLSPhase(c) != "",
@@ -832,7 +832,7 @@ func agentMounts(c *pgshardv1alpha1.PgShardCluster) []corev1.VolumeMount {
 
 // internalTLSRef returns the router/pooler mTLS secret reference, if any.
 func internalTLSRef(c *pgshardv1alpha1.PgShardCluster) *corev1.LocalObjectReference {
-	if ref := c.Spec.InternalTLS.SecretRef; ref != nil && ref.Name != "" {
+	if ref := internalTLS(c).SecretRef; ref != nil && ref.Name != "" {
 		return ref
 	}
 	return nil
@@ -844,7 +844,7 @@ func internalTLSRef(c *pgshardv1alpha1.PgShardCluster) *corev1.LocalObjectRefere
 // cannot tell a router from an agent, and a listener can only authorise
 // what it can distinguish.
 func internalTLSRefFor(c *pgshardv1alpha1.PgShardCluster, role string) *corev1.LocalObjectReference {
-	if c.Spec.InternalTLS.Issue {
+	if internalTLS(c).Issue {
 		return &corev1.LocalObjectReference{Name: RoleTLSSecretName(c.Name, role)}
 	}
 	return internalTLSRef(c)
@@ -853,5 +853,5 @@ func internalTLSRefFor(c *pgshardv1alpha1.PgShardCluster, role string) *corev1.L
 // internalTLSEnabled reports whether internal gRPC runs with TLS at all,
 // however the material arrives.
 func internalTLSEnabled(c *pgshardv1alpha1.PgShardCluster) bool {
-	return c.Spec.InternalTLS.Issue || internalTLSRef(c) != nil
+	return internalTLS(c).Issue || internalTLSRef(c) != nil
 }

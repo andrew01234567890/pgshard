@@ -40,7 +40,7 @@ type issuedCreds struct {
 // are returned until the Secret changes, so a connection dialled with them
 // is kept rather than redialled every pass.
 func (o *IssuedCredentials) For(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (agent, controller credentials.TransportCredentials, err error) {
-	if o == nil || !c.Spec.InternalTLS.Issue {
+	if o == nil || !internalTLS(c).Issue {
 		return nil, nil, nil
 	}
 	key := types.NamespacedName{Namespace: c.Namespace, Name: RoleTLSSecretName(c.Name, pki.RoleOperator)}
