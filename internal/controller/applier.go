@@ -104,11 +104,22 @@ func (s *PGMigrationStore) Databases(ctx context.Context) ([]string, error) {
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
+// ddlHoldStages are the stages of a reshard or upgrade during which no
+// migration starts: from the copy until the switch. They are spelled out
+// again in catalog.MigrationHeldPredicate, which cannot import them.
+var ddlHoldStages = []string{StageCopying, StageCatchUpDone, StageAwaitingSwitch, StageSwitching}
+
 // LockedDatabases implements MigrationStore. A reshard or upgrade cutover
 // takes these when it fences, precisely so that schema does not move under
-// a copy that is comparing the two sides.
+// a copy that is comparing the two sides; and every database is held by a
+// reshard or upgrade while it copies, since the copy's subscriptions apply
+// no DDL (PGS-872).
 func (s *PGMigrationStore) LockedDatabases(ctx context.Context) (map[string]string, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT key, workflow_id::text FROM pgshard.workflow_locks WHERE kind = 'ddl'`)
+	rows, err := s.Pool.Query(ctx, `SELECT key, workflow_id::text FROM pgshard.workflow_locks WHERE kind = 'ddl'
+		UNION ALL
+		SELECT d.name, w.id::text FROM pgshard.databases d, pgshard.workflows w
+		 WHERE w.kind = ANY($1) AND w.state = ANY($2) AND w.status->>'stage' = ANY($3)`,
+		copyKinds, []string{StateRunning, StatePaused}, ddlHoldStages)
 	if err != nil {
 		return nil, err
 	}
@@ -415,7 +426,10 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 			m.PerShard[catalogKey] = catalog.ShardMigration{State: catalog.ShardPending}
 		}
 		m.State, m.Meta.ShardSet = catalog.MigrationRunning, serving
-		if err := a.Store.Save(ctx, m, a.term()); err != nil {
+		if err := a.Store.Save(ctx, m, a.term()); errors.Is(err, catalog.ErrMigrationHeld) {
+			logger.Info("holding a migration while a reshard or upgrade copies")
+			return nil
+		} else if err != nil {
 			return err
 		}
 		logger.Info("migration started", "shards", len(targets), "shard_set", serving)

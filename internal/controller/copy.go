@@ -385,6 +385,39 @@ func (c *Copier) startCopy(ctx context.Context, wf *copyWorkflow) error {
 	return tx.Commit(ctx)
 }
 
+// migrationsApplying names the databases a migration is applying on. From
+// the moment a copy is recorded no migration starts (the applier's start is
+// refused while one copies), but one that started just before is still
+// applying, and the schema the copy materializes must not move under it.
+// FOR SHARE waits out a start already in flight, so it is seen running.
+func migrationsApplying(ctx context.Context, q interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}) ([]string, error) {
+	rows, err := q.Query(ctx, `SELECT database, state FROM pgshard.migrations WHERE state IN ('queued', 'running') FOR SHARE`)
+	if err != nil {
+		return nil, err
+	}
+	var applying []string
+	for rows.Next() {
+		var db, state string
+		if err := rows.Scan(&db, &state); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if state == catalog.MigrationRunning && !slices.Contains(applying, db) {
+			applying = append(applying, db)
+		}
+	}
+	return applying, rows.Err()
+}
+
+func waitingForMigrations(dbs []string) error {
+	if len(dbs) == 0 {
+		return nil
+	}
+	return retryf("a migration is still applying on %s; the copy waits for it before it materializes the schema", strings.Join(dbs, ", "))
+}
+
 func waitingForPlacements(n int) error {
 	if n == 0 {
 		return nil
@@ -695,6 +728,11 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 		}
 		wf.stage = StageCopying
 		advanced = true
+	}
+	if wf.stage == StageCopying {
+		if applying, err := migrationsApplying(ctx, c.Pool); err != nil || len(applying) > 0 {
+			return advanced, errors.Join(err, waitingForMigrations(applying))
+		}
 	}
 	if err := c.materializeSchemas(ctx, wf, srcSet, dbs); err != nil {
 		return advanced, err

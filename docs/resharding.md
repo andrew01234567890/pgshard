@@ -203,8 +203,11 @@ record under `status.copy` is informational except for the schema flags.
    yet.
 
 Tables registered or created after the publications exist are not picked
-up (the M4 DDL applier runs its own migrations; resharding under DDL is a
-later step). Sequences come across with their definitions only; values
+up, and logical replication carries no DDL, so schema does not move during
+a copy. From the moment a copy is recorded until the switch, the router
+refuses DDL (`0A000`, retry once the reshard completes) and the applier
+holds any queued migration; a migration already applying when the copy
+begins is waited for before the targets' schema is materialized. Sequences come across with their definitions only; values
 are not replicated.
 
 ## Cancel

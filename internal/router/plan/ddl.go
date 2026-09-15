@@ -125,6 +125,16 @@ func (w *walker) homeStatement() error {
 }
 
 func (w *walker) migration(m Migration) error {
+	// A reshard copies by logical replication, which carries no DDL: a
+	// schema change on the serving set while the targets apply its rows
+	// breaks their apply. The applier holds a migration queued while one
+	// copies; refusing it here tells the client at once rather than after
+	// the wait gives up (PGS-872). A local database's DDL runs on its home
+	// shard directly and would break the copy the same way.
+	if w.sess.Snapshot != nil && w.sess.Snapshot.Resharding() {
+		return notYet("DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply",
+			"retry once the reshard completes")
+	}
 	// Every DDL the planner recognises arrives here, so this is where a
 	// local database stops being a fan-out.
 	if w.sess.localOnly() {
