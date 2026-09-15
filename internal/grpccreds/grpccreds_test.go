@@ -368,3 +368,132 @@ func TestAListenerWithoutAuthorizeStillAcceptsAnyoneFromItsCA(t *testing.T) {
 		t.Fatalf("without Authorize a listener must accept any peer from its CA: %v", err)
 	}
 }
+
+// serverSerial connects to addr presenting the client pair and reports the
+// serial of the certificate the server presented, or why it was refused.
+func serverSerial(t *testing.T, addr string, roots []byte, certPEM, keyPEM []byte) (int64, error) {
+	t.Helper()
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(roots)
+	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{pair},
+		ServerName: "localhost", MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.Handshake(); err != nil {
+		return 0, err
+	}
+	// Under TLS 1.3 a server that refuses the client's certificate says so
+	// after the client's handshake has returned, so read what the server
+	// sends first: gRPC's HTTP/2 settings, or the alert.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err != nil {
+		return 0, err
+	}
+	return conn.ConnectionState().PeerCertificates[0].SerialNumber.Int64(), nil
+}
+
+// TestAListenerUsesRenewedFilesOnTheNextConnection (PGS-799): a renewal is
+// written into the same files, and a listener that read them once at start
+// kept presenting the old certificate until it expired and trusting only
+// the old CA.
+func TestAListenerUsesRenewedFilesOnTheNextConnection(t *testing.T) {
+	dir := t.TempDir()
+	ca := newTestCA(t)
+	srvCert, srvKey := ca.issue(t, "server", 10)
+	cliCert, cliKey := ca.issue(t, "client", 20)
+	certFile := writeFile(t, dir, "tls.crt", srvCert)
+	keyFile := writeFile(t, dir, "tls.key", srvKey)
+	caFile := writeFile(t, dir, "ca.crt", ca.pem)
+	creds, err := grpccreds.Listener(certFile, keyFile, caFile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := serve(t, creds)
+	if serial, err := serverSerial(t, addr, ca.pem, cliCert, cliKey); err != nil || serial != 10 {
+		t.Fatalf("before renewal: serial %d, %v", serial, err)
+	}
+
+	renewedCert, renewedKey := ca.issue(t, "server", 11)
+	writeFile(t, dir, "tls.crt", renewedCert)
+	writeFile(t, dir, "tls.key", renewedKey)
+	if serial, err := serverSerial(t, addr, ca.pem, cliCert, cliKey); err != nil || serial != 11 {
+		t.Fatalf("after renewal the listener presented serial %d (%v), want the renewed 11", serial, err)
+	}
+
+	// A new CA, with a server certificate from it: clients of the old CA are
+	// refused and clients of the new one admitted, without a restart.
+	rotated := newTestCA(t)
+	newSrvCert, newSrvKey := rotated.issue(t, "server", 30)
+	newCliCert, newCliKey := rotated.issue(t, "client", 31)
+	writeFile(t, dir, "tls.crt", newSrvCert)
+	writeFile(t, dir, "tls.key", newSrvKey)
+	writeFile(t, dir, "ca.crt", rotated.pem)
+	if _, err := serverSerial(t, addr, rotated.pem, cliCert, cliKey); err == nil {
+		t.Fatal("a client certificate from the replaced CA was still accepted")
+	}
+	if serial, err := serverSerial(t, addr, rotated.pem, newCliCert, newCliKey); err != nil || serial != 30 {
+		t.Fatalf("after CA rotation: serial %d, %v", serial, err)
+	}
+
+	// A half-written renewal -- a key that does not match the certificate --
+	// keeps the last good pair rather than failing every handshake.
+	writeFile(t, dir, "tls.key", srvKey)
+	if serial, err := serverSerial(t, addr, rotated.pem, newCliCert, newCliKey); err != nil || serial != 30 {
+		t.Fatalf("with a mismatched key on disk: serial %d, %v, want the last good pair", serial, err)
+	}
+}
+
+// TestADialerUsesRenewedFilesOnTheNextConnection is the client side: the
+// certificate it presents and the CA it verifies servers against are read
+// again for every new connection.
+func TestADialerUsesRenewedFilesOnTheNextConnection(t *testing.T) {
+	oldCA, newCA := newTestCA(t), newTestCA(t)
+	srvDir := t.TempDir()
+	srvCert, srvKey := newCA.issue(t, "server", 40)
+	listener, err := grpccreds.Listener(writeFile(t, srvDir, "tls.crt", srvCert), writeFile(t, srvDir, "tls.key", srvKey),
+		writeFile(t, srvDir, "ca.crt", newCA.pem), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := serve(t, listener)
+
+	dir := t.TempDir()
+	cliCert, cliKey := oldCA.issue(t, "client", 41)
+	dialer, err := grpccreds.Dialer(writeFile(t, dir, "tls.crt", cliCert), writeFile(t, dir, "tls.key", cliKey),
+		writeFile(t, dir, "ca.crt", oldCA.pem), "localhost", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := call(t, addr, dialer); status.Code(err) == codes.Unimplemented {
+		t.Fatal("a dialer holding another CA's material reached the service")
+	}
+
+	renewedCert, renewedKey := newCA.issue(t, "client", 42)
+	writeFile(t, dir, "tls.crt", renewedCert)
+	writeFile(t, dir, "tls.key", renewedKey)
+	writeFile(t, dir, "ca.crt", newCA.pem)
+	if err := call(t, addr, dialer); status.Code(err) != codes.Unimplemented {
+		t.Fatalf("after renewal the same dialer must reach the service: %v", err)
+	}
+}
+
+// TestEmptyFilesAreRefusedAtStart: reading the files at every handshake must
+// not loosen what start refuses. Empty files once compared equal to nothing
+// read yet and were never parsed, leaving a dialer with no client
+// certificate and the system's roots.
+func TestEmptyFilesAreRefusedAtStart(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile, caFile := writeFile(t, dir, "tls.crt", nil), writeFile(t, dir, "tls.key", nil), writeFile(t, dir, "ca.crt", nil)
+	if _, err := grpccreds.Listener(certFile, keyFile, caFile, false); err == nil {
+		t.Error("a listener started from empty files")
+	}
+	if _, err := grpccreds.Dialer(certFile, keyFile, caFile, "localhost", false); err == nil {
+		t.Error("a dialer started from empty files")
+	}
+}

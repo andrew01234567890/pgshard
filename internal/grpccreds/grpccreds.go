@@ -10,11 +10,15 @@
 package grpccreds
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"sync"
 
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -88,21 +92,21 @@ func Listener(certFile, keyFile, caFile string, insecureDev bool, opts ...Option
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, errors.New("--tls-cert, --tls-key and --tls-ca are required (or --insecure-dev)")
 	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	m, err := loadMaterial(certFile, keyFile, caFile)
 	if err != nil {
 		return nil, err
 	}
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
+	verify := verifyIdentity(apply(opts).allow)
+	config := func(cert tls.Certificate, pool *x509.CertPool) *tls.Config {
+		return &tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
+			ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13,
+			NextProtos: []string{"h2"}, VerifyPeerCertificate: verify}
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("%s: no certificates found", caFile)
+	cfg := config(m.current())
+	cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		return config(m.current()), nil
 	}
-	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
-		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13,
-		VerifyPeerCertificate: verifyIdentity(apply(opts).allow)}), nil
+	return credentials.NewTLS(cfg), nil
 }
 
 // Dialer returns the credentials an internal gRPC client dials with: it
@@ -121,19 +125,112 @@ func Dialer(certFile, keyFile, caFile, serverName string, insecureDev bool, opts
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, errors.New("a client certificate, key and CA are all required (or insecure dialling)")
 	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	m, err := loadMaterial(certFile, keyFile, caFile)
 	if err != nil {
 		return nil, err
 	}
-	pemBytes, err := os.ReadFile(caFile)
-	if err != nil {
+	return &reloadingDialer{m: m, serverName: serverName, verify: verifyIdentity(apply(opts).allow)}, nil
+}
+
+// material is one set of TLS files, read again at every handshake.
+//
+// Certificates are renewed into the same files: the operator reissues a
+// role's certificate into its Secret well before it expires, and the kubelet
+// swaps the mounted files in place. A process that parsed them once at start
+// kept presenting, and trusting, what it read then -- until it restarted, or
+// until the certificate it held expired and every handshake failed
+// (PGS-799). Read at the handshake, a renewal takes effect on the next
+// connection. The files are small and handshakes are rare, since gRPC keeps
+// its connections, so they are read every time and parsed only when their
+// bytes change. A read that fails, or a certificate and key that do not
+// match because the swap landed between the two reads, keeps the last good
+// material; the next handshake tries again.
+type material struct {
+	certFile, keyFile, caFile string
+
+	mu   sync.Mutex
+	raw  [3][]byte
+	cert tls.Certificate
+	pool *x509.CertPool
+}
+
+func loadMaterial(certFile, keyFile, caFile string) (*material, error) {
+	m := &material{certFile: certFile, keyFile: keyFile, caFile: caFile}
+	if err := m.refresh(); err != nil {
 		return nil, err
+	}
+	return m, nil
+}
+
+func (m *material) refresh() error {
+	var raw [3][]byte
+	for i, f := range []string{m.certFile, m.keyFile, m.caFile} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		raw[i] = b
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// m.pool is nil until the first parse succeeds: empty files compare
+	// equal to nothing read yet, and must still be parsed -- and refused.
+	if m.pool != nil && bytes.Equal(raw[0], m.raw[0]) && bytes.Equal(raw[1], m.raw[1]) && bytes.Equal(raw[2], m.raw[2]) {
+		return nil
+	}
+	cert, err := tls.X509KeyPair(raw[0], raw[1])
+	if err != nil {
+		return err
 	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("%s: no certificates found", caFile)
+	if !pool.AppendCertsFromPEM(raw[2]) {
+		return fmt.Errorf("%s: no certificates found", m.caFile)
 	}
+	m.raw, m.cert, m.pool = raw, cert, pool
+	return nil
+}
+
+// current is what to present and trust for a handshake starting now.
+func (m *material) current() (tls.Certificate, *x509.CertPool) {
+	_ = m.refresh()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cert, m.pool
+}
+
+// reloadingDialer builds the TLS configuration afresh for every handshake,
+// so the certificate it presents and the CA it verifies the server against
+// are the files as they are now. The verification is crypto/tls's own; only
+// its inputs are read later.
+type reloadingDialer struct {
+	m          *material
+	serverName string
+	verify     func([][]byte, [][]*x509.Certificate) error
+}
+
+func (d *reloadingDialer) creds() credentials.TransportCredentials {
+	cert, pool := d.m.current()
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool,
-		ServerName: serverName, MinVersion: tls.VersionTLS13,
-		VerifyPeerCertificate: verifyIdentity(apply(opts).allow)}), nil
+		ServerName: d.serverName, MinVersion: tls.VersionTLS13, VerifyPeerCertificate: d.verify})
+}
+
+func (d *reloadingDialer) ClientHandshake(ctx context.Context, authority string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	return d.creds().ClientHandshake(ctx, authority, conn)
+}
+
+func (d *reloadingDialer) ServerHandshake(net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	return nil, nil, errors.New("grpccreds: dialer credentials cannot accept connections")
+}
+
+func (d *reloadingDialer) Info() credentials.ProtocolInfo { return d.creds().Info() }
+
+func (d *reloadingDialer) Clone() credentials.TransportCredentials {
+	c := *d
+	return &c
+}
+
+// OverrideServerName is part of credentials.TransportCredentials.
+func (d *reloadingDialer) OverrideServerName(name string) error {
+	d.serverName = name
+	return nil
 }
