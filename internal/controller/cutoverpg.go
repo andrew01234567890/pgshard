@@ -1735,6 +1735,19 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 			return nil
 		}
 	}
+	// Not while another workflow still replicates into the set. A switch
+	// abandoned because another workflow retired its sources gets here with
+	// that workflow's retired set as its own source set. The other workflow
+	// keeps reverse subscriptions into it for its rollback window, and a
+	// pause fails their apply with 25006 until someone lifts it by hand, so
+	// that rollback can never finish (PGS-837). Its own Complete pauses the
+	// set when it ends.
+	others, err := o.otherReplicationInto(ctx, set, ids)
+	if err != nil || others > 0 {
+		o.c.logger().Info("reshard complete: retired set left writable, another workflow may still replicate into it",
+			"workflow", o.wf.id, "set", set, "subscriptions", others, "err", err)
+		return nil
+	}
 	// Best effort, and last: a set that cannot be reached is already
 	// beyond reach of a client too, and a retirement that has otherwise
 	// finished must not be undone by it.
@@ -1751,6 +1764,35 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 		o.c.logger().Info("reshard complete: retired set not made read-only", "workflow", o.wf.id, "set", set, "err", err)
 	}
 	return nil
+}
+
+// otherReplicationInto counts the reverse subscriptions on a set's
+// primaries that belong to another generation than this run's -- another
+// workflow's way back into the set. Forward subscriptions are left out: they
+// apply INTO the set only while it is a target, never once it is retired,
+// and a later workflow's frozen ones must not keep a retired set writable.
+// pg_subscription is shared by every database of a server, so one query per
+// primary sees them all.
+func (o *pgCutover) otherReplicationInto(ctx context.Context, set string, ids []int32) (int64, error) {
+	var total int64
+	for _, s := range ids {
+		conn, err := o.c.Shards.Dial(ctx, set, s)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_subscription WHERE subname LIKE 'pgshard\_reshard\_g%\_rev\_s%' AND subname NOT LIKE $1`,
+			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_%%", o.wf.gen))
+		var n int64
+		if err == nil {
+			n, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
+		}
+		_ = conn.Close(ctx)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // setIsServing reports whether a shard set is the one routing goes to.
