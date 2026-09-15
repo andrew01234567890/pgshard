@@ -96,7 +96,7 @@ The controller sweeps for this on every resolve tick and lifts it, logging
 doing anything by hand. What it sweeps:
 
 ```sql
-SELECT shard_set, shard_id, write_paused_by
+SELECT shard_set, shard_id, write_paused_by, write_paused_at
 FROM pgshard.shard_status s
 WHERE write_paused_by IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM pgshard.workflows w
@@ -121,7 +121,7 @@ SELECT pg_reload_conf();
 then clear the claim so the sweep stops revisiting it:
 
 ```sql
-UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+UPDATE pgshard.shard_status SET write_paused_by = NULL, write_paused_at = NULL, updated_at = now()
 WHERE shard_set = '<set>' AND shard_id = <id>;
 ```
 

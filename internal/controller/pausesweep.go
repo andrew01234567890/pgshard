@@ -83,7 +83,7 @@ func (s *WritePauseSweep) Pass(ctx context.Context) (int, error) {
 			errs = append(errs, fmt.Errorf("shard %s/%d: %w", sh.Set, sh.ID, err))
 			continue
 		}
-		if _, err := s.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+		if _, err := s.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, write_paused_at = NULL, updated_at = now()
 			WHERE shard_set = $1 AND shard_id = $2`, sh.Set, sh.ID); err != nil {
 			errs = append(errs, err)
 			continue

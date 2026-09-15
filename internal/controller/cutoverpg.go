@@ -1230,10 +1230,24 @@ func (o *pgCutover) PauseSources(ctx context.Context, pause bool) error {
 }
 
 // SourcesPaused reports whether every source still carries this workflow's
-// claimed pause and a fresh backend on it starts read-only.
+// claimed pause, with the instant it was confirmed at, and a fresh backend
+// on it starts read-only. The instants become this pass's, so its drain
+// still waits for a transaction that began before the pause: that the pause
+// is standing does not mean a drain under it finished, since a controller
+// can die in the middle of one (PGS-856). A claim without an instant -- the
+// pause was raised and the controller died before recording when -- is not
+// a pause this pass can drain under, and is raised again.
 func (o *pgCutover) SourcesPaused(ctx context.Context) (bool, error) {
-	claimed, err := o.claimedShards(ctx, o.srcSet, o.srcIDs)
-	if err != nil || len(claimed) != len(o.srcIDs) {
+	rows, err := o.c.Pool.Query(ctx, `SELECT shard_id, write_paused_at FROM pgshard.shard_status
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by = $3::uuid AND write_paused_at IS NOT NULL`, o.srcSet, o.srcIDs, o.wf.id)
+	if err != nil {
+		return false, err
+	}
+	instants, err := pgx.CollectRows(rows, pgx.RowToStructByPos[struct {
+		ID int32
+		At time.Time
+	}])
+	if err != nil || len(instants) != len(o.srcIDs) {
 		return false, err
 	}
 	for _, s := range o.srcIDs {
@@ -1241,6 +1255,12 @@ func (o *pgCutover) SourcesPaused(ctx context.Context) (bool, error) {
 		if err != nil || !on {
 			return false, err
 		}
+	}
+	if o.pausedAt == nil {
+		o.pausedAt = map[pausedShard]time.Time{}
+	}
+	for _, in := range instants {
+		o.pausedAt[pausedShard{o.srcSet, in.ID}] = in.At
 	}
 	return true, nil
 }
@@ -1295,7 +1315,10 @@ func (o *pgCutover) pauseSetClaimed(ctx context.Context, set string, ids []int32
 		if err := o.claimPause(ctx, set, ids); err != nil {
 			return err
 		}
-		return o.pauseSet(ctx, set, ids, true)
+		if err := o.pauseSet(ctx, set, ids, true); err != nil {
+			return err
+		}
+		return o.recordPauseInstants(ctx, set, ids)
 	}
 	// Lifting is scoped to this workflow's claim, like dropping it: an
 	// undone switch lifts its own pause and must not lift a pause some
@@ -1320,16 +1343,37 @@ func (o *pgCutover) claimedShards(ctx context.Context, set string, ids []int32) 
 	return pgx.CollectRows(rows, pgx.RowTo[int32])
 }
 
+// claimPause claims the shards for this workflow's pause and forgets any
+// instant recorded for an earlier raise, its own included: until the pause
+// about to be raised is confirmed and recorded, a transaction may have begun
+// after the old instant while the old pause was gone.
 func (o *pgCutover) claimPause(ctx context.Context, set string, ids []int32) error {
-	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = $3::uuid, updated_at = now()
-		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by IS DISTINCT FROM $3::uuid`, set, ids, o.wf.id)
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = $3::uuid, write_paused_at = NULL, updated_at = now()
+		WHERE shard_set = $1 AND shard_id = ANY($2) AND (write_paused_by IS DISTINCT FROM $3::uuid OR write_paused_at IS NOT NULL)`, set, ids, o.wf.id)
+	return err
+}
+
+// recordPauseInstants stores, beside this workflow's claim, the instant each
+// shard's pause was confirmed at. A pause raised again moves it later, which
+// only makes the drain wait for more.
+func (o *pgCutover) recordPauseInstants(ctx context.Context, set string, ids []int32) error {
+	var shards []int32
+	var instants []time.Time
+	for _, s := range ids {
+		if at, ok := o.pausedAt[pausedShard{set, s}]; ok {
+			shards, instants = append(shards, s), append(instants, at)
+		}
+	}
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status st SET write_paused_at = v.at, updated_at = now()
+		  FROM unnest($2::int[], $3::timestamptz[]) AS v(id, at)
+		 WHERE st.shard_set = $1 AND st.shard_id = v.id AND st.write_paused_by = $4::uuid`, set, shards, instants, o.wf.id)
 	return err
 }
 
 // dropPauseClaim is scoped to this workflow, so it releases nothing it did
 // not claim.
 func (o *pgCutover) dropPauseClaim(ctx context.Context, set string, ids []int32) error {
-	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, write_paused_at = NULL, updated_at = now()
 		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by = $3::uuid`, set, ids, o.wf.id)
 	return err
 }
@@ -1340,7 +1384,7 @@ func (o *pgCutover) dropPauseClaim(ctx context.Context, set string, ids []int32)
 // Complete is about to raise -- and after retirement no transient claim can
 // be legitimate, because nothing is left to lift.
 func (o *pgCutover) abandonPauseClaim(ctx context.Context, set string, ids []int32) error {
-	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, updated_at = now()
+	_, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = NULL, write_paused_at = NULL, updated_at = now()
 		WHERE shard_set = $1 AND shard_id = ANY($2) AND write_paused_by IS NOT NULL`, set, ids)
 	return err
 }

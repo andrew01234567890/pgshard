@@ -80,7 +80,7 @@ func TestDeletingAPausedWorkflowLeavesTheSourcesWritable(t *testing.T) {
 	mustExec(t, shard, `ALTER SYSTEM SET default_transaction_read_only = on`)
 	mustExec(t, shard, `SELECT pg_reload_conf()`)
 	waitReadOnly(t, shardDSN, true)
-	mustExec(t, cat, `UPDATE pgshard.shard_status SET write_paused_by = $1::uuid WHERE shard_set = 'default' AND shard_id = 0`, wfID)
+	mustExec(t, cat, `UPDATE pgshard.shard_status SET write_paused_by = $1::uuid, write_paused_at = now() WHERE shard_set = 'default' AND shard_id = 0`, wfID)
 	mustExec(t, cat, `DELETE FROM pgshard.workflows WHERE id = $1::uuid`, wfID)
 	freed, err = sweep.Pass(ctx)
 	if err != nil {
@@ -103,6 +103,10 @@ func TestDeletingAPausedWorkflowLeavesTheSourcesWritable(t *testing.T) {
 	}
 	if claimed != nil {
 		t.Fatalf("the claim survived the sweep: %s", *claimed)
+	}
+	var instant *time.Time
+	if err := cat.QueryRow(ctx, `SELECT write_paused_at FROM pgshard.shard_status WHERE shard_set = 'default' AND shard_id = 0`).Scan(&instant); err != nil || instant != nil {
+		t.Fatalf("the pause instant survived the claim: %v %v", instant, err)
 	}
 
 	// And a second pass over a cluster with nothing to sweep does nothing,

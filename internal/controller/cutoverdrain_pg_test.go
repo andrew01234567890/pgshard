@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 // realShards dials one real PostgreSQL for every shard id.
@@ -136,5 +139,116 @@ func TestADrainStopsAtTheCutoverBudgetAndNamesItsWriters(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ledger-batch") || !strings.Contains(err.Error(), "pid ") {
 		t.Fatalf("the drain did not name the transaction it waited for: %v", err)
+	}
+}
+
+// TestADrainAfterARestartStillWaitsForATransactionFromBeforeThePause
+// (PGS-856): the instant a switch's pause was confirmed at lived only in the
+// controller's memory. A controller that died while draining under that
+// pause left it standing, and the next pass found it standing, skipped
+// quiescing and drained without the instant -- so a transaction that began
+// before the pause, and had only read so far, was not waited for and could
+// write on a source after the positions the targets were checked against.
+func TestADrainAfterARestartStillWaitsForATransactionFromBeforeThePause(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	catalogDSN := startPostgres(t)
+	dsn := startPostgres(t)
+	cat := connect(t, catalogDSN)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, catalogDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	const wfID = "55555555-5555-5555-5555-555555555555"
+	mustExec(t, cat, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
+		VALUES ('default', 0, 'shard0', 'serving', 1)`)
+	newPass := func() *pgCutover {
+		return &pgCutover{c: &Copier{Pool: pool, Shards: realShards{dsn}}, wf: &copyWorkflow{id: wfID}, srcSet: "default", srcIDs: []int32{0}}
+	}
+
+	// Begun before the pause, and only read so far: no xid, still read-write.
+	reader := connect(t, dsn)
+	tx, err := reader.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var one int
+	if err := tx.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := newPass().pauseSetClaimed(ctx, "default", []int32{0}, true); err != nil {
+		t.Fatal(err)
+	}
+	// The controller dies here, in the middle of the drain.
+
+	later := newPass()
+	if stood, err := later.SourcesPaused(ctx); err != nil || !stood {
+		t.Fatalf("the claimed pause is standing: %v %v", stood, err)
+	}
+	busy, err := later.writingBackends(ctx, "default", []int32{0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(busy) != 1 {
+		t.Fatalf("a pass after a restart counted %v: the transaction from before the pause must still be waited for", busy)
+	}
+
+	// A claim whose instant was never recorded -- the controller died between
+	// raising the pause and writing when -- is not one to drain under.
+	mustExec(t, cat, `UPDATE pgshard.shard_status SET write_paused_at = NULL WHERE shard_set = 'default' AND shard_id = 0`)
+	if stood, err := newPass().SourcesPaused(ctx); err != nil || stood {
+		t.Fatalf("a claimed pause with no recorded instant was taken as standing: %v %v", stood, err)
+	}
+
+	// Raising the pause again under the standing claim forgets the old
+	// instant until the new one is confirmed -- a transaction may have begun
+	// while the old pause was gone -- and then records the later one.
+	again := newPass()
+	if err := again.pauseSetClaimed(ctx, "default", []int32{0}, true); err != nil {
+		t.Fatal(err)
+	}
+	instant := func() *time.Time {
+		t.Helper()
+		var at *time.Time
+		if err := cat.QueryRow(ctx, `SELECT write_paused_at FROM pgshard.shard_status WHERE shard_set = 'default' AND shard_id = 0`).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	first := instant()
+	if first == nil {
+		t.Fatal("no instant recorded for the raised pause")
+	}
+	if err := again.claimPause(ctx, "default", []int32{0}); err != nil {
+		t.Fatal(err)
+	}
+	if at := instant(); at != nil {
+		t.Fatalf("a re-raise kept the earlier instant %v until the new one is recorded", at)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := again.pauseSetClaimed(ctx, "default", []int32{0}, true); err != nil {
+		t.Fatal(err)
+	}
+	if at := instant(); at == nil || !at.After(*first) {
+		t.Fatalf("the re-raised pause recorded %v, want later than %v", at, *first)
+	}
+
+	// Lifting drops the instant with the claim.
+	lift := newPass()
+	if err := lift.pauseSetClaimed(ctx, "default", []int32{0}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := lift.pauseSetClaimed(ctx, "default", []int32{0}, false); err != nil {
+		t.Fatal(err)
+	}
+	var at *time.Time
+	if err := cat.QueryRow(ctx, `SELECT write_paused_at FROM pgshard.shard_status WHERE shard_set = 'default' AND shard_id = 0`).Scan(&at); err != nil || at != nil {
+		t.Fatalf("the instant outlived the claim: %v %v", at, err)
 	}
 }
