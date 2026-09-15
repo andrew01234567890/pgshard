@@ -435,7 +435,8 @@ func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, t
 	}
 	rows, err := db.Query(ctx, `UPDATE pgshard.migrations SET state = $2, per_shard = $3, error = $4, updated_at = now(),
 		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END
-		WHERE id = $1 AND `+leaderTermPredicate, m.ID, m.State, perShard, errText, termArg(term))
+		WHERE id = $1 AND `+leaderTermPredicate+`
+		  AND NOT (state = 'queued' AND $2 = 'running' AND `+MigrationHeldPredicate+`)`, m.ID, m.State, perShard, errText, termArg(term))
 	if err != nil {
 		return err
 	}
@@ -443,8 +444,35 @@ func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, t
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	// A start refused under a hold that ended before this look still reports
+	// held: the row is untouched either way, and the next pass starts it.
+	if rows.CommandTag().RowsAffected() == 0 && m.State == MigrationRunning {
+		var current, queued bool
+		if err := db.QueryRow(ctx, `SELECT ($2::bigint IS NULL OR $2 = (SELECT term FROM pgshard.leader_term)),
+			EXISTS (SELECT 1 FROM pgshard.migrations WHERE id = $1 AND state = 'queued')`, m.ID, termArg(term)).Scan(&current, &queued); err != nil {
+			return err
+		}
+		if current && queued {
+			return ErrMigrationHeld
+		}
+	}
 	return termHeld(term, rows.CommandTag().RowsAffected())
 }
+
+// MigrationHeldPredicate is true, for a pgshard.migrations row, while a
+// migration on its database may not start: a workflow holds the database's
+// DDL lock, or a reshard or upgrade is copying, and logical replication
+// carries no DDL -- a column added on the serving set while the targets'
+// subscriptions apply its rows breaks their apply, and the copy never
+// catches up (PGS-872). It is decided in the same statement that starts the
+// migration, so a pass that read no hold cannot start one after it is taken.
+const MigrationHeldPredicate = `(EXISTS (SELECT 1 FROM pgshard.workflow_locks l WHERE l.kind = 'ddl' AND l.key = pgshard.migrations.database)
+	OR EXISTS (SELECT 1 FROM pgshard.workflows w WHERE w.kind IN ('reshard', 'upgrade') AND w.state IN ('running', 'paused')
+		AND w.status->>'stage' IN ('copying', 'catch_up_done', 'awaiting_switch_writes', 'switching')))`
+
+// ErrMigrationHeld reports a queued migration that was not started because
+// it is held (see MigrationHeldPredicate). It stays queued.
+var ErrMigrationHeld = errors.New("catalog: the migration is held while a workflow copies or holds its database's DDL lock")
 
 // ErrNotLeaderTerm reports a write refused because the writer's leadership
 // has since passed to another controller. It is not a failure of the

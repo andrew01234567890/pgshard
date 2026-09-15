@@ -64,3 +64,28 @@ func TestPlanListsResolvedTables(t *testing.T) {
 		t.Fatal("another table must not be fenced")
 	}
 }
+
+// TestDDLRefusedWhileResharding (PGS-872): a reshard copies by logical
+// replication, which carries no DDL, so a schema change on the serving
+// shards during the copy breaks the new shards' apply. The applier holds
+// such a migration; the planner refuses it at once.
+func TestDDLRefusedWhileResharding(t *testing.T) {
+	snap := fixture(t)
+	p := New()
+	ddl := []string{"alter table orders add column extra int", "create index orders_note2 on orders (note)", "create role reporter", "grant select on items to app"}
+	for _, sql := range ddl {
+		pl, err := p.Plan(context.Background(), session(snap), sql)
+		if err != nil || pl.Kind != MigrationKind {
+			t.Fatalf("%q before a reshard: %v %v", sql, pl.Kind, err)
+		}
+	}
+	snap.Serving = map[snapshot.ShardKey]snapshot.Serving{{ShardSet: "g2", ShardID: 0}: {State: "provisioning"}}
+	for _, sql := range ddl {
+		pl, err := p.Plan(context.Background(), session(snap), sql)
+		checkRefusal(t, pl, err, "DDL is not available while a reshard is active")
+	}
+	snap.Serving[snapshot.ShardKey{ShardSet: "g2", ShardID: 0}] = snapshot.Serving{State: "serving"}
+	if pl, err := p.Plan(context.Background(), session(snap), ddl[0]); err != nil || pl.Kind != MigrationKind {
+		t.Fatalf("DDL after the reshard: %v %v", pl.Kind, err)
+	}
+}

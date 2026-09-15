@@ -82,8 +82,22 @@ func (s *PGMigrationStore) Pending(ctx context.Context) ([]catalog.DDLMigration,
 }
 
 // Save implements MigrationStore.
+//
+// A save that may start a migration takes the move gate first, as a reshard
+// or upgrade does to begin its copy. Its hold check then reads a snapshot
+// taken after any copy that began first has committed its stage; without the
+// gate a start whose snapshot predates that commit could lock the row before
+// the copier's look and begin unseen.
 func (s *PGMigrationStore) Save(ctx context.Context, m catalog.DDLMigration, term int64) error {
-	return catalog.SaveMigrationProgress(ctx, s.Pool, m, term)
+	if m.State != catalog.MigrationRunning {
+		return catalog.SaveMigrationProgress(ctx, s.Pool, m, term)
+	}
+	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		if err := lockMoveGate(ctx, tx); err != nil {
+			return err
+		}
+		return catalog.SaveMigrationProgress(ctx, tx, m, term)
+	})
 }
 
 // Shards implements MigrationStore.
@@ -104,11 +118,22 @@ func (s *PGMigrationStore) Databases(ctx context.Context) ([]string, error) {
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
+// ddlHoldStages are the stages of a reshard or upgrade during which no
+// migration starts: from the copy until the switch. They are spelled out
+// again in catalog.MigrationHeldPredicate, which cannot import them.
+var ddlHoldStages = []string{StageCopying, StageCatchUpDone, StageAwaitingSwitch, StageSwitching}
+
 // LockedDatabases implements MigrationStore. A reshard or upgrade cutover
 // takes these when it fences, precisely so that schema does not move under
-// a copy that is comparing the two sides.
+// a copy that is comparing the two sides; and every database is held by a
+// reshard or upgrade while it copies, since the copy's subscriptions apply
+// no DDL (PGS-872).
 func (s *PGMigrationStore) LockedDatabases(ctx context.Context) (map[string]string, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT key, workflow_id::text FROM pgshard.workflow_locks WHERE kind = 'ddl'`)
+	rows, err := s.Pool.Query(ctx, `SELECT key, workflow_id::text FROM pgshard.workflow_locks WHERE kind = 'ddl'
+		UNION ALL
+		SELECT d.name, w.id::text FROM pgshard.databases d, pgshard.workflows w
+		 WHERE w.kind = ANY($1) AND w.state = ANY($2) AND w.status->>'stage' = ANY($3)`,
+		copyKinds, []string{StateRunning, StatePaused}, ddlHoldStages)
 	if err != nil {
 		return nil, err
 	}
@@ -415,7 +440,10 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 			m.PerShard[catalogKey] = catalog.ShardMigration{State: catalog.ShardPending}
 		}
 		m.State, m.Meta.ShardSet = catalog.MigrationRunning, serving
-		if err := a.Store.Save(ctx, m, a.term()); err != nil {
+		if err := a.Store.Save(ctx, m, a.term()); errors.Is(err, catalog.ErrMigrationHeld) {
+			logger.Info("holding a migration while a reshard or upgrade copies")
+			return nil
+		} else if err != nil {
 			return err
 		}
 		logger.Info("migration started", "shards", len(targets), "shard_set", serving)

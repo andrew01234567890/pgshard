@@ -50,7 +50,7 @@ type RoleStore interface {
 	// SaveGroupStatus replaces the status rows of one group.
 	SaveGroupStatus(ctx context.Context, group string, generation int64, rows []RoleStatus) error
 	// RoleMigrationsPending reports whether a role or grant migration is
-	// queued or running, in which case the verifier waits.
+	// running or queued and not held, in which case the verifier waits.
 	RoleMigrationsPending(ctx context.Context) (bool, error)
 	// LiveShardSets names every shard set whose groups are running, not
 	// only the serving one: a reshard or upgrade target has the source's
@@ -152,9 +152,13 @@ func (s *PGRoleStore) SaveGroupStatus(ctx context.Context, group string, generat
 	return tx.Commit(ctx)
 }
 
-// RoleMigrationsPending implements RoleStore.
+// RoleMigrationsPending implements RoleStore. A held migration does not
+// count: it has touched no group, so the desired roles still describe every
+// group, and a reshard's targets need those roles before their schema copy
+// restores -- while that copy is what holds the migration (PGS-872).
 func (s *PGRoleStore) RoleMigrationsPending(ctx context.Context) (bool, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.migrations WHERE state IN ('queued', 'running')
+	rows, err := s.Pool.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.migrations
+		WHERE (state = 'running' OR (state = 'queued' AND NOT `+catalog.MigrationHeldPredicate+`))
 		AND kind IN ('CREATE ROLE', 'ALTER ROLE', 'DROP ROLE', 'GRANT ROLE', 'REVOKE ROLE', 'GRANT', 'REVOKE'))`)
 	if err != nil {
 		return false, err
