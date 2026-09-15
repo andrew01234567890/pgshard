@@ -311,6 +311,13 @@ func serialNumber() (*big.Int, error) {
 	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 }
 
+// Serves reports whether a server's identity is the given role: what a caller
+// that verifies a role-wide name rather than a per-member address checks, so
+// a certificate issued to another role cannot answer in its place.
+func Serves(role string) func(Identity) bool {
+	return func(id Identity) bool { return id.Role == role }
+}
+
 // callers is who may call each listener. It is a table rather than
 // configuration because it is a property of the system, not of a
 // deployment: the router is the only thing that calls a pooler, and a

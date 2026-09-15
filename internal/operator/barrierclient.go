@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/twopc"
@@ -121,7 +122,7 @@ func (c *GRPCAgentClient) SetWriteFence(ctx context.Context, addr string, epoch 
 
 // BarrierClient asks a cluster's controller for a certified barrier.
 type BarrierClient interface {
-	CreateBarrier(ctx context.Context, addr, name string) error
+	CreateBarrier(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, addr, name string) error
 }
 
 // GRPCBarrierClient is the production BarrierClient over pgshard.v1.Controller.
@@ -129,6 +130,10 @@ type GRPCBarrierClient struct {
 	// Creds secures the controller connection; nil dials plaintext, which
 	// only a controller run with --insecure-dev accepts.
 	Creds credentials.TransportCredentials
+	// Issued supplies a cluster's own credentials when the operator issues
+	// its certificates; they take precedence over Creds, which cannot chain
+	// to every issuing cluster's CA.
+	Issued *IssuedCredentials
 }
 
 // NewGRPCBarrierClient builds the barrier client from the operator's
@@ -153,8 +158,17 @@ func NewGRPCBarrierClient(certFile, keyFile, caFile string) (GRPCBarrierClient, 
 const barrierRPCTimeout = 5 * time.Minute
 
 // CreateBarrier implements BarrierClient.
-func (c GRPCBarrierClient) CreateBarrier(ctx context.Context, addr, name string) error {
+func (c GRPCBarrierClient) CreateBarrier(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, addr, name string) error {
 	creds := c.Creds
+	if cluster != nil {
+		_, issued, err := c.Issued.For(ctx, cluster)
+		if err != nil {
+			return err
+		}
+		if issued != nil {
+			creds = issued
+		}
+	}
 	if creds == nil {
 		creds = insecure.NewCredentials()
 	}

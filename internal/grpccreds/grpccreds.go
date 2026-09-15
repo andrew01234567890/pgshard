@@ -132,6 +132,23 @@ func Dialer(certFile, keyFile, caFile, serverName string, insecureDev bool, opts
 	return &reloadingDialer{m: m, serverName: serverName, verify: verifyIdentity(apply(opts).allow)}, nil
 }
 
+// DialerPEM returns dialler credentials from certificate, key and CA held in
+// memory rather than files: what a process that reads another workload's
+// Secret through the API dials with. It is fail-closed like Dialer. The
+// material is fixed; a caller whose Secret changes builds new credentials.
+func DialerPEM(certPEM, keyPEM, caPEM []byte, serverName string, opts ...Option) (credentials.TransportCredentials, error) {
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("no CA certificates found")
+	}
+	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, ServerName: serverName,
+		MinVersion: tls.VersionTLS13, VerifyPeerCertificate: verifyIdentity(apply(opts).allow)}), nil
+}
+
 // material is one set of TLS files, read again at every handshake.
 //
 // Certificates are renewed into the same files: the operator reissues a

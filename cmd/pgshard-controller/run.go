@@ -53,7 +53,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
 	keyFile := fs.String("tls-key", "", "server private key")
 	caFile := fs.String("tls-ca", "", "CA bundle that client certificates must chain to")
-	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
+	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener, and servers this process dials that are not the role it means to reach; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
 	interval := fs.Duration("reconcile-interval", 30*time.Second, "longest time between reconcile passes without a catalog notification")
 	retry := fs.Duration("election-retry", 5*time.Second, "time between leadership attempts")
@@ -80,6 +80,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	placementBuffer := fs.Duration("placement-buffer-timeout", controller.DefaultBufferTimeout, "longest table-scoped write pause of one placement swap attempt")
 	placementDropOld := fs.Duration("placement-drop-old-after", controller.DefaultDropOldAfter, "grace before a placement workflow drops the previous tables")
 	agentPort := fs.Int("agent-port", controller.DefaultAgentPort, "gRPC port of member agents (schema materialization)")
+	agentServerName := fs.String("agent-tls-server-name", "", "name an agent's certificate must carry, instead of the member address dialled; issued certificates name the cluster, not each member")
 	agentTokenFile := fs.String("agent-token-file", "", "file holding the cluster's agent control-plane token; agent RPCs are refused without it")
 	pgBin := fs.String("pg-bin", os.Getenv("PGSHARD_PG_BIN"), "directory with pg_dump and psql; when set, schemas are materialized from the controller host instead of through agents (PGSHARD_PG_BIN)")
 	var shardDSNs shardDSNFlag
@@ -226,7 +227,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		// only for a member that says it requires them.
 		var agentCreds credentials.TransportCredentials
 		if *certFile != "" || *keyFile != "" || *caFile != "" {
-			agentCreds, err = grpccreds.Dialer(*certFile, *keyFile, *caFile, "", false)
+			agentCreds, err = agentDialCredentials(*certFile, *keyFile, *caFile, *agentServerName, *authorizeCallers)
 			if err != nil {
 				fmt.Fprintf(stderr, "pgshard-controller run: agent credentials: %v\n", err)
 				return cli.ExitUsage
@@ -378,6 +379,18 @@ func withPasswordFile(dsn, path string) (string, error) {
 // nothing at all, so a cluster whose certificates were supplied rather
 // than issued keeps working: those certificates carry no pgshard identity,
 // and a fail-closed check would refuse every caller.
+// agentDialCredentials are what the controller dials an agent with. Agents are
+// dialled at their member host, which issued certificates do not name, so
+// serverName is the name they do; with identities, the server must be an
+// agent, since a pooler's certificate carries the same name (PGS-860).
+func agentDialCredentials(certFile, keyFile, caFile, serverName string, authorizeCallers bool) (credentials.TransportCredentials, error) {
+	var opts []grpccreds.Option
+	if authorizeCallers {
+		opts = append(opts, grpccreds.Authorize(pki.Serves(pki.RoleAgent)))
+	}
+	return grpccreds.Dialer(certFile, keyFile, caFile, serverName, false, opts...)
+}
+
 func authorize(on bool, role string) []grpccreds.Option {
 	if !on {
 		return nil

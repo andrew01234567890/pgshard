@@ -356,3 +356,124 @@ func TestTheConsumerCertificateIsClientOnly(t *testing.T) {
 		t.Error("the consumer certificate cannot be used as a client, which is all it is for")
 	}
 }
+
+// TestEveryCallerVerifiesANameTheIssuedCertificateCarries (PGS-860): a
+// router dials a shard's pooler at the member's headless-Service host, peer
+// routers by IP, and the controller dials an agent at the member host too.
+// None of those is a name an issued certificate carries, so every such
+// handshake failed hostname verification and an issuing cluster could not
+// route a statement. The callers verify a role-wide name instead; this pins
+// that the name the operator hands each caller is one the server's issued
+// certificate is valid for -- and that the member address is not, which is
+// why the name is needed.
+func TestEveryCallerVerifiesANameTheIssuedCertificateCarries(t *testing.T) {
+	c := issuingCluster("names")
+	r := pkiReconciler(t, time.Now(), c)
+	if err := r.reconcilePKI(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	certOf := func(role string) *x509.Certificate {
+		t.Helper()
+		sec := secretOf(t, r, c.Namespace, RoleTLSSecretName(c.Name, role))
+		block, _ := pem.Decode(sec.Data["tls.crt"])
+		if block == nil {
+			t.Fatalf("%s: no certificate", role)
+		}
+		crt, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return crt
+	}
+	flag := func(args []string, name string) string {
+		t.Helper()
+		for _, a := range args {
+			if v, ok := strings.CutPrefix(a, "--"+name+"="); ok {
+				return v
+			}
+		}
+		t.Fatalf("no --%s in %v", name, args)
+		return ""
+	}
+	routerArgs := Renderer{}.RouterDeployment(c).Spec.Template.Spec.Containers[0].Args
+	controllerArgs := Renderer{}.ControllerDeployment(c).Spec.Template.Spec.Containers[0].Args
+	shard := Groups(c)[1]
+	member := shard.MemberHost(shard.MemberNames()[0], c.Namespace)
+	for _, check := range []struct {
+		caller, flag, role, dialled string
+		args                        []string
+	}{
+		{"router -> pooler", "pooler-tls-server-name", pki.RolePooler, member, routerArgs},
+		{"router -> peer router", "peer-tls-server-name", pki.RoleRouter, "10.0.0.7", routerArgs},
+		{"controller -> agent", "agent-tls-server-name", pki.RoleAgent, member, controllerArgs},
+	} {
+		crt := certOf(check.role)
+		name := flag(check.args, check.flag)
+		if err := crt.VerifyHostname(name); err != nil {
+			t.Errorf("%s verifies %q, which the %s certificate does not name: %v", check.caller, name, check.role, err)
+		}
+		if err := crt.VerifyHostname(check.dialled); err == nil {
+			t.Errorf("%s: the %s certificate names the dialled address %s, so the test no longer shows why the name is needed", check.caller, check.role, check.dialled)
+		}
+	}
+	// A member's certificate must not be valid for another role's Service:
+	// those callers verify the Service host, and only the controller's and
+	// the router's own certificates may answer there.
+	for _, role := range []string{pki.RolePooler, pki.RoleAgent} {
+		for _, host := range []string{ControllerName(c.Name) + "." + c.Namespace + ".svc", RouterName(c.Name) + "." + c.Namespace + ".svc"} {
+			if err := certOf(role).VerifyHostname(host); err == nil {
+				t.Errorf("the %s certificate is valid to serve %s", role, host)
+			}
+		}
+	}
+}
+
+// TestAChangeToWhatARoleServesReissuesItsCertificate (PGS-860): certificates
+// were reissued only near expiry or on a CA change, so removing a name a role
+// may serve waited up to a certificate's life -- member certificates carrying
+// the namespace wildcards stayed valid for the controller's and router's
+// hosts. A stored certificate that names anything else is reissued, and one
+// that names exactly the role's names is left alone, or every pass would
+// churn the Secrets and roll the members.
+func TestAChangeToWhatARoleServesReissuesItsCertificate(t *testing.T) {
+	ctx := context.Background()
+	c := issuingCluster("names-change")
+	r := pkiReconciler(t, time.Now(), c)
+	if err := r.reconcilePKI(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	name := RoleTLSSecretName(c.Name, pki.RolePooler)
+	settled := secretOf(t, r, c.Namespace, name)
+	if err := r.reconcilePKI(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if again := secretOf(t, r, c.Namespace, name); string(again.Data["tls.crt"]) != string(settled.Data["tls.crt"]) {
+		t.Fatal("a certificate naming exactly its role's names was reissued")
+	}
+
+	caSec := secretOf(t, r, c.Namespace, CASecretName(c.Name))
+	ca, err := pki.LoadCA(pki.Material{CertPEM: caSec.Data["ca.crt"], KeyPEM: caSec.Data["ca.key"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := ca.Issue(pki.Request{Identity: pki.Identity{Namespace: c.Namespace, Cluster: c.Name, Role: pki.RolePooler},
+		DNSNames: append(roleDNSNames(c, pki.RolePooler), "*."+c.Namespace+".svc", "*."+c.Namespace+".pod"), Server: true, Client: true}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled.Data["tls.crt"], settled.Data["tls.key"] = old.CertPEM, old.KeyPEM
+	if err := r.Update(ctx, &settled); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcilePKI(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(secretOf(t, r, c.Namespace, name).Data["tls.crt"])
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := crt.VerifyHostname(ControllerName(c.Name) + "." + c.Namespace + ".svc"); err == nil {
+		t.Fatalf("a certificate issued with names the role no longer serves was kept: %v", crt.DNSNames)
+	}
+}

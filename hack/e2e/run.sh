@@ -28,7 +28,8 @@ case "$suite" in
 # milliseconds, and they had never executed anywhere. Naming the package
 # rather than filtering by test name keeps that from recurring.
 smoke)         args=(./test/e2e/); needs="" ;;
-operator)      args=(-timeout 70m ./test/e2e/operator/...); needs="base controller" ;;
+operator)      args=(-timeout 70m -skip 'TestAnIssuedTLSCluster' ./test/e2e/operator/...); needs="base controller" ;;
+tls)           args=(-timeout 45m -run 'TestAnIssuedTLSCluster' ./test/e2e/operator/...); needs="base controller" ;;
 backup)        args=(-timeout 70m ./test/e2e/backup/...); needs="base controller stores" ;;
 reshard)       args=(-timeout 50m -skip 'TestReshardSplitUnderLoad|TestReshardMergeUnderLoad' ./test/e2e/reshard/...); needs="base controller" ;;
 reshard-split) args=(-timeout 110m -run TestReshardSplitUnderLoad ./test/e2e/reshard/...); needs="base controller" ;;
@@ -36,7 +37,7 @@ reshard-merge) args=(-timeout 110m -run TestReshardMergeUnderLoad ./test/e2e/res
 upgrade)       args=(-timeout 110m ./test/e2e/upgrade/...); needs="base controller target-major" ;;
 *)
 	echo "usage: hack/e2e/run.sh <suite> [pg-major]" >&2
-	echo "suites: smoke operator backup reshard reshard-split reshard-merge upgrade" >&2
+	echo "suites: smoke operator tls backup reshard reshard-split reshard-merge upgrade" >&2
 	exit 2
 	;;
 esac

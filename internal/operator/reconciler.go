@@ -57,6 +57,9 @@ type ClusterReconciler struct {
 	// pods this reconciler observes and read by the agent client. Nil means
 	// every agent is plaintext.
 	AgentTLS *AgentTLSModes
+	// OperatorCreds are the per-cluster credentials the agent client dials
+	// an issuing cluster's agents with; recorded beside each member's mode.
+	OperatorCreds *IssuedCredentials
 	// FailoverDelay overrides DefaultFailoverDelay; PollInterval the
 	// quiesce poll; Now the clock. Zero values mean the defaults.
 	FailoverDelay  time.Duration
@@ -1460,6 +1463,13 @@ func (r *ClusterReconciler) observePod(ctx context.Context, c *pgshardv1alpha1.P
 	// its agent was started requiring, and during a rollout that differs
 	// from what the spec now asks for.
 	r.AgentTLS.Set(agentAddr(m.ip), pod.Annotations[AnnotationAgentMTLS] == "true")
+	if r.AgentTLS != nil && r.OperatorCreds != nil && m.ip != "" {
+		agentCreds, _, err := r.OperatorCreds.For(ctx, c)
+		if err != nil {
+			return nil, err
+		}
+		r.AgentTLS.SetCredentials(agentAddr(m.ip), agentCreds)
+	}
 	return m, nil
 }
 

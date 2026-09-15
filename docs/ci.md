@@ -10,7 +10,7 @@ runs the checker against the fixtures under `hack/testdata`.
 | --- | --- |
 | `ci.yml` | gofmt, vet, golangci-lint, `go test -race`, build; `buf lint`, `buf breaking` and a drift check that fails when `make proto` changes `internal/gen`; govulncheck; gitleaks; actionlint and the policy checker; PR title check |
 | `images.yml` | builds the PostgreSQL 18 and 19 images with `docker buildx bake` and pushes them to GHCR on `main` |
-| `e2e-kind.yml` | kind-based smoke, operator, backup and reshard suites for both majors, plus upgrade, reshard-split and reshard-merge on pg18 |
+| `e2e-kind.yml` | kind-based smoke, operator, backup and reshard suites for both majors, plus upgrade, reshard-split, reshard-merge and tls (operator-issued internal TLS) on pg18 |
 | `perf.yml` | benchstat comparison against the base branch; only benchmarks tagged `Gate` can fail a PR (see `hack/perf/gate.sh`) |
 | `repeat.yml` | manual: repeats one Go package or the integration suite up to 50 times, against an optional `ref`, and reports the pass rate |
 | `repeat-e2e.yml` | manual: repeats one kind e2e suite up to 12 times, against an optional `ref`, and reports the pass rate |

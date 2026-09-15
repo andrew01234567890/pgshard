@@ -2,7 +2,10 @@ package operator
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -117,7 +120,7 @@ func (r *ClusterReconciler) ensureRoleCert(ctx context.Context, c *pgshardv1alph
 	key := client.ObjectKey{Namespace: c.Namespace, Name: RoleTLSSecretName(c.Name, role)}
 	var sec corev1.Secret
 	err := r.Get(ctx, key, &sec)
-	if err == nil && currentFor(sec, ca, r.now()) {
+	if err == nil && currentFor(sec, ca, r.now()) && namesMatch(sec, req.DNSNames) {
 		return nil
 	}
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -154,6 +157,31 @@ func currentFor(sec corev1.Secret, ca *pki.CA, now time.Time) bool {
 	return !pki.NeedsRenewal(sec.Data["tls.crt"], now)
 }
 
+// namesMatch reports whether a stored certificate names exactly the names the
+// role is issued now. Without it a change to what a role may serve waited for
+// the certificate's renewal: member certificates issued with the namespace
+// wildcards stayed valid to serve the controller's and router's hosts for
+// the rest of their life (PGS-860).
+func namesMatch(sec corev1.Secret, want []string) bool {
+	block, _ := pem.Decode(sec.Data["tls.crt"])
+	if block == nil {
+		return false
+	}
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	return slices.Equal(slices.Sorted(slices.Values(crt.DNSNames)), slices.Sorted(slices.Values(want)))
+}
+
+// IssuedMemberServerName is the name callers verify a member's pooler or
+// agent certificate against. Members are dialled at their headless-Service
+// host (or IP), which no issued certificate names; every pooler and agent
+// certificate names the cluster's own Service host.
+func IssuedMemberServerName(c *pgshardv1alpha1.PgShardCluster) string {
+	return c.Name + "." + c.Namespace + ".svc"
+}
+
 // roleDNSNames are the names a role's listener is reached by, and none for
 // a role that only dials. A client certificate valid to serve some name is
 // a certificate that can impersonate that name.
@@ -168,9 +196,13 @@ func roleDNSNames(c *pgshardv1alpha1.PgShardCluster, role string) []string {
 	case pki.RoleController:
 		return svc(ControllerName(c.Name))
 	case pki.RolePooler, pki.RoleAgent:
-		// Reached pod by pod rather than through a Service: a caller that
-		// dials a member by name must find that name on the certificate.
-		return append(svc(c.Name), "*."+c.Namespace+".svc", "*."+c.Namespace+".pod")
+		// Reached pod by pod, at hosts and IPs no certificate can name
+		// ahead of time, so every caller verifies IssuedMemberServerName --
+		// the cluster's own name -- and the server's role instead. The
+		// namespace-wide wildcards these once carried made a pooler or
+		// agent certificate valid to serve the controller's and the
+		// router's Service hosts too (PGS-860).
+		return svc(c.Name)
 	default:
 		return nil
 	}

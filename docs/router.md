@@ -973,6 +973,15 @@ pgshard-router serve --listen 0.0.0.0:5432 --tls-cert router.crt --tls-key route
   --pooler-tls-cert router-client.crt --pooler-tls-key router-client.key --pooler-tls-ca ca.crt
 ```
 
+The router dials each shard's pooler at its member's headless-Service host
+and peer routers by IP. `--pooler-tls-server-name` and `--peer-tls-server-name`
+make it verify a name the server's certificate carries instead; with
+`--tls-authorize-callers` it also checks that the server is a pooler (or a
+router, or the controller). The operator passes both for a cluster whose
+certificates it issues -- `<cluster>.<namespace>.svc` and the router Service
+host -- because issued certificates name the cluster and its Services, not
+each member.
+
 `--tls-cert` **requires** TLS: once a certificate is configured, a client that
 never sends `SSLRequest` is refused with `28000` rather than served in the
 clear, so a misconfigured or downgraded client cannot send its SCRAM exchange

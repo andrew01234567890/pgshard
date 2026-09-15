@@ -103,7 +103,7 @@ func TestGRPCBarrierClientDialsControllerWithMTLS(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := secure.CreateBarrier(ctx, lis.Addr().String(), "b1"); err != nil {
+	if err := secure.CreateBarrier(ctx, nil, lis.Addr().String(), "b1"); err != nil {
 		t.Fatalf("mTLS CreateBarrier: %v", err)
 	}
 	if strings.Join(ctl.names, ",") != "b1" {
@@ -111,7 +111,7 @@ func TestGRPCBarrierClientDialsControllerWithMTLS(t *testing.T) {
 	}
 	shortCtx, cancelShort := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelShort()
-	if err := plain.CreateBarrier(shortCtx, lis.Addr().String(), "b2"); err == nil {
+	if err := plain.CreateBarrier(shortCtx, nil, lis.Addr().String(), "b2"); err == nil {
 		t.Fatal("plaintext client reached an mTLS controller")
 	}
 	if len(ctl.names) != 1 {

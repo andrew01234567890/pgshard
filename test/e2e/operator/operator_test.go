@@ -43,6 +43,11 @@ func env(key, def string) string {
 }
 
 func clusterManifest(major string, image string) string {
+	return clusterManifestTLS(major, image, "    insecure: true\n")
+}
+
+// clusterManifestTLS is clusterManifest with the spec.internalTLS block given.
+func clusterManifestTLS(major, image, internalTLS string) string {
 	img := ""
 	if image != "" {
 		img = "    image: " + image + "\n"
@@ -60,8 +65,7 @@ metadata:
   namespace: %[1]s
 spec:
   internalTLS:
-    insecure: true
-  postgresql:
+%[5]s  postgresql:
     major: %[3]s
 %[4]s  catalog:
     replicas: 3
@@ -75,7 +79,7 @@ spec:
     requests:
       cpu: 50m
       memory: 128Mi
-`, testNamespace, clusterName, major, img)
+`, testNamespace, clusterName, major, img, internalTLS)
 }
 
 func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, image string) {
