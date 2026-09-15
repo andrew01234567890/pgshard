@@ -442,8 +442,16 @@ var quotedKeywords = map[string]bool{
 // startupSearchPath extracts search_path from a startup "options" parameter
 // (-c search_path=a,b or --search_path=a,b); other options are left alone.
 func startupSearchPath(options string) []string {
+	if value, ok := startupOption(options, "search_path"); ok {
+		return splitSearchPathValue(value)
+	}
+	return nil
+}
+
+// startupOption is the last value the startup options string gives setting
+// name, in its -c name=value, -cname=value or --name=value forms.
+func startupOption(options, name string) (value string, found bool) {
 	fields := strings.Fields(options)
-	var path []string
 	for i := 0; i < len(fields); i++ {
 		f := fields[i]
 		switch {
@@ -457,13 +465,13 @@ func startupSearchPath(options string) []string {
 		default:
 			continue
 		}
-		name, value, ok := strings.Cut(f, "=")
-		if !ok || !strings.EqualFold(strings.TrimSpace(name), "search_path") {
+		key, v, ok := strings.Cut(f, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), name) {
 			continue
 		}
-		path = splitSearchPathValue(value)
+		value, found = v, true
 	}
-	return path
+	return value, found
 }
 
 // splitSearchPathValue splits one search_path VALUE into its elements, the
@@ -649,6 +657,9 @@ func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, e
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSessionAt(e.stmtSnap), sql)
 	if err == nil && pl.Kind == plan.MigrationKind && e.catalogSession() {
 		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
+	}
+	if err == nil && pl.HomeDDL && !e.catalogSession() {
+		err = e.checkHomeDDL(ctx)
 	}
 	if err != nil {
 		var perr *pgwire.Error

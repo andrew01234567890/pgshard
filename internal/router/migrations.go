@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
@@ -21,12 +24,23 @@ import (
 // migration is queued.
 const DDLAsyncGUC = "pgshard.ddl_async"
 
+// DDLDedupGUC is the session setting that, turned off, makes a statement
+// always queue a new migration rather than attach to an identical one.
+const DDLDedupGUC = "pgshard.ddl_dedup"
+
 // MigrationQueue hands DDL to the controller's applier and reports how it
 // ended.
 type MigrationQueue interface {
-	Enqueue(ctx context.Context, m catalog.DDLMigration) (id string, err error)
-	// Wait blocks until the migration is complete or failed.
-	Wait(ctx context.Context, id string) (catalog.DDLMigration, error)
+	// Enqueue queues m, or attaches to an identical migration that can
+	// stand for it when m carries a dedup key.
+	Enqueue(ctx context.Context, m catalog.DDLMigration) (catalog.EnqueueResult, error)
+	// Wait blocks until the migration is complete or failed. waiting, when
+	// not nil, is told what the migration waits for whenever that changes.
+	Wait(ctx context.Context, id string, waiting func([]catalog.Blocker)) (catalog.DDLMigration, error)
+	// HomeDDLBlockers lists what DDL run directly on database's home shard
+	// would overlap; queued is false for a catalog without the operation
+	// queue, where the caller keeps its own check.
+	HomeDDLBlockers(ctx context.Context, database string) (blockers []catalog.Blocker, queued bool, err error)
 }
 
 // PGMigrationQueue queues migrations in pgshard.migrations of the catalog
@@ -35,20 +49,50 @@ type PGMigrationQueue struct {
 	Pool *pgxpool.Pool
 	// Poll is the wait between state reads; default 200ms.
 	Poll time.Duration
-	// MaxWait bounds how long Wait tolerates a migration making no
-	// observable progress, so a deployment without a running applier does
-	// not block the client forever; any state change resets it. Default
-	// DefaultMigrationMaxWait.
+	// MaxWait bounds how long Wait tolerates no sign of a controller: no
+	// heartbeat for that long on a catalog with the operation queue, or no
+	// observable progress on one without. Default DefaultMigrationMaxWait.
 	MaxWait time.Duration
-	// load overrides the catalog read in tests.
-	load func(ctx context.Context, id string) (catalog.DDLMigration, error)
+	// RetryWindow is how long after an identical migration completed a
+	// statement sent again attaches to it; default catalog.DefaultRetryWindow.
+	RetryWindow time.Duration
+	// CatalogOutage bounds how long Wait keeps reading through catalog
+	// errors; default DefaultCatalogOutage.
+	CatalogOutage time.Duration
+
+	// Tests override the catalog reads.
+	load     func(ctx context.Context, id string) (catalog.DDLMigration, error)
+	blockers func(ctx context.Context, id string) ([]catalog.Blocker, error)
+	beat     func(ctx context.Context) (age time.Duration, found bool, err error)
+	queue    func(ctx context.Context) (bool, error)
+
+	mu           sync.Mutex
+	queuePresent bool
+	queueChecked time.Time
 }
 
-// DefaultMigrationMaxWait is how long Wait tolerates a migration whose
-// state does not change before giving up: a flat overall deadline would
-// abort a legitimately-progressing rewrite or CREATE INDEX CONCURRENTLY
-// that simply takes longer.
+// DefaultMigrationMaxWait is how long Wait tolerates no sign of a
+// controller before giving up: a flat overall deadline would abort a
+// migration that simply waits its turn behind a long reshard.
 const DefaultMigrationMaxWait = 10 * time.Minute
+
+// DefaultCatalogOutage is how long a waiting statement reads through
+// catalog errors -- a primary switchover, a catalog upgrade's cutover --
+// before it gives up.
+const DefaultCatalogOutage = 5 * time.Minute
+
+// blockersEvery is how often Wait asks what a queued migration waits for.
+const blockersEvery = 2 * time.Second
+
+// errNoApplier reports a migration no controller has been seen driving.
+type errNoApplier struct {
+	id, state string
+	quiet     time.Duration
+}
+
+func (e errNoApplier) Error() string {
+	return fmt.Sprintf("no pgshard controller has been seen applying migrations for %s; migration %s stays %s", e.quiet.Round(time.Second), e.id, e.state)
+}
 
 // migrationProgress fingerprints the durable state of m: Wait resets its
 // inactivity deadline whenever this changes.
@@ -67,13 +111,58 @@ func migrationProgress(m catalog.DDLMigration) string {
 	return b.String()
 }
 
+// queued reports whether the catalog has the operation queue; once it has,
+// it always will.
+func (q *PGMigrationQueue) queued(ctx context.Context) (bool, error) {
+	if q.queue != nil {
+		return q.queue(ctx)
+	}
+	if q.Pool == nil {
+		return false, nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.queuePresent || (!q.queueChecked.IsZero() && time.Since(q.queueChecked) < 30*time.Second) {
+		return q.queuePresent, nil
+	}
+	present, err := catalog.QueueSchema(ctx, q.Pool)
+	if err != nil {
+		return false, err
+	}
+	q.queuePresent, q.queueChecked = present, time.Now()
+	return present, nil
+}
+
 // Enqueue implements MigrationQueue.
-func (q *PGMigrationQueue) Enqueue(ctx context.Context, m catalog.DDLMigration) (string, error) {
-	return catalog.EnqueueMigration(ctx, q.Pool, m)
+func (q *PGMigrationQueue) Enqueue(ctx context.Context, m catalog.DDLMigration) (catalog.EnqueueResult, error) {
+	queued, err := q.queued(ctx)
+	if err != nil {
+		return catalog.EnqueueResult{}, err
+	}
+	if !queued {
+		m.DedupKey = ""
+		id, err := catalog.EnqueueMigration(ctx, q.Pool, m)
+		return catalog.EnqueueResult{ID: id, State: catalog.MigrationQueued}, err
+	}
+	window := q.RetryWindow
+	if window <= 0 {
+		window = catalog.DefaultRetryWindow
+	}
+	return catalog.EnqueueMigrationOnce(ctx, q.Pool, m, window)
+}
+
+// HomeDDLBlockers implements MigrationQueue.
+func (q *PGMigrationQueue) HomeDDLBlockers(ctx context.Context, database string) ([]catalog.Blocker, bool, error) {
+	queued, err := q.queued(ctx)
+	if err != nil || !queued {
+		return nil, false, err
+	}
+	blockers, err := catalog.HomeDDLBlockers(ctx, q.Pool, database)
+	return blockers, true, err
 }
 
 // Wait implements MigrationQueue.
-func (q *PGMigrationQueue) Wait(ctx context.Context, id string) (catalog.DDLMigration, error) {
+func (q *PGMigrationQueue) Wait(ctx context.Context, id string, waiting func([]catalog.Blocker)) (catalog.DDLMigration, error) {
 	poll := q.Poll
 	if poll <= 0 {
 		poll = 200 * time.Millisecond
@@ -82,29 +171,87 @@ func (q *PGMigrationQueue) Wait(ctx context.Context, id string) (catalog.DDLMigr
 	if maxWait <= 0 {
 		maxWait = DefaultMigrationMaxWait
 	}
-	deadline := time.Now().Add(maxWait)
-	last := ""
-	t := time.NewTicker(poll)
-	defer t.Stop()
-	load := q.load
+	outage := q.CatalogOutage
+	if outage <= 0 {
+		outage = DefaultCatalogOutage
+	}
+	load, blockers, beat := q.load, q.blockers, q.beat
 	if load == nil {
 		load = func(ctx context.Context, id string) (catalog.DDLMigration, error) {
 			return catalog.LoadMigration(ctx, q.Pool, id)
 		}
 	}
+	if blockers == nil {
+		blockers = func(ctx context.Context, id string) ([]catalog.Blocker, error) {
+			return catalog.OperationBlockers(ctx, q.Pool, catalog.OperationDDL, id)
+		}
+	}
+	if beat == nil {
+		beat = func(ctx context.Context) (time.Duration, bool, error) {
+			return catalog.ControllerHeartbeatAge(ctx, q.Pool, catalog.HeartbeatApplier)
+		}
+	}
+	deadline := time.Now().Add(maxWait)
+	last, lastBlockers := "", ""
+	var failingSince, blockersAt time.Time
+	var m catalog.DDLMigration
+	t := time.NewTicker(poll)
+	defer t.Stop()
 	for {
-		m, err := load(ctx, id)
-		if err != nil {
-			return m, err
-		}
-		if m.State == catalog.MigrationComplete || m.State == catalog.MigrationFailed {
-			return m, nil
-		}
-		if cur := migrationProgress(m); cur != last {
-			last = cur
+		err := func() error {
+			var err error
+			if m, err = load(ctx, id); err != nil {
+				return err
+			}
+			if m.State == catalog.MigrationComplete || m.State == catalog.MigrationFailed {
+				return nil
+			}
+			if cur := migrationProgress(m); cur != last {
+				last, deadline = cur, time.Now().Add(maxWait)
+			}
+			queued, err := q.queued(ctx)
+			if err != nil || !queued {
+				return err
+			}
+			age, found, err := beat(ctx)
+			if err != nil {
+				return err
+			}
+			if found && age < maxWait {
+				deadline = time.Now().Add(maxWait - age)
+			}
+			if waiting != nil && m.State == catalog.MigrationQueued && time.Since(blockersAt) >= blockersEvery {
+				blockersAt = time.Now()
+				bs, err := blockers(ctx, id)
+				if err != nil {
+					return err
+				}
+				if key := fmt.Sprint(bs); key != lastBlockers {
+					lastBlockers = key
+					waiting(bs)
+				}
+			}
+			return nil
+		}()
+		switch {
+		case err != nil && ctx.Err() == nil:
+			if failingSince.IsZero() {
+				failingSince = time.Now()
+			}
+			if time.Since(failingSince) > outage {
+				return m, err
+			}
 			deadline = time.Now().Add(maxWait)
-		} else if time.Now().After(deadline) {
-			return m, fmt.Errorf("migration %s is still %s with no progress observed for %s; it continues in the background: is a pgshard controller running the DDL applier?", id, m.State, maxWait)
+		case err != nil:
+			return m, ctx.Err()
+		default:
+			failingSince = time.Time{}
+			if m.State == catalog.MigrationComplete || m.State == catalog.MigrationFailed {
+				return m, nil
+			}
+			if time.Now().After(deadline) {
+				return m, errNoApplier{id: id, state: m.State, quiet: maxWait}
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -255,23 +402,60 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 			Roles:         m.Roles,
 			View:          m.View,
 			Database:      m.Database, DatabaseOp: m.DatabaseOp, Steps: migrationSteps(m.Steps), Rewrite: m.Rewrite}}
-	id, err := e.r.cfg.Migrations.Enqueue(ctx, req)
+	if !e.ddlDedupOff() {
+		req.DedupKey = catalog.MigrationDedupKey(req, normalizedStatement(m.Statement))
+	}
+	queued, err := e.r.cfg.Migrations.Enqueue(ctx, req)
 	if err != nil {
 		return pgwire.Errorf(codeConnectionFailure, "queueing the migration in the catalog failed: %v", err)
 	}
-	if e.ddlAsync() {
-		if err := w.Notice(&pgproto3.NoticeResponse{Severity: "NOTICE", SeverityUnlocalized: "NOTICE", Code: "00000",
-			Message: fmt.Sprintf("migration %s queued; the statement is applied in the background", id),
-			Hint:    "SELECT state, per_shard FROM pgshard.migrations WHERE id = '" + id + "'"}); err != nil {
+	id := queued.ID
+	hint := "SELECT state, per_shard FROM pgshard.migrations_public WHERE id = '" + id + "'"
+	if queued.Attached {
+		msg := fmt.Sprintf("an identical migration %s is already %s; waiting for it instead of queueing the statement again", id, queued.State)
+		if queued.State == catalog.MigrationComplete {
+			msg = fmt.Sprintf("an identical migration %s has just completed; not running the statement again", id)
+		}
+		if err := notice(w, msg, hint); err != nil {
 			return err
 		}
-		return nil
 	}
-	done, err := e.r.cfg.Migrations.Wait(ctx, id)
+	if e.ddlAsync() {
+		if !queued.Attached {
+			if err := notice(w, fmt.Sprintf("migration %s queued; the statement is applied in the background", id), hint); err != nil {
+				return err
+			}
+		}
+		return w.CommandComplete(m.Kind)
+	}
+	waitCtx, stop := ctx, context.CancelFunc(func() {})
+	if d := e.statementTimeout(); d > 0 {
+		waitCtx, stop = context.WithTimeoutCause(ctx, d, errStatementTimeout)
+	}
+	defer stop()
+	done, err := e.r.cfg.Migrations.Wait(waitCtx, id, func(blockers []catalog.Blocker) {
+		if len(blockers) > 0 {
+			_ = notice(w, fmt.Sprintf("migration %s waits for %s", id, describeBlockers(blockers)), hint)
+		}
+	})
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			e := pgwire.Errorf("57014", "canceling statement due to user request; migration %s continues in the background", id)
-			e.Hint = "SELECT state, per_shard FROM pgshard.migrations WHERE id = '" + id + "'"
+		continues := fmt.Sprintf("Migration %s continues in the background.", id)
+		if req.DedupKey != "" {
+			continues += " Running the same statement again waits for it while it is queued or running."
+		}
+		var quiet errNoApplier
+		switch {
+		case errors.Is(context.Cause(waitCtx), errStatementTimeout) && ctx.Err() == nil:
+			e := pgwire.Errorf(pgwire.CodeQueryCanceled, "canceling statement due to statement timeout")
+			e.Detail, e.Hint = continues, hint
+			return e
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			e := pgwire.Errorf(pgwire.CodeQueryCanceled, "canceling statement due to user request")
+			e.Detail, e.Hint = continues, hint
+			return e
+		case errors.As(err, &quiet):
+			e := pgwire.Errorf(codeObjectNotInPrerequisiteState, "%v", quiet)
+			e.Detail, e.Hint = continues, "check that a pgshard controller is running and leading"
 			return e
 		}
 		return pgwire.Errorf(codeConnectionFailure, "waiting for migration %s: %v", id, err)
@@ -287,6 +471,151 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 		}
 	}
 	return nil
+}
+
+// errStatementTimeout is the cause of a DDL wait the session's
+// statement_timeout ended.
+var errStatementTimeout = errors.New("statement timeout")
+
+// codeObjectNotInPrerequisiteState is SQLSTATE 55000.
+const codeObjectNotInPrerequisiteState = "55000"
+
+// notice sends a NOTICE and pushes it to the client now: a statement waiting
+// in the queue may not answer for hours, and a notice buffered until then
+// says nothing.
+func notice(w pgwire.ResultWriter, message, hint string) error {
+	if err := w.Notice(&pgproto3.NoticeResponse{Severity: "NOTICE", SeverityUnlocalized: "NOTICE", Code: "00000", Message: message, Hint: hint}); err != nil {
+		return err
+	}
+	if f, ok := w.(interface{ Flush() error }); ok {
+		return f.Flush()
+	}
+	return nil
+}
+
+// describeBlockers names what a migration waits for without the statement
+// text of anyone else's migration.
+func describeBlockers(blockers []catalog.Blocker) string {
+	names := make([]string, 0, len(blockers))
+	for _, b := range blockers {
+		what := map[string]string{catalog.OperationDDL: "migration", catalog.OperationReshard: "reshard",
+			catalog.OperationUpgrade: "major upgrade", catalog.OperationPlacement: "table placement"}[b.Kind]
+		if what == "" {
+			what = b.Kind
+		}
+		when := "in progress"
+		if b.Reason == catalog.BlockedByEarlier {
+			when = "queued before it"
+		}
+		names = append(names, fmt.Sprintf("%s %s (%s)", what, b.ID, when))
+	}
+	return strings.Join(names, ", ")
+}
+
+// normalizedStatement is sql as the parser renders it, so a statement sent
+// again with other whitespace, letter case or comments is recognised; sql
+// itself when it does not parse back.
+func normalizedStatement(sql string) string {
+	res, err := pgparser.Parse(sql)
+	if err != nil {
+		return sql
+	}
+	out, err := pgparser.Deparse(res.Tree)
+	if err != nil {
+		return sql
+	}
+	return out
+}
+
+// ddlDedupOff reports whether the session turned pgshard.ddl_dedup off.
+func (e *Executor) ddlDedupOff() bool {
+	off := false
+	for _, list := range [][]gucEntry{e.gucs, e.staged} {
+		for _, g := range list {
+			switch g.name {
+			case "":
+				off = false
+			case DDLDedupGUC:
+				off = g.value != "" && !gucOn(g.value)
+			}
+		}
+	}
+	return off
+}
+
+// statementTimeout is the session's statement_timeout: the startup value,
+// then every settled and staged SET and RESET in order.
+func (e *Executor) statementTimeout() time.Duration {
+	startup := e.info.Params["statement_timeout"]
+	if v, ok := startupOption(e.info.Params["options"], "statement_timeout"); ok {
+		startup = v
+	}
+	value := startup
+	for _, list := range [][]gucEntry{e.gucs, e.staged} {
+		for _, g := range list {
+			switch g.name {
+			case "":
+				value = startup
+			case "statement_timeout":
+				// RESET, and SET TO DEFAULT, carry no value and put the
+				// session back to what it started with.
+				value = g.value
+				if value == "" {
+					value = startup
+				}
+			}
+		}
+	}
+	return parseTimeGUC(value)
+}
+
+// parseTimeGUC reads a time setting whose base unit is milliseconds, as
+// PostgreSQL does: a bare number is milliseconds, and us, ms, s, min, h and d
+// name their unit. Anything else is no timeout.
+func parseTimeGUC(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	i := strings.IndexFunc(v, func(r rune) bool { return (r < '0' || r > '9') && r != '.' })
+	num, unit := v, ""
+	if i >= 0 {
+		num, unit = v[:i], strings.TrimSpace(v[i:])
+	}
+	n, err := strconv.ParseFloat(num, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	scale := map[string]time.Duration{"": time.Millisecond, "us": time.Microsecond, "ms": time.Millisecond, "s": time.Second,
+		"min": time.Minute, "h": time.Hour, "d": 24 * time.Hour}[unit]
+	if scale == 0 {
+		return 0
+	}
+	return time.Duration(n * float64(scale))
+}
+
+// checkHomeDDL refuses DDL a local database runs directly on its home shard
+// while something it would overlap is unfinished: it cannot wait its turn in
+// the operation queue the way a migration does.
+func (e *Executor) checkHomeDDL(ctx context.Context) error {
+	var blockers []catalog.Blocker
+	queued := false
+	if e.r.cfg.Migrations != nil {
+		var err error
+		if blockers, queued, err = e.r.cfg.Migrations.HomeDDLBlockers(ctx, e.info.Database); err != nil {
+			return pgwire.Errorf(codeConnectionFailure, "reading the operation queue: %v", err)
+		}
+	}
+	if !queued {
+		if snap := e.r.cfg.Snapshot(); snap != nil && snap.Resharding() {
+			return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
+		}
+		return nil
+	}
+	if len(blockers) == 0 {
+		return nil
+	}
+	err := pgwire.Errorf(codeObjectNotInPrerequisiteState, "schema changes on local database %s are not available while %s is unfinished", e.info.Database, describeBlockers(blockers))
+	err.Detail = "DDL on a local database runs on its home shard at once and cannot wait its turn behind a reshard, upgrade or table placement."
+	err.Hint = "retry once it completes; a shorter resharding.retireOldGroupsAfter shortens a reshard's wait"
+	return err
 }
 
 // migrationRefreshTimeout bounds how long an applied migration waits for

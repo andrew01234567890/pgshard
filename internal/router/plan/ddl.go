@@ -131,21 +131,25 @@ func (w *walker) homeStatement() error {
 	return nil
 }
 
+// homeDDL is homeStatement for DDL, marked so the executor can refuse it
+// while something it would overlap is unfinished.
+func (w *walker) homeDDL() error {
+	w.plan.HomeDDL = true
+	return w.homeStatement()
+}
+
 func (w *walker) migration(m Migration) error {
-	// A reshard copies by logical replication, which carries no DDL: a
-	// schema change on the serving set while the targets apply its rows
-	// breaks their apply. The applier holds a migration queued while one
-	// copies; refusing it here tells the client at once rather than after
-	// the wait gives up (PGS-872). A local database's DDL runs on its home
-	// shard directly and would break the copy the same way.
-	if w.sess.Snapshot != nil && w.sess.Snapshot.Resharding() {
-		return notYet("DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply",
-			"retry once the reshard completes, or once a failed reshard's shard set is removed")
-	}
+	// DDL is queued whatever else is in progress: a migration waits its
+	// turn in the operation queue behind a reshard, upgrade or placement
+	// that conflicts with it (PGS-892).
+	//
 	// Every DDL the planner recognises arrives here, so this is where a
-	// local database, or a local schema, stops being a fan-out.
+	// local database, or a local schema, stops being a fan-out. Its DDL
+	// runs on the home shard directly and cannot wait its turn, so the
+	// executor refuses it while something that conflicts with it is
+	// unfinished.
 	if w.homeOnly() {
-		return w.homeStatement()
+		return w.homeDDL()
 	}
 	if m.Strategy == "" {
 		m.Strategy = StrategyDirect
@@ -279,7 +283,7 @@ func (w *walker) alterTable(a *pgquerypb.AlterTableStmt) error {
 	// agreement about a table. A rewrite here takes the lock PostgreSQL
 	// takes and is over when PostgreSQL says it is.
 	if w.homeOnly() {
-		return w.homeStatement()
+		return w.homeDDL()
 	}
 	switch a.GetObjtype() {
 	case pgquerypb.ObjectType_OBJECT_TABLE:
@@ -576,7 +580,7 @@ func (w *walker) rename(s *pgquerypb.RenameStmt) error {
 // the database has anywhere else the object could be.
 func (w *walker) unfannable(what string) error {
 	if w.homeOnly() {
-		return w.homeStatement()
+		return w.homeDDL()
 	}
 	return refuseUnfannable(what)
 }

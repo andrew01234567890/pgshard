@@ -896,6 +896,12 @@ func (s *session) asQueryTimeout(qctx context.Context, err error) error {
 	}
 	e := Errorf(CodeQueryCanceled, "canceling statement due to statement timeout")
 	e.Detail = fmt.Sprintf("The router stops a statement after %s.", s.server.cfg.MaxQueryDuration)
+	// A statement that was waiting on work which carries on without it --
+	// a queued migration -- said so; that stays true whatever stopped it.
+	var own *Error
+	if errors.As(err, &own) && own.Code == CodeQueryCanceled && own.Detail != "" {
+		e.Detail, e.Hint = own.Detail+" "+e.Detail, own.Hint
+	}
 	return e
 }
 

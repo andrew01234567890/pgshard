@@ -115,7 +115,9 @@ const (
 
 // Plan is the routing decision for one statement.
 type Plan struct {
-	Kind Kind
+	// HomeDDL marks DDL a local database runs directly on its home shard.
+	HomeDDL bool
+	Kind    Kind
 	// Shards are the shard ids (in DefaultShardSet) the statement touches,
 	// ascending. Empty while Deferred.
 	Shards []int32

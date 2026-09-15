@@ -99,6 +99,10 @@ func (w *resultWriter) ParameterStatus(name, value string) error {
 }
 
 func (w *resultWriter) Notice(n *pgproto3.NoticeResponse) error { return w.send(n) }
+
+// Flush writes everything sent so far to the client now, for a statement
+// that tells the client something long before it answers.
+func (w *resultWriter) Flush() error { return w.flush() }
 func (w *resultWriter) Notification(n *pgproto3.NotificationResponse) error {
 	return w.send(n)
 }

@@ -87,3 +87,22 @@ func TestALocalDatabaseRunsItsOwnDDL(t *testing.T) {
 		t.Fatalf("refused for the wrong reason: %v", err)
 	}
 }
+
+// DDL a local database runs on its home shard is marked, so the executor can
+// refuse it while the operation queue holds something it would overlap; the
+// same statement in a shared database is a migration, which waits instead.
+func TestALocalDatabasesDDLIsMarkedAsHomeDDL(t *testing.T) {
+	p := New()
+	for _, c := range []struct {
+		snap    *snapshot.Snapshot
+		homeDDL bool
+	}{{localFixture(t), true}, {fixture(t), false}} {
+		pl, err := p.Plan(context.Background(), session(c.snap), `ALTER TABLE items ADD COLUMN extra int`)
+		if err != nil || pl.HomeDDL != c.homeDDL {
+			t.Fatalf("HomeDDL = %v (%v), want %v", pl.HomeDDL, err, c.homeDDL)
+		}
+	}
+	if pl, err := p.Plan(context.Background(), session(localFixture(t)), `SELECT 1`); err != nil || pl.HomeDDL {
+		t.Fatalf("a query in a local database is marked as DDL: %v", err)
+	}
+}
