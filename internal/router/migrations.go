@@ -165,7 +165,13 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 		err = e.queueMigration(ctx, m, w)
 	}
 	if err == nil {
-		err = e.replayPrelude(ctx)
+		if rerr := e.replayPrelude(ctx); rerr != nil {
+			// The DDL is in; a client told only that the connection failed
+			// would send it again and be told it already exists.
+			perr := pgwire.Errorf(codeConnectionFailure, "%s was applied, but opening the transaction again afterwards failed: %v", m.Kind, rerr)
+			perr.Hint = "the DDL stays applied; end this transaction and do not send it again"
+			err = perr
+		}
 	}
 	if err != nil {
 		// PostgreSQL fails the transaction a statement errors in. The
