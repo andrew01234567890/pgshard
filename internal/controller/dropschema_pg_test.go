@@ -137,3 +137,61 @@ func TestAResumedCreateIndexFindsItInItsTablesSchema(t *testing.T) {
 		t.Fatalf("a resumed CREATE INDEX whose index exists in its table's schema is %s: %+v", m.State, m.PerShard)
 	}
 }
+
+// TestAResumedCreateIndexIsLookedForOnItsTable (PGS-887): a resumed CREATE
+// INDEX looked for any relation of the index's name in the search path, so
+// a table of that name in an earlier schema made it report the index built
+// when it never was. The index is now looked for through pg_index on the
+// table the statement named; one left invalid there is rebuilt.
+func TestAResumedCreateIndexIsLookedForOnItsTable(t *testing.T) {
+	parallelPG(t)
+	pool, a, store := rewritePGFixture(t)
+	ctx := context.Background()
+	mustExecSQL(t, pool, `CREATE SCHEMA app`)
+	mustExecSQL(t, pool, `GRANT USAGE, CREATE ON SCHEMA app TO appowner`)
+	mustExecSQL(t, pool, `CREATE TABLE app.indexed_id (x int)`)
+	mustExecSQL(t, pool, `CREATE TABLE public.indexed (id int)`)
+	mustExecSQL(t, pool, `ALTER TABLE public.indexed OWNER TO appowner`)
+	resume := func(id string) catalog.DDLMigration {
+		t.Helper()
+		store.migrations = []catalog.DDLMigration{{ID: id, Database: "postgres", Statement: `CREATE INDEX indexed_id ON indexed (id)`,
+			Kind: "CREATE INDEX", Strategy: "direct", Scope: "all", State: catalog.MigrationRunning,
+			PerShard: map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning}},
+			Meta: catalog.MigrationMeta{RunAs: "appowner", SearchPath: "app, public",
+				Object: catalog.MigrationObject{Kind: "relation", Name: "indexed_id", Table: "indexed", Expect: "present"}}}}
+		if _, err := a.RunOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.migrations[0]
+	}
+	onTable := func() (exists, valid bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT count(*) > 0, coalesce(bool_and(i.indisvalid), false) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			WHERE i.indrelid = 'public.indexed'::regclass AND c.relname = 'indexed_id'`).Scan(&exists, &valid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return exists, valid
+	}
+
+	if m := resume("30000000-0000-0000-0000-000000000005"); m.State != catalog.MigrationComplete {
+		t.Fatalf("resumed CREATE INDEX: %s %+v", m.State, m.PerShard)
+	}
+	if exists, _ := onTable(); !exists {
+		t.Fatal("a table named like the index made the resumed CREATE INDEX report it built; it is not on public.indexed")
+	}
+
+	mustExecSQL(t, pool, `UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.indexed_id'::regclass`)
+	if m := resume("30000000-0000-0000-0000-000000000006"); m.State != catalog.MigrationComplete {
+		t.Fatalf("resumed CREATE INDEX over an invalid index: %s %+v", m.State, m.PerShard)
+	}
+	if exists, valid := onTable(); !exists || !valid {
+		t.Fatalf("an invalid index on the table was not rebuilt: exists %v valid %v", exists, valid)
+	}
+	var kept int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_class WHERE relname = 'indexed_id' AND relnamespace = 'app'::regnamespace AND relkind = 'r'`).Scan(&kept); err != nil || kept != 1 {
+		t.Fatalf("the table in app named like the index was touched: %d %v", kept, err)
+	}
+}

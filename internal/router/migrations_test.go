@@ -276,7 +276,7 @@ func TestDDLAsyncReturnsAtOnce(t *testing.T) {
 	if len(notices) != 1 || !strings.Contains(notices[0], q.last(t).ID) {
 		t.Fatalf("notices %q", notices)
 	}
-	if m := q.last(t); m.Strategy != "concurrent" {
+	if m := q.last(t); m.Strategy != "concurrent" || m.Meta.Object.Table != "orders" {
 		t.Fatalf("queued %+v", m)
 	}
 	if q.waited != 0 {

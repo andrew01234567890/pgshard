@@ -103,6 +103,9 @@ type ObjectRef struct {
 	Kind   string
 	Schema string
 	Name   string
+	// Table is the table an index is built on, so a resumed CREATE INDEX
+	// looks for the index there and not for any relation of its name.
+	Table string
 	// Expect is "present" after a CREATE and "absent" after a DROP.
 	Expect string
 }
@@ -339,7 +342,7 @@ func (w *walker) createIndex(s *pgquerypb.IndexStmt) error {
 		m.Strategy = StrategyConcurrent
 	}
 	if s.GetIdxname() != "" {
-		m.Object = ObjectRef{Kind: "relation", Schema: s.GetRelation().GetSchemaname(), Name: s.GetIdxname(), Expect: objectPresent}
+		m.Object = ObjectRef{Kind: "relation", Schema: s.GetRelation().GetSchemaname(), Name: s.GetIdxname(), Table: s.GetRelation().GetRelname(), Expect: objectPresent}
 	}
 	return w.migration(m)
 }

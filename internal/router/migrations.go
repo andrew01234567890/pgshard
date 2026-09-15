@@ -474,7 +474,7 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 	req := catalog.DDLMigration{Database: e.info.Database, Statement: m.Statement, Kind: m.Kind, Strategy: m.Strategy, Scope: m.Scope,
 		HomeShard: e.Home().ID, Meta: catalog.MigrationMeta{
 			SearchPath:    e.recordedSearchPath(),
-			Object:        catalog.MigrationObject{Kind: m.Object.Kind, Schema: m.Object.Schema, Name: m.Object.Name, Expect: m.Object.Expect},
+			Object:        catalog.MigrationObject{Kind: m.Object.Kind, Schema: m.Object.Schema, Name: m.Object.Name, Table: m.Object.Table, Expect: m.Object.Expect},
 			Target:        m.Target,
 			RunAs:         e.info.User,
 			Role:          m.Role,
