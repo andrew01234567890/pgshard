@@ -10,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -1829,11 +1831,17 @@ func (p *Placer) ensureReplication(ctx context.Context, wf *placementWorkflow, c
 		return err
 	}
 	if ident != "f" {
-		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", wf.shape.qualified(wf.spec.TableName))); err != nil {
-			return err
-		}
+		// Recorded before the ALTER, not after: an ALTER that committed while
+		// the controller died before saving left FULL on the user's table
+		// with nothing saying it was this workflow's to put back.
 		if !slices.Contains(wf.st.ReplicaIdentityFull, s) {
 			wf.st.ReplicaIdentityFull = append(wf.st.ReplicaIdentityFull, s)
+			if err := p.save(ctx, wf, fmt.Sprintf("widening the replica identity of %s on %s/%d", wf.spec.table(), wf.st.SourceSet, s)); err != nil {
+				return err
+			}
+		}
+		if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "FULL", 1); err != nil {
+			return err
 		}
 	}
 	rows, err = conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`, wf.publicationName())
@@ -2866,45 +2874,90 @@ func (p *Placer) publish(ctx context.Context, wf *placementWorkflow) error {
 }
 
 // dropReplication drops the slots and publications of the run on every
-// source; a cancelled run also restores the replica identity it changed
-// (a completed one dropped that table).
+// source; a cancelled or failed run also restores the replica identity it
+// changed (a completed one dropped that table). Every source is tried: one
+// that cannot be reached must not leave the slots on the others pinning WAL.
 func (p *Placer) dropReplication(ctx context.Context, wf *placementWorkflow) error {
+	var failed error
 	for _, s := range wf.from.Sources() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
-		if err != nil {
-			return err
+		if err := p.dropSourceReplication(ctx, wf, s); err != nil {
+			failed = errors.Join(failed, fmt.Errorf("replication objects on %s/%d: %w", wf.st.SourceSet, s, err))
 		}
-		err = func() error {
-			// A source under a barrier's pause, or a switch's, refuses DROP
-			// PUBLICATION and ALTER TABLE with 25006, and the fail path does
-			// not come back: the replica identity would stay widened for
-			// good. This session writes through; the shard stays paused.
-			if err := writeThroughPause(ctx, conn); err != nil {
-				return err
-			}
-			if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, wf.slotName(s)); err != nil {
-				return err
-			}
-			if _, err := conn.Exec(ctx, "DROP PUBLICATION IF EXISTS "+QuoteIdent(wf.publicationName())); err != nil {
-				return err
-			}
-			// On the failure path too, not only when cancelling: a failed
-			// workflow is never revisited, so REPLICA IDENTITY FULL left
-			// behind makes every UPDATE on the source log the whole old row
-			// for good.
-			if (wf.stage == StageCancelling || wf.stage == StageFailed) && slices.Contains(wf.st.ReplicaIdentityFull, s) {
-				if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY DEFAULT", wf.shape.qualified(wf.spec.TableName))); err != nil {
-					return err
-				}
-			}
-			return nil
-		}()
-		_ = conn.Close(ctx)
-		if err != nil {
-			return fmt.Errorf("replication objects on %s/%d: %w", wf.st.SourceSet, s, err)
+	}
+	return failed
+}
+
+func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflow, s int32) error {
+	conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	// A source under a barrier's pause, or a switch's, refuses DROP
+	// PUBLICATION and ALTER TABLE with 25006, and the fail path does not
+	// come back: the replica identity would stay widened for good. This
+	// session writes through; the shard stays paused.
+	if err := writeThroughPause(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, wf.slotName(s)); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, "DROP PUBLICATION IF EXISTS "+QuoteIdent(wf.publicationName())); err != nil {
+		return err
+	}
+	// On the failure path too, not only when cancelling: a failed workflow
+	// is never revisited, so REPLICA IDENTITY FULL left behind makes every
+	// UPDATE on the source log the whole old row for good. A few tries, as
+	// the fail path gets only this one pass.
+	if (wf.stage == StageCancelling || wf.stage == StageFailed) && slices.Contains(wf.st.ReplicaIdentityFull, s) {
+		if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "DEFAULT", 3); err != nil {
+			return fmt.Errorf("putting back the default replica identity of %s: %w", wf.spec.table(), err)
 		}
 	}
 	return nil
+}
+
+// replicaIdentityLockWait bounds how long changing a table's replica
+// identity waits for its AccessExclusiveLock. The waiting request queues
+// every new reader of the table behind it, so one waiting on a long
+// transaction would stall the user's reads for as long as that runs.
+const replicaIdentityLockWait = 5 * time.Second
+
+// setReplicaIdentity sets a table's replica identity with a bounded lock
+// wait, trying again after a lock timeout up to attempts times in all.
+func setReplicaIdentity(ctx context.Context, conn ShardConn, table, identity string, attempts int) error {
+	for attempt := 1; ; attempt++ {
+		err := execWithLockWait(ctx, conn, replicaIdentityLockWait, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY %s", table, identity))
+		var pgErr *pgconn.PgError
+		if err == nil || attempt >= attempts || !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// execWithLockWait runs one statement in a transaction of its own whose
+// lock_timeout is wait, leaving the session's setting alone.
+func execWithLockWait(ctx context.Context, conn ShardConn, wait time.Duration, sql string) error {
+	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
+		return err
+	}
+	_, err := conn.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", wait.Milliseconds()))
+	if err == nil {
+		_, err = conn.Exec(ctx, sql)
+	}
+	if err == nil {
+		_, err = conn.Exec(ctx, "COMMIT")
+	}
+	if err != nil {
+		_, _ = conn.Exec(ctx, "ROLLBACK")
+	}
+	return err
 }
 
 // dropOld drops the previous tables and gives the new table's indexes and

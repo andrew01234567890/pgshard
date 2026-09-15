@@ -824,7 +824,13 @@ func (p *Placer) dropShadows(ctx context.Context, wf *placementWorkflow) error {
 			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err))
 			continue
 		}
-		dropped, derr := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow(), wf.placementMarker())
+		// A failed move's shards may be under a barrier's pause or a
+		// retired set's, which refuse DROP TABLE with 25006, and fail does
+		// not come back: the shadows would stay and refuse the next move.
+		dropped, derr := false, writeThroughPause(ctx, conn)
+		if derr == nil {
+			dropped, derr = dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow(), wf.placementMarker())
+		}
 		if !dropped && derr == nil {
 			// Same reasoning as the retirement path: a shadow left behind
 			// because it is not ours is the right call, and saying nothing
