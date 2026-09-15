@@ -826,7 +826,7 @@ func (e *Executor) dropParked() {
 		if p.pinned {
 			if client, err := e.r.cfg.Poolers.Client(p.shard); err == nil {
 				if err := releaseRPC(context.Background(), client, e.sid, e.statement.Load()); err != nil {
-					e.r.cfg.Logger.Warn("releasing a transaction participant failed", "session", e.sid, "shard", p.shard, "err", err)
+					e.releaseFailed(p.shard, client, e.sid, e.statement.Load(), err)
 				}
 			}
 		}
@@ -927,6 +927,9 @@ func (e *Executor) txnControlBatch(ctx context.Context, batch []*pgshardv1.Execu
 // executor field, so several shards can be prepared at once; the executor
 // state a failure normally drops is left to the caller, which is serial.
 func (e *Executor) preparePart(ctx context.Context, sh Shard) (*txnPart, error) {
+	if err := e.refuseLostShard(sh); err != nil {
+		return nil, err
+	}
 	client, err := e.r.cfg.Poolers.Client(sh)
 	if err != nil {
 		return nil, err
