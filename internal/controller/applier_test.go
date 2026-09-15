@@ -386,9 +386,12 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		return &boolRows{vals: []bool{v}}, nil
 	case strings.Contains(sql, "DROP TRIGGER IF EXISTS %I"):
 		return &stringRows{vals: c.f.sweepDrops}, nil
+	case strings.Contains(sql, "SELECT n.nspname FROM"):
+		// recordDropSchema: the fake resolves no DROP's object to a schema.
+		return &stringRows{}, nil
 	}
 	name, _ := args[0].(string)
-	if len(args) == 3 || len(args) == 4 {
+	if (len(args) == 3 || len(args) == 4) && !strings.Contains(sql, "current_schema()") {
 		table, _ := args[0].(string)
 		obj, _ := args[2].(string)
 		if len(args) == 4 {

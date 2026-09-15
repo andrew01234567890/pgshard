@@ -691,6 +691,7 @@ func (a *Applier) retrying(ctx context.Context, logger *slog.Logger, m *catalog.
 			logger.Warn("step not started: progress not saved", "shard", id, "step", s.Step, "err", saveErr)
 		} else {
 			outcome, err = run()
+			s.DropSchema = m.PerShard[key].DropSchema
 		}
 		if err == nil {
 			s.State, s.Error, s.SQLState = outcome, "", ""
@@ -805,8 +806,11 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 	// After SET ROLE, because "$user" in a path resolves to the role that
 	// is current when the path is USED, and the client's path meant the
 	// client's role.
+	// set_config, not SET search_path = '<value>': the recorded value is a
+	// list ("app, public"), and SET takes a quoted string as ONE schema
+	// name, leaving the statement with no schema in its path at all.
 	if m.Meta.SearchPath != "" {
-		if _, err := conn.Exec(ctx, "SET search_path = "+quoteLiteral(m.Meta.SearchPath)); err != nil {
+		if _, err := conn.Exec(ctx, "SELECT set_config('search_path', $1, false)", m.Meta.SearchPath); err != nil {
 			_ = conn.Close(context.WithoutCancel(ctx))
 			return nil, err
 		}
@@ -831,15 +835,23 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 		return "", err
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	if resumed && m.Meta.Object.Kind != "" {
+	obj := m.Meta.Object
+	if unqualifiedDrop(obj) {
+		if resumed {
+			obj.Schema = m.PerShard[key].DropSchema
+		} else if err := a.recordDropSchema(ctx, conn, m, key); err != nil {
+			return "", err
+		}
+	}
+	if resumed && obj.Kind != "" {
 		switch {
-		case m.Kind == "CREATE INDEX" && m.Meta.Object.Name != "":
+		case m.Kind == "CREATE INDEX" && obj.Name != "":
 			dropped, err := dropInvalidIndex(ctx, conn, m.Meta.Object)
 			if err != nil {
 				return "", err
 			}
 			if !dropped {
-				matches, err := objectMatches(ctx, conn, m.Meta.Object)
+				matches, err := objectMatches(ctx, conn, obj)
 				if err != nil {
 					return "", err
 				}
@@ -848,7 +860,7 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 				}
 			}
 		default:
-			matches, err := objectMatches(ctx, conn, m.Meta.Object)
+			matches, err := objectMatches(ctx, conn, obj)
 			if err != nil {
 				return "", err
 			}
@@ -1224,15 +1236,54 @@ func invalidIndex(ctx context.Context, conn ShardConn, o catalog.MigrationObject
 	return false, nil
 }
 
+// unqualifiedDrop reports a DROP whose object the statement names without a
+// schema, so which object it drops depends on the search path at the time.
+func unqualifiedDrop(o catalog.MigrationObject) bool {
+	return o.Expect == "absent" && o.Schema == "" && (o.Kind == "relation" || o.Kind == "function")
+}
+
+// recordDropSchema saves, before an unqualified DROP is sent, the schema its
+// object resolves to on this shard. Not resolving is not an error: a DROP of
+// nothing drops nothing, whatever a resume then finds.
+func (a *Applier) recordDropSchema(ctx context.Context, conn ShardConn, m *catalog.DDLMigration, key string) error {
+	sql := `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass(quote_ident($1))`
+	if m.Meta.Object.Kind == "function" {
+		sql = `SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.oid = to_regprocedure($1)`
+	}
+	rows, err := conn.Query(ctx, sql, m.Meta.Object.Name)
+	if err != nil {
+		return err
+	}
+	schemas, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(schemas) == 0 {
+		return err
+	}
+	s := m.PerShard[key]
+	s.DropSchema = schemas[0]
+	m.PerShard[key] = s
+	if err := a.Store.Save(ctx, *m, a.term()); err != nil {
+		if errors.Is(err, catalog.ErrNotLeaderTerm) {
+			return errNotLeader
+		}
+		return &saveFailed{err}
+	}
+	return nil
+}
+
 // objectMatches reports whether o is present or absent as expected.
+//
+// A relation named without a schema is looked for where a CREATE puts it,
+// current_schema(); an absent one, where the name resolves now (a DROP
+// that recorded the schema it resolved to passes that schema instead).
 func objectMatches(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (bool, error) {
 	var sql string
 	args := []any{o.Name}
 	switch o.Kind {
 	case "relation":
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2))`
-		args = append(args, o.Schema)
+			WHERE c.relname = $1 AND CASE WHEN $2 <> '' THEN n.nspname = $2
+				WHEN $3 THEN n.nspname = current_schema() ELSE n.nspname = ANY (current_schemas(false)) END)`
+		args = append(args, o.Schema, o.Expect == "present")
 	case "schema":
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`
 	case "type":
