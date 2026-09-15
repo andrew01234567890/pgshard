@@ -32,6 +32,8 @@ const (
 	codeConnectionFailure = "08006"
 	maxIdentifierLen      = 63
 	releaseTimeout        = 5 * time.Second
+	releaseRetryDelay     = 250 * time.Millisecond
+	releaseRetries        = 6
 )
 
 type prepared struct {
@@ -112,8 +114,19 @@ type gucEntry struct {
 type Executor struct {
 	r    *Router
 	info pgwire.SessionInfo
-	sid  string
-	home Shard
+	// sid names the session to its poolers. A Release of it that failed
+	// may have left a pooler holding a backend under it, prepared
+	// statements and session state included, which the next statement
+	// would meet; renewSid then gives the session a name no pooler holds
+	// anything under. Written on the session goroutine under cancelMu,
+	// because cancelStatement reads it from another.
+	sid         string
+	renewals    uint64
+	releaseLost atomic.Bool
+	// ended is set, under cancelMu, once the session is over and its
+	// name will not be used again.
+	ended bool
+	home  Shard
 	// shard is the shard the session's stream is (or will next be) on.
 	shard Shard
 	// latency and the shard counters belong to latencyOf, kept so a
@@ -1290,13 +1303,15 @@ func (e *Executor) releaseOnShard(client pgshardv1.PoolerClient, sh Shard) {
 	done := make(chan struct{})
 	prev := e.releasing[sh]
 	e.releasing[sh] = done
-	n := e.statement.Load()
+	n, sid := e.statement.Load(), e.sid
 	go func() {
 		defer close(done)
 		if prev != nil {
 			<-prev
 		}
-		_ = releaseRPC(context.Background(), client, e.sid, n)
+		if err := releaseRPC(context.Background(), client, sid, n); err != nil {
+			e.releaseFailed(sh, client, sid, n, err)
+		}
 	}()
 }
 
@@ -1986,13 +2001,14 @@ func (e *Executor) afterBatch(ctx context.Context, err error) error {
 	if e.txnEnded && e.pinned {
 		e.txnEnded = false
 		// The transaction's outcome is already on the wire. A cancel or
-		// deadline that reached the statement after that must neither
-		// report it as a connection failure nor leave the pooler holding
-		// the backend the next statement expects to be fresh.
-		if rerr := e.release(context.WithoutCancel(ctx)); rerr != nil && err == nil {
-			err = rerr
+		// deadline that reached the statement after that, or a pooler that
+		// cannot be reached for the release, must not report it as a
+		// connection failure: 08006 tells a client the outcome is unknown.
+		if rerr := e.release(context.WithoutCancel(ctx)); rerr != nil {
+			e.releaseFailed(e.shard, nil, e.sid, e.statement.Load(), rerr)
 		}
 	}
+	e.renewSid()
 	e.txnEnded = false
 	e.stagedMark = len(e.staged)
 	return err
@@ -2066,6 +2082,7 @@ func (e *Executor) acquire(ctx context.Context, fresh map[string]bool) error {
 	if err := e.awaitRelease(ctx); err != nil {
 		return err
 	}
+	e.renewSid()
 	ps, err := openStream(e.ctx, client)
 	if err != nil {
 		return e.poolerRefused(err)
@@ -2508,14 +2525,75 @@ func (e *Executor) cancelStatement(ctx context.Context, n uint64) {
 		return
 	}
 	targets := append([]pgshardv1.PoolerClient(nil), e.cancelTo...)
+	sid := e.sid
 	e.cancelMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, releaseTimeout)
 	defer cancel()
 	for _, client := range targets {
-		if _, err := client.Cancel(cctx, &pgshardv1.CancelRequest{SessionId: e.sid, Statement: n}); err != nil {
-			e.r.cfg.Logger.Warn("cancel failed", "session", e.sid, "err", err)
+		if _, err := client.Cancel(cctx, &pgshardv1.CancelRequest{SessionId: sid, Statement: n}); err != nil {
+			e.r.cfg.Logger.Warn("cancel failed", "session", sid, "err", err)
 		}
 	}
+}
+
+// releaseFailed records that a Release of sid on shard sh failed. The pooler
+// may still hold the backend under sid, and on its own would free it only
+// after its reserve timeout, so the release is retried in the background;
+// the session itself moves to a new name before it next reaches a pooler.
+// client is the pooler the Release went to, or nil when there was none.
+func (e *Executor) releaseFailed(sh Shard, client pgshardv1.PoolerClient, sid string, statement uint64, err error) {
+	e.releaseLost.Store(true)
+	e.r.cfg.Logger.Warn("releasing a pooler session failed; retrying it in the background under its old name", "session", sid, "shard", sh, "err", err)
+	go e.retryRelease(sh, client, sid, statement)
+}
+
+// retryRelease releases sid again, to the pooler that refused it when that
+// is known: a failover's new pooler answers a Release of a session it never
+// had with success, while the old one keeps the backend.
+//
+// Not while the session still goes by sid. Until it is renamed -- a failure
+// in the middle of a transaction waits for its end -- it may reserve the
+// same shard again under sid in the same statement, and a late Release
+// carrying that statement's number would end the new reservation.
+func (e *Executor) retryRelease(sh Shard, client pgshardv1.PoolerClient, sid string, statement uint64) {
+	delay := releaseRetryDelay
+	for range releaseRetries {
+		time.Sleep(delay)
+		delay *= 2
+		if e.goesBy(sid) {
+			continue
+		}
+		c := client
+		if c == nil {
+			var err error
+			if c, err = e.r.cfg.Poolers.Client(sh); err != nil {
+				continue
+			}
+		}
+		if releaseRPC(context.Background(), c, sid, statement) == nil {
+			return
+		}
+	}
+	e.r.cfg.Logger.Warn("gave up releasing a pooler session; the pooler frees it at its reserve timeout", "session", sid, "shard", sh)
+}
+
+func (e *Executor) goesBy(sid string) bool {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	return !e.ended && e.sid == sid
+}
+
+// renewSid moves the session to a name no pooler holds anything under, once
+// a Release of the current one failed and the session holds nothing under
+// it itself.
+func (e *Executor) renewSid() {
+	if e.conn != nil || e.pinned || len(e.parked) > 0 || e.tx != pgwire.TxIdle || !e.releaseLost.CompareAndSwap(true, false) {
+		return
+	}
+	e.renewals++
+	e.cancelMu.Lock()
+	e.sid = e.r.prefix + "-" + strconv.FormatUint(e.info.ID, 10) + "-" + strconv.FormatUint(e.renewals, 10)
+	e.cancelMu.Unlock()
 }
 
 // release detaches the stream and returns the pinned backend to the pool.
@@ -2549,6 +2627,9 @@ func releaseRPC(ctx context.Context, client pgshardv1.PoolerClient, sid string, 
 // Release implements pgwire.Executor: the session is over.
 func (e *Executor) Release() {
 	e.r.forget(e)
+	e.cancelMu.Lock()
+	e.ended = true
+	e.cancelMu.Unlock()
 	e.dropParked()
 	pinned := e.pinned
 	if e.conn != nil {
@@ -2559,7 +2640,9 @@ func (e *Executor) Release() {
 		if client, err := e.client(); err == nil {
 			// Unnumbered: the session is over, so there is no later
 			// reservation this could be mistaken for.
-			_ = releaseRPC(context.Background(), client, e.sid, 0)
+			if err := releaseRPC(context.Background(), client, e.sid, 0); err != nil {
+				e.releaseFailed(e.shard, client, e.sid, 0, err)
+			}
 		}
 	}
 	e.cancel()

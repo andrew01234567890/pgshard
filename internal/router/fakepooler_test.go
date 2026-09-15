@@ -40,8 +40,11 @@ type fakePooler struct {
 	// refusal moved to the status channel: an OK response with the Error
 	// in the body.
 	legacyRefusal atomic.Bool
-	releases      []string
-	cancels       []string
+	// unreachableRelease makes Release fail the way a pooler the router
+	// cannot reach does: nothing is released.
+	unreachableRelease atomic.Bool
+	releases           []string
+	cancels            []string
 	// cancelNumbers and statements record the statement number each
 	// Cancel and each simple query carried, in arrival order.
 	cancelNumbers []uint64
@@ -366,6 +369,9 @@ func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (
 }
 
 func (f *fakePooler) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*pgshardv1.ReleaseResponse, error) {
+	if f.unreachableRelease.Load() {
+		return nil, status.Error(codes.Unavailable, "connection refused")
+	}
 	f.mu.Lock()
 	f.releases = append(f.releases, req.SessionId)
 	// Like the real Release: while the session still has an Execute stream

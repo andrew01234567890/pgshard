@@ -826,7 +826,7 @@ func (e *Executor) dropParked() {
 		if p.pinned {
 			if client, err := e.r.cfg.Poolers.Client(p.shard); err == nil {
 				if err := releaseRPC(context.Background(), client, e.sid, e.statement.Load()); err != nil {
-					e.r.cfg.Logger.Warn("releasing a transaction participant failed", "session", e.sid, "shard", p.shard, "err", err)
+					e.releaseFailed(p.shard, client, e.sid, e.statement.Load(), err)
 				}
 			}
 		}
