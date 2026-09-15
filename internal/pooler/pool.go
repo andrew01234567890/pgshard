@@ -416,7 +416,7 @@ func (p *Pool) popIdle(rp *rolePool, digest [32]byte) *Backend {
 			b = rp.idle[n-1]
 			rp.idle = rp.idle[:n-1]
 			// Out of the pool and owned again, so it may be returned again.
-			b.released = false
+			b.released.Store(false)
 		}
 		p.mu.Unlock()
 		if b == nil {
@@ -606,11 +606,11 @@ func (p *Pool) Discard(b *Backend) { p.release(b, true) }
 // been released here.
 func (p *Pool) Abandon(b *Backend) {
 	p.mu.Lock()
-	if b.released {
+	if b.released.Load() {
 		p.mu.Unlock()
 		return
 	}
-	b.released = true
+	b.released.Store(true)
 	b.broken = true
 	conn := b.conn
 	rp := p.role(b.database, b.role)
@@ -630,11 +630,11 @@ func (p *Pool) Abandon(b *Backend) {
 // under the one lock.
 func (p *Pool) release(b *Backend, broken bool) {
 	p.mu.Lock()
-	if b.released {
+	if b.released.Load() {
 		p.mu.Unlock()
 		return
 	}
-	b.released = true
+	b.released.Store(true)
 	if broken {
 		b.broken = true
 	}
