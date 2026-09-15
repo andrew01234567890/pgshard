@@ -2288,6 +2288,9 @@ func (p *Placer) releaseShardFence(ctx context.Context, wf *placementWorkflow) e
 	}
 	var failed error
 	for _, t := range ids {
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return errors.Join(failed, err)
+		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			failed = errors.Join(failed, err)

@@ -450,12 +450,19 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 			p.logger().Warn("failed placement left its shadow tables behind; the next move of the table refuses to start until they are dropped",
 				"workflow", wf.id, "table", wf.spec.TableName, "err", err)
 		}
-	case wf.rt == nil && stage != "" && stage != StagePlacementPreparing:
+	case wf.rt == nil && stage != StagePlacementPreparing:
 		// The routing could not be built -- the serving set changed, or the
 		// database is gone -- so the shards a shadow was built on are not
 		// known and nothing is dropped. Saying nothing would leave the next
 		// move of the table refusing to start with no record of why.
-		residue = append(residue, "shadow tables may remain on the shards of the new placement: its routing could not be loaded to find them")
+		if len(wf.st.Swapped) == 0 {
+			residue = append(residue, "shadow tables may remain on the shards of the new placement: its routing could not be loaded to find them")
+		} else {
+			residue = append(residue, "a swap had begun and the routing could not be loaded: the table's shards are left as they are for repair")
+		}
+		if wf.from == nil {
+			residue = append(residue, "replication slots and publications may remain on the sources: their routing could not be loaded either")
+		}
 	}
 	// The drops dial shard after shard and can outlast the lease; once they
 	// have, the lock belongs to whoever claimed the workflow since.

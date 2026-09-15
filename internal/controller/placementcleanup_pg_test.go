@@ -101,7 +101,8 @@ func TestAFailedPlacementKeepsTheShadowsOfAClaimLostDuringItsReplicationDrops(t 
 	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
-	id := startPlacement(t, f)
+	startPlacement(t, f)
+	id, _ := f.driveUntil("orders", time.Minute, StagePlacementCatchUp)
 	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET owner = 'replica-a', owned_at = now() WHERE id = $1::uuid`, id)
 	wf := f.load(id)
 	wf.owner, wf.fence = "replica-a", wf.state
@@ -186,12 +187,12 @@ func TestAFailedPlacementWithoutRoutingSaysItsShadowsMayRemain(t *testing.T) {
 	ctx := context.Background()
 	id := startPlacement(t, f)
 	wf := f.load(id)
-	wf.rt = nil
+	wf.rt, wf.from = nil, nil
 	if err := f.placer.fail(ctx, wf, fatal("serving shard set changed")); err != nil {
 		t.Fatal(err)
 	}
 	leaked := queryOne[string](t, f.catalog, `SELECT coalesce(status->>'leaked', '') FROM pgshard.workflows WHERE id = $1::uuid`, id)
-	if !strings.Contains(leaked, "shadow tables may remain") {
-		t.Fatalf("leaked = %q, want it to say the shadows may remain", leaked)
+	if !strings.Contains(leaked, "shadow tables may remain") || !strings.Contains(leaked, "replication slots and publications may remain") {
+		t.Fatalf("leaked = %q, want it to say the shadows and the replication objects may remain", leaked)
 	}
 }
