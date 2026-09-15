@@ -472,6 +472,7 @@ type fakeCertifier struct {
 	// when the catalog recorded it.
 	groups    []string
 	createdAt time.Time
+	lsns      map[string]uint64
 	err       error
 	asked     string
 	password  string
@@ -484,7 +485,7 @@ type fakeCertifier struct {
 
 func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, password, name string) (BarrierRecord, error) {
 	f.asked, f.password = name, password
-	return BarrierRecord{Certified: f.certified, Groups: f.groups, CreatedAt: f.createdAt}, f.err
+	return BarrierRecord{Certified: f.certified, Groups: f.groups, CreatedAt: f.createdAt, LSNs: f.lsns}, f.err
 }
 
 func (f *fakeCertifier) ClearWriteFenceAfterRestore(_ context.Context, _, _ string) error {
@@ -916,5 +917,55 @@ func TestABarrierRestoreWaitsForTheSourcesCatalogUpgrade(t *testing.T) {
 	_, got = reconcileRestore(t, r, "r1")
 	if certifier.asked == "" {
 		t.Fatalf("a restore waited through the retiring stage: %+v", got.Status)
+	}
+}
+
+// TestRestoreRefusesABackupThatEndedAfterTheBarrier (PGS-352): recovery
+// replays forward from where the base backup ended, so a backup of a group
+// that ended after the barrier's restore point there has already passed it.
+// Nothing checked the backup a barrier restore was given against the
+// barrier, and recovery ran to the end of the WAL and failed late.
+func TestRestoreRefusesABackupThatEndedAfterTheBarrier(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		stop         string
+		catalog      string
+		catalogStop  string
+		refused      bool
+		refusedGroup string
+	}{
+		{name: "a backup that ended before the barrier", stop: "0/2000000"},
+		{name: "a backup that ended after it", stop: "0/5000000", refused: true, refusedGroup: "shard-0"},
+		// The manifest names the catalog "catalog" whatever its generation.
+		{name: "an upgraded catalog's backup that ended after it", stop: "0/2000000", catalog: "catalog-g2", catalogStop: "0/5000000", refused: true, refusedGroup: "catalog-g2"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			source := boundCluster("old")
+			one := 1
+			source.Spec.Shards = &one
+			barrier := "nightly-2026"
+			rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new",
+				BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+			b := completedBackup("b1", "old")
+			b.Status.Groups[0].StopLSN = "0/1000000"
+			if c.catalog != "" {
+				source.Status.CatalogGeneration = 2
+				b.Status.Groups[0].Group, b.Status.Groups[0].StopLSN = c.catalog, c.catalogStop
+			}
+			b.Status.Groups[1].StopLSN = c.stop
+			cl := restoreClient(t, source, newPolicy(), b, rs, superuserSecret("old"))
+			r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil),
+				Barriers: &fakeCertifier{certified: true, groups: []string{"catalog", "shard-0"}, lsns: map[string]uint64{"catalog": 0x3000000, "shard-0": 0x3000000}},
+				Now:      func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+
+			_, got := reconcileRestore(t, r, "r1")
+			refused := got.Status.Phase == pgshardv1alpha1.RestorePhaseFailed
+			if refused != c.refused {
+				t.Fatalf("refused=%v (%s), want %v", refused, got.Status.Error, c.refused)
+			}
+			if refused && !strings.Contains(got.Status.Error, c.refusedGroup+" (backup ends at") {
+				t.Fatalf("the refusal must name %s, whose backup ended late: %s", c.refusedGroup, got.Status.Error)
+			}
+		})
 	}
 }

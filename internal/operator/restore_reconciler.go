@@ -268,6 +268,13 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 					name, rec.CreatedAt.UTC().Format(time.RFC3339), from, source.Name, source.Name, source.Name))
 			}
 		}
+		refusal, berr := backupAfterBarrier(ctx, r.Client, rs, name, rec)
+		if berr != nil {
+			return ctrl.Result{}, berr
+		}
+		if refusal != "" {
+			return ctrl.Result{}, r.fail(ctx, rs, refusal)
+		}
 		if missing := groupsWithoutBarrier(Groups(&source), rec.Groups); len(missing) > 0 {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q on %s has no restore point on group(s) %s, which this restore would recover to it; take a new barrier that covers every serving group",
 				name, source.Name, strings.Join(missing, ", ")))
@@ -724,6 +731,46 @@ func (r *RestoreReconciler) fail(ctx context.Context, rs *pgshardv1alpha1.PgShar
 // has no restore point for. The manifest keys a shard group by the name
 // shard_status carries, which is Group.Name(), and the catalog as "catalog"
 // whatever its generation.
+// backupAfterBarrier explains why the restore's base backup cannot reach the
+// barrier, or returns "". Recovery replays forward from where a backup
+// ended, so a backup of a group that ended after the barrier's restore point
+// on that group has already passed it: recovery never stops at the barrier,
+// and the member fails late. Only a backup the restore names as a
+// PgShardBackup is known group by group.
+func backupAfterBarrier(ctx context.Context, c client.Client, rs *pgshardv1alpha1.PgShardRestore, barrier string, rec BarrierRecord) (string, error) {
+	if rs.Spec.BackupID == "" {
+		return "", nil
+	}
+	var b pgshardv1alpha1.PgShardBackup
+	if err := c.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Spec.BackupID}, &b); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var late []string
+	for _, g := range b.Status.Groups {
+		key := g.Group
+		if strings.HasPrefix(key, "catalog") {
+			key = "catalog"
+		}
+		point, ok := rec.LSNs[key]
+		if !ok || g.StopLSN == "" {
+			continue
+		}
+		stop, err := backup.ParseLSN(g.StopLSN)
+		if err != nil || stop <= point {
+			continue
+		}
+		late = append(late, fmt.Sprintf("%s (backup ends at %s, the restore point is at %s)", g.Group, g.StopLSN, formatLSN(point)))
+	}
+	if len(late) == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("backup %s ended after barrier %q on group(s) %s, so recovery from it cannot stop at the barrier; use a backup taken before the barrier",
+		b.Name, barrier, strings.Join(late, ", ")), nil
+}
+
 func groupsWithoutBarrier(want []Group, recorded []string) []string {
 	var missing []string
 	for _, g := range want {

@@ -97,8 +97,11 @@ spec:
   major upgrade since (told apart by its database system identifier, which
   barriers record). So is a barrier a restored cluster inherited from the
   cluster it was restored from: its restore point is in that cluster's
-  repository. Take a new barrier. A barrier restore waits while the source's
-  catalog is being upgraded.
+  repository. Take a new barrier. So is a `backupId` whose backup of any
+  group ended after the barrier's restore point there: recovery replays
+  forward from where the backup ended and could never stop at the barrier.
+  A barrier restore waits while the source's catalog is switching
+  generations.
 - A barrier restore ends with a reconciliation phase: prepared
   `pgshard-*` transactions are finished against the restored decision log,
   and the write fence the barrier raised is released only when there is no

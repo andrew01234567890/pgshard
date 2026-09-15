@@ -505,12 +505,27 @@ func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name strin
 	var (
 		rec                    BarrierRecord
 		recordedSystem, system string
+		perGroup               []byte
 	)
-	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1), created_at,
+	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1), created_at, per_group,
 			coalesce(per_group->'catalog'->>'system_identifier', ''), (SELECT system_identifier::text FROM pg_control_system())
-		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&rec.Certified, &rec.Groups, &rec.CreatedAt, &recordedSystem, &system)
+		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&rec.Certified, &rec.Groups, &rec.CreatedAt, &perGroup, &recordedSystem, &system)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return BarrierRecord{}, nil
+	}
+	if err == nil {
+		var points map[string]struct {
+			LSN uint64 `json:"lsn"`
+		}
+		if err := json.Unmarshal(perGroup, &points); err != nil {
+			return BarrierRecord{}, fmt.Errorf("barrier %q manifest: %w", name, err)
+		}
+		rec.LSNs = map[string]uint64{}
+		for g, p := range points {
+			if p.LSN != 0 {
+				rec.LSNs[g] = p.LSN
+			}
+		}
 	}
 	// The manifest names the catalog "catalog" whatever its generation, and
 	// its rows travel with the catalog through a major upgrade. So a
@@ -520,6 +535,9 @@ func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name strin
 	// a manifest written before it was recorded is taken at its word.
 	if recordedSystem != "" && recordedSystem != system {
 		rec.Groups = slices.DeleteFunc(rec.Groups, func(g string) bool { return g == "catalog" })
+		// Its LSN is in the old catalog system's WAL, not comparable with
+		// a backup of the current one.
+		delete(rec.LSNs, "catalog")
 	}
 	return rec, err
 }
@@ -531,6 +549,8 @@ type BarrierRecord struct {
 	Groups []string
 	// CreatedAt is when the catalog recorded it.
 	CreatedAt time.Time
+	// LSNs is each group's restore point, by the manifest's group key.
+	LSNs map[string]uint64
 }
 
 // ClearWriteFenceAfterRestore lifts the fence on a restored catalog,

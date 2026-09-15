@@ -265,8 +265,8 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, per_group, certified)
-		VALUES (gen_random_uuid(), 'before-an-upgrade', 7, jsonb_build_object('catalog', jsonb_build_object('group', 'catalog', 'system_identifier', '1'), 'shard-0', jsonb_build_object('group', 'shard-0')), true),
-		       (gen_random_uuid(), 'after-an-upgrade', 7, jsonb_build_object('catalog', jsonb_build_object('group', 'catalog', 'system_identifier', $1::text), 'shard-0', jsonb_build_object('group', 'shard-0')), true)`, system); err != nil {
+		VALUES (gen_random_uuid(), 'before-an-upgrade', 7, jsonb_build_object('catalog', jsonb_build_object('group', 'catalog', 'system_identifier', '1', 'lsn', 50331648), 'shard-0', jsonb_build_object('group', 'shard-0')), true),
+		       (gen_random_uuid(), 'after-an-upgrade', 7, jsonb_build_object('catalog', jsonb_build_object('group', 'catalog', 'system_identifier', $1::text, 'lsn', 50331648), 'shard-0', jsonb_build_object('group', 'shard-0')), true)`, system); err != nil {
 		t.Fatal(err)
 	}
 
@@ -290,6 +290,12 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 		}
 		if rec.Certified != c.want || !slices.Equal(rec.Groups, c.groups) {
 			t.Errorf("CertifiedBarrier(%q) = %v %v, want %v %v", c.name, rec.Certified, rec.Groups, c.want, c.groups)
+		}
+		if c.name == "before-an-upgrade" && len(rec.LSNs) != 0 {
+			t.Errorf("CertifiedBarrier(%q) kept restore point LSNs %v from a catalog system that is gone", c.name, rec.LSNs)
+		}
+		if c.name == "after-an-upgrade" && (rec.LSNs["catalog"] != 50331648 || len(rec.LSNs) != 1) {
+			t.Errorf("CertifiedBarrier(%q) restore point LSNs %v, want the catalog's 50331648 only", c.name, rec.LSNs)
 		}
 		if c.groups != nil && time.Since(rec.CreatedAt) > time.Hour {
 			t.Errorf("CertifiedBarrier(%q) recorded at %v, want the row's created_at", c.name, rec.CreatedAt)
