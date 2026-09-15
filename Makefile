@@ -29,10 +29,14 @@ lint:
 # here and nothing enforced it -- `go test ./pkg/a ./pkg/b` walked straight
 # past it, and the failure was a container that never became ready in
 # whichever suite was unlucky. See internal/dockertest/parallel.go.
+#
+# -timeout is per test binary. internal/controller takes about 5.5 minutes
+# on a hosted runner and once took over 10 on a slow one, which go test's
+# default of 10 minutes turned into a failed gate with nothing hung.
 test: PGSHARD_TEST_PG_PARALLEL ?= 4
 test: PGSHARD_TEST_PG_GLOBAL ?= 6
 test:
-	PGSHARD_TEST_PG_PARALLEL=$(PGSHARD_TEST_PG_PARALLEL) PGSHARD_TEST_PG_GLOBAL=$(PGSHARD_TEST_PG_GLOBAL) go test -race -p 4 ./...
+	PGSHARD_TEST_PG_PARALLEL=$(PGSHARD_TEST_PG_PARALLEL) PGSHARD_TEST_PG_GLOBAL=$(PGSHARD_TEST_PG_GLOBAL) go test -race -p 4 -timeout 25m ./...
 
 # verify is the fast gate: everything that needs only Go, a C compiler and
 # the pinned linters. It deliberately does not run the gates that need a
