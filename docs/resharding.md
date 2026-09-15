@@ -413,8 +413,12 @@ to, desired_generation}`); `table_status.workflow_id` points at it. The
 placer (`internal/controller/placement.go`, one pass every
 `--placement-interval`) moves the rows within the serving shard set; no
 group is provisioned. Reshards and placement workflows never run together:
-a placement waits at `preparing` while a reshard is active, and a reshard
-waits at `ready_for_copy` while a placement is active. Concurrent
+a placement waits at `preparing` while a reshard or upgrade is active, and a
+reshard waits at `ready_for_copy` while a placement holds the serving set --
+running, paused, or still cleaning up after a cancel. A pending placement
+does not hold it, so the two cannot wait on each other. Both decide under
+one advisory lock (`MoveGateLockKey`), so they cannot both find the other
+absent and start together. Concurrent
 placements of different tables are serialized per table through
 `pgshard.workflow_locks(kind=table, key=database.schema.table)`.
 

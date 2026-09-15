@@ -550,12 +550,8 @@ func (p *Placer) advance(ctx context.Context, wf *placementWorkflow, stage, mess
 // prepare waits for reshards, validates the table against a source shard,
 // takes the per-table lock and records the routing plan.
 func (p *Placer) prepare(ctx context.Context, wf *placementWorkflow) (bool, error) {
-	var reshards int
-	if err := p.Pool.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflows WHERE kind = ANY($1) AND state = ANY($2)`, copyKinds, activeStates).Scan(&reshards); err != nil {
-		return false, err
-	}
-	if reshards > 0 {
-		return false, fmt.Errorf("waiting for %d active reshard workflow(s)", reshards)
+	if reshards, err := activeCopies(ctx, p.Pool); err != nil || reshards > 0 {
+		return false, errors.Join(err, waitingForReshards(reshards))
 	}
 	if err := p.load(ctx, wf); err != nil {
 		return false, err
@@ -563,20 +559,59 @@ func (p *Placer) prepare(ctx context.Context, wf *placementWorkflow) (bool, erro
 	if err := p.describe(ctx, wf); err != nil {
 		return false, err
 	}
-	if _, err := p.Pool.Exec(ctx, `INSERT INTO pgshard.workflow_locks (kind, key, workflow_id) VALUES ($1, $2, $3::uuid)
+	if err := p.start(ctx, wf); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// start takes the table's lock and records the workflow as running, in one
+// transaction that counts the reshards again under the lock a copy starts
+// under: a reshard that began its copy since prepare's first count is waited
+// for, and one still deciding waits for this.
+func (p *Placer) start(ctx context.Context, wf *placementWorkflow) error {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockMoveGate(ctx, tx); err != nil {
+		return err
+	}
+	if reshards, err := activeCopies(ctx, tx); err != nil || reshards > 0 {
+		return errors.Join(err, waitingForReshards(reshards))
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.workflow_locks (kind, key, workflow_id) VALUES ($1, $2, $3::uuid)
 		ON CONFLICT (kind, key) DO UPDATE SET workflow_id = EXCLUDED.workflow_id WHERE pgshard.workflow_locks.workflow_id = EXCLUDED.workflow_id`,
 		LockKindTable, wf.spec.table(), wf.id); err != nil {
-		return false, err
+		return err
 	}
 	var holder string
-	if err := p.Pool.QueryRow(ctx, `SELECT workflow_id::text FROM pgshard.workflow_locks WHERE kind = $1 AND key = $2`, LockKindTable, wf.spec.table()).Scan(&holder); err != nil {
-		return false, err
+	if err := tx.QueryRow(ctx, `SELECT workflow_id::text FROM pgshard.workflow_locks WHERE kind = $1 AND key = $2`, LockKindTable, wf.spec.table()).Scan(&holder); err != nil {
+		return err
 	}
 	if holder != wf.id {
-		return false, fmt.Errorf("table %s is locked by workflow %s", wf.spec.table(), holder)
+		return fmt.Errorf("table %s is locked by workflow %s", wf.spec.table(), holder)
 	}
-	wf.state = StateRunning
-	return p.advance(ctx, wf, StagePlacementShadow, fmt.Sprintf("%s -> %s: sources %v, targets %v", describePlacement(wf.spec.From), describePlacement(wf.spec.To), wf.st.Sources, wf.st.Targets))
+	state, stage := wf.state, wf.stage
+	wf.state, wf.stage = StateRunning, StagePlacementShadow
+	err = p.saveTx(ctx, tx, wf, fmt.Sprintf("%s -> %s: sources %v, targets %v", describePlacement(wf.spec.From), describePlacement(wf.spec.To), wf.st.Sources, wf.st.Targets))
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if err != nil {
+		wf.state, wf.stage = state, stage
+		return err
+	}
+	wf.fence = wf.state
+	return nil
+}
+
+func waitingForReshards(n int) error {
+	if n == 0 {
+		return nil
+	}
+	return fmt.Errorf("waiting for %d active reshard workflow(s)", n)
 }
 
 func describePlacement(t TablePlacement) string {

@@ -341,6 +341,13 @@ func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) 
 }
 
 func (c *Copier) save(ctx context.Context, wf *copyWorkflow, stage, message string) error {
+	return ownedExec(ctx, c.Pool, wf.owner, saveCopySQL, wf.id, mustJSON(copyStatusPatch(wf, stage, message)), nullIfEmpty(wf.owner), wf.fence)
+}
+
+const saveCopySQL = `UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now()
+	WHERE id = $1::uuid AND ($3::text IS NULL OR (owner = $3 AND state = $4))`
+
+func copyStatusPatch(wf *copyWorkflow, stage, message string) map[string]any {
 	// progress and targets are lifted to the top of status because that is
 	// where the admin panel and the operator read them; copy keeps the
 	// whole phase record.
@@ -351,10 +358,38 @@ func (c *Copier) save(ctx context.Context, wf *copyWorkflow, stage, message stri
 	if stage != "" {
 		patch["stage"] = stage
 	}
-	return ownedExec(ctx, c.Pool, wf.owner,
-		`UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now()
-		 WHERE id = $1::uuid AND ($3::text IS NULL OR (owner = $3 AND state = $4))`,
-		wf.id, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
+	return patch
+}
+
+// startCopy records the workflow as copying unless a table placement holds
+// the serving set, counting under the lock a placement starts under.
+func (c *Copier) startCopy(ctx context.Context, wf *copyWorkflow) error {
+	tx, err := c.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockMoveGate(ctx, tx); err != nil {
+		return err
+	}
+	if placements, err := placementsHoldingTheSet(ctx, tx); err != nil || placements > 0 {
+		return errors.Join(err, waitingForPlacements(placements))
+	}
+	tag, err := tx.Exec(ctx, saveCopySQL, wf.id, mustJSON(copyStatusPatch(wf, StageCopying, "copy started")), nullIfEmpty(wf.owner), wf.fence)
+	if err != nil {
+		return err
+	}
+	if wf.owner != "" && tag.RowsAffected() == 0 {
+		return errNotOwner
+	}
+	return tx.Commit(ctx)
+}
+
+func waitingForPlacements(n int) error {
+	if n == 0 {
+		return nil
+	}
+	return fmt.Errorf("waiting for %d active table placement workflow(s)", n)
 }
 
 func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error {
@@ -647,23 +682,19 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	}
 	advanced := false
 	if wf.stage == StageReadyForCopy {
-		var placements int
-		if err := c.Pool.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflows WHERE kind = $1 AND state = ANY($2)`, KindTablePlacement, activeStates).Scan(&placements); err != nil {
-			return false, err
-		}
-		if placements > 0 {
-			return false, fmt.Errorf("waiting for %d active table placement workflow(s)", placements)
+		if placements, err := placementsHoldingTheSet(ctx, c.Pool); err != nil || placements > 0 {
+			return false, errors.Join(err, waitingForPlacements(placements))
 		}
 		if wf.kind == KindUpgrade {
 			if err := c.upgradePreconditions(ctx, wf, srcSet, srcIDs, dbs); err != nil {
 				return false, err
 			}
 		}
+		if err := c.startCopy(ctx, wf); err != nil {
+			return false, err
+		}
 		wf.stage = StageCopying
 		advanced = true
-		if err := c.save(ctx, wf, StageCopying, "copy started"); err != nil {
-			return advanced, err
-		}
 	}
 	if err := c.materializeSchemas(ctx, wf, srcSet, dbs); err != nil {
 		return advanced, err
