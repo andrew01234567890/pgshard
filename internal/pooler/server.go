@@ -641,7 +641,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 			still := func() bool {
 				r.srv.mu.Lock()
 				defer r.srv.mu.Unlock()
-				return r.se.b == b && !b.released
+				return r.se.b == b && !b.released.Load()
 			}
 			if err := b.cancel(ctx, r.srv.cfg.Dialer, nil, still); err != nil {
 				r.srv.cfg.Logger.Warn("cancel failed", "session", r.se.id, "err", err)
@@ -774,7 +774,7 @@ func (r *relay) flushed(ctx context.Context, b *Backend) {
 	still := func() bool {
 		r.srv.mu.Lock()
 		defer r.srv.mu.Unlock()
-		return r.se.b == b && !b.released && r.se.statement.Load() == cur
+		return r.se.b == b && !b.released.Load() && r.se.statement.Load() == cur
 	}
 	// Not on the relay's goroutine: that one is about to read the
 	// statement's answers, and delivering holds cancelMu, which a later
@@ -1197,7 +1197,7 @@ func (s *Server) Cancel(ctx context.Context, req *pgshardv1.CancelRequest) (*pgs
 		still := func() bool {
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			return se.b == b && !b.released && !se.staleStatement(req.Statement)
+			return se.b == b && !b.released.Load() && !se.staleStatement(req.Statement)
 		}
 		if err := b.cancel(ctx, s.cfg.Dialer, &se.cancelMu, still); err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
