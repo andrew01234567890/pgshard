@@ -86,6 +86,9 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if err := p.checkTriggerFunctions(ctx, conn, wf); err != nil {
 		return err
 	}
+	if err := p.checkPolicyDependencies(ctx, conn, wf); err != nil {
+		return err
+	}
 	if err := p.checkForeignKeys(ctx, conn, wf); err != nil {
 		return err
 	}
@@ -100,6 +103,10 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if wf.st.Triggers, err = triggerStates(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
 		return err
 	}
+	if wf.st.Policies, err = tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.spec.TableName)); err != nil {
+		return err
+	}
+	wf.st.PoliciesAtSwap = true
 	if wf.st.Owner, wf.st.Grants, err = tableOwnerAndGrants(ctx, conn, wf.spec.SchemaName, wf.spec.TableName,
 		wf.shape.qualified(wf.spec.TableName)); err != nil {
 		return err
@@ -429,6 +436,139 @@ func (p *Placer) checkTriggerFunctions(ctx context.Context, source ShardConn, wf
 	}
 	return fatal("table %s has triggers calling functions its target shards do not have (%s); create them there, then retry the move",
 		wf.spec.table(), strings.Join(parts, "; "))
+}
+
+// checkPolicyDependencies refuses a move whose row-level security policies
+// use something a holder of the new placement does not have: a table the
+// expression reads (a lookup table left on the home shard, say), a function
+// or type it calls, or a role it applies to.
+//
+// The policies are created in the swap's transaction, under the fence. One
+// that cannot be created there fails that shard's swap on every pass while
+// the shards that already swapped serve the new table and the table stays
+// fenced -- and a move past its swap cannot be cancelled. So the question is
+// asked at prepare, and again before the first rename.
+func (p *Placer) checkPolicyDependencies(ctx context.Context, source ShardConn, wf *placementWorkflow) error {
+	recheck := source == nil
+	if recheck {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, wf.from.Sources()[0], wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		source = conn
+		// The swap runs the statements captured at prepare, so those are
+		// what has to be checked. A policy created, altered or dropped since
+		// would be recreated wrong, or checked for what it no longer uses.
+		now, err := tablePolicies(ctx, source, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.spec.TableName))
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(now, wf.st.Policies) {
+			return fatal("the row-level security policies of %s changed during the move; retry the move", wf.spec.table())
+		}
+	}
+	rows, err := source.Query(ctx, `SELECT DISTINCT kind, name, col FROM (
+			SELECT CASE d.refclassid
+					WHEN 'pg_class'::regclass THEN CASE WHEN d.refobjsubid = 0 THEN 'relation' ELSE 'column' END
+					WHEN 'pg_proc'::regclass THEN 'function'
+					WHEN 'pg_type'::regclass THEN 'type'
+					WHEN 'pg_operator'::regclass THEN 'operator'
+					WHEN 'pg_collation'::regclass THEN 'collation'
+					ELSE 'unchecked' END AS kind,
+				CASE d.refclassid
+					WHEN 'pg_class'::regclass THEN d.refobjid::regclass::text
+					WHEN 'pg_proc'::regclass THEN d.refobjid::regprocedure::text
+					WHEN 'pg_type'::regclass THEN d.refobjid::regtype::text
+					WHEN 'pg_operator'::regclass THEN d.refobjid::regoperator::text
+					WHEN 'pg_collation'::regclass THEN d.refobjid::regcollation::text
+					ELSE pg_describe_object(d.refclassid, d.refobjid, d.refobjsubid) END AS name,
+				CASE WHEN d.refclassid = 'pg_class'::regclass AND d.refobjsubid > 0
+					THEN (SELECT attname FROM pg_attribute WHERE attrelid = d.refobjid AND attnum = d.refobjsubid) ELSE '' END AS col
+			FROM pg_policy pol
+			JOIN pg_depend d ON d.classid = 'pg_policy'::regclass AND d.objid = pol.oid
+			WHERE pol.polrelid = $1::regclass AND d.deptype = 'n'
+			  AND NOT (d.refclassid = 'pg_class'::regclass AND d.refobjid = pol.polrelid)
+			UNION ALL
+			SELECT 'role', r.rolname, ''
+			FROM pg_policy pol, unnest(pol.polroles) AS u(oid) JOIN pg_roles r ON r.oid = u.oid
+			WHERE pol.polrelid = $1::regclass
+		) x ORDER BY 1, 2, 3`, wf.shape.qualified(wf.spec.TableName))
+	if err != nil {
+		return err
+	}
+	type need struct{ Kind, Name, Col string }
+	needed, err := pgx.CollectRows(rows, pgx.RowToStructByPos[need])
+	if err != nil || len(needed) == 0 {
+		return err
+	}
+	var kinds, names, cols []string
+	for _, n := range needed {
+		if n.Kind == "unchecked" {
+			return fatal("table %s has row-level security policies using %s, which a move cannot check the shards of its new placement for; drop the policy before moving the table",
+				wf.spec.table(), n.Name)
+		}
+		kinds, names, cols = append(kinds, n.Kind), append(names, n.Name), append(cols, n.Col)
+	}
+	describe := func(i int, noRelation bool) string {
+		if cols[i] != "" && !noRelation {
+			return fmt.Sprintf("column %s.%s", names[i], cols[i])
+		}
+		if cols[i] != "" {
+			return "relation " + names[i]
+		}
+		return kinds[i] + " " + names[i]
+	}
+	var mu sync.Mutex
+	var missing []string
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(verifyPlacementConcurrency)
+	for _, t := range wf.rt.Holders() {
+		g.Go(func() error {
+			conn, err := p.Shards.DialDatabase(gctx, wf.st.SourceSet, t, wf.spec.Database)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = conn.Close(gctx) }()
+			rows, err := conn.Query(gctx, `SELECT i::int, kind = 'column' AND to_regclass(name) IS NULL FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS u(kind, name, col, i)
+				WHERE NOT CASE kind
+					WHEN 'relation' THEN to_regclass(name) IS NOT NULL
+					WHEN 'column' THEN EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(name) AND attname = col AND NOT attisdropped)
+					WHEN 'function' THEN to_regprocedure(name) IS NOT NULL
+					WHEN 'type' THEN to_regtype(name) IS NOT NULL
+					WHEN 'operator' THEN to_regoperator(name) IS NOT NULL
+					WHEN 'collation' THEN to_regcollation(name) IS NOT NULL
+					ELSE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = name) END
+				ORDER BY i`, kinds, names, cols)
+			if err != nil {
+				return err
+			}
+			type lack struct {
+				I          int
+				NoRelation bool
+			}
+			lacking, err := pgx.CollectRows(rows, pgx.RowToStructByPos[lack])
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, l := range lacking {
+				missing = append(missing, fmt.Sprintf("%s on %s/%d", describe(l.I-1, l.NoRelation), wf.st.SourceSet, t))
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	slices.Sort(missing)
+	missing = slices.Compact(missing)
+	return fatal("table %s has row-level security policies using what a shard of its new placement does not have (%s); create it there, or move it first, then retry the move",
+		wf.spec.table(), strings.Join(missing, "; "))
 }
 
 // triggerFunctions are the functions the table's user triggers call, as
@@ -968,11 +1108,15 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 					return oerr
 				}
 				// LIKE INCLUDING ALL carries no row-level security policy
-				// and neither RLS flag, so a swap without these would leave
-				// the table looking correct and enforcing nothing.
-				pols, perr := tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
-				if perr != nil {
-					return perr
+				// and neither RLS flag. A workflow prepared by an earlier
+				// version recreates the policies here; one that captured
+				// them does so at the swap.
+				var pols []string
+				if !wf.st.PoliciesAtSwap {
+					var perr error
+					if pols, perr = tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow())); perr != nil {
+						return perr
+					}
 				}
 				tgs, terr := tableTriggers(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
 				if terr != nil {
@@ -1271,11 +1415,13 @@ func extendedStatistics(ctx context.Context, conn ShardConn, wf *placementWorkfl
 		out = append(out, stmt+" ON "+st.Columns+" FROM "+wf.shape.qualified(wf.shadow()))
 	}
 	// Same for the remote path: a shadow built from the catalog carries no
-	// policies either, and the swap enables row-level security on whatever
-	// it finds.
-	pols, err := tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
-	if err != nil {
-		return nil, err
+	// policies either.
+	var pols []string
+	if !wf.st.PoliciesAtSwap {
+		var err error
+		if pols, err = tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow())); err != nil {
+			return nil, err
+		}
 	}
 	tgs, err := tableTriggers(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
 	if err != nil {
@@ -1311,19 +1457,22 @@ func tableRowSecurity(ctx context.Context, conn ShardConn, schema, table string)
 	return f.Enabled, f.Forced, nil
 }
 
-// tablePolicies renders the source table's row-level security policies onto
-// the shadow.
+// tablePolicies renders the source table's row-level security policies as
+// statements creating them on target.
 //
 // PostgreSQL has no pg_get_policydef(), so they are rebuilt from pg_policy.
-// They are created on the shadow while row-level security is still DISABLED
-// there, which makes them inert until the swap enables it, in the
-// transaction that renames the table.
+// The swap runs them after the renames, while row-level security is still
+// off on the renamed table, and then enables it. Created on the shadow
+// instead, an expression that names the table -- a correlated subquery
+// ("notes.region"), a whole-row reference -- fails there, and a subquery
+// reading the table binds to the source by OID and goes on reading the
+// retired table.
 //
-// The order matters for two reasons. A policy in force during the copy
-// filters the copier's own rows -- how much depends on the role it holds,
-// and pgshard's DDL role is NOBYPASSRLS -- and losing rows that way is
-// silent. And a shadow is not the table clients see, so nothing should be
-// enforcing on it before it is.
+// Row-level security stays off until then for two reasons. A policy in force
+// during the copy filters the copier's own rows -- how much depends on the
+// role it holds, and pgshard's DDL role is NOBYPASSRLS -- and losing rows
+// that way is silent. And a shadow is not the table clients see, so nothing
+// should be enforcing on it before it is.
 func tablePolicies(ctx context.Context, conn ShardConn, schema, table, shadow string) ([]string, error) {
 	rows, err := conn.Query(ctx, `SELECT p.polname, p.polcmd::text, p.polpermissive,
 			(SELECT coalesce(string_agg(CASE WHEN u.oid = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END, ', '), '')
@@ -2345,6 +2494,9 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		if err := restorePrivileges(ctx, conn, wf); err != nil {
 			return err
 		}
+		if err := restorePolicies(ctx, conn, wf); err != nil {
+			return err
+		}
 		if err := enableRowSecurity(ctx, conn, wf); err != nil {
 			return err
 		}
@@ -2368,6 +2520,21 @@ func restorePrivileges(ctx context.Context, conn ShardConn, wf *placementWorkflo
 	}
 	_, err := conn.Exec(ctx, "ALTER TABLE "+wf.shape.qualified(wf.spec.TableName)+" OWNER TO "+wf.st.Owner)
 	return err
+}
+
+// restorePolicies recreates the source table's policies on the table clients
+// now see, in the swap's transaction and before row-level security is
+// enabled, so the table is never enforcing without them.
+func restorePolicies(ctx context.Context, conn ShardConn, wf *placementWorkflow) error {
+	if !wf.st.PoliciesAtSwap {
+		return nil
+	}
+	for _, stmt := range wf.st.Policies {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("%s: %w", stmt, err)
+		}
+	}
+	return nil
 }
 
 // restoreTriggers puts each user trigger back into the state the source had,
