@@ -195,7 +195,35 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 	if done.State == catalog.MigrationFailed {
 		return migrationError(done)
 	}
+	if err := e.refreshAfterMigration(ctx); err != nil {
+		if err := w.Notice(&pgproto3.NoticeResponse{Severity: "WARNING", SeverityUnlocalized: "WARNING", Code: "01000",
+			Message: fmt.Sprintf("migration %s is applied, but this router could not reload the catalog: %v", id, err),
+			Hint:    "the next statement may be planned without what the migration changed until the router's catalog snapshot reloads"}); err != nil {
+			return err
+		}
+	}
 	return w.CommandComplete(m.Kind)
+}
+
+// migrationRefreshTimeout bounds how long an applied migration waits for
+// the router's snapshot to catch up before it is answered anyway.
+const migrationRefreshTimeout = 5 * time.Second
+
+// refreshAfterMigration reloads the snapshot before an applied migration is
+// answered. The watcher reloads on its own after a migration notifies, but
+// behind a notification budget every per-shard step of a migration draws
+// on, so the reload can land after the client's next statement has been
+// planned -- without a view the migration recorded, which is then read from
+// one shard with no error (PGS-871).
+func (e *Executor) refreshAfterMigration(ctx context.Context) error {
+	if e.r.cfg.RefreshSnapshot == nil {
+		return nil
+	}
+	// Not cut short by the client: the migration is already applied, and the
+	// bound is short.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrationRefreshTimeout)
+	defer cancel()
+	return e.r.cfg.RefreshSnapshot(ctx)
 }
 
 // migrationError reports a failed migration with the shard that failed

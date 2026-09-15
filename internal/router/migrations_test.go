@@ -287,3 +287,88 @@ func TestPGMigrationQueueWaitResetsOnProgress(t *testing.T) {
 		t.Fatal("Wait never finished")
 	}
 }
+
+// TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt (PGS-871): the
+// watcher's own reload after a migration can wait out a notification budget
+// the migration's per-shard steps drained, and the client's next statement
+// was planned without the view it had just created. An applied migration is
+// answered only after the router has reloaded; a failed one, or one queued
+// asynchronously, is not held for it; and a reload that fails still answers
+// the applied DDL, with a warning.
+func TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt(t *testing.T) {
+	ctx := context.Background()
+	var (
+		mu        sync.Mutex
+		refreshes int
+		waitedAt  int
+		fail      error
+	)
+	q := &fakeQueue{}
+	refresh := func(context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		refreshes++
+		q.mu.Lock()
+		waitedAt = q.waited
+		q.mu.Unlock()
+		return fail
+	}
+	h := newShardedHarnessWith(t, Config{Migrations: q, RefreshSnapshot: func(ctx context.Context) error {
+		time.Sleep(200 * time.Millisecond)
+		return refresh(ctx)
+	}})
+	var notices []string
+	cfg, err := pgx.ParseConfig(h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) { notices = append(notices, n.Severity+": "+n.Message) }
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	start := time.Now()
+	if _, err := conn.Exec(ctx, "create table audit (tenant_id int8, id int, primary key (tenant_id, id))"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if refreshes != 1 || waitedAt != 1 || time.Since(start) < 200*time.Millisecond {
+		t.Fatalf("an applied migration was answered after %d refreshes (after %d waits) in %s; want it answered after the refresh that followed its wait", refreshes, waitedAt, time.Since(start))
+	}
+	mu.Unlock()
+
+	q.mu.Lock()
+	q.outcome = func(m catalog.DDLMigration) catalog.DDLMigration { m.State = catalog.MigrationFailed; return m }
+	q.mu.Unlock()
+	if _, err := conn.Exec(ctx, "create index orders_idx on orders (id)"); err == nil {
+		t.Fatal("the failed migration was answered as applied")
+	}
+	if _, err := conn.Exec(ctx, "set pgshard.ddl_async = on"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "create index concurrently orders_id2 on orders (id)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "reset pgshard.ddl_async"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if refreshes != 1 {
+		t.Fatalf("a failed or asynchronous migration refreshed the snapshot: %d refreshes", refreshes)
+	}
+	fail = errors.New("catalog unreachable")
+	mu.Unlock()
+
+	q.mu.Lock()
+	q.outcome = nil
+	q.mu.Unlock()
+	notices = nil
+	if _, err := conn.Exec(ctx, "create table audit2 (tenant_id int8, id int, primary key (tenant_id, id))"); err != nil {
+		t.Fatalf("an applied migration whose refresh failed was not answered: %v", err)
+	}
+	if len(notices) != 1 || !strings.HasPrefix(notices[0], "WARNING: ") || !strings.Contains(notices[0], "catalog unreachable") {
+		t.Fatalf("notices after a failed refresh: %q", notices)
+	}
+}
