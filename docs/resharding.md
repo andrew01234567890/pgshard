@@ -207,12 +207,15 @@ record under `status.copy` is informational except for the schema flags.
 
 Tables registered or created after the publications exist are not picked
 up, and logical replication carries no DDL, so schema does not move during
-a copy. From the moment the new shards are provisioned until the switch,
-the router refuses DDL (`0A000`); from the copy until the switch the applier
-holds any queued migration, and a migration already applying when the copy
-begins is waited for before the targets' schema is materialized. A reshard
-that failed keeps its new shards, so the router keeps refusing DDL until
-that shard set is removed. A held role or grant migration does not stop
+a copy. DDL sent while a reshard is in flight is therefore **queued, not
+refused**: the statement takes its place in the operation queue behind the
+reshard and runs when the reshard finishes
+([operation-queue.md](operation-queue.md)). The session waits, is told what
+it is waiting for, and gets the command tag when the migration completes. A
+migration already applying when the copy begins is waited for before the
+targets' schema is materialized. A reshard that failed still holds the
+queue while its shard set is there, so statements behind it keep waiting
+until it is removed. A held role or grant migration does not stop
 the role verifier, which puts the managed roles on the new shards before
 their schema is restored. Sequences come across with their definitions only; values
 are not replicated.
@@ -394,6 +397,10 @@ and defer migrations of affected tables while a row exists.
 
 `switched` holds for `spec.resharding.retireOldGroupsAfter` (default 24h)
 and, when `pauseBefore` is `complete`, for `pgshard.io/proceed: complete`.
+At `0s` it does not hold at all: the run completes and the operator deletes
+the old groups on the pass that sees the switch, so there is no window to
+switch back in. `pauseBefore: complete` still holds a `0s` run, because an
+operator's pause is not a timer.
 `completing` drops the forward and reverse subscriptions, slots and
 publications on both sides and ends the workflow at `completed`. The
 operator then deletes the retired groups' pods, PVCs and Services; their

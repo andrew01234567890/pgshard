@@ -16,7 +16,7 @@
 | [Backups and restore](guide/backup-restore.md) | Object stores, schedules, PITR, certified barriers |
 | [Resharding](guide/resharding.md) | Declaring range and key changes; current workflow status |
 | [Major upgrades](guide/upgrades.md) | 18→19: what exists, what is planned |
-| [Admin UI](guide/admin-ui.md) | Topology, backups, migrations, streams panels |
+| [Admin UI](guide/admin-ui.md) | Topology, queue, backups, migrations, streams panels |
 | [Router autoscaling](guide/router-autoscaling.md) | HPA, drain, why scale-down is safe |
 
 ## Runbooks
@@ -46,6 +46,7 @@
 | [backup.md](backup.md) | pgBackRest, stanzas, restore, certified barriers |
 | [router.md](router.md) | Wire protocol, planner, scatter, transactions, operations |
 | [ddl.md](ddl.md) | DDL/DCL migration model and strategies |
+| [operation-queue.md](operation-queue.md) | One arrival order for DDL, reshards, upgrades and placements; deduplicating retries |
 | [roles.md](roles.md) | Cluster-wide roles, grants, drift repair |
 | [pooler.md](pooler.md) | Per-shard pooler, SCRAM passthrough, fencing |
 | [placement.md](placement.md) | Extended hash port, key ranges, controller reconcile |

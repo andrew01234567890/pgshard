@@ -154,15 +154,22 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    not refreshed yet. Other routers pick it up on their own reload, which is
    drawn from the notification budget, or on the periodic reload. `SET pgshard.ddl_async = on` returns immediately after the insert
    with the tag and a NOTICE naming the migration id; `RESET` restores
-   synchronous DDL. Cancelling a waiting statement leaves the migration
-   running in the background (`57014` names the id).
+   synchronous DDL. Cancelling a waiting statement, or letting
+   `statement_timeout` end it, leaves the migration in the queue (`57014`
+   names the id, and the DETAIL says it continues); the same statement sent
+   again attaches to it rather than queueing a second, so an ordinary retry
+   loop builds the index once ([operation-queue.md](operation-queue.md)).
 
 5. **Apply.** The controller leader's applier (`internal/controller/applier.go`)
-   holds a queued migration while a reshard or upgrade copies (from the copy
-   to its switch; logical replication carries no DDL) or holds the database's
-   DDL lock. The router refuses new DDL from the moment a reshard's new
-   shards are provisioned until its switch, and after a failed reshard until
-   its shard set is removed. Otherwise it
+   starts a queued migration only when the operation queue says it is its
+   turn: nothing that conflicts with it has started and is unfinished, and
+   nothing that conflicts with it arrived earlier and still holds its place
+   ([operation-queue.md](operation-queue.md)). A reshard or upgrade
+   conflicts with all DDL, because logical replication carries no DDL; a
+   placement conflicts with DDL in its database until it has swapped; and
+   two migrations conflict in the same database, or when either is about
+   roles or databases. The statement is not refused for any of that — it
+   waits, and the session is told what it waits for. Otherwise the applier
    takes queued and running migrations oldest first, one at a time, and
    runs each on its targets in shard order. Client statements never run on
    a superuser session: the applier logs into the shard's primary as

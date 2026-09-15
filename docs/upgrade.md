@@ -57,9 +57,14 @@ name:
    sequence positions), reverse publications and subscriptions for
    rollback, journal rows, the serving-map flip, replication swap and
    fence release. DDL is frozen for the window through `workflow_locks`.
+   DDL sent while the upgrade runs is queued behind it rather than refused
+   ([operation-queue.md](operation-queue.md)).
 4. **Retirement** — the old groups stay for
    `spec.resharding.retireOldGroupsAfter` with reverse replication
-   flowing, then the run completes and they are deleted.
+   flowing, then the run completes and they are deleted. Set it to `0s`
+   and they go as soon as the switch lands: the operator deletes them on
+   the pass that sees the cutover complete, which is the trade of a
+   rollback window for the storage of running two majors at once.
 
 `spec.upgrade.maxParallelGroups` bounds provisioning parallelism: at most
 that many new-major target groups are brought up at a time, the next one
