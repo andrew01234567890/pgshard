@@ -663,9 +663,11 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 				return waiting, err
 			}
 		} else {
-			// The pause stood, so the transactions left are read-only ones
-			// begun under it. Only one that has written -- a client that
-			// overrode the pause for its own transaction -- is waited for.
+			// The pause stood, and SourcesPaused gave this pass the instant
+			// it was confirmed at: the drain still waits for a transaction
+			// older than that, which a controller that died in the middle
+			// of an earlier drain left unwaited for, and for one that
+			// overrode the pause and has written.
 			if err := ops.DrainSources(ctx); err != nil {
 				return true, retryf("%s", err)
 			}
