@@ -388,9 +388,6 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 		// left on would shut the table to every client for good.
 		return err
 	}
-	if err := p.unlock(ctx, wf); err != nil {
-		return err
-	}
 	wf.stage, wf.state = StageFailed, StateFailed
 	// The slots go with the fence and the lock, for the same reason the
 	// comment above gives: a failed workflow is never revisited. list()
@@ -403,17 +400,35 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 	// source that cannot be reached must not stop the workflow being marked
 	// failed, or the next pass gives up the fence and the lock again and the
 	// workflow never ends.
-	residue := ""
+	var residue []string
 	if wf.from != nil {
 		if err := p.dropReplication(ctx, wf); err != nil {
-			residue = err.Error()
+			residue = append(residue, err.Error())
 			p.logger().Warn("failed placement left replication objects behind; they pin WAL on the source until dropped",
-				"workflow", wf.id, "table", wf.spec.TableName, "err", residue)
+				"workflow", wf.id, "table", wf.spec.TableName, "err", err)
 		}
 	}
+	// The shadows too, while no shard has begun its swap: a failed move's
+	// shadows are only in the way, and the next move of the table refuses
+	// to build over a shadow another workflow marked. Once a swap has begun
+	// a shadow may be the only copy of what that shard should now hold, so
+	// what is there is left for whoever repairs the table.
+	if wf.rt != nil && len(wf.st.Swapped) == 0 {
+		if err := p.dropShadows(ctx, wf); err != nil {
+			residue = append(residue, err.Error())
+			p.logger().Warn("failed placement left its shadow tables behind; the next move of the table refuses to start until they are dropped",
+				"workflow", wf.id, "table", wf.spec.TableName, "err", err)
+		}
+	}
+	// The lock goes last, after the best-effort drops: released first, the
+	// next move of the table could start and build its shadow while this
+	// one's was still being dropped.
+	if err := p.unlock(ctx, wf); err != nil {
+		return err
+	}
 	status := map[string]any{"stage": StageFailed, "placement": wf.st, "message": cause.Error()}
-	if residue != "" {
-		status["leaked"] = residue
+	if len(residue) > 0 {
+		status["leaked"] = strings.Join(residue, "; ")
 	}
 	if err := ownedExec(ctx, p.Pool, wf.owner,
 		`UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now()
@@ -676,10 +691,24 @@ func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
 	if err := p.dropReplication(ctx, wf); err != nil {
 		return err
 	}
+	if err := p.dropShadows(ctx, wf); err != nil {
+		return err
+	}
+	return p.unlock(ctx, wf)
+}
+
+// dropShadows drops this workflow's shadow on every shard it may have built
+// one on. A table under the shadow's name without this workflow's marker is
+// left alone.
+func (p *Placer) dropShadows(ctx context.Context, wf *placementWorkflow) error {
+	// Every shard is tried: one that cannot be reached must not leave the
+	// shadows on the others, each of which would refuse the next move.
+	var failed error
 	for _, t := range wf.rt.ids {
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
-			return err
+			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err))
+			continue
 		}
 		dropped, derr := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow(), wf.placementMarker())
 		if !dropped && derr == nil {
@@ -687,16 +716,16 @@ func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
 			// because it is not ours is the right call, and saying nothing
 			// about it is not.
 			if left, lerr := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow()); lerr == nil && left {
-				p.logger().Warn("cancellation left a shadow in place: it does not carry this workflow's marker",
+				p.logger().Warn("placement left a shadow in place: it does not carry this workflow's marker",
 					"shard", fmt.Sprintf("%s/%d", wf.st.SourceSet, t), "table", wf.shape.qualified(wf.shadow()), "workflow", wf.id)
 			}
 		}
 		_ = conn.Close(ctx)
 		if derr != nil {
-			return derr
+			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, derr))
 		}
 	}
-	return p.unlock(ctx, wf)
+	return failed
 }
 
 // cancelPlacement marks an active placement workflow for cleanup unless it
