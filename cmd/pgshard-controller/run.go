@@ -55,6 +55,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	caFile := fs.String("tls-ca", "", "CA bundle that client certificates must chain to")
 	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener, and servers this process dials that are not the role it means to reach; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
+	acceptPlaintext := fs.Bool("tls-accept-plaintext", false, "also serve plaintext callers on this listener while the cluster moves to mutual TLS; a TLS caller still gets the full check (needs the TLS flags)")
 	interval := fs.Duration("reconcile-interval", 30*time.Second, "longest time between reconcile passes without a catalog notification")
 	retry := fs.Duration("election-retry", 5*time.Second, "time between leadership attempts")
 	lockKey := fs.Int64("leader-lock-key", controller.LeaderLockKey, "pg_advisory_lock key that elects the leader")
@@ -115,7 +116,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var creds credentials.TransportCredentials
 	if *listen != "" {
 		var err error
-		if creds, err = grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev, authorize(*authorizeCallers, pki.RoleController)...); err != nil {
+		if creds, err = grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev, listenerOptions(*authorizeCallers, *acceptPlaintext, pki.RoleController)...); err != nil {
 			fmt.Fprintf(stderr, "pgshard-controller run: %v\n", err)
 			return cli.ExitUsage
 		}
@@ -278,26 +279,14 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "pgshard-controller run: %v\n", err)
 		return cli.ExitNotReady
 	}
-	// Admitting a caller and letting it call everything are different
-	// decisions. The credentials above admit {router, operator}; these
-	// narrow what an admitted role may reach, so a router's certificate is
-	// not also a credential for CancelWorkflow.
-	serverOpts := []grpc.ServerOption{grpc.Creds(creds)}
-	//
-	// Not under --insecure-dev: there are no certificates, so there are no
-	// identities to judge, and every call would be refused for having
-	// none. grpccreds.Listener already drops Authorize for the same reason
-	// -- doing one and not the other is what turns a dev flag into a
-	// listener that answers PermissionDenied to everything while logging
-	// that it is up.
-	if unary, stream := grpccreds.MethodInterceptors(pki.RoleController, *authorizeCallers && !*insecureDev); unary != nil {
-		serverOpts = append(serverOpts, grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream))
-	}
-	g := grpc.NewServer(serverOpts...)
+	g := grpc.NewServer(serverOptions(creds, *authorizeCallers, *insecureDev, *acceptPlaintext)...)
 	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams, Leader: leader})
 	mode := "mTLS"
 	if *insecureDev {
 		mode = "INSECURE plaintext"
+	}
+	if *acceptPlaintext {
+		mode = "mTLS, and plaintext while moving to mTLS"
 	}
 	fmt.Fprintf(stdout, "pgshard-controller run: listening on %s (%s)\n", l.Addr(), mode)
 	errc := make(chan error, 1)
@@ -391,13 +380,43 @@ func agentDialCredentials(certFile, keyFile, caFile, serverName string, authoriz
 	return grpccreds.Dialer(certFile, keyFile, caFile, serverName, false, opts...)
 }
 
-func authorize(on bool, role string) []grpccreds.Option {
-	if !on {
-		return nil
+// serverOptions are the controller listener's credentials and method
+// authorization.
+//
+// Admitting a caller and letting it call everything are different
+// decisions. The credentials admit {router, operator}; the interceptors
+// narrow what an admitted role may reach, so a router's certificate is not
+// also a credential for CancelWorkflow.
+//
+// Not under --insecure-dev: there are no certificates, so there are no
+// identities to judge, and every call would be refused for having none.
+// grpccreds.Listener already drops Authorize for the same reason -- doing
+// one and not the other is what turns a dev flag into a listener that
+// answers PermissionDenied to everything while logging that it is up. And
+// a listener accepting plaintext passes plaintext callers through, or every
+// caller still dialling plaintext mid-transition is refused.
+func serverOptions(creds credentials.TransportCredentials, authorizeCallers, insecureDev, acceptPlaintext bool) []grpc.ServerOption {
+	opts := []grpc.ServerOption{grpc.Creds(creds)}
+	var methodOpts []grpccreds.Option
+	if acceptPlaintext {
+		methodOpts = append(methodOpts, grpccreds.AcceptPlaintext())
 	}
-	allow, ok := pki.AllowedCallers(role)
-	if !ok {
-		return nil
+	if unary, stream := grpccreds.MethodInterceptors(pki.RoleController, authorizeCallers && !insecureDev, methodOpts...); unary != nil {
+		opts = append(opts, grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream))
 	}
-	return []grpccreds.Option{grpccreds.Authorize(allow)}
+	return opts
+}
+
+func listenerOptions(authorizeCallers, acceptPlaintext bool, role string) []grpccreds.Option {
+	var opts []grpccreds.Option
+	if acceptPlaintext {
+		opts = append(opts, grpccreds.AcceptPlaintext())
+	}
+	if !authorizeCallers {
+		return opts
+	}
+	if allow, ok := pki.AllowedCallers(role); ok {
+		opts = append(opts, grpccreds.Authorize(allow))
+	}
+	return opts
 }

@@ -12,7 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/credentials"
+
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 // Role is the bootstrap role of an instance.
@@ -155,6 +159,25 @@ type TLSFiles struct {
 	// and the check is fail-closed, so turning it on without them refuses
 	// every caller.
 	AuthorizeCallers bool `json:"authorizeCallers,omitempty"`
+	// AcceptPlaintext also serves callers that dial plaintext, for the
+	// length of a move to mutual TLS: the operator and controller switch to
+	// TLS member by member, and a caller still dialling plaintext must not
+	// be refused before it has. Needs the three files.
+	AcceptPlaintext bool `json:"acceptPlaintext,omitempty"`
+}
+
+// listenerCredentials are the agent gRPC listener's transport credentials.
+func (t TLSFiles) listenerCredentials() (credentials.TransportCredentials, error) {
+	var opts []grpccreds.Option
+	if t.AcceptPlaintext {
+		opts = append(opts, grpccreds.AcceptPlaintext())
+	}
+	if t.AuthorizeCallers {
+		if allow, ok := pki.AllowedCallers(pki.RoleAgent); ok {
+			opts = append(opts, grpccreds.Authorize(allow))
+		}
+	}
+	return grpccreds.Listener(t.CertFile, t.KeyFile, t.CAFile, t.Plaintext(), opts...)
 }
 
 // Plaintext reports that the listener carries no transport security, so the

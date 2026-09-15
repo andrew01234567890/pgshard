@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -30,11 +31,21 @@ import (
 // Returns nil when the caller is not authorising by identity at all, so a
 // deployment that has not turned mTLS on is unchanged rather than half
 // enforced.
-func MethodInterceptors(role string, authorize bool) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+//
+// A listener that also accepts plaintext (AcceptPlaintext) passes a plaintext
+// peer through, as --insecure-dev does: refusing it would refuse every
+// caller still dialling plaintext while the cluster moves to TLS, which is
+// the outage the option exists to avoid. A TLS peer without an identity is
+// still refused.
+func MethodInterceptors(role string, authorize bool, opts ...Option) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	if !authorize || role == "" {
 		return nil, nil
 	}
+	acceptPlaintext := apply(opts).acceptPlaintext
 	check := func(ctx context.Context, fullMethod string) error {
+		if acceptPlaintext && plaintextPeer(ctx) {
+			return nil
+		}
 		id, ok := peerIdentity(ctx)
 		if !ok {
 			// No identity to judge. The credentials refuse an
@@ -61,6 +72,11 @@ func MethodInterceptors(role string, authorize bool) (grpc.UnaryServerIntercepto
 		return handler(srv, ss)
 	}
 	return unary, stream
+}
+
+func plaintextPeer(ctx context.Context) bool {
+	p, ok := peer.FromContext(ctx)
+	return ok && p.AuthInfo != nil && p.AuthInfo.AuthType() == insecure.NewCredentials().Info().SecurityProtocol
 }
 
 // peerIdentity reads the pgshard identity off the peer's verified
