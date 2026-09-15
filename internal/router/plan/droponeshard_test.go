@@ -85,12 +85,12 @@ func TestDroppingAnObjectOnATableFollowsTheTable(t *testing.T) {
 // left every other shard holding the old name.
 func TestRenamingFollowsTheSameRulesAsDropping(t *testing.T) {
 	snap := fixture(t)
-	for _, c := range []struct{ sql, want string }{
-		{"alter trigger t on orders rename to u", ScopeAll},
-		{"alter policy p on orders rename to q", ScopeAll},
-		{"alter rule r on orders rename to q", ScopeAll},
-		{"alter table orders rename constraint a to b", ScopeAll},
-		{"alter table settings rename constraint a to b", ScopeHome},
+	for _, c := range []struct{ sql, want, kind string }{
+		{"alter trigger t on orders rename to u", ScopeAll, "ALTER TRIGGER"},
+		{"alter policy p on orders rename to q", ScopeAll, "ALTER POLICY"},
+		{"alter rule r on orders rename to q", ScopeAll, "ALTER RULE"},
+		{"alter table orders rename constraint a to b", ScopeAll, "ALTER TABLE"},
+		{"alter table settings rename constraint a to b", ScopeHome, "ALTER TABLE"},
 	} {
 		p, err := New().Plan(context.Background(), session(snap), c.sql)
 		if err != nil {
@@ -103,6 +103,10 @@ func TestRenamingFollowsTheSameRulesAsDropping(t *testing.T) {
 		}
 		if got := p.Migration.Scope; got != c.want {
 			t.Errorf("%s: scope %q, want %q", c.sql, got, c.want)
+		}
+		// PGS-880: a trigger's rename was recorded as ALTER ACCESS_METHOD.
+		if got := p.Migration.Kind; got != c.kind {
+			t.Errorf("%s: kind %q, want %q", c.sql, got, c.kind)
 		}
 	}
 	// And the objects that exist in every group, which pgshard never
