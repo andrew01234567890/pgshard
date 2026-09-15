@@ -1246,16 +1246,27 @@ wait:
 		}
 	}
 	s.mu.Lock()
-	var held []*Backend
+	var relayed, idle []*Backend
 	for id, se := range s.sessions {
-		if se.b != nil {
-			held = append(held, se.b)
-			se.b = nil
+		switch {
+		case se.b == nil:
+		case se.attached:
+			relayed = append(relayed, se.b)
+		default:
+			idle = append(idle, se.b)
 		}
+		se.b = nil
 		delete(s.sessions, id)
 	}
 	s.mu.Unlock()
-	for _, b := range held {
+	// Abandon, not Discard, for a backend whose session still has its
+	// stream: that stream's relay may be inside a read or write on it. A
+	// reservation whose stream is gone has nothing driving its backend,
+	// so it is closed properly.
+	for _, b := range relayed {
+		s.cfg.Pool.Abandon(b)
+	}
+	for _, b := range idle {
 		s.cfg.Pool.Discard(b)
 	}
 	s.cfg.Pool.Close()

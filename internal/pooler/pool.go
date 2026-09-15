@@ -588,6 +588,39 @@ func (p *Pool) Release(b *Backend) { p.release(b, false) }
 // Discard closes b and frees its slot without reuse.
 func (p *Pool) Discard(b *Backend) { p.release(b, true) }
 
+// Abandon ends a backend that another goroutine may still be using, and is
+// for exactly that case: a drain whose deadline has passed with a session
+// mid-statement.
+//
+// Discard is not safe there. It closes the backend through its
+// pgproto3.Frontend -- a Terminate and a flush -- and reads the Frontend's
+// buffered state to decide whether to pool it, while the session's relay is
+// inside a Receive or a Flush on the same Frontend, which is not safe for
+// concurrent use; and it clears b.conn underneath that call.
+//
+// Abandon touches none of that. It closes the socket, which is safe to do
+// underneath a read or write in progress and makes that call return with an
+// error, takes the backend out of the pool's accounting, and leaves the
+// relay to find its connection gone on its own goroutine. When the relay
+// later releases or discards the backend, that is a no-op: it has already
+// been released here.
+func (p *Pool) Abandon(b *Backend) {
+	p.mu.Lock()
+	if b.released {
+		p.mu.Unlock()
+		return
+	}
+	b.released = true
+	b.broken = true
+	conn := b.conn
+	rp := p.role(b.database, b.role)
+	p.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+	p.free(rp)
+}
+
 // release returns b once. A second call for the same handout does nothing:
 // free drains a token from two channels, so freeing one backend's slot
 // twice takes another backend's tokens, and once they run out the receive
