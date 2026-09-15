@@ -1301,6 +1301,8 @@ func objectMatchesIn(ctx context.Context, conn ShardConn, o catalog.MigrationObj
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`
 	case "database":
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`
+	case "function":
+		sql = `SELECT to_regprocedure($1) IS NOT NULL`
 	default:
 		return false, nil
 	}

@@ -24,16 +24,22 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
 
    | Statement | Scope |
    |---|---|
-   | tables declared sharded or reference; schemas, sequences, types, views over sharded tables; databases; roles; `GRANT`/`REVOKE` not limited to unsharded tables | `all` — every shard of the set |
+   | tables declared sharded or reference; schemas, sequences, types, views over sharded tables; `CREATE [OR REPLACE] FUNCTION`/`PROCEDURE` and `DROP FUNCTION`/`PROCEDURE IF EXISTS`; databases; roles; `GRANT`/`REVOKE` not limited to unsharded tables | `all` — every shard of the set |
    | unsharded tables and views/grants over them only | `home` — the database's home shard |
-   | `DROP`/`ALTER`/`REINDEX INDEX`, `DROP`/`ALTER VIEW` (owning table unknown to the router) | `existing` — every shard, shards without the object are skipped; failed if no shard had it |
+   | `DROP`/`ALTER`/`REINDEX INDEX`, `DROP`/`ALTER VIEW` (owning table unknown to the router), `DROP FUNCTION`/`PROCEDURE` without `IF EXISTS` | `existing` — every shard, shards without the object are skipped; failed if no shard had it |
 
-   An object that belongs to a table follows the table: `DROP`/`ALTER … RENAME`
-   of a `TRIGGER`, `POLICY` or `RULE`, and `ALTER TABLE … RENAME CONSTRAINT`,
-   take the table's scope like any other statement over it.
+   An object that belongs to a table follows the table: `CREATE [OR REPLACE]
+   TRIGGER`, `COMMENT ON TABLE|VIEW|COLUMN`, `DROP`/`ALTER … RENAME` of a
+   `TRIGGER`, `POLICY` or `RULE`, and `ALTER TABLE … RENAME CONSTRAINT`, take
+   the table's scope like any other statement over it. `CREATE TRIGGER` on a
+   reference table is refused: the router refuses writes to a reference
+   table that has a trigger, so the trigger would make the table read-only.
+   A function is fanned out, not declared: it is not added to
+   `pgshard.functions`, so a scatter still refuses to project it until an
+   operator lists it there.
 
    Every other `DROP`, `RENAME`, `OWNER TO` and `SET SCHEMA` the router does
-   not list explicitly — `FUNCTION`, `AGGREGATE`, `EXTENSION`, `DOMAIN`,
+   not list explicitly — `ALTER FUNCTION`, `AGGREGATE`, `EXTENSION`, `DOMAIN`,
    `OPERATOR`, `COLLATION`, `CAST`, the text search objects, `STATISTICS`,
    `SERVER`, `PUBLICATION` — is **refused**. A database exists in every
    group, so the objects inside one do too, and pgshard cannot fan the

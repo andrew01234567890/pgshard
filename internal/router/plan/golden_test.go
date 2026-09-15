@@ -416,7 +416,7 @@ func golden() []want {
 		{sql: "merge into orders o using orders_src s on o.id = s.id when matched then delete", kind: Refuse, msg: "MERGE is not supported through the router"},
 		{sql: "do $$ begin delete from orders; end $$", kind: Refuse, msg: "DO is not supported through the router"},
 		{sql: "call cleanup_orders()", kind: Refuse, msg: "CALL is not supported through the router"},
-		{sql: "create function f() returns int language sql as 'select 1'", kind: Refuse, msg: "CREATE FUNCTION is not supported through the router"},
+		{sql: "create extension hstore", kind: Refuse, msg: "CREATE EXTENSION is not supported through the router"},
 		// A matview can only have been created over unsharded data, so it
 		// lives on the home shard and refreshing it goes there. Before this
 		// the view was frozen at its creation contents for good.

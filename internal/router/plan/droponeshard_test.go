@@ -12,12 +12,12 @@ import (
 // nothing said so. Seventeen object types took that path.
 //
 // pgshard cannot fan these out, because it never created them -- CREATE
-// FUNCTION, CREATE AGGREGATE and CREATE EXTENSION are all refused here. So
-// the honest answer is the one the CREATE gives: not through the router.
+// AGGREGATE and CREATE EXTENSION are refused here. So the honest answer is
+// the one the CREATE gives: not through the router. A function is fanned out
+// by its CREATE, and its DROP with it.
 func TestADropThePlannerCannotFanOutIsRefused(t *testing.T) {
 	snap := fixture(t)
 	for _, sql := range []string{
-		"drop function f(int)",
 		"drop aggregate agg(int)",
 		"drop extension postgis",
 		"drop domain d",

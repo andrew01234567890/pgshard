@@ -112,9 +112,9 @@ schema-qualified call is looked up by its last name element for the same
 reason.
 
 It is edited with normal SQL because the router cannot learn it any other
-way today: `CREATE FUNCTION`, `CREATE AGGREGATE` and `CREATE EXTENSION` are
-all refused through the router, so there is no DDL path for it to record
-from. `WHERE`-clause functions are not affected; the classification covers the
+way today: `CREATE AGGREGATE` and `CREATE EXTENSION` are refused through the
+router, and a `CREATE FUNCTION` it fans out says nothing a parse tree can
+trust about whether projecting the function across shards is safe. `WHERE`-clause functions are not affected; the classification covers the
 target list and the `ORDER BY` expressions, which become hidden target
 columns and are the same question about the same value.
 
