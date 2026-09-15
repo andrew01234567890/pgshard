@@ -18,24 +18,66 @@ func TestAResumedFunctionMigrationRecognisesTheFunctionItMade(t *testing.T) {
 	mustExec(t, conn, `CREATE SCHEMA app`)
 	mustExec(t, conn, `CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'begin return new; end'`)
 	mustExec(t, conn, `CREATE FUNCTION app.f(a int, b text[], OUT c int) LANGUAGE sql AS 'select 1'`)
+	mustExec(t, conn, `CREATE FUNCTION public.shadowed() RETURNS int LANGUAGE sql AS 'select 1'`)
 	shard := pgxShardConn{conn}
-	for _, c := range []struct {
-		sig, expect string
-		want        bool
+	check := func(searchPath string, cases []struct {
+		schema, sig, expect string
+		want                bool
+	}) {
+		t.Helper()
+		mustExec(t, conn, `SET search_path = `+searchPath)
+		for _, c := range cases {
+			got, err := objectMatches(ctx, shard, catalog.MigrationObject{Kind: "function", Schema: c.schema, Name: c.sig, Expect: c.expect})
+			if err != nil {
+				t.Fatalf("%s: %v", c.sig, err)
+			}
+			if got != c.want {
+				t.Errorf("search_path %s: function %q.%s expected %s: matches = %v, want %v", searchPath, c.schema, c.sig, c.expect, got, c.want)
+			}
+		}
+	}
+	check("public", []struct {
+		schema, sig, expect string
+		want                bool
 	}{
-		{`"f"()`, "present", true},
-		{`"app"."f"("pg_catalog"."int4", "text"[])`, "present", true},
-		{`"app"."f"("pg_catalog"."int4")`, "present", false},
-		{`"g"()`, "absent", true},
-		{`"f"()`, "absent", false},
-	} {
-		got, err := objectMatches(ctx, shard, catalog.MigrationObject{Kind: "function", Name: c.sig, Expect: c.expect})
-		if err != nil {
-			t.Fatalf("%s: %v", c.sig, err)
-		}
-		if got != c.want {
-			t.Errorf("function %s expected %s: matches = %v, want %v", c.sig, c.expect, got, c.want)
-		}
+		{"", `"f"()`, "present", true},
+		{"app", `"f"("pg_catalog"."int4", "text"[])`, "present", true},
+		{"app", `"f"("pg_catalog"."int4")`, "present", false},
+		{"", `"g"()`, "absent", true},
+		{"", `"f"()`, "absent", false},
+	})
+	// A CREATE naming no schema made its function in the first schema of
+	// the path; one of the same signature further along is not it.
+	check("app, public", []struct {
+		schema, sig, expect string
+		want                bool
+	}{
+		{"", `"shadowed"()`, "present", false},
+		{"", `"f"("pg_catalog"."int4", "text"[])`, "present", true},
+	})
+}
+
+// TestAResumedCreateFunctionIsNotRunAgain (PGS-867): a shard whose CREATE
+// FUNCTION committed before its progress was saved is recognised as applied
+// when the migration resumes, instead of failing on the function it made.
+func TestAResumedCreateFunctionIsNotRunAgain(t *testing.T) {
+	parallelPG(t)
+	pool, a, store := rewritePGFixture(t)
+	ctx := context.Background()
+	mustExecSQL(t, pool, `CREATE FUNCTION made_before_the_crash() RETURNS int LANGUAGE sql AS 'select 1'`)
+	store.migrations = []catalog.DDLMigration{{ID: "20000000-0000-0000-0000-0000000000f5", Database: "postgres",
+		Statement: `CREATE FUNCTION made_before_the_crash() RETURNS int LANGUAGE sql AS 'select 1'`, Kind: "CREATE FUNCTION", Strategy: "direct", Scope: "all",
+		State:    catalog.MigrationRunning,
+		PerShard: map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning}},
+		Meta:     catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "function", Name: `"made_before_the_crash"()`, Expect: "present"}}}}
+	if _, err := a.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	m := store.migrations[0]
+	store.mu.Unlock()
+	if m.State != catalog.MigrationComplete {
+		t.Fatalf("a resumed CREATE FUNCTION whose function exists is %s: %q %+v", m.State, m.Error, m.PerShard)
 	}
 }
 

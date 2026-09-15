@@ -2,8 +2,11 @@ package plan
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
 // Everything DROP did not name explicitly fell through to the home shard.
@@ -125,6 +128,10 @@ func TestRenamingFollowsTheSameRulesAsDropping(t *testing.T) {
 		// the shared helper is written for.
 		if strings.Contains(err.Error(), "ALTER TABLE") {
 			t.Errorf("%s: refused as %v, which names a table", sql, err)
+		}
+		var pgErr *pgwire.Error
+		if strings.Contains(sql, "function") && (!errors.As(err, &pgErr) || strings.Contains(pgErr.Hint, "CREATE is refused")) {
+			t.Errorf("%s: refused with %v, whose hint says a function's CREATE is refused", sql, err)
 		}
 	}
 }

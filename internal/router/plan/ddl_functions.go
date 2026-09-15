@@ -32,8 +32,8 @@ func (w *walker) createFunction(f *pgquerypb.CreateFunctionStmt) error {
 			}
 			args = append(args, fp.GetArgType())
 		}
-		if sig, ok := functionSignature(f.GetFuncname(), args); ok {
-			m.Object = ObjectRef{Kind: "function", Name: sig, Expect: objectPresent}
+		if schema, sig, ok := functionSignature(f.GetFuncname(), args); ok {
+			m.Object = ObjectRef{Kind: "function", Schema: schema, Name: sig, Expect: objectPresent}
 		}
 	}
 	return w.migration(m)
@@ -52,8 +52,8 @@ func (w *walker) dropFunction(kind string, d *pgquerypb.DropStmt) error {
 			for _, a := range o.GetObjargs() {
 				args = append(args, a.GetTypeName())
 			}
-			if sig, ok := functionSignature(o.GetObjname(), args); ok {
-				m.Object = ObjectRef{Kind: "function", Name: sig, Expect: objectAbsent}
+			if schema, sig, ok := functionSignature(o.GetObjname(), args); ok {
+				m.Object = ObjectRef{Kind: "function", Schema: schema, Name: sig, Expect: objectAbsent}
 			}
 		}
 	}
@@ -112,25 +112,29 @@ func (w *walker) comment(c *pgquerypb.CommentStmt) error {
 	return w.migration(Migration{Kind: "COMMENT", Scope: scope})
 }
 
-// functionSignature renders a function's name and argument types the way
-// to_regprocedure reads them, or reports that it cannot: a %TYPE argument
-// names a column rather than a type.
-func functionSignature(name []*pgquerypb.Node, args []*pgquerypb.TypeName) (string, bool) {
+// functionSignature renders a function's schema, if the statement names
+// one, and its unqualified name and argument types the way to_regprocedure
+// reads them; or reports that it cannot: a %TYPE argument names a column
+// rather than a type.
+func functionSignature(name []*pgquerypb.Node, args []*pgquerypb.TypeName) (schema, sig string, ok bool) {
 	parts := stringList(name)
 	if len(parts) == 0 {
-		return "", false
+		return "", "", false
+	}
+	if len(parts) >= 2 {
+		schema = parts[len(parts)-2]
 	}
 	types := make([]string, 0, len(args))
 	for _, a := range args {
 		if a == nil || a.GetPctType() {
-			return "", false
+			return "", "", false
 		}
 		names := stringList(a.GetNames())
 		if len(names) == 0 {
-			return "", false
+			return "", "", false
 		}
 		t := pgx.Identifier(names).Sanitize() + strings.Repeat("[]", len(a.GetArrayBounds()))
 		types = append(types, t)
 	}
-	return pgx.Identifier(parts).Sanitize() + "(" + strings.Join(types, ", ") + ")", true
+	return schema, pgx.Identifier{parts[len(parts)-1]}.Sanitize() + "(" + strings.Join(types, ", ") + ")", true
 }

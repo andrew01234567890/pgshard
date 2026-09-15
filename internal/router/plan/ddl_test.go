@@ -173,6 +173,9 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "drop function f(int)", mig: "DROP FUNCTION existing", object: `function:"f"("pg_catalog"."int4"):absent`},
 		{sql: "drop function f", mig: "DROP FUNCTION existing"},
 		{sql: "drop procedure if exists p(int)", mig: "DROP PROCEDURE all", object: `function:"p"("pg_catalog"."int4"):absent`},
+		{sql: "drop routine f(int)", mig: "DROP ROUTINE existing", object: `function:"f"("pg_catalog"."int4"):absent`},
+		{sql: "create function f(variadic a int[]) returns int language sql as 'select 1'", mig: "CREATE FUNCTION all", object: `function:"f"("pg_catalog"."int4"[]):present`},
+		{sql: "create procedure p(out a int) language sql as 'select 1'", mig: "CREATE PROCEDURE all", object: `function:"p"():present`},
 		{sql: "create trigger t before insert or update on orders for each row execute function f()", mig: "CREATE TRIGGER all"},
 		{sql: "create or replace trigger t before insert on items for each row execute function f()", mig: "CREATE TRIGGER home"},
 		{sql: "create trigger t before insert on regions for each row execute function f()", refuse: "CREATE TRIGGER on a reference table is not available"},
@@ -222,7 +225,11 @@ func TestDDLClassification(t *testing.T) {
 			o := pl.Migration.Object
 			got := ""
 			if o.Kind != "" {
-				got = o.Kind + ":" + o.Name + ":" + o.Expect
+				name := o.Name
+				if o.Kind == "function" && o.Schema != "" {
+					name = `"` + o.Schema + `".` + name
+				}
+				got = o.Kind + ":" + name + ":" + o.Expect
 			}
 			if got != c.object {
 				t.Fatalf("object = %q, want %q", got, c.object)
