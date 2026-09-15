@@ -1142,21 +1142,36 @@ func (s *SQLBarrierGroups) PauseWrites(ctx context.Context, g GroupRef, pause bo
 	// the reset is sent: a workflow claims by updating that row before it
 	// pauses, so it cannot claim between this check and the reset and then
 	// have its own pause lifted.
+	//
+	// So is whether the set was retired since the barrier listed it. A
+	// rollback during the run retires a set the barrier paused as a serving
+	// one, and Complete's retirement pause is then already standing; the
+	// reset lifted it for good (PGS-822). Resumed anyway while a live
+	// workflow names the set or the primary still applies a subscription,
+	// the cases Complete itself leaves writable.
 	if !pause && !g.Catalog() {
 		tx, err := s.Pool.Begin(ctx)
 		if err != nil {
 			return time.Time{}, err
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
-		var claimed bool
-		if err := tx.QueryRow(ctx, `SELECT coalesce(bool_or(write_paused_by IS NOT NULL), false)
-			FROM (SELECT write_paused_by FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2 FOR UPDATE) st`, g.Set, g.ID).Scan(&claimed); err != nil {
+		var claimed, retired bool
+		if err := tx.QueryRow(ctx, `SELECT coalesce(bool_or(st.write_paused_by IS NOT NULL), false),
+				coalesce(bool_or(ss.state = 'retired' AND NOT `+liveWorkflowNamesSet("st.shard_set")+`), false)
+			FROM (SELECT write_paused_by, shard_set FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2 FOR UPDATE) st
+			LEFT JOIN pgshard.shard_sets ss ON ss.shard_set = st.shard_set`, g.Set, g.ID).Scan(&claimed, &retired); err != nil {
 			return time.Time{}, err
 		}
 		if claimed {
 			return time.Time{}, nil
 		}
 		if err := s.with(ctx, g, func(c groupConn) error {
+			if retired {
+				replicating, err := scalar[bool](ctx, c, `SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subenabled)`)
+				if err != nil || !replicating {
+					return err
+				}
+			}
 			if _, err := c.Exec(ctx, stmt); err != nil {
 				return err
 			}

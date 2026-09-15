@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -168,5 +170,57 @@ func TestAnUnreachableShardKeepsItsClaimAndStopsNothingElse(t *testing.T) {
 	}
 	if strings.Contains(cat.execs[0], "default 0") {
 		t.Fatalf("the claim was dropped for a shard still refusing writes: %v", cat.execs)
+	}
+}
+
+// recordingCatalog answers every query with no rows and records its text.
+type recordingCatalog struct {
+	mu      sync.Mutex
+	queries []string
+}
+
+func (c *recordingCatalog) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queries = append(c.queries, sql)
+	return &shardRefRows{}, nil
+}
+
+func (c *recordingCatalog) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+
+func (c *recordingCatalog) asked(fragment string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, q := range c.queries {
+		if strings.Contains(q, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// PGS-822: the loop the controller runs looks for lost retirement pauses as
+// well as orphaned claims, on every tick.
+func TestEverySweepTickAlsoLooksForALostRetirementPause(t *testing.T) {
+	c := &recordingCatalog{}
+	s := &WritePauseSweep{Pool: c, Shards: &pauseDialer{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Run(ctx, time.Millisecond, nil)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !c.asked("write_paused_by IS NOT NULL") || !c.asked("ss.state = 'retired'") {
+		if time.Now().After(deadline) {
+			t.Fatal("the sweep loop never looked for a retired set that lost its pause")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

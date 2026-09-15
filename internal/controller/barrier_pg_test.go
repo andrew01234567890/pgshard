@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -500,5 +502,117 @@ func TestABarrierDoesNotLiftAWorkflowsClaimedPause(t *testing.T) {
 	var still string
 	if err := f.pool.QueryRow(ctx, `SELECT coalesce(write_paused_by::text, '') FROM pgshard.shard_status WHERE shard_set = 'default' AND shard_id = 0`).Scan(&still); err != nil || still != owner {
 		t.Fatalf("the claim is %q (%v) after the barrier, want %s's still standing", still, err, owner)
+	}
+}
+
+// retiringGroups retires the shard set named set the first time the barrier
+// takes a shard group's restore point: a rollback retiring the set, and its
+// Complete finding the pause already standing, in the middle of the run.
+// also, when set, runs at the same moment.
+type retiringGroups struct {
+	*SQLBarrierGroups
+	set  string
+	also func(context.Context) error
+	once sync.Once
+}
+
+func (g *retiringGroups) CreateRestorePoint(ctx context.Context, ref GroupRef, name string) (RestorePointResult, error) {
+	if !ref.Catalog() {
+		var err error
+		g.once.Do(func() {
+			_, err = g.Pool.Exec(ctx, `UPDATE pgshard.shard_sets SET state = 'retired' WHERE shard_set = $1`, g.set)
+			if err == nil && g.also != nil {
+				err = g.also(ctx)
+			}
+		})
+		if err != nil {
+			return RestorePointResult{}, err
+		}
+	}
+	return g.SQLBarrierGroups.CreateRestorePoint(ctx, ref, name)
+}
+
+// TestABarrierDoesNotLiftARetirementPauseRaisedDuringItsRun (PGS-822): the
+// barrier lists a set while it serves and pauses it; a rollback retires it
+// before the barrier resumes, and Complete's retirement pause is the one
+// standing. Resuming every group it had listed lifted that pause for good.
+func TestABarrierDoesNotLiftARetirementPauseRaisedDuringItsRun(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixtureWith(t, "-c archive_mode=on", "-c archive_command=/bin/true")
+	ctx := context.Background()
+	var state string
+	if err := f.pool.QueryRow(ctx, `SELECT state FROM pgshard.shard_sets WHERE shard_set = 'default'`).Scan(&state); err != nil || state != "serving" {
+		t.Fatalf("the fixture's set is %q (%v), want serving", state, err)
+	}
+	write := func(dsn string) error {
+		c, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close(ctx) }()
+		_, err = c.Exec(ctx, `INSERT INTO t VALUES ('after the barrier')`)
+		return err
+	}
+	refused := func(err error) bool {
+		var pgErr *pgconn.PgError
+		return errors.As(err, &pgErr) && pgErr.Code == "25006"
+	}
+	barrier := func(name string, also func(context.Context) error) error {
+		groups := &retiringGroups{SQLBarrierGroups: &SQLBarrierGroups{Pool: f.pool, Shards: f.dialer}, set: "default", also: also}
+		b := &Barrier{Store: &PGBarrierStore{Pool: f.pool}, Groups: groups, Resolver: f.res, Poll: 50 * time.Millisecond}
+		srv := &Server{Pool: f.pool, Barrier: b, Resolver: f.res}
+		_, err := srv.CreateBarrier(ctx, &pgshardv1.CreateBarrierRequest{Name: name})
+		return err
+	}
+
+	// While a workflow still names the set it may need it writable -- a
+	// switch back after the rollback -- so the barrier resumes it as before.
+	var wf string
+	if err := f.pool.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status)
+		VALUES (gen_random_uuid(), 'reshard', 'running', '{"shard_set": "default", "source_set": "older"}', '{}') RETURNING id::text`).Scan(&wf); err != nil {
+		t.Fatal(err)
+	}
+	if err := barrier("beside-a-rollback", nil); err != nil {
+		t.Fatalf("CreateBarrier: %v", err)
+	}
+	for i, dsn := range f.shards {
+		waitFor(t, 20*time.Second, func() bool { return write(dsn) == nil }, fmt.Sprintf("the barrier left shard %d paused although a live workflow names its set", i))
+	}
+
+	// Once nothing does, the retirement pause is the one that stands.
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.workflows SET state = 'completed' WHERE id = $1::uuid`, wf); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.shard_sets SET state = 'serving' WHERE shard_set = 'default'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := barrier("across-a-retirement", nil); err != nil {
+		t.Fatalf("CreateBarrier: %v", err)
+	}
+	for i, dsn := range f.shards {
+		if err := write(dsn); !refused(err) {
+			t.Fatalf("shard %d of the set retired during the barrier took a write after it (err %v): the barrier lifted the retirement pause", i, err)
+		}
+	}
+
+	// Nor when the primary started applying a subscription during the run,
+	// which the pause would fail with 25006. The barrier refuses to certify
+	// across it; whether it resumed is what matters here.
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.shard_sets SET state = 'serving' WHERE shard_set = 'default'`); err != nil {
+		t.Fatal(err)
+	}
+	sub := connect(t, f.shards[0])
+	mustExec(t, sub, `SET default_transaction_read_only = off`)
+	_ = barrier("beside-a-subscription", func(ctx context.Context) error {
+		if _, err := sub.Exec(ctx, `CREATE SUBSCRIPTION leftover CONNECTION 'host=127.0.0.1 port=1 dbname=postgres' PUBLICATION p
+			WITH (connect = false, slot_name = 'leftover')`); err != nil {
+			return err
+		}
+		_, err := sub.Exec(ctx, `ALTER SUBSCRIPTION leftover ENABLE`)
+		return err
+	})
+	waitFor(t, 20*time.Second, func() bool { return write(f.shards[0]) == nil }, "the barrier left a retired shard that still applies a subscription paused")
+	if err := write(f.shards[1]); !refused(err) {
+		t.Fatalf("shard 1 has no subscription and took a write after the barrier (err %v)", err)
 	}
 }
