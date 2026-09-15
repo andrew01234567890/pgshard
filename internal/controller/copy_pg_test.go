@@ -677,3 +677,77 @@ func TestCancelLiftsAFenceTheStageDoesNotKnowAbout(t *testing.T) {
 		t.Fatalf("%d shard(s) still write-fenced after cancel: %s", n, stuck)
 	}
 }
+
+// TestCancelDropsItsPublicationsOnARetiredSource: a workflow cancelled after
+// another workflow retired its sources found them read-only -- the retirement
+// pause -- and DROP PUBLICATION was refused with 25006 on every pass, so the
+// cancel never finished and its slots stayed (PGS-836).
+func TestCancelDropsItsPublicationsOnARetiredSource(t *testing.T) {
+	parallelPG(t)
+	f := newCopyFixture(t)
+	ctx := context.Background()
+	id := f.startWorkflow()
+
+	pubs := func() int64 {
+		var n int64
+		for s := range int32(2) {
+			n += queryOne[int64](t, connect(t, f.appDSN("default", s)), `SELECT count(*) FROM pg_publication WHERE pubname LIKE 'pgshard_reshard_%'`)
+		}
+		return n
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for pubs() == 0 {
+		f.pass()
+		if time.Now().After(deadline) {
+			_, stage, msg := f.workflow(id)
+			t.Fatalf("the workflow never published on its sources: %s %q", stage, msg)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	slots := func() int64 {
+		var n int64
+		for s := range int32(2) {
+			n += queryOne[int64](t, connect(t, f.dsns[ShardRef{Set: "default", ID: s}]), `SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgshard_reshard_%'`)
+		}
+		return n
+	}
+	if slots() == 0 {
+		t.Fatal("the workflow holds no slots on its sources, so the check after the cancel proves nothing")
+	}
+	for s := range int32(2) {
+		admin := connect(t, f.dsns[ShardRef{Set: "default", ID: s}])
+		mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
+		mustExec(t, admin, `SELECT pg_reload_conf()`)
+	}
+	waitFor(t, 20*time.Second, func() bool {
+		for s := range int32(2) {
+			if queryOne[string](t, connect(t, f.appDSN("default", s)), `SHOW default_transaction_read_only`) != "on" {
+				return false
+			}
+		}
+		return true
+	}, "the sources never became read-only")
+
+	if err := f.reconcileDrop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(time.Minute)
+	for {
+		out := f.pass()
+		if out.Cancelled == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			_, stage, msg := f.workflow(id)
+			t.Fatalf("the cancel never finished on read-only sources: %s %q", stage, msg)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if n := pubs(); n != 0 {
+		t.Fatalf("%d publications left on the sources after the cancel", n)
+	}
+	if n := slots(); n != 0 {
+		t.Fatalf("%d reshard slots left on the sources after the cancel", n)
+	}
+}

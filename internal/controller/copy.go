@@ -1305,7 +1305,13 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 			if err != nil {
 				return err
 			}
-			err = dropPublications(ctx, conn, wf.gen)
+			// Another workflow may have retired these sources since, and a
+			// retired set refuses writes: this workflow's own publications
+			// are still its to drop (PGS-836).
+			err = writeThroughPause(ctx, conn)
+			if err == nil {
+				err = dropPublications(ctx, conn, wf.gen)
+			}
 			_ = conn.Close(ctx)
 			if err != nil {
 				return err
