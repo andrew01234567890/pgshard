@@ -91,6 +91,8 @@ func TestRenamingFollowsTheSameRulesAsDropping(t *testing.T) {
 		{"alter rule r on orders rename to q", ScopeAll, "ALTER RULE"},
 		{"alter table orders rename constraint a to b", ScopeAll, "ALTER TABLE"},
 		{"alter table settings rename constraint a to b", ScopeHome, "ALTER TABLE"},
+		{"alter materialized view mv rename column a to b", ScopeExisting, "ALTER MATERIALIZED VIEW"},
+		{"alter foreign table ft rename column a to b", ScopeExisting, "ALTER FOREIGN TABLE"},
 	} {
 		p, err := New().Plan(context.Background(), session(snap), c.sql)
 		if err != nil {

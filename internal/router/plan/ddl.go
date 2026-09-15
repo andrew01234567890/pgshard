@@ -698,6 +698,10 @@ func objectWord(t pgquerypb.ObjectType) string {
 		return "SERVER"
 	case pgquerypb.ObjectType_OBJECT_FDW:
 		return "FOREIGN DATA WRAPPER"
+	case pgquerypb.ObjectType_OBJECT_MATVIEW:
+		return "MATERIALIZED VIEW"
+	case pgquerypb.ObjectType_OBJECT_FOREIGN_TABLE:
+		return "FOREIGN TABLE"
 	}
 	return strings.TrimPrefix(t.String(), "OBJECT_")
 }
