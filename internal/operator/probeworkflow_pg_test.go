@@ -284,12 +284,15 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 		// keyed by. This is the case the fake could never fail on.
 		{BarrierRestorePoint("nightly"), false, nil},
 	} {
-		got, groups, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
+		rec, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		if got != c.want || !slices.Equal(groups, c.groups) {
-			t.Errorf("CertifiedBarrier(%q) = %v %v, want %v %v", c.name, got, groups, c.want, c.groups)
+		if rec.Certified != c.want || !slices.Equal(rec.Groups, c.groups) {
+			t.Errorf("CertifiedBarrier(%q) = %v %v, want %v %v", c.name, rec.Certified, rec.Groups, c.want, c.groups)
+		}
+		if c.groups != nil && time.Since(rec.CreatedAt) > time.Hour {
+			t.Errorf("CertifiedBarrier(%q) recorded at %v, want the row's created_at", c.name, rec.CreatedAt)
 		}
 	}
 }

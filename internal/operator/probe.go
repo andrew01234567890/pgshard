@@ -487,31 +487,30 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 // of the restored catalog afterwards: certified is WAL-logged after the
 // catalog group's own restore point, so a catalog recovered to that name
 // always reads back uncertified, even for a good barrier.
-func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, []string, error) {
+func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name string) (BarrierRecord, error) {
 	// The operator has no PGPASSWORD for an arbitrary cluster's superuser,
 	// so the password comes from that cluster's secret and is set on the
 	// parsed config rather than written into the DSN, which reaches logs
 	// and error messages.
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return false, nil, err
+		return BarrierRecord{}, err
 	}
 	cfg.Password = password
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		return false, nil, err
+		return BarrierRecord{}, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	var (
-		certified              bool
-		groups                 []string
+		rec                    BarrierRecord
 		recordedSystem, system string
 	)
-	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1),
+	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1), created_at,
 			coalesce(per_group->'catalog'->>'system_identifier', ''), (SELECT system_identifier::text FROM pg_control_system())
-		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&certified, &groups, &recordedSystem, &system)
+		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&rec.Certified, &rec.Groups, &rec.CreatedAt, &recordedSystem, &system)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil, nil
+		return BarrierRecord{}, nil
 	}
 	// The manifest names the catalog "catalog" whatever its generation, and
 	// its rows travel with the catalog through a major upgrade. So a
@@ -520,9 +519,18 @@ func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name strin
 	// none of its restore points. The system identifier tells them apart;
 	// a manifest written before it was recorded is taken at its word.
 	if recordedSystem != "" && recordedSystem != system {
-		groups = slices.DeleteFunc(groups, func(g string) bool { return g == "catalog" })
+		rec.Groups = slices.DeleteFunc(rec.Groups, func(g string) bool { return g == "catalog" })
 	}
-	return certified, groups, err
+	return rec, err
+}
+
+// BarrierRecord is what the source's catalog says about a barrier.
+type BarrierRecord struct {
+	Certified bool
+	// Groups are the groups its manifest holds a restore point on.
+	Groups []string
+	// CreatedAt is when the catalog recorded it.
+	CreatedAt time.Time
 }
 
 // ClearWriteFenceAfterRestore lifts the fence on a restored catalog,

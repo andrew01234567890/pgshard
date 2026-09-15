@@ -95,7 +95,10 @@ spec:
   the barrier has no restore point on a group the restore would recover:
   one created by a reshard since the barrier, or a catalog rebuilt by a
   major upgrade since (told apart by its database system identifier, which
-  barriers record). Take a new barrier.
+  barriers record). So is a barrier a restored cluster inherited from the
+  cluster it was restored from: its restore point is in that cluster's
+  repository. Take a new barrier. A barrier restore waits while the source's
+  catalog is being upgraded.
 - A barrier restore ends with a reconciliation phase: prepared
   `pgshard-*` transactions are finished against the restored decision log,
   and the write fence the barrier raised is released only when there is no
