@@ -226,6 +226,10 @@ type Executor struct {
 	savepoints []savepointMark
 	// portals maps portal names to logical statement names.
 	portals map[string]string
+	// portalDDL holds the migration a portal was bound to, as its Bind
+	// found the statement: a name parsed again before the Execute names
+	// another statement by then.
+	portalDDL map[string]*plan.Plan
 
 	batch       []*pgshardv1.ExecuteRequest
 	batchStmts  []string
@@ -243,6 +247,11 @@ type Executor struct {
 	batchScatter     *plan.Plan
 	batchScatterStmt string
 	batchExec        []execItem
+	// batchDDL holds, for each Parse, Bind and Execute of the batch in
+	// order, the migration its statement plans to as that message arrived,
+	// or nil. Resolving names at Sync instead sees only the last statement
+	// a name was parsed to, so every Execute of a pipeline would run it.
+	batchDDL []*plan.Plan
 	// batchInject maps a batch index to the requests sent right after it:
 	// the search_path reapplication a staged RESET needs before the next
 	// pipelined statement runs. hiddenExec flags, per Execute on the wire,
@@ -313,7 +322,7 @@ func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
 		ident: &pgshardv1.UserIdentity{Username: info.User,
 			ScramClientKey: append([]byte(nil), keys.ClientKey...), ScramServerKey: append([]byte(nil), keys.ServerKey...)},
 		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
-		stmts: map[string]prepared{}, portals: map[string]string{},
+		stmts: map[string]prepared{}, portals: map[string]string{}, portalDDL: map[string]*plan.Plan{},
 	}
 	e.startupSearchPath = startupPath(info.Params)
 	return e
@@ -1379,6 +1388,7 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 	e.stmts[name] = st
 	e.batchStmts = append(e.batchStmts, name)
 	e.batch = append(e.batch, parseReq(e.physical(name), st.shardSQL(), st.shardOIDs()))
+	e.batchDDL = append(e.batchDDL, migrationPlan(e.stmts, name))
 	return nil
 }
 
@@ -1496,7 +1506,9 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 		}
 	}
 	e.portals[portal] = statement
+	e.portalDDL[portal] = migrationPlan(e.stmts, statement)
 	e.batch = append(e.batch, bindReq(portal, e.physical(statement), paramFormats, params, resultFormats))
+	e.batchDDL = append(e.batchDDL, e.portalDDL[portal])
 	return nil
 }
 
@@ -1624,6 +1636,7 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class, tables: st.plan.Tables})
 	}
 	e.batch = append(e.batch, executeReq(portal, maxRows))
+	e.batchDDL = append(e.batchDDL, e.portalDDL[portal])
 	return nil
 }
 
@@ -1660,6 +1673,7 @@ func (e *Executor) Close(_ context.Context, kind pgwire.DescribeKind, name strin
 		name = e.physical(name)
 	} else {
 		delete(e.portals, name)
+		delete(e.portalDDL, name)
 	}
 	e.batch = append(e.batch, closeReq(kind, name))
 	return nil
@@ -1670,7 +1684,7 @@ func (e *Executor) failBatch() {
 		delete(e.stmts, name)
 	}
 	e.staged = e.staged[:e.stagedMark]
-	e.batch, e.batchStmts, e.batchFailed, e.batchWriter = nil, nil, true, nil
+	e.batch, e.batchStmts, e.batchFailed, e.batchWriter, e.batchDDL = nil, nil, true, nil, nil
 	e.batchTarget, e.batchExec, e.describes, e.batchBinds = nil, nil, nil, nil
 	e.batchInject = nil
 	e.batchScatter, e.batchScatterStmt = nil, ""
@@ -1727,6 +1741,7 @@ func (e *Executor) flush(ctx context.Context, w pgwire.ResultWriter) error {
 	// The messages are about to be sent, so the Sync that follows must not
 	// send them again. The portals stay: that is the point of a Flush.
 	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec, e.batchBinds = nil, nil, nil, nil, nil, nil
+	e.batchDDL = nil
 	e.pendingDescribes, e.describes = e.describes, nil
 	if w == nil {
 		w = discardWriter{}
@@ -1784,7 +1799,7 @@ func (e *Executor) sync(ctx context.Context) error {
 		e.batchFailed = false
 		return e.closeBackendBatch(ctx)
 	}
-	batch, w, executed, binds := e.batch, e.batchWriter, e.batchExec, e.batchBinds
+	batch, w, executed, binds, ddl := e.batch, e.batchWriter, e.batchExec, e.batchBinds, e.batchDDL
 	target := e.shard
 	if e.batchTarget != nil {
 		target = *e.batchTarget
@@ -1805,6 +1820,7 @@ func (e *Executor) sync(ctx context.Context) error {
 		pin = pin || item.class.Session == plan.SessionPrepare
 	}
 	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec, e.batchBinds = nil, nil, nil, nil, nil, nil
+	e.batchDDL = nil
 	e.pendingDescribes, e.describes = e.describes, nil
 	if len(batch) == 0 {
 		return e.closeBackendBatch(ctx)
@@ -1846,7 +1862,7 @@ func (e *Executor) sync(ctx context.Context) error {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, err)
 	}
-	if handled, err := e.migrationBatch(ctx, batch, parsed, w); handled {
+	if handled, err := e.migrationBatch(ctx, batch, ddl, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, err)
 	}
@@ -2774,4 +2790,13 @@ func (e *Executor) forgetCancelTargets() {
 	e.cancelMu.Lock()
 	e.cancelTo = nil
 	e.cancelMu.Unlock()
+}
+
+// migrationPlan is the migration statement name plans to, or nil.
+func migrationPlan(stmts map[string]prepared, name string) *plan.Plan {
+	if st, ok := stmts[name]; ok && st.plan.Kind == plan.MigrationKind {
+		pl := st.plan
+		return &pl
+	}
+	return nil
 }
