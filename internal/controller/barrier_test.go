@@ -231,13 +231,15 @@ type fakeGroups struct {
 	paused  map[string]bool
 	writers map[string]int
 	subs    map[string]int
+	// retired are groups of retired shard sets, listed after the rest.
+	retired []GroupRef
 }
 
 func (g *fakeGroups) List(context.Context) ([]GroupRef, error) {
 	if err := g.fail["list"]; err != nil {
 		return nil, err
 	}
-	return []GroupRef{{Name: CatalogGroup}, {Name: "shard0", Set: "default", ID: 0}, {Name: "shard1", Set: "default", ID: 1}}, nil
+	return append([]GroupRef{{Name: CatalogGroup}, {Name: "shard0", Set: "default", ID: 0}, {Name: "shard1", Set: "default", ID: 1}}, g.retired...), nil
 }
 
 func (g *fakeGroups) PreparedGIDs(_ context.Context, ref GroupRef) ([]string, error) {
@@ -693,6 +695,74 @@ func TestBarrierRefusesWhileACopyIsApplying(t *testing.T) {
 	}
 	if f.store.fenced {
 		t.Fatal("fence left raised")
+	}
+}
+
+// TestABarrierLeavesARetiredSetsPauseAlone: a retired set keeps a permanent
+// write pause from the cutover that retired it, and a barrier that pauses
+// and then resumes every group it lists lifted that pause for good
+// (PGS-817). Nor does it take a restore point on a set that is going away.
+func TestABarrierLeavesARetiredSetsPauseAlone(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.retired = []GroupRef{{Name: "old0", Set: "old", ID: 0, Retired: true}}
+	f.groups.paused["old0"] = true
+	// Answerable if asked, so a barrier that wrongly includes the set gets
+	// as far as resuming it rather than failing on its archive first.
+	f.groups.archived["old0"] = "000000010000000000000009"
+	if _, err := f.b.Run(context.Background(), "b"); err != nil {
+		t.Fatal(err)
+	}
+	if !f.groups.paused["old0"] {
+		t.Fatal("the barrier resumed a retired set's permanent pause")
+	}
+	if pts := f.groups.points["old0"]; len(pts) != 0 {
+		t.Fatalf("restore point taken on a retired set: %v", pts)
+	}
+	for _, entry := range f.journal {
+		if strings.HasSuffix(entry, " old0") {
+			t.Fatalf("the barrier acted on the retired set: %q", entry)
+		}
+	}
+}
+
+// TestABarrierStillRefusesARetiredSetApplyingReverseReplication: retired is
+// not terminal. For the day a cutover sits switched, its old set is retired
+// yet live, applying reverse replication so a rollback can return serving to
+// it -- and a barrier certified then has no point on the set a rollback
+// makes serving again, which only shows up as a restore that never reaches
+// its target. Leaving retired groups out of the barrier altogether skipped
+// the subscription check that refused exactly that.
+func TestABarrierStillRefusesARetiredSetApplyingReverseReplication(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.retired = []GroupRef{{Name: "old0", Set: "old", ID: 0, Retired: true}}
+	f.groups.subs["old0"] = 1
+	_, err := f.b.Run(context.Background(), "b")
+	if err == nil || !strings.Contains(err.Error(), "old0") || !strings.Contains(err.Error(), "subscription") {
+		t.Fatalf("err %v, want a refusal naming the retired set's subscription", err)
+	}
+	if len(f.groups.points) != 0 {
+		t.Fatalf("restore points taken while a retired set was applying reverse replication: %v", f.groups.points)
+	}
+}
+
+// TestRecoveryLeavesARetiredSetsPauseAlone: Recover resumes every group it
+// finds paused after an interrupted barrier, and a retired set is always
+// paused, so it read that pause as one the run had left behind.
+func TestRecoveryLeavesARetiredSetsPauseAlone(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.retired = []GroupRef{{Name: "old0", Set: "old", ID: 0, Retired: true}}
+	f.store.fenced = true
+	f.store.fencedAt = f.clock
+	f.groups.paused["shard0"], f.groups.paused["old0"] = true, true
+	f.clock = f.clock.Add(2 * f.b.maxRunTime())
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.groups.paused["shard0"] {
+		t.Fatal("recovery did not resume the shard the interrupted run left paused")
+	}
+	if !f.groups.paused["old0"] {
+		t.Fatal("recovery resumed a retired set's permanent pause")
 	}
 }
 
