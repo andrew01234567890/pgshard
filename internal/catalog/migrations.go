@@ -429,7 +429,10 @@ func collectMigrations(rows pgx.Rows) ([]DDLMigration, error) {
 	return out, rows.Err()
 }
 
-// SaveMigrationProgress writes the state, per-shard detail and error of m.
+// SaveMigrationProgress writes the state, per-shard detail and error of m,
+// and the shard set it was started against: the applier pins it at the
+// start, and a pass or controller that loads the migration later needs it
+// to tell a resume from a straddled cutover.
 func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, term int64) error {
 	perShard, err := json.Marshal(m.PerShard)
 	if err != nil {
@@ -440,9 +443,10 @@ func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, t
 		errText = &m.Error
 	}
 	rows, err := db.Query(ctx, `UPDATE pgshard.migrations SET state = $2, per_shard = $3, error = $4, updated_at = now(),
-		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END
+		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END,
+		meta = CASE WHEN $6 = '' THEN meta ELSE jsonb_set(meta, '{shard_set}', to_jsonb($6::text)) END
 		WHERE id = $1 AND `+leaderTermPredicate+`
-		  AND NOT (state = 'queued' AND $2 = 'running' AND `+MigrationHeldPredicate+`)`, m.ID, m.State, perShard, errText, termArg(term))
+		  AND NOT (state = 'queued' AND $2 = 'running' AND `+MigrationHeldPredicate+`)`, m.ID, m.State, perShard, errText, termArg(term), m.Meta.ShardSet)
 	if err != nil {
 		return err
 	}
