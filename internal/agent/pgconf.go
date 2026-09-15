@@ -211,6 +211,7 @@ const superuserRole = "postgres"
 const (
 	routerRole      = "pgshard_router"
 	controllerRole  = "pgshard_controller"
+	adminUIRole     = "pgshard_admin_ui"
 	replicationRole = "pgshard_replication"
 )
 
@@ -254,6 +255,9 @@ func RenderPgHBAConf(c *Config) string {
 	// superuser's, and matched by the line above.
 	fmt.Fprintf(&b, "%-8s all             %-19s %-23s scram-sha-256\n", hostKeyword(host), routerRole, cidr)
 	fmt.Fprintf(&b, "%-8s all             %-19s %-23s scram-sha-256\n", hostKeyword(host), controllerRole, cidr)
+	// The admin UI reads the catalog as a role that can only read, and it
+	// reaches it over TCP like the rest of the control plane.
+	fmt.Fprintf(&b, "%-8s all             %-19s %-23s scram-sha-256\n", hostKeyword(host), adminUIRole, cidr)
 	// A standby streams as its own role rather than as the superuser, and
 	// pg_rewind reaches the source as the same role over an ordinary
 	// connection -- so it needs both lines, not just the replication one.

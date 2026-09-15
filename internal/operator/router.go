@@ -62,6 +62,13 @@ func RouterReplicas(c *pgshardv1alpha1.PgShardCluster) (minReplicas, maxReplicas
 	return minReplicas, maxReplicas
 }
 
+// AdminCatalogDSN is the admin UI's read-only catalog connection; its
+// password arrives in the environment, as the router's does.
+func AdminCatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
+	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres application_name=pgshard-admin connect_timeout=5",
+		CatalogServiceRW(c.Name), c.Namespace, postgresPort, adminUILoginRole)
+}
+
 // CatalogDSN is the libpq connection string the control plane uses to reach
 // the catalog primary as the superuser; the password comes from PGPASSWORD.
 func CatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {

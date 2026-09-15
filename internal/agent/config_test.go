@@ -321,7 +321,7 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 		// replication role is how a standby streams and how pg_rewind
 		// reaches its source, and it exists on every group.
 		controlPlane := map[string]bool{"postgres": true, catalog.RouterRole: true,
-			catalog.ControllerRole: true, catalog.ReplicationRole: true}
+			catalog.ControllerRole: true, catalog.ReplicationRole: true, catalog.AdminUIRole: true}
 		var host, superuser, reject int
 		for _, line := range strings.Split(RenderPgHBAConf(c), "\n") {
 			f := strings.Fields(line)

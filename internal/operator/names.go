@@ -377,6 +377,9 @@ func catalogGroupAt(c *pgshardv1alpha1.PgShardCluster, gen int64, major int) Gro
 // SecretName is the Secret holding the superuser password.
 func SecretName(cluster string) string { return cluster + "-superuser" }
 
+// AdminCatalogSecretName holds the admin UI's catalog login password.
+func AdminCatalogSecretName(cluster string) string { return cluster + "-admin-catalog" }
+
 // RouterSecretName holds the router's catalog login password.
 func RouterSecretName(cluster string) string { return cluster + "-router" }
 
@@ -397,6 +400,7 @@ func ControllerSecretName(cluster string) string { return cluster + "-controller
 // "catalog", which shadows the package.
 const (
 	routerLoginRole     = catalog.RouterRole
+	adminUILoginRole    = catalog.AdminUIRole
 	controllerLoginRole = catalog.ControllerRole
 )
 

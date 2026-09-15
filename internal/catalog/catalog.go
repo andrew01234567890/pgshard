@@ -66,6 +66,10 @@ const PoolerRole = "pgshard_pooler"
 // controller's environment used to be direct write access to every shard.
 const ControllerRole = "pgshard_controller"
 
+// AdminUIRole is the login the admin UI reads the catalog with: a reader
+// that may also see the operation queue and the redacted migrations.
+const AdminUIRole = "pgshard_admin_ui"
+
 //go:embed schema/*.sql
 var schemaFS embed.FS
 

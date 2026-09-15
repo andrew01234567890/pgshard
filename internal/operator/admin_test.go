@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -178,5 +179,69 @@ func TestAdminSecretIsGeneratedAndKept(t *testing.T) {
 	}
 	if string(su.Data["password"]) == first {
 		t.Error("the admin token must not be the superuser password")
+	}
+}
+
+// TestAdminReadsTheCatalogAsItsOwnLogin (PGS-902): the operator never gave
+// the admin a catalog connection, so every catalog-backed page -- the
+// migrations panel, the workflow rows, the operation queue -- was empty in
+// a cluster it deployed. It reads as pgshard_admin_ui, whose password
+// reaches the pod in the environment and appears in no argument.
+func TestAdminReadsTheCatalogAsItsOwnLogin(t *testing.T) {
+	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns1"}}
+	dep := Renderer{}.AdminDeployment(c, adminSecretKey)
+	ctr := dep.Spec.Template.Spec.Containers[0]
+	want := "--catalog-dsn=host=" + CatalogServiceRW(c.Name) + "." + c.Namespace + ".svc port=5432 user=pgshard_admin_ui dbname=postgres application_name=pgshard-admin connect_timeout=5"
+	if !slices.Contains(ctr.Args, want) {
+		t.Fatalf("args %q, want %q", ctr.Args, want)
+	}
+	var env *corev1.EnvVar
+	for i := range ctr.Env {
+		if ctr.Env[i].Name == "PGPASSWORD" {
+			env = &ctr.Env[i]
+		}
+	}
+	if env == nil || env.Value != "" || env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil ||
+		env.ValueFrom.SecretKeyRef.Name != AdminCatalogSecretName(c.Name) || env.ValueFrom.SecretKeyRef.Key != "password" {
+		t.Fatalf("PGPASSWORD %+v, want it read from the %s secret", env, AdminCatalogSecretName(c.Name))
+	}
+	for _, arg := range ctr.Args {
+		if strings.Contains(strings.ToLower(arg), "password") {
+			t.Errorf("an argument carries a password: %q", arg)
+		}
+	}
+}
+
+// TestAdminCatalogSecretIsMadeBeforeAnythingMountsIt (PGS-902): the
+// Deployment names the Secret holding the catalog password, so a pod that
+// starts before it exists never starts at all. It goes with the admin.
+func TestAdminCatalogSecretIsMadeBeforeAnythingMountsIt(t *testing.T) {
+	requireEnvtest(t)
+	r, _, c := setup(t, "admcat")
+	ctx := context.Background()
+	reconcile(t, r, c)
+
+	var sec corev1.Secret
+	get(t, AdminCatalogSecretName(c.Name), &sec)
+	ownedBy(t, &sec, c)
+	if string(sec.Data["username"]) != "pgshard_admin_ui" || len(sec.Data["password"]) < 32 {
+		t.Fatalf("catalog login secret %q with a %d-character password", sec.Data["username"], len(sec.Data["password"]))
+	}
+	first := string(sec.Data["password"])
+	reconcile(t, r, c)
+	get(t, AdminCatalogSecretName(c.Name), &sec)
+	if string(sec.Data["password"]) != first {
+		t.Error("the catalog password must survive a reconcile: it was regenerated")
+	}
+
+	disabled := false
+	get(t, c.Name, c)
+	c.Spec.Admin.Enabled = &disabled
+	if err := r.Update(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: AdminCatalogSecretName(c.Name)}, &sec); !apierrors.IsNotFound(err) {
+		t.Errorf("a disabled admin left its catalog credential behind: %v", err)
 	}
 }

@@ -56,9 +56,9 @@ var ClusterScopedMigrationKinds = []string{"CREATE ROLE", "ALTER ROLE", "DROP RO
 
 // Blocker is an operation another one waits for.
 type Blocker struct {
-	Kind   string
-	ID     string
-	Reason string
+	Kind   string `json:"kind"`
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
 }
 
 // QueueSchema reports whether the catalog has the operation queue. A
@@ -209,4 +209,56 @@ func ControllerHeartbeatAge(ctx context.Context, q RowQuerier, component string)
 		return 0, false, err
 	}
 	return time.Duration(seconds * float64(time.Second)), true, nil
+}
+
+// QueueEntry is a row of pgshard.operation_queue_detail.
+type QueueEntry struct {
+	Position    int64      `json:"position"`
+	Kind        string     `json:"kind"`
+	ID          string     `json:"id"`
+	Database    *string    `json:"database"`
+	Command     string     `json:"command"`
+	Statement   *string    `json:"statement,omitempty"`
+	State       string     `json:"state"`
+	Stage       *string    `json:"stage"`
+	WaitingFor  *string    `json:"waiting_for"`
+	Blockers    []Blocker  `json:"blockers"`
+	Progress    *float64   `json:"progress"`
+	ProgressBar *string    `json:"progress_bar"`
+	Detail      *string    `json:"detail"`
+	CreatedAt   time.Time  `json:"created_at"`
+	StartedAt   *time.Time `json:"started_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	RetireAt    *time.Time `json:"retire_at"`
+}
+
+// ListOperationQueue reads the operation queue in arrival order, with each
+// migration's statement when detail is set (pgshard.operation_queue_detail,
+// for administrators) and without it otherwise.
+func ListOperationQueue(ctx context.Context, q Querier, detail bool) ([]QueueEntry, error) {
+	statement, view := "NULL::text", "pgshard.operation_queue"
+	if detail {
+		statement, view = "statement", "pgshard.operation_queue_detail"
+	}
+	rows, err := q.Query(ctx, `SELECT position, kind, id::text, database, command, `+statement+`, state, stage, waiting_for, blockers,
+		progress::float8, progress_bar, detail, created_at, started_at, updated_at, retire_at
+		FROM `+view+` ORDER BY position`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (QueueEntry, error) {
+		var e QueueEntry
+		var blockers []struct {
+			Kind   string `json:"kind"`
+			ID     string `json:"id"`
+			Reason string `json:"reason"`
+		}
+		err := row.Scan(&e.Position, &e.Kind, &e.ID, &e.Database, &e.Command, &e.Statement, &e.State, &e.Stage, &e.WaitingFor, &blockers,
+			&e.Progress, &e.ProgressBar, &e.Detail, &e.CreatedAt, &e.StartedAt, &e.UpdatedAt, &e.RetireAt)
+		e.Blockers = make([]Blocker, 0, len(blockers))
+		for _, b := range blockers {
+			e.Blockers = append(e.Blockers, Blocker(b))
+		}
+		return e, err
+	})
 }

@@ -38,15 +38,34 @@ kubectl get secret demo-admin -o jsonpath='{.data.token}' | base64 -d
   restart/confirmed LSNs, WAL retained behind the slot, `wal_status`,
   synced-on-standby. A red banner names streams with a lost
   (invalidated) slot.
+- **`/queue` Queue** — every unfinished operation in the order it runs: DDL
+  migrations, reshards, major upgrades and table placements, each with what
+  it is, where it stands, what it waits for and how far along it is. A
+  statement waiting behind a reshard says so, and names the reshard. The
+  same list is in the catalog for `psql`:
+
+  ```sql
+  SELECT position, kind, command, state, waiting_for, progress_bar, detail
+  FROM pgshard.operation_queue;
+  ```
+
 - **JSON** — everything the pages render from is under `/api/v1/...`
   (`clusters`, `backups`, `restores`, `restore-points`, `migrations`,
-  `streams`).
+  `queue`, `streams`).
 
-The migrations, streams and restore-point panels need `--catalog-dsn` (the
-operator wires it); without it the UI is Kubernetes-only.
+The queue, migrations, streams and restore-point panels need
+`--catalog-dsn`. The operator wires it to a read-only login of its own
+(`pgshard_admin_ui`), whose password it keeps in the `<cluster>-admin-catalog`
+Secret and hands to the pod in the environment. That login sees the queue
+and the migrations through views that redact a password-setting statement,
+and cannot read the verifiers. Without a catalog DSN the UI is
+Kubernetes-only.
 
 ## Security
 
 The UI authenticates nobody and its RBAC is get/list/watch only, with no
 Secret access. Keep the Service internal and front it with an
-authenticating ingress or proxy. Give `--catalog-dsn` a read-only role.
+authenticating ingress or proxy. Give `--catalog-dsn` a read-only role;
+`pgshard_admin_ui`, which the catalog schema creates and the operator uses,
+is one: read-only transactions, a statement timeout, a connection limit, and
+no access to password material.
