@@ -345,7 +345,8 @@ one bound cluster after another) runs `controller.Barrier`:
    shard backend could still write: none holds a transaction id, and none
    began its transaction before that shard's write pause landed. The one
    exception is a table placement's initial copy
-   (`application_name = pgshard-placement-copy`), whose `READ ONLY` snapshot
+   (`application_name = pgshard-placement-copy`, connected as the controller's
+   own role), whose `READ ONLY` snapshot
    is held for the whole copy and cannot write; it is counted again once it
    holds a transaction id. Any other long transaction open across the pause,
    a read-only report included, fails the barrier at the drain timeout;
