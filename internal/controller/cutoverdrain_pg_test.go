@@ -252,3 +252,141 @@ func TestADrainAfterARestartStillWaitsForATransactionFromBeforeThePause(t *testi
 		t.Fatalf("the instant outlived the claim: %v %v", at, err)
 	}
 }
+
+// TestADrainDoesNotWaitForATransactionWritingOnlyATemporaryTable (PGS-850):
+// a read-only transaction may still write a temporary table that already
+// exists, and doing so takes an xid like any write. A session doing that
+// inside a long transaction held the drain -- and past the journal the flip
+// -- although nothing it writes can reach a target.
+func TestADrainDoesNotWaitForATransactionWritingOnlyATemporaryTable(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	catalogDSN := startPostgres(t)
+	dsn := startPostgres(t)
+	cat := connect(t, catalogDSN)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, catalogDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	const wfID = "44444444-4444-4444-4444-444444444444"
+	mustExec(t, cat, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, write_paused_by)
+		VALUES ('default', 0, 'shard0', 'serving', 1, $1::uuid)`, wfID)
+
+	mustExec(t, connect(t, dsn), `CREATE TABLE ledger (id int)`)
+	scratch := connect(t, dsn)
+	mustExec(t, scratch, `CREATE TEMP TABLE scratch (id int)`)
+	both := connect(t, dsn)
+	mustExec(t, both, `CREATE TEMP TABLE scratch (id int)`)
+	// Begun before the pause, so read-write whatever it has written so far.
+	early := connect(t, dsn)
+	mustExec(t, early, `CREATE TEMP TABLE scratch (id int)`)
+	earlyTx, err := early.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = earlyTx.Rollback(ctx) }()
+	if _, err := earlyTx.Exec(ctx, `INSERT INTO scratch VALUES (0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := connect(t, dsn)
+	mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, admin, `SELECT pg_reload_conf()`)
+	waitReadOnly(t, dsn, true)
+	o := &pgCutover{c: &Copier{Pool: pool, Shards: realShards{dsn}}, wf: &copyWorkflow{id: wfID}, srcSet: "default", srcIDs: []int32{0}}
+	at, err := o.shardNow(ctx, "default", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.pausedAt = map[pausedShard]time.Time{{"default", 0}: at}
+	time.Sleep(10 * time.Millisecond)
+
+	// Under the pause, reading the ledger and writing the scratch table.
+	tempTx, err := scratch.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tempTx.Rollback(ctx) }()
+	if _, err := tempTx.Exec(ctx, `INSERT INTO scratch SELECT id FROM ledger`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tempTx.Exec(ctx, `INSERT INTO scratch VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	var xid *string
+	if err := tempTx.QueryRow(ctx, `SELECT backend_xid::text FROM pg_stat_activity WHERE pid = pg_backend_pid()`).Scan(&xid); err != nil || xid == nil {
+		t.Fatalf("the premise is a transaction holding an xid for its temporary write: %v %v", xid, err)
+	}
+	quiet := func(o *pgCutover, want int, why string) {
+		t.Helper()
+		busy, err := o.writingBackends(ctx, "default", []int32{0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(busy) != want {
+			t.Fatalf("%s: counted %v", why, busy)
+		}
+	}
+	quiet(o, 1, "only the transaction begun before the pause may still write the ledger")
+	if err := earlyTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	quiet(o, 0, "a transaction under the pause that wrote only a temporary table held the drain")
+
+	// A pass with no pause instant -- the rollback path drains without
+	// pausing -- cannot tell when a transaction began relative to a pause, so
+	// it counts every transaction holding an xid.
+	unpaused := &pgCutover{c: &Copier{Pool: pool, Shards: realShards{dsn}}, wf: &copyWorkflow{id: wfID}, srcSet: "default", srcIDs: []int32{0}}
+	quiet(unpaused, 1, "a pass with no pause instant must count every transaction holding an xid")
+
+	mustExec(t, cat, `UPDATE pgshard.shard_status SET write_paused_at = $1 WHERE shard_set = 'default' AND shard_id = 0`, at)
+	later := &pgCutover{c: &Copier{Pool: pool, Shards: realShards{dsn}}, wf: &copyWorkflow{id: wfID}, srcSet: "default", srcIDs: []int32{0}}
+	if stood, err := later.SourcesPaused(ctx); err != nil || !stood {
+		t.Fatalf("the pause is standing under the claim: %v %v", stood, err)
+	}
+	quiet(later, 0, "a pass after a restart drains under the recorded instant, so the temporary writer does not hold it")
+
+	// An xid with no lock that says what it wrote is counted.
+	bare := connect(t, dsn)
+	bareTx, err := bare.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = bareTx.Rollback(ctx) }()
+	if _, err := bareTx.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+		t.Fatal(err)
+	}
+	quiet(o, 1, "a transaction holding an xid and no lock to tell what it wrote must be waited for")
+	if err := bareTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// One that overrode the pause and wrote the ledger is waited for, and so
+	// is one that wrote both.
+	writer := connect(t, dsn)
+	writeTx, err := writer.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writeTx.Rollback(ctx) }()
+	if _, err := writeTx.Exec(ctx, `INSERT INTO ledger VALUES (2)`); err != nil {
+		t.Fatal(err)
+	}
+	quiet(o, 1, "a transaction that wrote a permanent table must be waited for")
+	bothTx, err := both.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = bothTx.Rollback(ctx) }()
+	if _, err := bothTx.Exec(ctx, `INSERT INTO scratch VALUES (3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bothTx.Exec(ctx, `INSERT INTO ledger VALUES (3)`); err != nil {
+		t.Fatal(err)
+	}
+	quiet(o, 2, "a transaction that wrote a temporary and a permanent table must be waited for")
+}
