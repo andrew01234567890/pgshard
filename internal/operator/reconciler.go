@@ -231,6 +231,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// derived from the superuser password, so nothing that holds that
 	// password can call Promote, Demote, Rewind or Reclone.
 	ctx = agentauth.WithToken(ctx, agentToken)
+	if err := r.reconcileInternalTLSMove(ctx, &cluster); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.reconcilePKI(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("internal certificates: %w", err)
 	}

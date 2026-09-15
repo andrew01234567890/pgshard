@@ -124,6 +124,12 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 				"--pooler-tls-server-name="+IssuedMemberServerName(c),
 				"--peer-tls-server-name="+RouterName(c.Name)+"."+c.Namespace+".svc")
 		}
+		switch internalTLSPhase(c) {
+		case pgshardv1alpha1.InternalTLSAccepting:
+			args = append(args, "--tls-accept-plaintext", "--tls-dial-plaintext")
+		case pgshardv1alpha1.InternalTLSDialing:
+			args = append(args, "--tls-accept-plaintext")
+		}
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
 	} else if c.Spec.InternalTLS.Insecure {
@@ -186,6 +192,9 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	// The routers are stateless, but a node taking all of them out at once
 	// is still a gap in service that spreading avoids.
 	applyPlacement(&dep.Spec.Template.Spec, c.Spec.Placement, labels)
+	if phase := internalTLSPhase(c); phase != "" {
+		dep.Spec.Template.Annotations[AnnotationInternalTLSPhase] = phase
+	}
 	return dep
 }
 

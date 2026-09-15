@@ -127,6 +127,11 @@ func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings
 		RestartToken: c.Annotations[AnnotationRestart],
 		InternalTLS:  internalTLSMode(c),
 	}
+	// Both steps of a move render members alike -- listening for TLS and
+	// plaintext -- so moving from the first to the second rolls none.
+	if internalTLSPhase(c) != "" {
+		tpl.InternalTLS += "+accepting-plaintext"
+	}
 	if pol != nil {
 		spec := pol.Spec.DeepCopy()
 		tpl.Backup = spec
@@ -572,6 +577,9 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 	if agentGRPCTLS(c) != (agent.TLSFiles{}) {
 		meta.Annotations[AnnotationAgentMTLS] = "true"
 	}
+	if phase := internalTLSPhase(c); phase != "" {
+		meta.Annotations[AnnotationInternalTLSPhase] = phase
+	}
 	meta.Annotations[AnnotationReplicationLogin] = "true"
 	pod := &corev1.Pod{
 		ObjectMeta: meta,
@@ -700,6 +708,9 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		if c.Spec.InternalTLS.Issue {
 			args = append(args, "--tls-authorize-callers")
 		}
+		if internalTLSPhase(c) != "" {
+			args = append(args, "--tls-accept-plaintext")
+		}
 		mounts = append(mounts, corev1.VolumeMount{Name: vol, MountPath: dir, ReadOnly: true})
 	} else if c.Spec.InternalTLS.Insecure {
 		args = append(args, "--insecure-dev")
@@ -789,9 +800,12 @@ func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
 		// Only when the operator issued them: supplied certificates carry
 		// no identity to authorise.
 		AuthorizeCallers: c.Spec.InternalTLS.Issue,
-		CertFile:         internalTLSMountPath + "/tls.crt",
-		KeyFile:          internalTLSMountPath + "/tls.key",
-		CAFile:           internalTLSMountPath + "/ca.crt",
+		// A caller that has not switched to TLS yet is still served while
+		// the cluster moves to it.
+		AcceptPlaintext: internalTLSPhase(c) != "",
+		CertFile:        internalTLSMountPath + "/tls.crt",
+		KeyFile:         internalTLSMountPath + "/tls.key",
+		CAFile:          internalTLSMountPath + "/ca.crt",
 	}
 }
 

@@ -103,6 +103,9 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 		if c.Spec.InternalTLS.Issue {
 			args = append(args, "--tls-authorize-callers", "--agent-tls-server-name="+IssuedMemberServerName(c))
 		}
+		if internalTLSPhase(c) != "" {
+			args = append(args, "--tls-accept-plaintext")
+		}
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
 	} else if c.Spec.InternalTLS.Insecure {
@@ -146,6 +149,9 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 				},
 			},
 		},
+	}
+	if phase := internalTLSPhase(c); phase != "" {
+		dep.Spec.Template.Annotations[AnnotationInternalTLSPhase] = phase
 	}
 	return dep
 }

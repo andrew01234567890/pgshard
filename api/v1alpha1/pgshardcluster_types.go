@@ -26,6 +26,10 @@ const (
 	ConditionControllerReady   = "ControllerReady"
 	ConditionTuningApplied     = "TuningApplied"
 	ConditionRolloutInProgress = "RolloutInProgress"
+	// ConditionInternalTLSMoving is True while a running cluster moves
+	// from plaintext to mutual TLS; its message names what the next step
+	// waits for.
+	ConditionInternalTLSMoving = "InternalTLSMoving"
 	// ConditionSQLSurfaceBehindServers is true while the shards run a
 	// PostgreSQL major newer than the grammar the routers parse with.
 	//
@@ -672,6 +676,50 @@ type PgShardClusterStatus struct {
 	Tuning TuningStatus `json:"tuning,omitempty"`
 	// +optional
 	Rollout RolloutStatus `json:"rollout,omitempty"`
+	// InternalTLS is the internal transport the operator renders and any
+	// move between two in progress.
+	// +optional
+	InternalTLS *InternalTLSStatus `json:"internalTLS,omitempty"`
+}
+
+// Phases of a move from plaintext to mutual TLS.
+const (
+	// InternalTLSAccepting: every listener serves TLS and plaintext, and
+	// every caller still dials plaintext. Members, routers and the
+	// controller roll into it.
+	InternalTLSAccepting = "Accepting"
+	// InternalTLSDialing: every listener still serves both, and every
+	// caller dials TLS. Only the routers roll into it.
+	InternalTLSDialing = "Dialing"
+)
+
+// InternalTLSStatus records the internal transport a cluster runs.
+//
+// A running cluster cannot switch from plaintext to mutual TLS in one step:
+// members roll one at a time and routers as a Deployment, so for a while
+// some callers dial plaintext and some TLS. The operator moves it through
+// Accepting and Dialing and renders each step only once every pod of the
+// one before has gone.
+type InternalTLSStatus struct {
+	// Mode is the internal transport the cluster was last rendered with
+	// outside a move: insecure, issued, or secret:<name>.
+	// +optional
+	Mode string `json:"mode,omitempty"`
+	// Move is the move from plaintext to mutual TLS in progress, if any.
+	// +optional
+	Move *InternalTLSMove `json:"move,omitempty"`
+}
+
+// InternalTLSMove is one move from plaintext to mutual TLS.
+type InternalTLSMove struct {
+	// +kubebuilder:validation:Enum=Accepting;Dialing
+	Phase string `json:"phase"`
+	// Target is the spec.internalTLS the move is heading to. Once callers
+	// dial TLS the operator renders it, whatever the spec has since been
+	// changed to, until the move completes.
+	Target InternalTLSSpec `json:"target"`
+	// +optional
+	StartedAt metav1.Time `json:"startedAt,omitempty"`
 }
 
 // PgShardCluster is a sharded PostgreSQL cluster.

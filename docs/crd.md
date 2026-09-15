@@ -63,6 +63,42 @@ the operator does not call, and on an agent old enough not to say),
 [resharding.md](resharding.md) for how `spec.shards` becomes a reshard and how a `pgshard.tables` edit
 becomes a placement workflow.
 
+### Moving a running cluster from plaintext to mutual TLS
+
+`status.internalTLS{mode, move{phase, target, startedAt}}` and the
+`InternalTLSMoving` condition track it. `mode` is the transport the cluster was
+last rendered with outside a move: `insecure`, `issued` or `secret:<name>`. A
+cluster created with TLS, or first seen by this operator, takes its spec's mode
+and never moves.
+
+Changing `spec.internalTLS` on a cluster recorded as `insecure` to `issue: true`
+or a `secretRef` does not switch every process at once, because members roll one
+at a time and routers roll as a Deployment. It moves in two steps:
+
+1. **Accepting**: every member (pooler and agent), router and controller pod is
+   rendered with its certificate and also serves plaintext on the same port
+   (`--tls-accept-plaintext`). Routers keep dialling plaintext
+   (`--tls-dial-plaintext`), and so does the operator's barrier client. The
+   operator and the controller dial each agent with TLS as soon as that member's
+   pod is recorded as serving it (`pgshard.io/agent-mtls`). Each pod carries
+   `pgshard.io/internal-tls-phase`.
+2. **Dialing**: once no member, router or controller pod from before Accepting
+   is left, terminating ones included, routers dial TLS. Members are rendered
+   exactly as in Accepting and do not roll.
+
+Once no router pod from Accepting is left, the move completes. Listeners stop
+serving plaintext and members, routers and the controller roll once more.
+
+- **Change of mind.** Setting the spec back to `insecure` during Accepting ends
+  the move, because nothing depends on TLS yet. Any other change to
+  `spec.internalTLS` during a move waits for the move to complete, and the
+  condition says so.
+- **External consumers.** A change-stream consumer dialling plaintext is served
+  until the move completes; give it the `<cluster>-tls-consumer` certificate
+  before then.
+- **Disruption.** The move costs two member rolls, so each group switches over
+  twice.
+
 ## PgShardGroup (status subresource)
 
 Status-only mirror of one replication group. `spec{clusterRef, kind: catalog|shard, shardId, shardSet, nonServing}`;
