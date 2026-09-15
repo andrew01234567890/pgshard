@@ -497,7 +497,7 @@ func (r *ClusterReconciler) memberEndpoint(c *pgshardv1alpha1.PgShardCluster, g 
 
 func agentAddr(ip string) string { return fmt.Sprintf("%s:%d", ip, agentGRPCPort) }
 
-// podFenceGrace is the grace period the old primary's Pod is deleted with.
+// PodFenceGrace is the grace period the old primary's Pod is deleted with.
 // It has to be non-zero for the wait below to mean anything: a delete with
 // grace zero is a force delete, which removes the object from the API server
 // without the kubelet confirming anything, so "the Pod is gone" would be
@@ -510,7 +510,7 @@ func agentAddr(ip string) string { return fmt.Sprintf("%s:%d", ip, agentGRPCPort
 // fast shutdown plus the agent's own overhead. It used to be ten seconds
 // against a stop that spent the first five in a smart shutdown the pooler's
 // connections never let finish, leaving a fast shutdown five.
-const podFenceGrace = agentShutdownTimeout + agent.TerminationOverhead
+const PodFenceGrace = agentShutdownTimeout + agent.TerminationOverhead
 
 // fencePod deletes the old primary's Pod and waits for the kubelet to confirm
 // it is gone, so a primary that is alive but unreachable to the operator is
@@ -526,7 +526,7 @@ func (r *ClusterReconciler) fencePod(ctx context.Context, m *memberInfo) error {
 	if m == nil || m.pod == nil {
 		return nil
 	}
-	if err := r.Delete(ctx, m.pod, client.GracePeriodSeconds(int64(podFenceGrace/time.Second))); client.IgnoreNotFound(err) != nil {
+	if err := r.Delete(ctx, m.pod, client.GracePeriodSeconds(int64(PodFenceGrace/time.Second))); client.IgnoreNotFound(err) != nil {
 		return err
 	}
 	deadline := r.now().Add(r.podFenceTimeout())
@@ -562,7 +562,7 @@ func (r *ClusterReconciler) fencePod(ctx context.Context, m *memberInfo) error {
 // DefaultPodFenceTimeout bounds the wait for the kubelet to confirm the old
 // primary's Pod is gone before the delete is escalated to a force delete. It
 // is the failover latency a node failure costs, so it is only as long as a
-// healthy kubelet needs to act on podFenceGrace.
+// healthy kubelet needs to act on PodFenceGrace.
 const DefaultPodFenceTimeout = 30 * time.Second
 
 func (r *ClusterReconciler) podFenceTimeout() time.Duration {
