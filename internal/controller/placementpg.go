@@ -781,6 +781,40 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
+// recheckDependents runs the preflight's feature check again on every
+// source, just before the first rename. The preflight ran at prepare, and a
+// copy can take hours: a view, another table's rule or policy, a subscription
+// or a function created on the table meanwhile is bound to it by OID, and
+// the swap would leave it on the retired table -- silently, until retiring
+// the old table fails for ever on "other objects depend on it" (PGS-826).
+//
+// What this workflow put on the table itself is expected and ignored: its
+// publication, and the replica identity it raised to FULL for the copy.
+// Anything else fails the move here, with nothing yet renamed, and the table
+// stays where it is.
+//
+// What remains is the moment between this check and each shard's rename.
+func (p *Placer) recheckDependents(ctx context.Context, wf *placementWorkflow) error {
+	own := map[string]bool{"replica identity FULL": true, "publication " + wf.publicationName(): true}
+	for _, src := range wf.from.Sources() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, src, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		found, err := unsupportedTableFeatures(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
+		_ = conn.Close(ctx)
+		if err != nil {
+			return err
+		}
+		found = slices.DeleteFunc(found, func(f string) bool { return own[f] })
+		if len(found) > 0 {
+			return fatal("table %s on %s/%d gained dependents a placement move cannot carry while it was copying (%s); the move stops before the swap and the table stays where it is",
+				wf.spec.table(), wf.st.SourceSet, src, strings.Join(found, ", "))
+		}
+	}
+	return nil
+}
+
 func tableExists(ctx context.Context, conn ShardConn, schema, name string) (bool, error) {
 	rows, err := conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r')`, schema, name)

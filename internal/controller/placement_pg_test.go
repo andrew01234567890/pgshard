@@ -1720,3 +1720,51 @@ func (c copyWalkConn) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	}
 	return c.ShardConn.Query(ctx, sql, args...)
 }
+
+// TestAMoveStopsBeforeItsSwapWhenTheTableGainedADependent: the preflight
+// ran once, at prepare, and a copy can take hours. A view created over the
+// table in between is bound to it by OID, and the swap left it reading the
+// retired table -- with no error, until retiring the old table failed for
+// ever because the view depends on it (PGS-826). The dependents are checked
+// again just before the first rename, and the move stops there.
+func TestAMoveStopsBeforeItsSwapWhenTheTableGainedADependent(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE ledger (id bigint PRIMARY KEY, v text)`)
+	mustExec(t, home, `INSERT INTO ledger SELECT g, 'row-' || g FROM generate_series(1, 20) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'ledger', 'unsharded', NULL)`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'id' WHERE table_name = 'ledger'`)
+	f.reconcile()
+	f.driveUntil("ledger", 2*time.Minute, StagePlacementCatchUp, StagePlacementBuffering)
+
+	mustExec(t, home, `CREATE VIEW ledger_rows AS SELECT id, v FROM ledger`)
+
+	deadline := time.Now().Add(2 * time.Minute)
+	var state, stage, msg string
+	for {
+		if _, err := f.placer.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_, state, stage, msg = f.workflow("ledger")
+		if state == StateFailed || state == StateCompleted || stage == StagePlacementRetiring || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if state != StateFailed || !strings.Contains(msg, "view public.ledger_rows") {
+		t.Fatalf("a move whose table gained a view during the copy went on to %s %s %q; it must stop before the swap naming the view", state, stage, msg)
+	}
+	// Nothing was renamed: the view still reads the live table, which still
+	// holds every row.
+	if n := queryOne[int64](t, home, `SELECT count(*) FROM ledger_rows`); n != 20 {
+		t.Fatalf("the view reads %d rows after the stopped move, want 20", n)
+	}
+	if n := queryOne[int64](t, home, `SELECT count(*) FROM pg_class WHERE relname = 'ledger' AND relkind = 'r'`); n != 1 {
+		t.Fatal("the table was renamed away despite the move stopping")
+	}
+	// And writable: the move had fenced the shards before the check, and a
+	// stop that left the fence up would leave the table refusing writes.
+	mustExec(t, home, `INSERT INTO ledger VALUES (21, 'after-the-stopped-move')`)
+}
