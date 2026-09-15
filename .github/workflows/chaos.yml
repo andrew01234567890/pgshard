@@ -52,10 +52,21 @@ jobs:
           version: v0.32.0
           install_only: true
       - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        id: install_kind_retry
         if: steps.install_kind.outcome == 'failure'
+        continue-on-error: true
         with:
           version: v0.32.0
           install_only: true
+      # Both attempts above fetch the same release asset into the same tool
+      # cache and fail alike on a bad download (PGS-828); the module proxy is
+      # a different path, verified against the checksum database.
+      - name: Install kind from the module proxy
+        if: steps.install_kind_retry.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          hack/ci/retry.sh -- go install sigs.k8s.io/kind@v0.32.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       # The experiments run against a real cluster, so the images have to
       # exist and be in the node before the operator asks for them. Only the
       # PostgreSQL images are published, so a control-plane tag would not
