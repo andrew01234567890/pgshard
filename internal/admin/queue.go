@@ -30,13 +30,23 @@ func (p PgxCatalog) OperationQueue(ctx context.Context) ([]catalog.QueueEntry, e
 type QueueView struct {
 	Entries []QueueRow `json:"entries"`
 	// Waiting counts the entries that wait for another.
-	Waiting int    `json:"waiting"`
-	Running int    `json:"running"`
+	Waiting int `json:"waiting"`
+	Running int `json:"running"`
+	// States counts every state present, in the order it first appears, so
+	// that the summary accounts for all of the entries and not only the two
+	// states with their own counter.
+	States []QueueStateCount `json:"states"`
 	Error   string `json:"error,omitempty"`
 	// Unavailable says why there is no queue to show: no catalog, or a
 	// catalog not yet migrated to have one.
 	Unavailable string    `json:"unavailable,omitempty"`
 	ReadAt      time.Time `json:"read_at"`
+}
+
+// QueueStateCount is how many entries are in one state.
+type QueueStateCount struct {
+	State string `json:"state"`
+	Count int    `json:"count"`
 }
 
 // QueueRow is one queue entry as the page shows it.
@@ -120,9 +130,20 @@ func BuildQueueView(ctx context.Context, src QueueSource, now time.Time) QueueVi
 		case "running", "retiring":
 			v.Running++
 		}
+		v.States = countState(v.States, e.State)
 		v.Entries = append(v.Entries, row)
 	}
 	return v
+}
+
+func countState(counts []QueueStateCount, state string) []QueueStateCount {
+	for i := range counts {
+		if counts[i].State == state {
+			counts[i].Count++
+			return counts
+		}
+	}
+	return append(counts, QueueStateCount{State: state, Count: 1})
 }
 
 func shortID(id string) string {

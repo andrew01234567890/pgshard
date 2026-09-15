@@ -91,3 +91,39 @@ func TestQueuePageSaysWhenThereIsNoQueue(t *testing.T) {
 		t.Errorf("with a broken catalog: %s", body)
 	}
 }
+
+func TestQueuePageShowsTheFirstBlockerAndFoldsTheRest(t *testing.T) {
+	now := time.Now()
+	entries := queueEntries(now)
+	last := entries[len(entries)-1]
+	last.Position = 3
+	last.ID = "00000000-0000-0000-0000-0000000000d2"
+	last.Command = "ALTER TABLE orders ADD COLUMN shipped_at timestamptz"
+	last.Statement = ptr(last.Command)
+	last.Blockers = []catalog.Blocker{
+		{Kind: catalog.OperationDDL, ID: "00000000-0000-0000-0000-0000000000d1", Reason: catalog.BlockedByEarlier},
+		{Kind: catalog.OperationReshard, ID: "00000000-0000-0000-0000-0000000000r1", Reason: catalog.BlockedByStarted},
+	}
+	s, _ := newTestServer(t, fakeQueueCatalog{queue: fakeQueueSource{entries: append(entries, last)}})
+	body := get(t, s, "/queue").Body.String()
+	head := "<a href=\"/migrations/00000000-0000-0000-0000-0000000000d1\">DDL 00000000</a> <span class=\"meta\">(queued before it)</span></div><details><summary class=\"meta\">and 1 more</summary>"
+	if !strings.Contains(body, head) {
+		t.Errorf("the page does not fold the blockers after the first: %s", body)
+	}
+	if !strings.Contains(body, "reshard 00000000 <span class=\"meta\">(in progress)</span></div></details>") {
+		t.Errorf("the folded blockers are missing: %s", body)
+	}
+}
+
+func TestQueueSummaryAccountsForEveryEntry(t *testing.T) {
+	now := time.Now()
+	entries := queueEntries(now)
+	paused := entries[0]
+	paused.Position = 3
+	paused.ID = "00000000-0000-0000-0000-0000000000r2"
+	paused.State = "paused"
+	s, _ := newTestServer(t, fakeQueueCatalog{queue: fakeQueueSource{entries: append(entries, paused)}})
+	if body := get(t, s, "/queue").Body.String(); !strings.Contains(body, "3 in the queue · 1 running · 1 waiting · 1 paused") {
+		t.Errorf("the summary drops the paused operation: %s", body)
+	}
+}
