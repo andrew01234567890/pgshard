@@ -108,3 +108,32 @@ func TestAResumedCreateLooksWhereItCreates(t *testing.T) {
 		t.Fatal("a resumed CREATE TABLE found public.made and never created app.made")
 	}
 }
+
+// TestAResumedCreateIndexFindsItInItsTablesSchema: an index is created in
+// its table's schema, not in current_schema(). A resumed CREATE INDEX on a
+// table later in the path that looked only in current_schema() ran again
+// and failed on the index it had made.
+func TestAResumedCreateIndexFindsItInItsTablesSchema(t *testing.T) {
+	parallelPG(t)
+	pool, a, store := rewritePGFixture(t)
+	ctx := context.Background()
+	mustExecSQL(t, pool, `CREATE SCHEMA app`)
+	mustExecSQL(t, pool, `GRANT USAGE, CREATE ON SCHEMA app TO appowner`)
+	mustExecSQL(t, pool, `CREATE TABLE public.indexed (id int)`)
+	mustExecSQL(t, pool, `ALTER TABLE public.indexed OWNER TO appowner`)
+	mustExecSQL(t, pool, `CREATE INDEX indexed_id ON public.indexed (id)`)
+	store.migrations = []catalog.DDLMigration{{ID: "30000000-0000-0000-0000-000000000004", Database: "postgres", Statement: `CREATE INDEX indexed_id ON indexed (id)`,
+		Kind: "CREATE INDEX", Strategy: "direct", Scope: "all", State: catalog.MigrationRunning,
+		PerShard: map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning}},
+		Meta: catalog.MigrationMeta{RunAs: "appowner", SearchPath: "app, public",
+			Object: catalog.MigrationObject{Kind: "relation", Name: "indexed_id", Expect: "present"}}}}
+	if _, err := a.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	m := store.migrations[0]
+	store.mu.Unlock()
+	if m.State != catalog.MigrationComplete {
+		t.Fatalf("a resumed CREATE INDEX whose index exists in its table's schema is %s: %+v", m.State, m.PerShard)
+	}
+}

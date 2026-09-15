@@ -851,7 +851,9 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 				return "", err
 			}
 			if !dropped {
-				matches, err := objectMatches(ctx, conn, obj)
+				// An index is created in its table's schema, which the
+				// statement need not name: any schema of the path.
+				matches, err := objectMatchesIn(ctx, conn, obj, false)
 				if err != nil {
 					return "", err
 				}
@@ -1150,7 +1152,7 @@ func (a *Applier) catalogLocals(m *catalog.DDLMigration, key string) []string {
 		out = append(out, "SET LOCAL ROLE "+pgx.Identifier{m.Meta.RunAs}.Sanitize())
 	}
 	if m.Meta.SearchPath != "" {
-		out = append(out, "SET LOCAL search_path = "+quoteLiteral(m.Meta.SearchPath))
+		out = append(out, "SELECT set_config('search_path', "+quoteLiteral(m.Meta.SearchPath)+", true)")
 	}
 	return out
 }
@@ -1159,9 +1161,9 @@ func outsideTransaction(kind string) bool {
 	return kind == "CREATE DATABASE" || kind == "DROP DATABASE"
 }
 
-// inTransaction runs sql in its own transaction. locals are SET LOCAL
-// statements applied inside it first, so they hold for sql and for nothing
-// else on that session, however the transaction ends.
+// inTransaction runs sql in its own transaction. locals are statements
+// setting transaction-local values, applied inside it first, so they hold
+// for sql and for nothing else on that session, however the transaction ends.
 func inTransaction(ctx context.Context, conn ShardConn, sql string, locals ...string) error {
 	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
 		return err
@@ -1276,6 +1278,13 @@ func (a *Applier) recordDropSchema(ctx context.Context, conn ShardConn, m *catal
 // current_schema(); an absent one, where the name resolves now (a DROP
 // that recorded the schema it resolved to passes that schema instead).
 func objectMatches(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (bool, error) {
+	return objectMatchesIn(ctx, conn, o, o.Expect == "present")
+}
+
+// objectMatchesIn is objectMatches with the choice of where an unqualified
+// relation that should be present is looked for: current_schema(), or any
+// schema of the path.
+func objectMatchesIn(ctx context.Context, conn ShardConn, o catalog.MigrationObject, inCurrentSchema bool) (bool, error) {
 	var sql string
 	args := []any{o.Name}
 	switch o.Kind {
@@ -1283,7 +1292,7 @@ func objectMatches(ctx context.Context, conn ShardConn, o catalog.MigrationObjec
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE c.relname = $1 AND CASE WHEN $2 <> '' THEN n.nspname = $2
 				WHEN $3 THEN n.nspname = current_schema() ELSE n.nspname = ANY (current_schemas(false)) END)`
-		args = append(args, o.Schema, o.Expect == "present")
+		args = append(args, o.Schema, inCurrentSchema)
 	case "schema":
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`
 	case "type":
