@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -502,13 +503,24 @@ func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name strin
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	var (
-		certified bool
-		groups    []string
+		certified              bool
+		groups                 []string
+		recordedSystem, system string
 	)
-	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1)
-		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&certified, &groups)
+	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1),
+			coalesce(per_group->'catalog'->>'system_identifier', ''), (SELECT system_identifier::text FROM pg_control_system())
+		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&certified, &groups, &recordedSystem, &system)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil, nil
+	}
+	// The manifest names the catalog "catalog" whatever its generation, and
+	// its rows travel with the catalog through a major upgrade. So a
+	// barrier from before one reads back here as covering the catalog,
+	// while the catalog group a restore recovers was initdb'd since and has
+	// none of its restore points. The system identifier tells them apart;
+	// a manifest written before it was recorded is taken at its word.
+	if recordedSystem != "" && recordedSystem != system {
+		groups = slices.DeleteFunc(groups, func(g string) bool { return g == "catalog" })
 	}
 	return certified, groups, err
 }

@@ -83,6 +83,10 @@ type RestorePointResult struct {
 	LSN        uint64
 	Timeline   int64
 	WALSegment string
+	// SystemIdentifier names the database system the point was written
+	// in; a group rebuilt by initdb, as a catalog major upgrade is, has a
+	// new one and none of the old system's restore points.
+	SystemIdentifier string
 }
 
 // BarrierGroups runs the per-group steps of a barrier.
@@ -171,10 +175,11 @@ type BarrierStore interface {
 
 // GroupRestorePoint is the recorded restore point of one group.
 type GroupRestorePoint struct {
-	Group      string `json:"group"`
-	LSN        uint64 `json:"lsn"`
-	Timeline   int64  `json:"timeline"`
-	WALSegment string `json:"wal_segment"`
+	Group            string `json:"group"`
+	LSN              uint64 `json:"lsn"`
+	Timeline         int64  `json:"timeline"`
+	WALSegment       string `json:"wal_segment"`
+	SystemIdentifier string `json:"system_identifier,omitempty"`
 }
 
 // RestorePoint is one row of pgshard.restore_points.
@@ -397,7 +402,7 @@ func (b *Barrier) fenced(ctx context.Context, name, owner string, groups []Group
 		if err != nil {
 			return RestorePoint{}, fmt.Errorf("barrier %s: restore point on %s: %w", name, g.Name, err)
 		}
-		rp.Groups = append(rp.Groups, GroupRestorePoint{Group: g.Name, LSN: res.LSN, Timeline: res.Timeline, WALSegment: res.WALSegment})
+		rp.Groups = append(rp.Groups, GroupRestorePoint{Group: g.Name, LSN: res.LSN, Timeline: res.Timeline, WALSegment: res.WALSegment, SystemIdentifier: res.SystemIdentifier})
 	}
 	if err := b.awaitArchived(ctx, name, groups, rp.Groups); err != nil {
 		return RestorePoint{}, err
@@ -1101,7 +1106,8 @@ func (s *SQLBarrierGroups) PreparedGIDs(ctx context.Context, g GroupRef) ([]stri
 func (s *SQLBarrierGroups) CreateRestorePoint(ctx context.Context, g GroupRef, name string) (RestorePointResult, error) {
 	var res RestorePointResult
 	err := s.with(ctx, g, func(c groupConn) error {
-		rows, err := c.Query(ctx, `SELECT (lsn - '0/0'::pg_lsn)::bigint, pg_walfile_name(lsn), timeline_id::bigint
+		rows, err := c.Query(ctx, `SELECT (lsn - '0/0'::pg_lsn)::bigint, pg_walfile_name(lsn), timeline_id::bigint,
+				(SELECT system_identifier::text FROM pg_control_system())
 			FROM pg_create_restore_point($1) AS lsn, pg_control_checkpoint()`, name)
 		if err != nil {
 			return err
@@ -1110,11 +1116,12 @@ func (s *SQLBarrierGroups) CreateRestorePoint(ctx context.Context, g GroupRef, n
 			LSN      int64
 			Segment  string
 			Timeline int64
+			System   string
 		}])
 		if err != nil {
 			return err
 		}
-		res = RestorePointResult{LSN: uint64(row.LSN), Timeline: row.Timeline, WALSegment: row.Segment}
+		res = RestorePointResult{LSN: uint64(row.LSN), Timeline: row.Timeline, WALSegment: row.Segment, SystemIdentifier: row.System}
 		_, err = scalar[string](ctx, c, `SELECT pg_switch_wal()::text`)
 		return err
 	})
