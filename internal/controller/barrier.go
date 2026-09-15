@@ -1131,6 +1131,48 @@ func (s *SQLBarrierGroups) PauseWrites(ctx context.Context, g GroupRef, pause bo
 	if pause {
 		stmt = `ALTER SYSTEM SET default_transaction_read_only = on`
 	}
+	// A pause a workflow has claimed is that workflow's to lift. A switch
+	// holds its sources paused from quiesce until forward replication is
+	// off, and a barrier that resumed every group it had paused made them
+	// writable in between -- where a write lands after the positions the
+	// targets were checked against (PGS-844). Pausing an already paused
+	// shard changes nothing; resuming skips it.
+	//
+	// Asked at resume time, and with the shard's status row locked until
+	// the reset is sent: a workflow claims by updating that row before it
+	// pauses, so it cannot claim between this check and the reset and then
+	// have its own pause lifted.
+	if !pause && !g.Catalog() {
+		tx, err := s.Pool.Begin(ctx)
+		if err != nil {
+			return time.Time{}, err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var claimed bool
+		if err := tx.QueryRow(ctx, `SELECT coalesce(bool_or(write_paused_by IS NOT NULL), false)
+			FROM (SELECT write_paused_by FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2 FOR UPDATE) st`, g.Set, g.ID).Scan(&claimed); err != nil {
+			return time.Time{}, err
+		}
+		if claimed {
+			return time.Time{}, nil
+		}
+		if err := s.with(ctx, g, func(c groupConn) error {
+			if _, err := c.Exec(ctx, stmt); err != nil {
+				return err
+			}
+			ok, err := scalar[bool](ctx, c, `SELECT pg_reload_conf()`)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("pg_reload_conf() refused to signal the postmaster")
+			}
+			return nil
+		}); err != nil {
+			return time.Time{}, err
+		}
+		return time.Time{}, tx.Commit(ctx)
+	}
 	err := s.with(ctx, g, func(c groupConn) error {
 		// ALTER SYSTEM cannot run inside a transaction block, so both
 		// statements are sent on their own.

@@ -451,3 +451,54 @@ func TestABarrierLeavesARetiredSetPaused(t *testing.T) {
 		t.Fatalf("the retired set took a write after the barrier (err %v): its retirement pause was lifted", err)
 	}
 }
+
+// TestABarrierDoesNotLiftAWorkflowsClaimedPause (PGS-844): a switch holds its
+// sources paused, under its claim, from quiesce until forward replication is
+// off. The barrier resumes every group it paused and lifted that pause with
+// its own, letting a write land after the positions the switch had checked.
+func TestABarrierDoesNotLiftAWorkflowsClaimedPause(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixtureWith(t, "-c archive_mode=on", "-c archive_command=/bin/true")
+	ctx := context.Background()
+
+	var owner string
+	if err := f.pool.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status)
+		VALUES (gen_random_uuid(), 'upgrade', 'running', '{}', '{}') RETURNING id::text`).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.shard_status SET write_paused_by = $1::uuid WHERE shard_set = 'default' AND shard_id = 0`, owner); err != nil {
+		t.Fatal(err)
+	}
+	claimed := connect(t, f.shards[0])
+	mustExec(t, claimed, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, claimed, `SELECT pg_reload_conf()`)
+	write := func(dsn string) error {
+		c, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close(ctx) }()
+		_, err = c.Exec(ctx, `INSERT INTO t VALUES ('after the barrier')`)
+		return err
+	}
+	refused := func(err error) bool {
+		var pgErr *pgconn.PgError
+		return errors.As(err, &pgErr) && pgErr.Code == "25006"
+	}
+	waitFor(t, 20*time.Second, func() bool { return refused(write(f.shards[0])) }, "the claimed pause never took")
+
+	b := &Barrier{Store: &PGBarrierStore{Pool: f.pool}, Groups: &SQLBarrierGroups{Pool: f.pool, Shards: f.dialer}, Resolver: f.res, Poll: 50 * time.Millisecond}
+	srv := &Server{Pool: f.pool, Barrier: b, Resolver: f.res}
+	resp, err := srv.CreateBarrier(ctx, &pgshardv1.CreateBarrierRequest{Name: "beside-a-switch"})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreateBarrier: %v %v", err, resp.GetError())
+	}
+	if err := write(f.shards[0]); !refused(err) {
+		t.Fatalf("the shard a workflow holds paused took a write after the barrier (err %v): the barrier lifted the claimed pause", err)
+	}
+	waitFor(t, 20*time.Second, func() bool { return write(f.shards[1]) == nil }, "the barrier left the unclaimed shard paused")
+	var still string
+	if err := f.pool.QueryRow(ctx, `SELECT coalesce(write_paused_by::text, '') FROM pgshard.shard_status WHERE shard_set = 'default' AND shard_id = 0`).Scan(&still); err != nil || still != owner {
+		t.Fatalf("the claim is %q (%v) after the barrier, want %s's still standing", still, err, owner)
+	}
+}
