@@ -126,7 +126,11 @@ type Executor struct {
 	// ended is set, under cancelMu, once the session is over and its
 	// name will not be used again.
 	ended bool
-	home  Shard
+	// lostOn records, under lostMu, the shards a Release of the session's
+	// name failed on, and the name it failed for.
+	lostMu sync.Mutex
+	lostOn map[Shard]string
+	home   Shard
 	// shard is the shard the session's stream is (or will next be) on.
 	shard Shard
 	// latency and the shard counters belong to latencyOf, kept so a
@@ -2083,6 +2087,18 @@ func (e *Executor) acquire(ctx context.Context, fresh map[string]bool) error {
 		return err
 	}
 	e.renewSid()
+	if err := e.refuseLostShard(e.shard); err != nil {
+		if e.inClientTransaction() {
+			// The transaction cannot go on, and has to be seen to have
+			// failed: ending it as a failover does leaves ReadyForQuery
+			// saying so, and a COMMIT answering ROLLBACK. Dropping only
+			// the parked parts would leave the client, told to retry the
+			// transaction, outside one -- where its COMMIT succeeds.
+			e.dropStream()
+			e.failTxn()
+		}
+		return err
+	}
 	ps, err := openStream(e.ctx, client)
 	if err != nil {
 		return e.poolerRefused(err)
@@ -2542,6 +2558,12 @@ func (e *Executor) cancelStatement(ctx context.Context, n uint64) {
 // the session itself moves to a new name before it next reaches a pooler.
 // client is the pooler the Release went to, or nil when there was none.
 func (e *Executor) releaseFailed(sh Shard, client pgshardv1.PoolerClient, sid string, statement uint64, err error) {
+	e.lostMu.Lock()
+	if e.lostOn == nil {
+		e.lostOn = map[Shard]string{}
+	}
+	e.lostOn[sh] = sid
+	e.lostMu.Unlock()
 	e.releaseLost.Store(true)
 	e.r.cfg.Logger.Warn("releasing a pooler session failed; retrying it in the background under its old name", "session", sid, "shard", sh, "err", err)
 	go e.retryRelease(sh, client, sid, statement)
@@ -2590,10 +2612,31 @@ func (e *Executor) renewSid() {
 	if e.conn != nil || e.pinned || len(e.parked) > 0 || e.tx != pgwire.TxIdle || !e.releaseLost.CompareAndSwap(true, false) {
 		return
 	}
+	e.lostMu.Lock()
+	e.lostOn = nil
+	e.lostMu.Unlock()
 	e.renewals++
 	e.cancelMu.Lock()
 	e.sid = e.r.prefix + "-" + strconv.FormatUint(e.info.ID, 10) + "-" + strconv.FormatUint(e.renewals, 10)
 	e.cancelMu.Unlock()
+}
+
+// refuseLostShard refuses to reach sh under the session's current name
+// when a Release of that name on sh failed and the session could not be
+// renamed since -- it is inside a transaction. The pooler may still hold
+// the session there, and a stream or Reserve under the same name would
+// attach to the backend the router believed it had given back: its
+// prepared statements, and a transaction a dropped part had begun.
+func (e *Executor) refuseLostShard(sh Shard) error {
+	e.lostMu.Lock()
+	lost, ok := e.lostOn[sh]
+	e.lostMu.Unlock()
+	if !ok || !e.goesBy(lost) {
+		return nil
+	}
+	return &pgwire.Error{Severity: "ERROR", Code: codeRetryable,
+		Message: fmt.Sprintf("the pooler session on shard %s/%d could not be released; retry the transaction", sh.Set, sh.ID),
+		Detail:  "Reaching that shard again in this transaction could attach to the backend the release left behind."}
 }
 
 // release detaches the stream and returns the pinned backend to the pool.

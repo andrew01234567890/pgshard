@@ -927,6 +927,9 @@ func (e *Executor) txnControlBatch(ctx context.Context, batch []*pgshardv1.Execu
 // executor field, so several shards can be prepared at once; the executor
 // state a failure normally drops is left to the caller, which is serial.
 func (e *Executor) preparePart(ctx context.Context, sh Shard) (*txnPart, error) {
+	if err := e.refuseLostShard(sh); err != nil {
+		return nil, err
+	}
 	client, err := e.r.cfg.Poolers.Client(sh)
 	if err != nil {
 		return nil, err
