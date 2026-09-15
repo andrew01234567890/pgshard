@@ -2,7 +2,10 @@ package operator
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -117,7 +120,7 @@ func (r *ClusterReconciler) ensureRoleCert(ctx context.Context, c *pgshardv1alph
 	key := client.ObjectKey{Namespace: c.Namespace, Name: RoleTLSSecretName(c.Name, role)}
 	var sec corev1.Secret
 	err := r.Get(ctx, key, &sec)
-	if err == nil && currentFor(sec, ca, r.now()) {
+	if err == nil && currentFor(sec, ca, r.now()) && namesMatch(sec, req.DNSNames) {
 		return nil
 	}
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -152,6 +155,23 @@ func currentFor(sec corev1.Secret, ca *pki.CA, now time.Time) bool {
 		return false
 	}
 	return !pki.NeedsRenewal(sec.Data["tls.crt"], now)
+}
+
+// namesMatch reports whether a stored certificate names exactly the names the
+// role is issued now. Without it a change to what a role may serve waited for
+// the certificate's renewal: member certificates issued with the namespace
+// wildcards stayed valid to serve the controller's and router's hosts for
+// the rest of their life (PGS-860).
+func namesMatch(sec corev1.Secret, want []string) bool {
+	block, _ := pem.Decode(sec.Data["tls.crt"])
+	if block == nil {
+		return false
+	}
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	return slices.Equal(slices.Sorted(slices.Values(crt.DNSNames)), slices.Sorted(slices.Values(want)))
 }
 
 // IssuedMemberServerName is the name callers verify a member's pooler or

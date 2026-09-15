@@ -1463,7 +1463,7 @@ func (r *ClusterReconciler) observePod(ctx context.Context, c *pgshardv1alpha1.P
 	// its agent was started requiring, and during a rollout that differs
 	// from what the spec now asks for.
 	r.AgentTLS.Set(agentAddr(m.ip), pod.Annotations[AnnotationAgentMTLS] == "true")
-	if r.AgentTLS != nil && r.OperatorCreds != nil {
+	if r.AgentTLS != nil && r.OperatorCreds != nil && m.ip != "" {
 		agentCreds, _, err := r.OperatorCreds.For(ctx, c)
 		if err != nil {
 			return nil, err

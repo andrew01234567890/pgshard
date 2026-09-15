@@ -427,3 +427,53 @@ func TestEveryCallerVerifiesANameTheIssuedCertificateCarries(t *testing.T) {
 		}
 	}
 }
+
+// TestAChangeToWhatARoleServesReissuesItsCertificate (PGS-860): certificates
+// were reissued only near expiry or on a CA change, so removing a name a role
+// may serve waited up to a certificate's life -- member certificates carrying
+// the namespace wildcards stayed valid for the controller's and router's
+// hosts. A stored certificate that names anything else is reissued, and one
+// that names exactly the role's names is left alone, or every pass would
+// churn the Secrets and roll the members.
+func TestAChangeToWhatARoleServesReissuesItsCertificate(t *testing.T) {
+	ctx := context.Background()
+	c := issuingCluster("names-change")
+	r := pkiReconciler(t, time.Now(), c)
+	if err := r.reconcilePKI(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	name := RoleTLSSecretName(c.Name, pki.RolePooler)
+	settled := secretOf(t, r, c.Namespace, name)
+	if err := r.reconcilePKI(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if again := secretOf(t, r, c.Namespace, name); string(again.Data["tls.crt"]) != string(settled.Data["tls.crt"]) {
+		t.Fatal("a certificate naming exactly its role's names was reissued")
+	}
+
+	caSec := secretOf(t, r, c.Namespace, CASecretName(c.Name))
+	ca, err := pki.LoadCA(pki.Material{CertPEM: caSec.Data["ca.crt"], KeyPEM: caSec.Data["ca.key"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := ca.Issue(pki.Request{Identity: pki.Identity{Namespace: c.Namespace, Cluster: c.Name, Role: pki.RolePooler},
+		DNSNames: append(roleDNSNames(c, pki.RolePooler), "*."+c.Namespace+".svc", "*."+c.Namespace+".pod"), Server: true, Client: true}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled.Data["tls.crt"], settled.Data["tls.key"] = old.CertPEM, old.KeyPEM
+	if err := r.Update(ctx, &settled); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcilePKI(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(secretOf(t, r, c.Namespace, name).Data["tls.crt"])
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := crt.VerifyHostname(ControllerName(c.Name) + "." + c.Namespace + ".svc"); err == nil {
+		t.Fatalf("a certificate issued with names the role no longer serves was kept: %v", crt.DNSNames)
+	}
+}

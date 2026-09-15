@@ -124,6 +124,8 @@ func TestAnIssuingClustersAgentIsDialledWithThatClustersCredentials(t *testing.T
 	impostor := &AgentTLSModes{}
 	impostor.Set(poolerOnLoopback, true)
 	impostor.SetCredentials(poolerOnLoopback, recorded)
+	// The agent client waits for the connection to be ready, so the reason
+	// is not in its error; the role check is pinned by mutation.
 	if err := call(withModes(impostor), poolerOnLoopback); err == nil {
 		t.Fatal("a pooler's certificate answered the operator dialling an agent")
 	}
@@ -212,10 +214,11 @@ func TestAnIssuingClustersControllerIsDialledWithThatClustersCredentials(t *test
 		t.Cleanup(g.Stop)
 		return l.Addr().String()
 	}
-	// The Service host resolves, here, to whichever listener the test says.
+	// A backup policy may name any endpoint for the controller; it resolves,
+	// here, to whichever listener the test says.
 	call := func(listener string) error {
 		t.Helper()
-		host := ControllerName(c.Name) + "." + c.Namespace + ".svc:1"
+		host := "barriers.example.internal:1"
 		cc, err := grpc.NewClient("passthrough:///"+host, grpc.WithTransportCredentials(controllerCreds),
 			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", listener)
@@ -235,8 +238,8 @@ func TestAnIssuingClustersControllerIsDialledWithThatClustersCredentials(t *test
 	if err := call(serve(pki.RoleController)); err != nil {
 		t.Fatalf("the operator could not reach an issuing cluster's controller with that cluster's credentials: %v", err)
 	}
-	if err := call(serve(pki.RoleRouter)); err == nil {
-		t.Fatal("a router's certificate answered the operator dialling the controller")
+	if err := call(serve(pki.RoleRouter)); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("a router's certificate answering the operator dialling the controller was not refused: %v", err)
 	}
 	// A certificate from the cluster's CA that names the controller's host
 	// but is not the controller's: refused for its identity, not its name.

@@ -233,7 +233,11 @@ const (
 // and a client with credentials but no predicate dials TLS everywhere, which
 // is what a fleet that finished its rollout looks like.
 func (c *GRPCAgentClient) wantTLS(addr string) bool {
-	return c.credsFor(addr) != nil && (c.RequiresTLS == nil || c.RequiresTLS(addr))
+	return c.credsFor(addr) != nil && c.requires(addr)
+}
+
+func (c *GRPCAgentClient) requires(addr string) bool {
+	return c.RequiresTLS == nil || c.RequiresTLS(addr)
 }
 
 func (c *GRPCAgentClient) credsFor(addr string) credentials.TransportCredentials {
@@ -259,10 +263,10 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 	if c.used == nil {
 		c.used = map[string]time.Time{}
 	}
-	wantTLS := c.wantTLS(addr)
-	tc := insecure.NewCredentials()
-	if wantTLS {
-		tc = c.credsFor(addr)
+	tc := c.credsFor(addr)
+	wantTLS := tc != nil && c.requires(addr)
+	if !wantTLS {
+		tc = insecure.NewCredentials()
 	}
 	conn, ok := c.conns[addr]
 	if ok && (c.mode[addr] != wantTLS || (wantTLS && c.dialledWith[addr] != tc)) {

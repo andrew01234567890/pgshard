@@ -62,7 +62,9 @@ func (o *IssuedCredentials) For(ctx context.Context, c *pgshardv1alpha1.PgShardC
 	if err != nil {
 		return nil, nil, fmt.Errorf("operator credentials for %s/%s: %w", c.Namespace, c.Name, err)
 	}
-	controller, err = grpccreds.DialerPEM(sec.Data["tls.crt"], sec.Data["tls.key"], sec.Data["ca.crt"], "",
+	// The controller's Service host, whatever endpoint a backup policy names
+	// to reach it: its certificate carries that name.
+	controller, err = grpccreds.DialerPEM(sec.Data["tls.crt"], sec.Data["tls.key"], sec.Data["ca.crt"], ControllerName(c.Name)+"."+c.Namespace+".svc",
 		grpccreds.Authorize(pki.Serves(pki.RoleController)))
 	if err != nil {
 		return nil, nil, fmt.Errorf("operator credentials for %s/%s: %w", c.Namespace, c.Name, err)
