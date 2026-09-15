@@ -1047,6 +1047,7 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	for _, c := range []struct{ ddl, table, want string }{
 		{`CREATE TABLE ruled (id bigint PRIMARY KEY); CREATE RULE r1 AS ON DELETE TO ruled DO INSTEAD NOTHING`, "ruled", "rule r1"},
 		{`CREATE TABLE base (id bigint PRIMARY KEY); CREATE TABLE inh (x int) INHERITS (base)`, "inh", "inheritance/partition membership"},
+		{`CREATE TABLE heir (id bigint PRIMARY KEY); CREATE TABLE heir_child (x int) INHERITS (heir)`, "heir", "inheritance/partition membership"},
 		{`CREATE TABLE ri (id bigint PRIMARY KEY); ALTER TABLE ri REPLICA IDENTITY FULL`, "ri", "replica identity FULL"},
 		// Bound by OID from outside the table, so the swap leaves each of
 		// them on the retired table with no error (PGS-790).
@@ -1065,6 +1066,15 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			CREATE FUNCTION rowed_all() RETURNS SETOF rowed LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY SELECT * FROM rowed; END $$`, "rowed", "row type used by function rowed_all()"},
 		{`CREATE TABLE snapshotted (id bigint PRIMARY KEY); CREATE TABLE snapshot_log (s snapshotted[])`, "snapshotted", "row type used by column s of table snapshot_log"},
 		{`CREATE TABLE casted (id bigint PRIMARY KEY); CREATE VIEW casted_null AS SELECT NULL::casted AS r`, "casted", "row type used by column r of view casted_null"},
+		// The table's OID as a regclass constant (PGS-888).
+		{`CREATE TABLE selfnamed (id bigint PRIMARY KEY, me regclass DEFAULT 'selfnamed'::regclass)`, "selfnamed", "reference to the table by OID in default value for column me of table selfnamed"},
+		{`CREATE TABLE pointed (id bigint PRIMARY KEY); CREATE TABLE pointer (y int CHECK (y <> 'pointed'::regclass::int))`, "pointed", "reference to the table by OID in constraint pointer_y_check on table pointer"},
+		{`CREATE TABLE selfchecked (a int CHECK (a <> 'selfchecked'::regclass::int))`, "selfchecked", "reference to the table by OID in constraint selfchecked_a_check on table selfchecked"},
+		{`CREATE TABLE selfgenerated (a int, g int GENERATED ALWAYS AS (a + 'selfgenerated'::regclass::int) STORED)`, "selfgenerated", "reference to the table by OID in default value for column g of table selfgenerated"},
+		{`CREATE TABLE indexpointed (id bigint PRIMARY KEY); CREATE TABLE indexpointer (a int);
+			CREATE INDEX indexpointer_a ON indexpointer (a) WHERE a <> 'indexpointed'::regclass::int`, "indexpointed", "reference to the table by OID in index indexpointer_a"},
+		{`CREATE TABLE selfwhen (a int); CREATE FUNCTION selfwhen_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+			CREATE TRIGGER selfwhen_t BEFORE INSERT ON selfwhen FOR EACH ROW WHEN (NEW.a <> 'selfwhen'::regclass::int) EXECUTE FUNCTION selfwhen_noop()`, "selfwhen", "reference to the table by OID in trigger selfwhen_t on table selfwhen"},
 		// A rule that writes into the table from a view is the rule, not
 		// the view: the view's own _RETURN rule does not touch this table.
 		{`CREATE TABLE sink (id bigint PRIMARY KEY); CREATE VIEW sink_entry AS SELECT 1::bigint AS id;
@@ -1075,7 +1085,13 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 		if err != nil || !slices.Contains(got, c.want) {
 			t.Fatalf("%s: unsupported = %v (%v), want %q", c.table, got, err, c.want)
 		}
+		if len(slices.Compact(slices.Clone(got))) != len(got) {
+			t.Errorf("%s: %v reports a feature twice", c.table, got)
+		}
 		for _, f := range got {
+			if strings.Contains(f, "by OID in table ") {
+				t.Errorf("%s: %q reports an inheriting table as a reference by OID", c.table, f)
+			}
 			if strings.Contains(f, "_RETURN") {
 				t.Errorf("%s: %q names a view's internal rule; the view's column already names it", c.table, f)
 			}
@@ -1104,9 +1120,16 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 		t.Fatalf("a function that names the table only in text follows the swap and must not be refused: %v %v", got, err)
 	}
 
+	// The table's own expression naming another table by OID survives the
+	// swap unchanged, since that table is not moved.
+	mustExec(t, home, `CREATE TABLE namesother (a int CHECK (a <> 'lookedup'::regclass::int))`)
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "namesother"); err != nil || len(got) != 0 {
+		t.Fatalf("a regclass constant naming another table must not be refused: %v %v", got, err)
+	}
+
 	// And what is no longer refused: row-level security and user triggers
 	// are reproduced, so the feature detector reports neither.
-	mustExec(t, home, `CREATE TABLE rlsonly (id bigint PRIMARY KEY, owner text)`)
+	mustExec(t, home, `CREATE TABLE rlsonly (id bigint PRIMARY KEY, owner text CHECK (owner <> ''), amount int DEFAULT 0 CHECK (amount >= 0))`)
 	mustExec(t, home, `ALTER TABLE rlsonly ENABLE ROW LEVEL SECURITY`)
 	mustExec(t, home, `CREATE POLICY own_rows ON rlsonly USING (owner = current_user)`)
 	mustExec(t, home, `CREATE FUNCTION stamp_owner() RETURNS trigger LANGUAGE plpgsql AS $$
