@@ -216,3 +216,31 @@ func TestDisplayEndpointStripsUserinfo(t *testing.T) {
 		t.Fatalf("plain endpoint changed: %q", got)
 	}
 }
+
+// A barrier taken before a catalog major upgrade is refused by a restore
+// (PGS-825). The listing says so, so an operator does not find out from a
+// failed restore (PGS-855).
+func TestABarrierFromBeforeACatalogUpgradeIsShownAsNotRestorable(t *testing.T) {
+	src := fakeCatalog{points: []controller.RestorePoint{
+		{Name: "before-the-upgrade", CreatedAt: time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC), CatalogSuperseded: true},
+		{Name: "after-the-upgrade", CreatedAt: time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)},
+	}}
+	s, _ := newTestServer(t, src, populated()...)
+	body := get(t, s, "/backups").Body.String()
+	before := strings.Index(body, "before-the-upgrade")
+	after := strings.Index(body, "after-the-upgrade")
+	marker := "not restorable: taken before the catalog's major upgrade"
+	if before < 0 || after < 0 || strings.Count(body, marker) != 1 {
+		t.Fatalf("want one barrier marked not restorable:\n%s", body)
+	}
+	if at := strings.Index(body, marker); at < before || (after > before && at > after) {
+		t.Fatalf("the marker is not on the superseded barrier:\n%s", body)
+	}
+	var points []RestorePoint
+	if err := json.Unmarshal(get(t, s, "/api/v1/restore-points").Body.Bytes(), &points); err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 2 || !points[0].CatalogSuperseded || points[1].CatalogSuperseded {
+		t.Fatalf("restore points: %+v", points)
+	}
+}

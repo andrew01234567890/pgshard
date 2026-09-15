@@ -161,6 +161,9 @@ message GroupRestorePoint {
   uint64 lsn = 2;
   int64 timeline = 3;
   string wal_segment = 4;
+  // The database system the point was written in; empty for points recorded
+  // before it was.
+  string system_identifier = 5;
 }
 
 // Barrier is one recorded restore point.
@@ -177,6 +180,10 @@ message Barrier {
   repeated GroupRestorePoint groups = 6;
   // Unix seconds.
   int64 created_at = 7;
+  // The catalog was rebuilt since this barrier -- a major upgrade initdb's
+  // a new one -- so its catalog restore point is not in the catalog's
+  // repository and a restore to it is refused.
+  bool catalog_superseded = 8;
 }
 
 // CreateBarrierResponse returns the recorded barrier.

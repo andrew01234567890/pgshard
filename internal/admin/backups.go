@@ -77,6 +77,9 @@ type RestorePoint struct {
 	CreatedAt          time.Time           `json:"createdAt"`
 	ShardMapGeneration int64               `json:"shardMapGeneration"`
 	Groups             []RestorePointGroup `json:"groups"`
+	// CatalogSuperseded: the catalog was rebuilt by a major upgrade since,
+	// so a restore to this point is refused.
+	CatalogSuperseded bool `json:"catalogSuperseded,omitempty"`
 }
 
 // GroupRestore is one group's progress inside a restore.
@@ -397,7 +400,8 @@ func describeTarget(t pgshardv1alpha1.RestoreTarget) (kind, value string) {
 }
 
 func convertRestorePoint(rp controller.RestorePoint) RestorePoint {
-	out := RestorePoint{Name: rp.Name, CreatedAt: rp.CreatedAt, ShardMapGeneration: rp.ShardMapGeneration, Groups: []RestorePointGroup{}}
+	out := RestorePoint{Name: rp.Name, CreatedAt: rp.CreatedAt, ShardMapGeneration: rp.ShardMapGeneration, Groups: []RestorePointGroup{},
+		CatalogSuperseded: rp.CatalogSuperseded}
 	for _, g := range rp.Groups {
 		out.Groups = append(out.Groups, RestorePointGroup{Group: g.Group, LSN: formatLSN(g.LSN), Timeline: g.Timeline, WALSegment: g.WALSegment})
 	}

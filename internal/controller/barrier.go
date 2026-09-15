@@ -190,6 +190,11 @@ type RestorePoint struct {
 	Certified          bool
 	Groups             []GroupRestorePoint
 	CreatedAt          time.Time
+	// CatalogSuperseded is set when the catalog was rebuilt since the point
+	// was taken -- a major upgrade initdb's a new one -- so its catalog
+	// restore point is not in the catalog's repository and a restore to it
+	// is refused.
+	CatalogSuperseded bool
 }
 
 // RestorePointName is the WAL restore point name of a barrier. It is derived
@@ -982,7 +987,8 @@ func (s *PGBarrierStore) ShardMapGeneration(ctx context.Context) (int64, error) 
 
 // ListRestorePoints returns recorded restore points, newest first.
 func ListRestorePoints(ctx context.Context, q catalog.Querier, certifiedOnly bool) ([]RestorePoint, error) {
-	rows, err := q.Query(ctx, `SELECT id::text, name, shard_map_generation, per_group, certified, created_at
+	rows, err := q.Query(ctx, `SELECT id::text, name, shard_map_generation, per_group, certified, created_at,
+			(SELECT system_identifier::text FROM pg_control_system())
 		FROM pgshard.restore_points WHERE NOT $1 OR certified ORDER BY created_at DESC, name`, certifiedOnly)
 	if err != nil {
 		return nil, err
@@ -994,6 +1000,7 @@ func ListRestorePoints(ctx context.Context, q catalog.Querier, certifiedOnly boo
 		PerGroup   []byte
 		Certified  bool
 		CreatedAt  time.Time
+		System     string
 	}
 	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
 	if err != nil {
@@ -1009,6 +1016,9 @@ func ListRestorePoints(ctx context.Context, q catalog.Querier, certifiedOnly boo
 		for name, g := range perGroup {
 			g.Group = name
 			rp.Groups = append(rp.Groups, g)
+			if name == CatalogGroup && g.SystemIdentifier != "" && g.SystemIdentifier != r.System {
+				rp.CatalogSuperseded = true
+			}
 		}
 		sort.Slice(rp.Groups, func(i, j int) bool { return rp.Groups[i].Group < rp.Groups[j].Group })
 		out = append(out, rp)

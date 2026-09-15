@@ -84,6 +84,25 @@ func TestBarrierOnPostgres(t *testing.T) {
 			t.Errorf("the manifest records %s's system as %q, want %q", group, got, want)
 		}
 	}
+	// Listed as restorable while the catalog is the one it was taken on, and
+	// not once the manifest names another system (PGS-855).
+	if list, err := srv.ListBarriers(ctx, &pgshardv1.ListBarriersRequest{}); err != nil || len(list.GetBarriers()) != 1 || list.GetBarriers()[0].GetCatalogSuperseded() {
+		t.Fatalf("a barrier on the current catalog listed as superseded: %v %v", list, err)
+	} else if id := list.GetBarriers()[0].GetGroups()[0].GetSystemIdentifier(); id != systemOf(f.pool) {
+		t.Fatalf("the catalog's listed system is %q, want %q", id, systemOf(f.pool))
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.restore_points SET per_group = jsonb_set(per_group, '{catalog,system_identifier}', '"1"') WHERE name = 'b1'`); err != nil {
+		t.Fatal(err)
+	}
+	if list, err := srv.ListBarriers(ctx, &pgshardv1.ListBarriersRequest{}); err != nil || !list.GetBarriers()[0].GetCatalogSuperseded() {
+		t.Fatalf("a barrier from another catalog system is not listed as superseded: %v %v", list, err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.restore_points SET per_group = per_group #- '{catalog,system_identifier}' WHERE name = 'b1'`); err != nil {
+		t.Fatal(err)
+	}
+	if list, err := srv.ListBarriers(ctx, &pgshardv1.ListBarriersRequest{}); err != nil || list.GetBarriers()[0].GetCatalogSuperseded() {
+		t.Fatalf("a barrier recorded before identifiers were recorded is listed as superseded: %v %v", list, err)
+	}
 	var restorePoint string
 	if err := connect(t, f.shardDSN(1)).QueryRow(ctx, `SELECT pg_walfile_name(pg_current_wal_lsn())`).Scan(&restorePoint); err != nil {
 		t.Fatal(err)

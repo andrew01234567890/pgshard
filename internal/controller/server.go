@@ -89,9 +89,10 @@ func (s *Server) ListBarriers(ctx context.Context, req *pgshardv1.ListBarriersRe
 
 func restorePointProto(rp RestorePoint) *pgshardv1.Barrier {
 	out := &pgshardv1.Barrier{Id: rp.ID, Name: rp.Name, RestorePoint: RestorePointName(rp.Name), ShardMapGeneration: rp.ShardMapGeneration,
-		Certified: rp.Certified, CreatedAt: rp.CreatedAt.Unix()}
+		Certified: rp.Certified, CreatedAt: rp.CreatedAt.Unix(), CatalogSuperseded: rp.CatalogSuperseded}
 	for _, g := range rp.Groups {
-		out.Groups = append(out.Groups, &pgshardv1.GroupRestorePoint{Group: g.Group, Lsn: g.LSN, Timeline: g.Timeline, WalSegment: g.WALSegment})
+		out.Groups = append(out.Groups, &pgshardv1.GroupRestorePoint{Group: g.Group, Lsn: g.LSN, Timeline: g.Timeline, WalSegment: g.WALSegment,
+			SystemIdentifier: g.SystemIdentifier})
 	}
 	return out
 }
