@@ -1119,14 +1119,14 @@ func TestAMismatchedAttachDoesNotTakeARunningStreamsBackend(t *testing.T) {
 	if !evicted {
 		t.Fatal("the session must be marked so its own stream gets rid of the backend")
 	}
-	if b.released {
+	if b.released.Load() {
 		t.Fatal("the backend was returned to the pool while its stream still held it")
 	}
 
 	// The owner ends. It is the only one to return the backend, and because
 	// the session was torn down the backend goes rather than being reused.
 	s.detach(se)
-	if !b.released {
+	if !b.released.Load() {
 		t.Fatal("the stream did not return the backend on its way out")
 	}
 	if !b.broken {
