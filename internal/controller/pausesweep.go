@@ -57,7 +57,91 @@ func (s *WritePauseSweep) Run(ctx context.Context, interval time.Duration, leade
 		if _, err := s.Pass(ctx); err != nil {
 			s.logger().Warn("write pause sweep failed", "err", err)
 		}
+		if _, err := s.Reassert(ctx); err != nil {
+			s.logger().Warn("retirement pause sweep failed", "err", err)
+		}
 	})
+}
+
+// liveWorkflowNamesSet is true while a workflow that has not ended names the
+// set in column col as its target or its source: a switch that has flipped
+// keeps its retired source writable for reverse replication until it
+// completes. A pending workflow has created nothing that could need it, and
+// an in-place range edit stays pending for good. The source is read from
+// the cutover status too, where the copier records the one it resolved.
+func liveWorkflowNamesSet(col string) string {
+	return `EXISTS (SELECT 1 FROM pgshard.workflows w
+		WHERE w.state NOT IN ('pending', 'completed', 'failed', 'cancelled')
+		  AND ` + col + ` IN (w.spec->>'shard_set', w.spec->>'source_set', w.status->'cutover'->>'source_set'))`
+}
+
+// Reassert puts the retirement pause back on every primary of a retired set
+// that has lost it, and returns how many it paused.
+//
+// Complete raises that pause once and nothing else ever did: a barrier that
+// resumed the set after a rollback retired it mid-run, or one from before
+// barriers stopped listing retired sets, left it writable for good, and a
+// client connected straight to it had writes acknowledged by a primary
+// nothing reads from again.
+//
+// Only a set nothing may still need writable: no claimed pause on the shard,
+// no live workflow naming the set, and no enabled subscription on the
+// primary -- a pause would fail its apply with 25006 and hold WAL on its
+// publisher.
+func (s *WritePauseSweep) Reassert(ctx context.Context) (int, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT st.shard_set, st.shard_id FROM pgshard.shard_status st
+		JOIN pgshard.shard_sets ss ON ss.shard_set = st.shard_set
+		WHERE ss.state = 'retired' AND st.write_paused_by IS NULL
+		  AND NOT `+liveWorkflowNamesSet("st.shard_set")+`
+		ORDER BY st.shard_set, st.shard_id`)
+	if err != nil {
+		return 0, err
+	}
+	retired, err := pgx.CollectRows(rows, pgx.RowToStructByPos[ShardRef])
+	if err != nil {
+		return 0, err
+	}
+	paused := 0
+	var errs []error
+	for _, sh := range retired {
+		did, err := s.repause(ctx, sh)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("shard %s/%d: %w", sh.Set, sh.ID, err))
+			continue
+		}
+		if did {
+			paused++
+			s.logger().Warn("put the retirement write pause back on a retired shard that had lost it",
+				"shard_set", sh.Set, "shard_id", sh.ID)
+		}
+	}
+	return paused, errors.Join(errs...)
+}
+
+func (s *WritePauseSweep) repause(ctx context.Context, sh ShardRef) (bool, error) {
+	conn, err := s.Shards.Dial(ctx, sh.Set, sh.ID)
+	if err != nil {
+		// Not an error to report on every tick: a retired set's pods are
+		// deleted before its catalog rows, and a primary nothing can reach
+		// takes no writes either.
+		s.logger().Debug("retired shard unreachable; its retirement pause is not checked", "shard_set", sh.Set, "shard_id", sh.ID, "err", err)
+		return false, nil
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT current_setting('default_transaction_read_only') <> 'on'
+		AND NOT EXISTS (SELECT 1 FROM pg_subscription WHERE subenabled)`)
+	if err != nil {
+		return false, err
+	}
+	lost, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+	if err != nil || !lost {
+		return false, err
+	}
+	if _, err := conn.Exec(ctx, `ALTER SYSTEM SET default_transaction_read_only = on`); err != nil {
+		return false, err
+	}
+	_, err = conn.Exec(ctx, `SELECT pg_reload_conf()`)
+	return err == nil, err
 }
 
 // Pass lifts every orphaned pause and returns how many shards it made

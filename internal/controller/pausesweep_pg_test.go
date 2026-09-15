@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -223,4 +225,104 @@ func pauseClaim(t *testing.T, cat *pgx.Conn) string {
 		return ""
 	}
 	return *claim
+}
+
+// PGS-822. Complete raises a retired set's write pause once and nothing
+// reasserted it, so a pause lost afterwards -- a barrier resuming the set,
+// most likely -- stayed lost until the set was deleted, and a client
+// connected straight to the retired primary had its writes acknowledged by a
+// shard nothing reads from again.
+//
+// The sweep puts it back, but only on a set nothing may still need writable.
+func TestARetiredSetThatLostItsPauseGetsItBack(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	catalogDSN := startPostgres(t)
+	shardDSN := startPostgres(t)
+
+	cat := connect(t, catalogDSN)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, catalogDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('old', 98, 'retired'), ('new', 99, 'serving')`)
+	mustExec(t, cat, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
+		VALUES ('old', 0, 'o0', 'retired', 1)`)
+	waitReadOnly(t, shardDSN, false)
+
+	sweep := &WritePauseSweep{Pool: pool, Shards: realShards{shardDSN}}
+	reassert := func(want int) {
+		t.Helper()
+		got, err := sweep.Reassert(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("paused %d retired shards, want %d", got, want)
+		}
+	}
+	unpause := func() {
+		t.Helper()
+		shard := connect(t, shardDSN)
+		mustExec(t, shard, `ALTER SYSTEM RESET default_transaction_read_only`)
+		mustExec(t, shard, `SELECT pg_reload_conf()`)
+		waitReadOnly(t, shardDSN, false)
+	}
+
+	// A switch that has flipped but not completed keeps its retired source
+	// writable for reverse replication, whether the set is named by its
+	// spec, as its target, or only by the source its copier resolved.
+	const wfID = "33333333-3333-3333-3333-333333333333"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES ($1::uuid, 'reshard', 'running', '{"shard_set": "new", "source_set": "old"}')`, wfID)
+	reassert(0)
+	mustExec(t, cat, `UPDATE pgshard.workflows SET spec = '{"shard_set": "old", "source_set": "new"}' WHERE id = $1::uuid`, wfID)
+	reassert(0)
+	mustExec(t, cat, `UPDATE pgshard.workflows SET spec = '{"shard_set": "new"}', status = '{"cutover": {"source_set": "old"}}' WHERE id = $1::uuid`, wfID)
+	reassert(0)
+	waitReadOnly(t, shardDSN, false)
+
+	// A pending one has created nothing that could need it -- an in-place
+	// range edit sits pending for good -- so it does not.
+	mustExec(t, cat, `UPDATE pgshard.workflows SET state = 'pending', spec = '{"shard_set": "old"}' WHERE id = $1::uuid`, wfID)
+	reassert(1)
+	waitReadOnly(t, shardDSN, true)
+	unpause()
+
+	// A claimed pause belongs to its claimant.
+	mustExec(t, cat, `UPDATE pgshard.workflows SET state = 'completed' WHERE id = $1::uuid`, wfID)
+	mustExec(t, cat, `UPDATE pgshard.shard_status SET write_paused_by = $1::uuid WHERE shard_set = 'old'`, wfID)
+	reassert(0)
+	mustExec(t, cat, `UPDATE pgshard.shard_status SET write_paused_by = NULL WHERE shard_set = 'old'`)
+
+	// A primary still applying a subscription: a pause would fail its
+	// apply with 25006 and hold WAL on its publisher. A disabled one applies
+	// nothing, so it does not count.
+	shard := connect(t, shardDSN)
+	mustExec(t, shard, `CREATE SUBSCRIPTION leftover CONNECTION 'host=127.0.0.1 port=1 dbname=postgres' PUBLICATION p
+		WITH (connect = false, slot_name = 'leftover')`)
+	mustExec(t, shard, `ALTER SUBSCRIPTION leftover ENABLE`)
+	reassert(0)
+	waitReadOnly(t, shardDSN, false)
+	mustExec(t, shard, `ALTER SUBSCRIPTION leftover DISABLE`)
+
+	// Nothing left that needs it writable: the pause comes back.
+	reassert(1)
+	waitReadOnly(t, shardDSN, true)
+	writer := connect(t, shardDSN)
+	var pgErr *pgconn.PgError
+	if _, err := writer.Exec(ctx, `CREATE TABLE after_the_sweep (id int)`); !errors.As(err, &pgErr) || pgErr.Code != "25006" {
+		t.Fatalf("the retired shard took a write after the sweep: %v", err)
+	}
+
+	// Already paused: nothing to do, which is what makes it safe on every
+	// tick. And a serving set is never touched.
+	reassert(0)
+	unpause()
+	mustExec(t, cat, `UPDATE pgshard.shard_sets SET state = 'serving' WHERE shard_set = 'old'`)
+	reassert(0)
+	waitReadOnly(t, shardDSN, false)
 }
