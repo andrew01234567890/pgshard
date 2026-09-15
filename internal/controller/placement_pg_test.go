@@ -1651,3 +1651,72 @@ func TestPlacementReleasesTheFenceAfterPublishDespiteAnUnreachableShardOnPostgre
 		t.Fatalf("the live table is still write-fenced on a healthy shard: %v", err)
 	}
 }
+
+// TestABarrierDuringAPlacementCopyDoesNotWaitForItsSnapshot (PGS-863): the
+// copy holds one REPEATABLE READ READ ONLY transaction for its whole walk,
+// and the barrier's drain counted it as a transaction begun before the
+// pause that might still write, so every barrier landing during a copy
+// longer than the drain timeout failed. A barrier paused mid-walk now finds
+// no writer.
+func TestABarrierDuringAPlacementCopyDoesNotWaitForItsSnapshot(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE items (id int PRIMARY KEY, v text)`)
+	mustExec(t, home, `INSERT INTO items SELECT g, 'v' FROM generate_series(1, 50) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'items', 'unsharded', NULL)`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'id' WHERE table_name = 'items'`)
+	f.reconcile()
+
+	groups := &SQLBarrierGroups{Pool: f.pool, Shards: f.placer.Shards}
+	g := GroupRef{Name: "shard0", Set: "default", ID: 0}
+	writers := -1
+	var werr error
+	f.placer.Shards = onCopyWalk{ShardDBDialer: f.placer.Shards, once: &sync.Once{}, fire: func() {
+		pausedAt, err := groups.PauseWrites(ctx, g, true)
+		if err == nil {
+			writers, err = groups.WritersSince(ctx, g, pausedAt)
+		}
+		if _, rerr := groups.PauseWrites(ctx, g, false); err == nil {
+			err = rerr
+		}
+		werr = err
+	}}
+	f.driveUntil("items", time.Minute, StagePlacementCatchUp)
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	if writers != 0 {
+		t.Fatalf("a barrier paused during the copy counted %d writer(s); the copy's read-only snapshot holds its drain", writers)
+	}
+}
+
+// onCopyWalk runs fire once, just before the first keyset query of a
+// placement copy, while its snapshot is open.
+type onCopyWalk struct {
+	ShardDBDialer
+	once *sync.Once
+	fire func()
+}
+
+func (d onCopyWalk) DialDatabase(ctx context.Context, set string, id int32, db string) (ShardConn, error) {
+	c, err := d.ShardDBDialer.DialDatabase(ctx, set, id, db)
+	if err != nil {
+		return nil, err
+	}
+	return copyWalkConn{ShardConn: c, d: d}, nil
+}
+
+type copyWalkConn struct {
+	ShardConn
+	d onCopyWalk
+}
+
+func (c copyWalkConn) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, " AS src") {
+		c.d.once.Do(c.d.fire)
+	}
+	return c.ShardConn.Query(ctx, sql, args...)
+}
