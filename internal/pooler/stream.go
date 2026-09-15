@@ -459,6 +459,16 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 			if positionGone(pgErr) {
 				return reasoned(st, ReasonPositionTooOld)
 			}
+			// object_in_use: a walsender still holds the slot. Most often it
+			// is this pooler's own previous reader, whose backend outlives its
+			// closed connection by however long it takes to notice -- the
+			// seat in s.readers is already free, which is how this call got
+			// here. It is a reader to wait for, and without the reason the
+			// router ended the consumer's stream with an internal error for
+			// a race its own reconnect would have won.
+			if pgErr.Code == "55006" {
+				return reasoned(st, ReasonReaderActive)
+			}
 			return st.Err()
 		}
 		return status.Errorf(codes.Unavailable, "start replication: %v", err)
