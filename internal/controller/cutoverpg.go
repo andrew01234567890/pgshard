@@ -1449,6 +1449,19 @@ func (o *pgCutover) drainWriters(ctx context.Context, set string, ids []int32) e
 // for SET TRANSACTION READ WRITE. It is deliberately overriding the pause,
 // and the router's own fence is what refuses it, but if it has reached the
 // point of writing here it must still be drained.
+//
+// Not one that began after the pause instant this pass measured and has
+// written only temporary tables. A read-only transaction may write a
+// temporary table that already exists, which takes an xid like any write,
+// and a session doing that inside a long transaction held the drain although
+// it can write nothing a target receives (PGS-850). It is told apart by its
+// locks: every lock it holds stronger than AccessShareLock is on a temporary
+// relation of its own database. One that holds none, holds one on a shared
+// catalog or on a relation this session cannot resolve, is counted. So is
+// every transaction holding an xid on a pass with no pause instant. A
+// client that overrode the pause and has so far written only temporary
+// tables is left out as well, as one that has written nothing yet already
+// was; the router's fence is what refuses its writes.
 func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32) ([]string, error) {
 	var busy []string
 	for _, s := range ids {
@@ -1456,11 +1469,14 @@ func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32
 		if err != nil {
 			return nil, err
 		}
-		// A zero instant means this set was never paused -- the rollback
-		// path drains without pausing -- so fall back to the written-only
-		// question rather than waiting for every open transaction.
+		// A zero instant means this set was not paused on this pass -- the
+		// rollback path drains without pausing -- so fall back to the
+		// written-only question rather than waiting for every open
+		// transaction.
 		since := o.pausedAt[pausedShard{set, s}]
-		rows, err := conn.Query(ctx, `SELECT format('%s/%s pid %s (%s, %s, open %s)', $2::text, $3::int, pid,
+		rows, err := conn.Query(ctx, `SELECT pid, coalesce(datname, ''),
+			       coalesce(backend_xid IS NOT NULL AND xact_start >= $1::timestamptz, false),
+			       format('%s/%s pid %s (%s, %s, open %s)', $2::text, $3::int, pid,
 			       coalesce(nullif(application_name, ''), usename, '?'), state, date_trunc('second', clock_timestamp() - xact_start))
 			  FROM pg_stat_activity
 			 WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
@@ -1468,17 +1484,69 @@ func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32
 			        OR ($1::timestamptz IS NOT NULL AND xact_start IS NOT NULL AND xact_start < $1::timestamptz))
 			 ORDER BY xact_start`,
 			nullTime(since), set, s)
-		var found []string
+		type backend struct {
+			PID       int32
+			Database  string
+			MaybeTemp bool
+			Name      string
+		}
+		var found []backend
 		if err == nil {
-			found, err = pgx.CollectRows(rows, pgx.RowTo[string])
+			found, err = pgx.CollectRows(rows, pgx.RowToStructByPos[backend])
 		}
 		_ = conn.Close(ctx)
 		if err != nil {
 			return nil, err
 		}
-		busy = append(busy, found...)
+		maybeTemp := map[string][]int32{}
+		for _, b := range found {
+			if b.MaybeTemp && b.Database != "" && !since.IsZero() {
+				maybeTemp[b.Database] = append(maybeTemp[b.Database], b.PID)
+			}
+		}
+		tempOnly := map[int32]bool{}
+		for db, pids := range maybeTemp {
+			only, err := o.writingOnlyTemporaryTables(ctx, set, s, db, pids)
+			if err != nil {
+				// Counted rather than failing the drain: a database the
+				// controller cannot connect to is no reason to stop it.
+				o.c.logger().Info("reshard drain: could not ask which relations a writer holds; counting it", "set", set, "shard", s, "database", db, "err", err)
+				continue
+			}
+			for _, pid := range only {
+				tempOnly[pid] = true
+			}
+		}
+		for _, b := range found {
+			if !tempOnly[b.PID] {
+				busy = append(busy, b.Name)
+			}
+		}
 	}
 	return busy, nil
+}
+
+// writingOnlyTemporaryTables returns those of pids, all connected to db,
+// whose every lock stronger than AccessShareLock is on a temporary relation.
+// pg_class is per database, so it is asked from db itself; a lock on a shared
+// catalog, or on a relation created by a transaction this session cannot
+// see, finds no temporary relation and keeps its backend counted.
+func (o *pgCutover) writingOnlyTemporaryTables(ctx context.Context, set string, s int32, db string, pids []int32) ([]int32, error) {
+	conn, err := o.c.Shards.DialDatabase(ctx, set, s, db)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT l.pid FROM pg_locks l
+		  LEFT JOIN pg_class c ON c.oid = l.relation
+		       AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+		 WHERE l.pid = ANY($1) AND l.locktype = 'relation' AND l.mode <> 'AccessShareLock'
+		 GROUP BY l.pid
+		HAVING bool_and(c.relpersistence IS NOT DISTINCT FROM 't')`, pids)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int32])
 }
 
 // nullTime renders a zero instant as SQL NULL, so an unpaused set falls back

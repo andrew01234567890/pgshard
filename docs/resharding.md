@@ -326,7 +326,12 @@ idempotent, so a controller crash anywhere repeats at most one step:
    one PostgreSQL the target's statement would have waited for it
    (PGS-750). Prepared transactions are asked for again because they have
    no backend for the drain to see and `COMMIT PREPARED` runs in a
-   read-only transaction.
+   read-only transaction. A transaction begun after the pause instant that
+   has written only temporary tables — which a read-only transaction may
+   do — is not waited for: every lock it holds beyond `AccessShareLock` is
+   on a temporary relation. A pass with no pause instant — the rollback
+   path, which drains without pausing — waits for every transaction
+   holding an xid.
 
    It comes before the journal so that a transaction that will not end
    cannot hold the write fence for good: a drain that does not finish
