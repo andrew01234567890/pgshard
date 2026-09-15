@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -149,15 +150,52 @@ func TestNextPVCName(t *testing.T) {
 	}
 }
 
-func TestTuningDropsAgentOwnedSettingsAndNeedsMemory(t *testing.T) {
+func TestTuningDropsAgentOwnedSettingsAndSetsConnectionsWithoutMemory(t *testing.T) {
 	c := newCluster("tune")
 	c.Spec.PostgreSQL.Parameters = nil
 	g := Groups(c)[1]
-	if s, err := Tuning(c, g); err != nil || s != nil {
-		t.Fatalf("no memory: %v %v", s, err)
-	}
-	c.Spec.Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceCPU: resource.MustParse("2")}}
+	// Without a memory budget nothing memory-shaped is derived, but the
+	// connection limits are: PostgreSQL's own (100, 3 reserved) leave
+	// non-superusers fewer slots than the pooler's budget and the control
+	// plane a reserve of three (PGS-829).
 	s, err := Tuning(c, g)
+	if err != nil {
+		t.Fatalf("no memory: %v", err)
+	}
+	got := map[string]string{}
+	for _, x := range s {
+		got[x.Name] = x.Value
+	}
+	if len(got) != 2 || got["max_connections"] != "108" || got["superuser_reserved_connections"] != "8" {
+		t.Fatalf("no memory: %v, want only max_connections 108 and superuser_reserved_connections 8", s)
+	}
+	if maxConns, _ := strconv.Atoi(got["max_connections"]); maxConns-8 < defaultMaxBackends {
+		t.Fatalf("non-superusers get %d slots, fewer than the pooler's budget of %d", maxConns-8, defaultMaxBackends)
+	}
+	c.Spec.PostgreSQL.Parameters = map[string]string{"max_connections": "300"}
+	if s, _ := Tuning(c, g); !contains(OverrideConf(s), "max_connections = 300") {
+		t.Errorf("a user's max_connections must survive in the override, which is read after the parameters: %s", OverrideConf(s))
+	}
+	// Two spellings of one setting resolve the same way every time; map
+	// order used to decide, and the settings hash then changed between
+	// passes and rolled the members for ever.
+	c.Spec.PostgreSQL.Parameters = map[string]string{"max_connections": "200", "MAX_CONNECTIONS": "300"}
+	first, _ := Tuning(c, g)
+	for range 50 {
+		if again, _ := Tuning(c, g); OverrideConf(again) != OverrideConf(first) {
+			t.Fatalf("the same spec rendered two overrides:\n%s\n%s", OverrideConf(first), OverrideConf(again))
+		}
+	}
+	// A memory budget too small to derive from still gets the limits.
+	c.Spec.PostgreSQL.Parameters = nil
+	c.Spec.Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")}}
+	if s, err := Tuning(c, g); err == nil || !contains(OverrideConf(s), "max_connections = 108") {
+		t.Errorf("a failed derivation must still set the connection limits: %v %s", err, OverrideConf(s))
+	}
+	c.Spec.Resources = corev1.ResourceRequirements{}
+	c.Spec.PostgreSQL.Parameters = nil
+	c.Spec.Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceCPU: resource.MustParse("2")}}
+	s, err = Tuning(c, g)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,4 +329,26 @@ func TestAHeldRolloutSaysWhichKindOfNothing(t *testing.T) {
 			t.Fatalf("target=%q why=%q, want %q", target, why, standby)
 		}
 	})
+}
+
+// TestAClusterWithoutAMemoryBudgetIsNotReportedAsTuned: without memory only
+// the connection limits are set, so the settings list is no longer empty --
+// and "empty" was how TuningApplied told a cluster with no budget from one
+// that was tuned.
+func TestAClusterWithoutAMemoryBudgetIsNotReportedAsTuned(t *testing.T) {
+	c := newCluster("nomem")
+	c.Spec.PostgreSQL.Parameters = nil
+	var obs []groupObservation
+	for _, g := range Groups(c) {
+		s, err := Tuning(c, g)
+		if err != nil {
+			t.Fatal(err)
+		}
+		obs = append(obs, groupObservation{group: g, tuning: s})
+	}
+	reasons := map[string]string{}
+	(&ClusterReconciler{}).setRolloutStatus(c, obs, func(typ string, _ bool, reason, _ string) { reasons[typ] = reason })
+	if got := reasons[pgshardv1alpha1.ConditionTuningApplied]; got != "NoMemoryBudget" {
+		t.Fatalf("TuningApplied reason = %q for a cluster with no memory budget, want NoMemoryBudget", got)
+	}
 }

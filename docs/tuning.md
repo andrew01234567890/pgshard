@@ -8,9 +8,25 @@ derived value with its reason under `status.tuning.derived` (`DerivedSetting`).
 
 The operator feeds `Derive` with the memory and CPU of `spec.resources`
 (limits, else requests), the group's `storage.size`, `spec.postgresql.profile`
-and `spec.postgresql.parameters` as overrides. Without a memory request nothing
-is derived (`TuningApplied=False/NoMemoryBudget`) and the agent's fixed
-configuration stands alone; a derivation error surfaces as
+and `spec.postgresql.parameters` as overrides. Without a memory request only the
+connection limits are set — `max_connections` (the pooler's budget of 100 plus
+8) and `superuser_reserved_connections` (8), which depend on nothing else; left
+to PostgreSQL's defaults (100, 3 reserved) non-superusers would get fewer slots
+than the pooler's budget and the control plane a reserve of three. Nothing
+memory-shaped is derived (`TuningApplied=False/NoMemoryBudget`) and the agent's
+fixed configuration stands for the rest. The same two are set when a derivation
+fails. A `max_connections` set in `spec.postgresql.parameters` is kept, and
+the reserve of 8 comes out of it, so size it as the pooler's budget plus 8.
+
+Clusters without a memory budget that were created before these limits were
+set pick them up as a restart-required change and roll their members:
+standbys first, then a switchover and the old primary. Lowering them again
+(for example by downgrading the operator) would restart standbys below their
+primary's `max_connections`, which PostgreSQL refuses for a hot standby; pin
+`max_connections: "108"` and `superuser_reserved_connections: "8"` in
+`spec.postgresql.parameters` before downgrading so nothing changes.
+
+A derivation error surfaces as
 `TuningApplied=False/DeriveFailed`. Settings the agent fixes itself in
 `postgresql.conf` (`ssl`, `wal_level`, slot and sender counts,
 `max_prepared_transactions`, `synchronous_commit`, ...) are dropped from the
