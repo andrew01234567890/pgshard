@@ -21,7 +21,9 @@ import (
 const Schema = "pgshard"
 
 // DesiredChannel is the NOTIFY channel fired after every statement that
-// changes a desired-state table. The payload is "<table>:<generation>".
+// changes a desired-state table, with the payload "<table>:<generation>",
+// and after every change to pgshard.migrations, with the payload
+// "migrations".
 const DesiredChannel = "pgshard_desired"
 
 // ServingChannel is the NOTIFY channel fired after every statement that

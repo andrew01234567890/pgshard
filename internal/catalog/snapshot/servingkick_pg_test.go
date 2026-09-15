@@ -23,6 +23,22 @@ import (
 // the point is that the flip does not queue behind the throttle, and the
 // margin is wide (measured worst case 64ms with the wake, 905ms without).
 func TestAFlipIsSeenWhileDesiredStateChurns(t *testing.T) {
+	flipSeenDuringChurn(t, func(ctx context.Context, c *pgx.Conn) {
+		_, _ = c.Exec(ctx, `SELECT pg_notify($1, 'churn')`, catalog.DesiredChannel)
+	})
+}
+
+// TestAFlipIsSeenWhileMigrationsProgress (PGS-874): every per-shard step of
+// a migration updates its pgshard.migrations row. Those notifications went
+// out on the serving channel and spent the budget a flip needs.
+func TestAFlipIsSeenWhileMigrationsProgress(t *testing.T) {
+	flipSeenDuringChurn(t, func(ctx context.Context, c *pgx.Conn) {
+		_, _ = c.Exec(ctx, `UPDATE pgshard.migrations SET updated_at = now()`)
+	})
+}
+
+func flipSeenDuringChurn(t *testing.T, churnOnce func(context.Context, *pgx.Conn)) {
+	t.Helper()
 	dsn := startPostgres(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -32,6 +48,10 @@ func TestAFlipIsSeenWhileDesiredStateChurns(t *testing.T) {
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.EnqueueMigration(ctx, conn, catalog.DDLMigration{Database: "app", Statement: "ALTER TABLE orders ADD COLUMN extra int",
+		Kind: "ALTER TABLE", Strategy: "direct", Scope: "all"}); err != nil {
 		t.Fatal(err)
 	}
 	w := NewWatcher(dsn, Options{Logf: func(string, ...any) {}})
@@ -52,7 +72,7 @@ func TestAFlipIsSeenWhileDesiredStateChurns(t *testing.T) {
 		// size-1 channel, so back-to-back notifications cost one token
 		// between them and drain nothing.
 		for churn.Err() == nil {
-			_, _ = c.Exec(churn, `SELECT pg_notify($1, 'churn')`, catalog.DesiredChannel)
+			churnOnce(churn, c)
 			time.Sleep(120 * time.Millisecond)
 		}
 	}()
@@ -81,7 +101,7 @@ func TestAFlipIsSeenWhileDesiredStateChurns(t *testing.T) {
 			t.Fatalf("flip %d never observed", i)
 		}
 		if saw > notifyRefill/2 {
-			t.Fatalf("flip %d took %s to be seen while desired-state churn held the budget; that wait is the window a straggling write to a retiring source lives in", i, saw)
+			t.Fatalf("flip %d took %s to be seen during churn; that wait is the window a straggling write to a retiring source lives in", i, saw)
 		}
 	}
 }

@@ -272,7 +272,10 @@ the loader rejects duplicate versions only.
 Migration `0004_status_notify` adds a statement-level trigger on
 `shard_status`, `table_status` and `shard_map_generation` that sends
 `NOTIFY pgshard_serving` with the table name as payload, so routers learn of
-effective-map changes without polling.
+effective-map changes without polling. Desired-state tables notify
+`pgshard_desired` with `<table>:<generation>`, and `pgshard.migrations`
+notifies `pgshard_desired` with `migrations` on every change (migration
+`0057`; until then it notified `pgshard_serving`).
 
 A notification costs its sender nothing and costs every router a full catalog
 load and every pooler a serving load, and `pg_notify()` is an ordinary
@@ -281,7 +284,10 @@ by notifications are therefore drawn from a budget: five immediately, then
 one per second. A real change still reloads every component at once -- a
 cutover flip is measured by how fast they do -- while a sender in a loop
 settles to one load per second per component. The periodic reload is not
-drawn from the budget.
+drawn from the budget. Each channel has a budget of its own, and a serving
+notification cuts short a wait the desired budget imposed, so desired-state
+churn -- including every per-shard step of a busy DDL queue -- does not
+delay a flip.
 
 ## Router snapshots
 
