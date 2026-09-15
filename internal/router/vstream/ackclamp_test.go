@@ -109,6 +109,9 @@ func TestTheNameIsInheritedWhenTheStreamHoldingItEnds(t *testing.T) {
 		e := h.server.liveStream("plain")
 		return e != nil && e != held
 	})
+	// The first stream's pooler call can still be reading when the router
+	// has let go of it (PGS-853).
+	waitFor(t, func() bool { return h.pool[0].slotTaken("plain") >= 2 })
 	h.pool[0].feed("plain", batch(0, evRelation(16384, "t", "id")))
 	h.pool[0].feed("plain", txn(16384, 8, 3000, 4000, "2"))
 	recvN(t, second, 4, 5*time.Second)
