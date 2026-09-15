@@ -1075,6 +1075,11 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 		if err != nil || !slices.Contains(got, c.want) {
 			t.Fatalf("%s: unsupported = %v (%v), want %q", c.table, got, err, c.want)
 		}
+		for _, f := range got {
+			if strings.Contains(f, "_RETURN") {
+				t.Errorf("%s: %q names a view's internal rule; the view's column already names it", c.table, f)
+			}
+		}
 	}
 	// A subscription applying into the table. It needs a publication to
 	// list the table, so another database on the same server publishes it;

@@ -923,6 +923,7 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 				FROM pg_depend d, t
 				WHERE d.refclassid = 'pg_type'::regclass AND d.deptype = 'n'
 				  AND d.refobjid IN (t.reltype, (SELECT typarray FROM pg_type WHERE oid = t.reltype))
+				  AND NOT (d.classid = 'pg_rewrite'::regclass AND EXISTS (SELECT 1 FROM pg_rewrite WHERE oid = d.objid AND rulename = '_RETURN'))
 		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err
