@@ -121,8 +121,12 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    above.
 
 3. **Refuse what cannot be applied online.** `0A000`:
-   * DDL inside a transaction block — each shard commits its own
-     transaction; the fan-out cannot be rolled back with the client's.
+   * DDL inside a transaction block, or inside the implicit transaction
+     of a multi-statement query — each shard commits its own transaction;
+     the fan-out cannot be rolled back with the client's. A database with
+     `ddl_transactions = 'sequential'` (see `docs/catalog.md`) instead runs
+     a transaction's DDL statement by statement while the transaction has
+     run nothing on a shard.
    * Remaining rewrite class (`SET LOGGED`/`SET UNLOGGED`,
      `SET TABLESPACE`, `ADD COLUMN … GENERATED AS IDENTITY`,
      `ADD COLUMN` of a serial type, `ADD COLUMN … GENERATED … STORED`,

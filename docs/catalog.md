@@ -50,6 +50,7 @@ definition of the max over `roles`, `role_members`, `grants` and
 | `default_placement` | `unsharded`, `sharded` or `reference`; placement of tables not listed in `pgshard.tables`. |
 | `home_shard` | Shard that holds unsharded tables. |
 | `local_only` | Every object lives on `home_shard`, and DDL runs on the client's own connection instead of fanning out. See below. |
+| `ddl_transactions` | `atomic` (default) or `sequential`: how DDL inside a client transaction runs. See below. |
 | `created_at`, `updated_at` | Timestamps. |
 
 #### Local databases
@@ -74,6 +75,38 @@ The declaration is explicit rather than inferred from "has no sharded tables
 yet", because inferring it would change what DDL means the moment somebody
 declared a sharded table, and leave everything that ran before that point
 unrecorded.
+
+#### DDL transactions
+
+A fanned-out DDL statement is applied by the controller on every shard, each
+in the shard's own transaction, so it cannot be rolled back with the client's
+transaction. In an `atomic` database DDL inside `BEGIN`/`COMMIT`, or inside
+the implicit transaction of a multi-statement query, is refused.
+
+Migration tools send DDL in transactions that hold nothing else: pgroll
+recreates a version view as `BEGIN; DROP VIEW …; CREATE VIEW …; COMMIT` and
+installs its trigger function and trigger in one transaction. In a
+`sequential` database:
+
+- A DDL statement in a transaction that has run nothing on a shard is applied
+  and awaited as if it had been sent on its own. The client gets a NOTICE
+  saying so: a `ROLLBACK` does not undo it.
+- `BEGIN` and `COMMIT` inside a multi-statement query are accepted while the
+  transaction has run nothing on a shard. As in a local database, statements
+  after such a `COMMIT` in the same query each commit on their own.
+- A statement that runs on a shard after DDL in the same transaction, or DDL
+  after one, is refused (`0A000`): the two could not commit together.
+- DDL that fails fails the transaction, as in PostgreSQL: later statements
+  get `25P02` and `COMMIT` answers `ROLLBACK`. DDL in a transaction that a
+  statement has already failed is refused with `25P02` and not applied.
+- While the migration applies, the transaction's backend is not held open:
+  its (empty) transaction is ended and opened again before the statement is
+  answered, so `idle_in_transaction_session_timeout` does not end it and a
+  barrier's drain does not wait for it.
+
+```sql
+UPDATE pgshard.databases SET ddl_transactions = 'sequential' WHERE name = 'app';
+```
 
 ### `pgshard.tables`
 
