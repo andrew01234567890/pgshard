@@ -1723,3 +1723,64 @@ func TestCancelDuringCopyInWakesTheSession(t *testing.T) {
 		t.Fatal("the session did not survive the cancelled COPY")
 	}
 }
+
+// TestCancelPIDsAreNotTheSessionCounter (PGS-798): a cancel arrives before
+// TLS and authentication, and a protocol 3.0 key is its process id and four
+// random bytes. The process id was the session counter, so a client read
+// roughly where it stood from its own BackendKeyData and could walk it,
+// leaving only the 32-bit secret to guess. Consecutive sessions now get ids
+// with no relation to each other, and a cancel still finds its session by
+// the id it was given -- and only with its secret.
+func TestCancelPIDsAreNotTheSessionCounter(t *testing.T) {
+	ts := startServer(t, Config{})
+	seen := map[uint32]bool{}
+	var pids []uint32
+	var conns []*rawClient
+	for range 8 {
+		c := dialRaw(t, ts.addr)
+		conns = append(conns, c)
+		res := c.startup(ProtocolVersion30)
+		pid := res.key.ProcessID
+		if pid == 0 || pid > 0x7fffffff {
+			t.Fatalf("process id %d is not a positive int32", pid)
+		}
+		if seen[pid] {
+			t.Fatalf("process id %d given to two live sessions", pid)
+		}
+		seen[pid] = true
+		pids = append(pids, pid)
+		if !ts.CancelLocal(CancelKey{PID: pid, Secret: res.key.SecretKey}) {
+			t.Fatalf("the cancel key session %d was given does not reach it", len(pids))
+		}
+		wrong := append([]byte(nil), res.key.SecretKey...)
+		wrong[0] ^= 0xff
+		if ts.CancelLocal(CancelKey{PID: pid, Secret: wrong}) {
+			t.Fatal("a cancel with the right process id and a wrong secret was accepted")
+		}
+	}
+	adjacent := 0
+	for i := 1; i < len(pids); i++ {
+		if d := int64(pids[i]) - int64(pids[i-1]); d >= -8 && d <= 8 {
+			adjacent++
+		}
+	}
+	if adjacent > 1 {
+		t.Fatalf("consecutive sessions got nearby process ids %v: they are still guessable from one another", pids)
+	}
+	for _, c := range conns {
+		_ = c.conn.Close()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ts.Server.mu.Lock()
+		left := len(ts.byCancelPID)
+		ts.Server.mu.Unlock()
+		if left == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d process ids still mapped after every session closed", left)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

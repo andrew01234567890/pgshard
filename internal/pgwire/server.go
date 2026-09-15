@@ -118,12 +118,13 @@ type Server struct {
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
 
-	mu       sync.Mutex
-	sessions map[uint64]*session
-	closing  bool
-	nextID   atomic.Uint64
-	wg       sync.WaitGroup
-	listener net.Listener
+	mu          sync.Mutex
+	sessions    map[uint64]*session
+	byCancelPID map[uint32]*session
+	closing     bool
+	nextID      atomic.Uint64
+	wg          sync.WaitGroup
+	listener    net.Listener
 }
 
 // NewServer validates cfg and returns a Server ready to Serve.
@@ -160,7 +161,7 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.MaxStartupConns == 0 {
 		cfg.MaxStartupConns = 100
 	}
-	srv := &Server{cfg: cfg, instanceID: id, logger: cfg.Logger, sessions: map[uint64]*session{}, shutdownCh: make(chan struct{})}
+	srv := &Server{cfg: cfg, instanceID: id, logger: cfg.Logger, sessions: map[uint64]*session{}, byCancelPID: map[uint32]*session{}, shutdownCh: make(chan struct{})}
 	ceiling := cfg.MaxMessageBodyLen
 	if ceiling <= 0 {
 		ceiling = DefaultMaxMessageBodyLen
@@ -260,8 +261,14 @@ func (s *Server) register(sess *session) bool {
 }
 
 func (s *Server) unregister(sess *session) {
+	sess.mu.Lock()
+	pid := sess.cancelKey.PID
+	sess.mu.Unlock()
 	s.mu.Lock()
 	delete(s.sessions, sess.id)
+	if s.byCancelPID[pid] == sess {
+		delete(s.byCancelPID, pid)
+	}
 	s.mu.Unlock()
 }
 
@@ -454,8 +461,11 @@ func (s *Server) Sessions() int {
 	return len(s.sessions)
 }
 
-func (s *Server) newCancelKey(sessionID uint64, protocolVersion uint32) (CancelKey, error) {
-	pid := uint32(sessionID)
+// newCancelKey mints sess's cancel key. The process id is random rather than
+// the session counter: a cancel arrives before authentication, and a counter
+// read off one's own BackendKeyData left a 3.0 key's 4-byte secret as the
+// only unknown (PGS-798).
+func (s *Server) newCancelKey(sess *session, protocolVersion uint32) (CancelKey, error) {
 	n := CancelKeyLen30
 	if protocolVersion >= ProtocolVersion32 {
 		n = CancelKeyLen32
@@ -463,6 +473,22 @@ func (s *Server) newCancelKey(sessionID uint64, protocolVersion uint32) (CancelK
 	secret := make([]byte, n)
 	if _, err := rand.Read(secret); err != nil {
 		return CancelKey{}, err
+	}
+	var pid uint32
+	for {
+		var raw [4]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return CancelKey{}, err
+		}
+		// 31 bits: a process id is an int32 to most clients.
+		pid = binary.BigEndian.Uint32(raw[:]) & 0x7fffffff
+		s.mu.Lock()
+		if pid != 0 && s.byCancelPID[pid] == nil {
+			s.byCancelPID[pid] = sess
+			s.mu.Unlock()
+			break
+		}
+		s.mu.Unlock()
 	}
 	if n == CancelKeyLen32 {
 		binary.BigEndian.PutUint32(secret[0:4], s.instanceID)
@@ -484,12 +510,26 @@ func (s *Server) OwnsCancelKey(key CancelKey) bool {
 // key, if any. It reports whether a matching session was found.
 func (s *Server) CancelLocal(key CancelKey) bool {
 	s.mu.Lock()
-	sess := s.sessions[uint64(key.PID)]
+	sess := s.byCancelPID[key.PID]
+	s.mu.Unlock()
+	return sess != nil && sess.cancelQuery(key.Secret)
+}
+
+// SessionForCancelKey reports the id of the local session key belongs to,
+// secret included, without cancelling anything.
+func (s *Server) SessionForCancelKey(key CancelKey) (uint64, bool) {
+	s.mu.Lock()
+	sess := s.byCancelPID[key.PID]
 	s.mu.Unlock()
 	if sess == nil {
-		return false
+		return 0, false
 	}
-	return sess.cancelQuery(key.Secret)
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if !keysEqual(key.Secret, sess.cancelKey.Secret) {
+		return 0, false
+	}
+	return sess.id, true
 }
 
 func (s *Server) dispatchCancel(ctx context.Context, key CancelKey) {
