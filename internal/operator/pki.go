@@ -176,9 +176,13 @@ func roleDNSNames(c *pgshardv1alpha1.PgShardCluster, role string) []string {
 	case pki.RoleController:
 		return svc(ControllerName(c.Name))
 	case pki.RolePooler, pki.RoleAgent:
-		// Reached pod by pod rather than through a Service: a caller that
-		// dials a member by name must find that name on the certificate.
-		return append(svc(c.Name), "*."+c.Namespace+".svc", "*."+c.Namespace+".pod")
+		// Reached pod by pod, at hosts and IPs no certificate can name
+		// ahead of time, so every caller verifies IssuedMemberServerName --
+		// the cluster's own name -- and the server's role instead. The
+		// namespace-wide wildcards these once carried made a pooler or
+		// agent certificate valid to serve the controller's and the
+		// router's Service hosts too (PGS-860).
+		return svc(c.Name)
 	default:
 		return nil
 	}

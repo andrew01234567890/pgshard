@@ -416,4 +416,14 @@ func TestEveryCallerVerifiesANameTheIssuedCertificateCarries(t *testing.T) {
 			t.Errorf("%s: the %s certificate names the dialled address %s, so the test no longer shows why the name is needed", check.caller, check.role, check.dialled)
 		}
 	}
+	// A member's certificate must not be valid for another role's Service:
+	// those callers verify the Service host, and only the controller's and
+	// the router's own certificates may answer there.
+	for _, role := range []string{pki.RolePooler, pki.RoleAgent} {
+		for _, host := range []string{ControllerName(c.Name) + "." + c.Namespace + ".svc", RouterName(c.Name) + "." + c.Namespace + ".svc"} {
+			if err := certOf(role).VerifyHostname(host); err == nil {
+				t.Errorf("the %s certificate is valid to serve %s", role, host)
+			}
+		}
+	}
 }

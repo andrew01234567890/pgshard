@@ -66,7 +66,7 @@ type fakeBarriers struct {
 	fail  map[string]error
 }
 
-func (f *fakeBarriers) CreateBarrier(_ context.Context, addr, name string) error {
+func (f *fakeBarriers) CreateBarrier(_ context.Context, _ *pgshardv1alpha1.PgShardCluster, addr, name string) error {
 	f.calls = append(f.calls, addr+" "+name)
 	return f.fail[addr]
 }
@@ -544,7 +544,7 @@ type blockingBarriers struct {
 	once    sync.Once
 }
 
-func (b *blockingBarriers) CreateBarrier(ctx context.Context, _, _ string) error {
+func (b *blockingBarriers) CreateBarrier(ctx context.Context, _ *pgshardv1alpha1.PgShardCluster, _, _ string) error {
 	b.once.Do(func() { close(b.entered) })
 	<-ctx.Done()
 	return ctx.Err()

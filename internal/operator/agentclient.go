@@ -118,10 +118,19 @@ type GRPCAgentClient struct {
 	// Nil means every agent is plaintext, which is what a client built by
 	// NewGRPCAgentClient serves.
 	RequiresTLS func(addr string) bool
+	// CredsFor returns the credentials for the agent at addr when they are
+	// its cluster's own -- an issuing cluster has its own CA, so no one
+	// process-wide certificate reaches every cluster's agents. Nil, or a nil
+	// answer, falls back to creds.
+	CredsFor func(addr string) credentials.TransportCredentials
 	// mode records how each cached connection was dialled, so a member that
 	// flips from plaintext to TLS mid-roll is redialled rather than answered
 	// from a connection that can no longer reach it.
 	mode map[string]bool
+	// dialledWith records the credentials each cached connection presents,
+	// so one dialled before its cluster's credentials were renewed or first
+	// known is redialled.
+	dialledWith map[string]credentials.TransportCredentials
 	// used is when each connection was last dialled, so one to an address
 	// nothing asks for any more is closed. Addresses are pod IPs, and a
 	// member that is deleted, rolled or failed over never appears again.
@@ -155,6 +164,7 @@ func (c *GRPCAgentClient) evictIdle(now time.Time, keep string) {
 		}
 		delete(c.conns, addr)
 		delete(c.mode, addr)
+		delete(c.dialledWith, addr)
 		delete(c.used, addr)
 	}
 }
@@ -184,6 +194,7 @@ func (c *GRPCAgentClient) Close() {
 		_ = cc.Close()
 		delete(c.conns, addr)
 		delete(c.mode, addr)
+		delete(c.dialledWith, addr)
 		delete(c.used, addr)
 	}
 }
@@ -196,6 +207,7 @@ func (c *GRPCAgentClient) drop(addr string, cc *grpc.ClientConn) {
 	if c.conns[addr] == cc {
 		delete(c.conns, addr)
 		delete(c.mode, addr)
+		delete(c.dialledWith, addr)
 		delete(c.used, addr)
 		_ = cc.Close()
 	}
@@ -221,10 +233,16 @@ const (
 // and a client with credentials but no predicate dials TLS everywhere, which
 // is what a fleet that finished its rollout looks like.
 func (c *GRPCAgentClient) wantTLS(addr string) bool {
-	if c.creds == nil {
-		return false
+	return c.credsFor(addr) != nil && (c.RequiresTLS == nil || c.RequiresTLS(addr))
+}
+
+func (c *GRPCAgentClient) credsFor(addr string) credentials.TransportCredentials {
+	if c.CredsFor != nil {
+		if creds := c.CredsFor(addr); creds != nil {
+			return creds
+		}
 	}
-	return c.RequiresTLS == nil || c.RequiresTLS(addr)
+	return c.creds
 }
 
 func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.AgentClient, error) {
@@ -235,12 +253,19 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 	if c.mode == nil {
 		c.mode = map[string]bool{}
 	}
+	if c.dialledWith == nil {
+		c.dialledWith = map[string]credentials.TransportCredentials{}
+	}
 	if c.used == nil {
 		c.used = map[string]time.Time{}
 	}
 	wantTLS := c.wantTLS(addr)
+	tc := insecure.NewCredentials()
+	if wantTLS {
+		tc = c.credsFor(addr)
+	}
 	conn, ok := c.conns[addr]
-	if ok && c.mode[addr] != wantTLS {
+	if ok && (c.mode[addr] != wantTLS || (wantTLS && c.dialledWith[addr] != tc)) {
 		// The member restarted into the other mode. Its existing connection
 		// cannot reach it, and keeping it would fail every call until
 		// something else closed it.
@@ -250,10 +275,6 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 	}
 	if !ok {
 		var err error
-		tc := c.creds
-		if !wantTLS {
-			tc = insecure.NewCredentials()
-		}
 		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(tc))
 		if err != nil {
 			c.mu.Unlock()
@@ -261,6 +282,7 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 		}
 		c.conns[addr] = conn
 		c.mode[addr] = wantTLS
+		c.dialledWith[addr] = tc
 	}
 	now := c.clock()
 	c.used[addr] = now

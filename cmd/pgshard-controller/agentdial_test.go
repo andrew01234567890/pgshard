@@ -18,11 +18,12 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
-// PGS-860: with issued certificates the router dials a pooler at its
-// member's headless-Service host, which the pooler's certificate does not
-// name, and every handshake failed. The router verifies the role-wide name
-// the operator gives it instead, and checks the server is a pooler.
-func TestTheRouterReachesAnIssuedPoolerByTheNameItsCertificateCarries(t *testing.T) {
+// PGS-860: with issued certificates the controller dials an agent at its
+// member host, which the agent's certificate does not name, so a reshard
+// target's schema was never materialised. The controller verifies the
+// role-wide name the operator gives it instead, and checks the server is an
+// agent.
+func TestTheControllerReachesAnIssuedAgentByTheNameItsCertificateCarries(t *testing.T) {
 	now := time.Now()
 	ca, err := pki.NewCA("demo", now)
 	if err != nil {
@@ -49,7 +50,7 @@ func TestTheRouterReachesAnIssuedPoolerByTheNameItsCertificateCarries(t *testing
 	serve := func(role string) string {
 		t.Helper()
 		cert, key := issue(role, "demo", "demo.default", "demo.default.svc", "*.demo.default.svc")
-		allow, _ := pki.AllowedCallers(pki.RolePooler)
+		allow, _ := pki.AllowedCallers(pki.RoleAgent)
 		creds, err := grpccreds.Listener(cert, key, caFile, false, grpccreds.Authorize(allow))
 		if err != nil {
 			t.Fatal(err)
@@ -59,15 +60,15 @@ func TestTheRouterReachesAnIssuedPoolerByTheNameItsCertificateCarries(t *testing
 			t.Fatal(err)
 		}
 		g := grpc.NewServer(grpc.Creds(creds))
-		pgshardv1.RegisterPoolerServer(g, pgshardv1.UnimplementedPoolerServer{})
+		pgshardv1.RegisterAgentServer(g, pgshardv1.UnimplementedAgentServer{})
 		go func() { _ = g.Serve(l) }()
 		t.Cleanup(g.Stop)
 		return l.Addr().String()
 	}
-	routerCert, routerKey := issue(pki.RoleRouter, "demo-router.default.svc")
+	controllerCert, controllerKey := issue(pki.RoleController, "demo-controller.default.svc")
 	call := func(addr, serverName string) error {
 		t.Helper()
-		creds, err := dialCredentials(routerCert, routerKey, caFile, false, serverName, true, pki.RolePooler)
+		creds, err := agentDialCredentials(controllerCert, controllerKey, caFile, serverName, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -78,7 +79,7 @@ func TestTheRouterReachesAnIssuedPoolerByTheNameItsCertificateCarries(t *testing
 		defer func() { _ = cc.Close() }()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err = pgshardv1.NewPoolerClient(cc).Health(ctx, &pgshardv1.HealthRequest{})
+		_, err = pgshardv1.NewAgentClient(cc).Status(ctx, &pgshardv1.StatusRequest{})
 		if err == nil {
 			return nil
 		}
@@ -89,17 +90,17 @@ func TestTheRouterReachesAnIssuedPoolerByTheNameItsCertificateCarries(t *testing
 		return err
 	}
 
-	pooler := serve(pki.RolePooler)
-	if err := call(pooler, ""); err == nil || !strings.Contains(err.Error(), "certificate") {
-		t.Fatalf("dialling the pooler by its address verified: %v; the premise is that the issued certificate does not name it", err)
-	}
-	if err := call(pooler, "demo.default.svc"); err != nil {
-		t.Fatalf("the router could not reach an issued pooler by the name its certificate carries: %v", err)
-	}
-	// A certificate of another role is valid for the same name; it must not
-	// answer as a pooler.
 	agent := serve(pki.RoleAgent)
-	if err := call(agent, "demo.default.svc"); err == nil || !strings.Contains(err.Error(), "not allowed") {
-		t.Fatalf("an agent's certificate answering a router dialling a pooler was not refused for its identity: %v", err)
+	if err := call(agent, ""); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("dialling the agent by its address verified: %v; the premise is that the issued certificate does not name it", err)
+	}
+	if err := call(agent, "demo.default.svc"); err != nil {
+		t.Fatalf("the controller could not reach an issued agent by the name its certificate carries: %v", err)
+	}
+	// A pooler's certificate is valid for the same name; it must not answer
+	// as an agent.
+	pooler := serve(pki.RolePooler)
+	if err := call(pooler, "demo.default.svc"); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("a pooler's certificate answering the controller dialling an agent was not refused for its identity: %v", err)
 	}
 }

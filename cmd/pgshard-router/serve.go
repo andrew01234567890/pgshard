@@ -85,7 +85,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	poolerCA := fs.String("pooler-tls-ca", "", "CA bundle pooler server certificates must chain to")
 	poolerServerName := fs.String("pooler-tls-server-name", "", "name a pooler's certificate must carry, instead of the address dialled; issued certificates name the cluster, not each member")
 	peerServerName := fs.String("peer-tls-server-name", "", "name a peer router's certificate must carry, instead of the address dialled; peers are dialled by IP")
-	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
+	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener, and servers this process dials that are not the role it means to reach; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "talk plaintext gRPC to poolers (development only)")
 	rolesTTL := fs.Duration("roles-ttl", 5*time.Second, "how long catalog role verifiers are cached")
 	snapshotWait := fs.Duration("snapshot-wait", 30*time.Second, "time to wait for the first catalog snapshot")

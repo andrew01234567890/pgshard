@@ -101,16 +101,20 @@ func Run(ctx context.Context, o Options) error {
 	// reach a fleet that is half rolled over: the mode is per member, not
 	// per process.
 	agentModes := &AgentTLSModes{}
+	issued := &IssuedCredentials{Client: mgr.GetClient()}
 	agents := NewGRPCAgentClient()
 	if o.AgentTLSCert != "" || o.AgentTLSKey != "" || o.AgentTLSCA != "" {
 		agents, err = NewGRPCAgentClientTLS(o.AgentTLSCert, o.AgentTLSKey, o.AgentTLSCA, "")
 		if err != nil {
 			return fmt.Errorf("agent credentials: %w", err)
 		}
-		agents.RequiresTLS = agentModes.Requires
 	}
+	// Always: an issuing cluster's agents are dialled with that cluster's
+	// own credentials whether or not the process was given any.
+	agents.RequiresTLS = agentModes.Requires
+	agents.CredsFor = agentModes.Credentials
 	defer agents.Close()
-	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage, ControllerPlacementDropOldAfter: o.ControllerPlacementDropOldAfter}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents, AgentTLS: agentModes,
+	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage, ControllerPlacementDropOldAfter: o.ControllerPlacementDropOldAfter}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents, AgentTLS: agentModes, OperatorCreds: issued,
 		Metrics: metrics.NewOperator(ctrlmetrics.Registry)}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)
@@ -122,6 +126,7 @@ func Run(ctx context.Context, o Options) error {
 	if err != nil {
 		return fmt.Errorf("controller credentials: %w", err)
 	}
+	barriers.Issued = issued
 	scheduler := NewBackupScheduler(mgr.GetClient())
 	scheduler.Barriers = barriers
 	scheduler.Agents = agents

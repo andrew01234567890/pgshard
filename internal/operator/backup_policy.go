@@ -637,7 +637,7 @@ func (s *BackupScheduler) FireBarrier(ctx context.Context, key types.NamespacedN
 		c := &clusters[i]
 		addr := ControllerEndpoint(pol.Spec.ControllerEndpoint, c.Name, c.Namespace)
 		name := ScheduledBarrierName(key.Name, c.Name, at)
-		if err := s.Barriers.CreateBarrier(ctx, addr, name); err != nil {
+		if err := s.Barriers.CreateBarrier(ctx, c, addr, name); err != nil {
 			errs = append(errs, fmt.Errorf("cluster %s (%s): barrier %s: %w", c.Name, addr, name, err))
 			continue
 		}

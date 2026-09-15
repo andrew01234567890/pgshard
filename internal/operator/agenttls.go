@@ -1,6 +1,10 @@
 package operator
 
-import "sync"
+import (
+	"sync"
+
+	"google.golang.org/grpc/credentials"
+)
 
 // AgentTLSModes records, per agent address, whether that member's agent was
 // started requiring mutual TLS.
@@ -15,8 +19,38 @@ import "sync"
 // answer a plaintext caller, so a protocol that discovers the mode by calling
 // has to solve this problem before it can run.
 type AgentTLSModes struct {
-	mu sync.RWMutex
-	m  map[string]bool
+	mu    sync.RWMutex
+	m     map[string]bool
+	creds map[string]credentials.TransportCredentials
+}
+
+// SetCredentials records what the agent at addr is dialled with: its own
+// cluster's operator credentials, since every issuing cluster has its own
+// CA. Nil forgets them, and the client's process-wide credentials apply.
+func (a *AgentTLSModes) SetCredentials(addr string, creds credentials.TransportCredentials) {
+	if a == nil || addr == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if creds == nil {
+		delete(a.creds, addr)
+		return
+	}
+	if a.creds == nil {
+		a.creds = map[string]credentials.TransportCredentials{}
+	}
+	a.creds[addr] = creds
+}
+
+// Credentials returns what SetCredentials recorded for addr, or nil.
+func (a *AgentTLSModes) Credentials(addr string) credentials.TransportCredentials {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.creds[addr]
 }
 
 // Set records how the agent at addr must be dialled.
