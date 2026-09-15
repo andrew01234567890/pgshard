@@ -1279,16 +1279,31 @@ func (s *SQLBarrierGroups) SubscriptionCount(ctx context.Context, g GroupRef) (i
 // began before the pause landed keeps the read-write mode it was started
 // with, so it can still write however the default was changed afterwards:
 // both must be gone before any restore point is taken.
+//
+// Except a table placement's copy, which holds one READ ONLY snapshot for
+// its whole walk and says so in its application_name: pg_stat_activity does
+// not show a transaction's access mode, and waiting for it failed every
+// barrier that landed during a copy longer than the drain timeout
+// (PGS-863). Were it to write after all, it would hold an xid and count.
+// The name alone is not trusted: a client can SET application_name through
+// the router, which replays it onto its pooler sessions. Only a backend of
+// the role the controller itself connects as is left out.
 func (s *SQLBarrierGroups) WritersSince(ctx context.Context, g GroupRef, since time.Time) (int, error) {
 	var n int
 	err := s.with(ctx, g, func(c groupConn) (err error) {
 		n, err = scalar[int](ctx, c, `SELECT count(*)::int FROM pg_stat_activity
 			WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
-			AND (backend_xid IS NOT NULL OR (xact_start IS NOT NULL AND xact_start <= $1))`, since)
+			AND (backend_xid IS NOT NULL
+			     OR (xact_start IS NOT NULL AND xact_start <= $1
+			         AND NOT (application_name IS NOT DISTINCT FROM $2 AND usename = current_user)))`, since, PlacementCopyApplicationName)
 		return err
 	})
 	return n, err
 }
+
+// PlacementCopyApplicationName is the application_name of a table
+// placement's initial copy while it holds its read-only snapshot.
+const PlacementCopyApplicationName = "pgshard-placement-copy"
 
 // ArchivedThrough implements BarrierGroups.
 func (s *SQLBarrierGroups) ArchivedThrough(ctx context.Context, g GroupRef) (string, error) {

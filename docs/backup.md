@@ -341,7 +341,15 @@ one bound cluster after another) runs `controller.Barrier`:
    narrower filter — finishing a transaction it did not coordinate is not its
    decision — so a foreign prepared transaction blocks every barrier until
    somebody commits or rolls it back. The drain error names the gids holding
-   it up, which is how the two cases are told apart;
+   it up, which is how the two cases are told apart. It also waits until no
+   shard backend could still write: none holds a transaction id, and none
+   began its transaction before that shard's write pause landed. The one
+   exception is a table placement's initial copy
+   (`application_name = pgshard-placement-copy`, connected as the controller's
+   own role), whose `READ ONLY` snapshot
+   is held for the whole copy and cannot write; it is counted again once it
+   holds a transaction id. Any other long transaction open across the pause,
+   a read-only report included, fails the barrier at the drain timeout;
 3. `pg_create_restore_point('pgshard-<name>')` on the catalog and every shard
    primary (through the resolver's shard DSNs), followed by `pg_switch_wal()`,
    recording LSN, timeline and WAL segment;

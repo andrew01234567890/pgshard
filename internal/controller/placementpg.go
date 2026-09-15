@@ -1459,6 +1459,12 @@ func (p *Placer) copySource(ctx context.Context, wf *placementWorkflow, s int32)
 		pkCols = append(pkCols, "src."+QuoteIdent(k))
 	}
 	pkIdx := wf.shape.pkIndexes()
+	// The snapshot is held for the whole walk, which a barrier's drain
+	// would otherwise wait on as a transaction that began before its pause
+	// and might still write.
+	if _, err := conn.Exec(ctx, `SELECT set_config('application_name', $1, false)`, PlacementCopyApplicationName); err != nil {
+		return err
+	}
 	if _, err := conn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); err != nil {
 		return err
 	}

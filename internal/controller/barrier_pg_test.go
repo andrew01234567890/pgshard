@@ -205,6 +205,51 @@ func TestWriteFenceOwnerCASOnPostgres(t *testing.T) {
 	}
 }
 
+// TestTheBarrierDrainLeavesOutOnlyAPlacementCopyThatHasNotWritten
+// (PGS-863): a placement copy's read-only snapshot, begun before the pause,
+// is not waited for; the same session is once it holds an xid, and a
+// transaction begun before the pause under any other name, or under the
+// copy's name by another role, still is.
+func TestTheBarrierDrainLeavesOutOnlyAPlacementCopyThatHasNotWritten(t *testing.T) {
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	groups := &SQLBarrierGroups{Pool: f.pool, Shards: f.dialer}
+	g := GroupRef{Name: "shard0", Set: "default", ID: 0}
+
+	cp := connect(t, f.shardDSN(0))
+	mustExec(t, cp, `SELECT set_config('application_name', $1, false)`, PlacementCopyApplicationName)
+	mustExec(t, cp, `CREATE TEMP TABLE scratch (id int)`)
+	mustExec(t, cp, `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`)
+	mustExec(t, cp, `SELECT 1`)
+	other := connect(t, f.shardDSN(0))
+	mustExec(t, other, `BEGIN`)
+	mustExec(t, other, `SELECT 1`)
+	mustExec(t, connect(t, f.shardDSN(0)), `CREATE ROLE app LOGIN`)
+	impostor := connect(t, strings.Replace(f.shardDSN(0), "postgres://postgres@", "postgres://app@", 1))
+	mustExec(t, impostor, `SELECT set_config('application_name', $1, false)`, PlacementCopyApplicationName)
+	mustExec(t, impostor, `BEGIN`)
+	mustExec(t, impostor, `SELECT 1`)
+
+	pausedAt, err := groups.PauseWrites(ctx, g, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = groups.PauseWrites(context.Background(), g, false) })
+	if n, err := groups.WritersSince(ctx, g, pausedAt); err != nil || n != 2 {
+		t.Fatalf("writers with a placement copy's snapshot, another pre-pause transaction and another role under the copy's name open: %d %v, want the two others", n, err)
+	}
+	mustExec(t, other, `ROLLBACK`)
+	mustExec(t, impostor, `ROLLBACK`)
+	if n, err := groups.WritersSince(ctx, g, pausedAt); err != nil || n != 0 {
+		t.Fatalf("a placement copy's read-only snapshot held the drain: %d %v", n, err)
+	}
+	mustExec(t, cp, `INSERT INTO scratch VALUES (1)`)
+	if n, err := groups.WritersSince(ctx, g, pausedAt); err != nil || n != 1 {
+		t.Fatalf("a placement copy holding an xid was not counted: %d %v", n, err)
+	}
+	mustExec(t, cp, `ROLLBACK`)
+}
+
 // TestBarrierPauseAndWriterCountOnPostgres exercises the pause and the writer
 // drain against real PostgreSQL: a paused shard refuses writes, an in-flight
 // write transaction is counted, and resuming restores writes.
