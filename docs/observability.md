@@ -5,6 +5,13 @@ built on one shared package (`internal/metrics`): a per-process registry
 carrying the Go runtime and process collectors plus a
 `pgshard_build_info{process,version}` gauge.
 
+Every process that uses internal mTLS also exports, per certificate file,
+`pgshard_tls_certificate_not_after_seconds{cert_file}` (the expiry of the
+certificate the next connection presents; the files are read again at every
+handshake and scrape) and `pgshard_tls_material_reload_failures_total{cert_file}`
+(distinct renewals that could not be used, so the previous certificate stayed
+in use). The operator's are on controller-runtime's registry.
+
 The `/metrics` listeners are unauthenticated; keep them off untrusted
 networks (an authenticating admin proxy is planned).
 
@@ -106,7 +113,9 @@ documented rules: aged in-doubt 2PC, oversized decision log, replication
 lag, slot WAL retention pressure (`wal_status` leaving reserved/extended
 under `max_slot_wal_keep_size`), change-stream lag, backup staleness and
 failures (including ArchiveDuplicateError surfaced as a failed backup),
-operator reconcile errors and exceeded cutover pauses. Apply it directly
+operator reconcile errors, exceeded cutover pauses, and an internal TLS
+certificate in use within two weeks of expiry or a renewal that could not be
+used. Apply it directly
 where the Prometheus Operator CRDs exist, or copy `spec.groups` into a
 plain `rule_files` entry.
 

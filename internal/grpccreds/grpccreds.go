@@ -12,14 +12,18 @@ package grpccreds
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -175,6 +179,13 @@ func DialerPEM(certPEM, keyPEM, caPEM []byte, serverName string, opts ...Option)
 
 // material is one set of TLS files, read again at every handshake.
 //
+// A renewal that cannot be used -- unreadable, corrupt, a key that does not
+// match -- keeps the last good material, and would otherwise do so silently
+// until the certificate in use expired: the outage renewal exists to
+// prevent, with nothing pointing at it (PGS-847). Each distinct failure is
+// logged and counted once, and not parsed again at every handshake; the
+// expiry of the certificate in use is exported so an alert can fire first.
+//
 // Certificates are renewed into the same files: the operator reissues a
 // role's certificate into its Secret well before it expires, and the kubelet
 // swaps the mounted files in place. A process that parsed them once at start
@@ -189,46 +200,162 @@ func DialerPEM(certPEM, keyPEM, caPEM []byte, serverName string, opts ...Option)
 type material struct {
 	certFile, keyFile, caFile string
 
-	mu   sync.Mutex
-	raw  [3][]byte
-	cert tls.Certificate
-	pool *x509.CertPool
+	// mu is held across the reads as well as the parse: two handshakes
+	// that read either side of a file swap and installed what they read in
+	// the other order put the older generation back.
+	mu       sync.Mutex
+	raw      [3][]byte
+	cert     tls.Certificate
+	pool     *x509.CertPool
+	notAfter time.Time
+	// failed fingerprints the last files, or read error, that could not be
+	// used, and failErr is what they failed with. reported is set once the
+	// same failure has been read twice: a certificate read before the
+	// kubelet's swap and a key read after it do not match either, and the
+	// next read heals that. Content that fails, is replaced by good content
+	// and then comes back unchanged is not reported again.
+	failed   [32]byte
+	failErr  error
+	reported bool
+	failures int
 }
+
+// loaded is every material this process has loaded, for Collector, and
+// logged the failure last logged for each certificate file: a process that
+// listens and dials with the same files loads them twice, and says so once.
+var (
+	loadedMu sync.Mutex
+	loaded   []*material
+	logged   = map[string][32]byte{}
+)
 
 func loadMaterial(certFile, keyFile, caFile string) (*material, error) {
 	m := &material{certFile: certFile, keyFile: keyFile, caFile: caFile}
 	if err := m.refresh(); err != nil {
 		return nil, err
 	}
+	loadedMu.Lock()
+	loaded = append(loaded, m)
+	loadedMu.Unlock()
 	return m, nil
 }
 
 func (m *material) refresh() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var raw [3][]byte
 	for i, f := range []string{m.certFile, m.keyFile, m.caFile} {
 		b, err := os.ReadFile(f)
 		if err != nil {
-			return err
+			return m.fail(sha256.Sum256([]byte(err.Error())), err)
 		}
 		raw[i] = b
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	// m.pool is nil until the first parse succeeds: empty files compare
 	// equal to nothing read yet, and must still be parsed -- and refused.
 	if m.pool != nil && bytes.Equal(raw[0], m.raw[0]) && bytes.Equal(raw[1], m.raw[1]) && bytes.Equal(raw[2], m.raw[2]) {
 		return nil
 	}
+	sum := sha256.New()
+	for _, b := range raw {
+		sum.Write(b)
+		sum.Write([]byte{0})
+	}
+	var fingerprint [32]byte
+	sum.Sum(fingerprint[:0])
+	if m.failErr != nil && fingerprint == m.failed {
+		return m.fail(fingerprint, m.failErr)
+	}
 	cert, err := tls.X509KeyPair(raw[0], raw[1])
 	if err != nil {
-		return err
+		return m.fail(fingerprint, err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return m.fail(fingerprint, err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(raw[2]) {
-		return fmt.Errorf("%s: no certificates found", m.caFile)
+		return m.fail(fingerprint, fmt.Errorf("%s: no certificates found", m.caFile))
 	}
-	m.raw, m.cert, m.pool = raw, cert, pool
+	m.raw, m.cert, m.pool, m.notAfter = raw, cert, pool, leaf.NotAfter
+	m.failErr = nil
 	return nil
+}
+
+// fail records a refresh that could not be used, and reports it the second
+// time the same failure is read. Only a failure with a last good material to
+// fall back on is reported: without one the caller returns the error and the
+// process does not start.
+func (m *material) fail(fingerprint [32]byte, err error) error {
+	if m.failErr == nil || fingerprint != m.failed {
+		m.failed, m.failErr, m.reported = fingerprint, err, false
+		return err
+	}
+	if m.reported || m.pool == nil {
+		return m.failErr
+	}
+	m.reported = true
+	err = m.failErr
+	m.failures++
+	loadedMu.Lock()
+	first := logged[m.certFile] != fingerprint
+	logged[m.certFile] = fingerprint
+	loadedMu.Unlock()
+	if first {
+		slog.Default().Warn("internal TLS material could not be reloaded; still using the previous certificate",
+			"cert_file", m.certFile, "key_file", m.keyFile, "ca_file", m.caFile, "not_after", m.notAfter, "err", err)
+	}
+	return err
+}
+
+var (
+	notAfterDesc = prometheus.NewDesc("pgshard_tls_certificate_not_after_seconds",
+		"Expiry, as a Unix time, of the internal TLS certificate in use for each certificate file.", []string{"cert_file"}, nil)
+	reloadFailuresDesc = prometheus.NewDesc("pgshard_tls_material_reload_failures_total",
+		"Distinct renewals of internal TLS material that could not be used, so the previous certificate stayed in use.", []string{"cert_file"}, nil)
+)
+
+type collector struct{}
+
+// Collector exports the expiry of the internal TLS certificates this process
+// uses, and the renewals of them it could not use.
+func Collector() prometheus.Collector { return collector{} }
+
+func (collector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- notAfterDesc
+	ch <- reloadFailuresDesc
+}
+
+// Collect reports one series per certificate file, for the material the
+// next connection would use: each is read again first, so a renewal that
+// cannot be used is noticed at the scrape even while no connection is
+// made. A process that listens and dials with the same files loads them
+// twice; the earliest expiry and the larger failure count speak for both.
+func (collector) Collect(ch chan<- prometheus.Metric) {
+	type state struct {
+		notAfter time.Time
+		failures int
+	}
+	byFile := map[string]state{}
+	loadedMu.Lock()
+	ms := append([]*material(nil), loaded...)
+	loadedMu.Unlock()
+	for _, m := range ms {
+		_ = m.refresh()
+		m.mu.Lock()
+		st, seen := byFile[m.certFile]
+		if !seen || m.notAfter.Before(st.notAfter) {
+			st.notAfter = m.notAfter
+		}
+		st.failures = max(st.failures, m.failures)
+		byFile[m.certFile] = st
+		m.mu.Unlock()
+	}
+	for file, st := range byFile {
+		ch <- prometheus.MustNewConstMetric(notAfterDesc, prometheus.GaugeValue, float64(st.notAfter.Unix()), file)
+		ch <- prometheus.MustNewConstMetric(reloadFailuresDesc, prometheus.CounterValue, float64(st.failures), file)
+	}
 }
 
 // current is what to present and trust for a handshake starting now.

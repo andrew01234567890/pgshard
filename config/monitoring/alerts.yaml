@@ -168,3 +168,35 @@ spec:
               configured pause before {{ $labels.pause }}; it proceeds only
               when an operator lets it. Workflows an operator paused outright
               are pgshard_controller_workflows{state="paused"} instead.
+    - name: pgshard-certificates
+      rules:
+        - alert: PgshardTLSCertificateExpiringInUse
+          expr: min by (namespace, pod, cert_file) (pgshard_tls_certificate_not_after_seconds) - time() < 14 * 86400
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: An internal TLS certificate in use expires within two weeks
+            description: >-
+              {{ $labels.pod }} is presenting the certificate in
+              {{ $labels.cert_file }}, which expires in under fourteen days.
+              The operator reissues a workload certificate a third of its
+              life before it expires -- thirty days for the ninety-day leaf --
+              and the process reads a renewal at its next connection, so a
+              certificate this close to expiry was not renewed or its renewal
+              was not usable. When it expires every internal connection it
+              makes or accepts fails. Check
+              pgshard_tls_material_reload_failures_total and the pod log for
+              "could not be reloaded".
+        - alert: PgshardTLSRenewalUnusable
+          expr: increase(pgshard_tls_material_reload_failures_total[30m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A renewal of internal TLS material could not be used
+            description: >-
+              {{ $labels.pod }} read new files for {{ $labels.cert_file }} and
+              could not use them (unreadable, not a certificate, or a key that
+              does not match), so it keeps presenting and trusting the
+              previous material until that expires. The pod log says why
+              ("could not be reloaded").

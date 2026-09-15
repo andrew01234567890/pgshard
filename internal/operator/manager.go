@@ -13,6 +13,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
@@ -116,6 +117,9 @@ func Run(ctx context.Context, o Options) error {
 	defer agents.Close()
 	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage, ControllerPlacementDropOldAfter: o.ControllerPlacementDropOldAfter}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents, AgentTLS: agentModes, OperatorCreds: issued,
 		Metrics: metrics.NewOperator(ctrlmetrics.Registry)}
+	// The operator's metrics live on controller-runtime's registry rather
+	// than one from metrics.NewRegistry, so its TLS collector is added here.
+	ctrlmetrics.Registry.MustRegister(grpccreds.Collector())
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)
 	}
