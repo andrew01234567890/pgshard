@@ -169,7 +169,9 @@ func (c GRPCBarrierClient) CreateBarrier(ctx context.Context, cluster *pgshardv1
 			creds = issued
 		}
 	}
-	if creds == nil {
+	// The controller may still be the pod that serves plaintext only until
+	// the move to TLS has rolled it.
+	if creds == nil || (cluster != nil && internalTLSPhase(cluster) == pgshardv1alpha1.InternalTLSAccepting) {
 		creds = insecure.NewCredentials()
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))

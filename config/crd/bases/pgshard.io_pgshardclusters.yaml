@@ -1856,6 +1856,109 @@ spec:
                   EffectiveShards is the shard count of the serving shard set as
                   materialized in the catalog; zero until the catalog exists.
                 type: integer
+              internalTLS:
+                description: |-
+                  InternalTLS is the internal transport the operator renders and any
+                  move between two in progress.
+                properties:
+                  mode:
+                    description: |-
+                      Mode is the internal transport the cluster was last rendered with
+                      outside a move: insecure, issued, or secret:<name>.
+                    type: string
+                  move:
+                    description: Move is the move from plaintext to mutual TLS in
+                      progress, if any.
+                    properties:
+                      phase:
+                        enum:
+                        - Accepting
+                        - Dialing
+                        type: string
+                      startedAt:
+                        format: date-time
+                        type: string
+                      target:
+                        description: |-
+                          Target is the spec.internalTLS the move is heading to. Once callers
+                          dial TLS the operator renders it, whatever the spec has since been
+                          changed to, until the move completes.
+                        properties:
+                          agentMTLS:
+                            description: |-
+                              AgentMTLS makes each member's agent REQUIRE mutual TLS on its gRPC
+                              listener, using the same material secretRef supplies.
+
+                              Separate from secretRef because turning it on is a rollout, not a
+                              setting: members restart one at a time, so for the length of the roll
+                              some agents require TLS and some do not. The operator dials each
+                              member according to the spec that member is running, which is why the
+                              switch is safe to make while the cluster serves. Until every member
+                              has restarted, a caller that cannot tell them apart -- the controller
+                              today -- must not be given the material.
+                            type: boolean
+                          insecure:
+                            description: |-
+                              Insecure runs the pooler port as plaintext gRPC. Unsupported outside
+                              development; the network must be protected by other means.
+                            type: boolean
+                          issue:
+                            description: |-
+                              Issue makes the operator its own certificate authority: it mints a
+                              CA for the cluster and a certificate per workload from it, and each
+                              listener then accepts only the identities it is meant to serve.
+
+                              secretRef cannot do that, whoever supplies it. One Secret is one
+                              certificate, and it is mounted into the agent, the router and the
+                              pooler alike -- so it spans three trust boundaries, and a listener
+                              verifying the chain learns only that the peer is somewhere in the
+                              cluster. Distinguishing a router from an agent needs them to hold
+                              different certificates, and that needs an issuer.
+                            type: boolean
+                          secretRef:
+                            description: |-
+                              SecretRef names a Secret with tls.crt, tls.key and ca.crt; the
+                              poolers refuse clients whose certificate does not chain to ca.crt
+                              and the routers dial with the certificate.
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                        x-kubernetes-validations:
+                        - message: 'internalTLS requires issue: true, or secretRef,
+                            or insecure: true to explicitly opt into plaintext (unsupported
+                            outside development)'
+                          rule: (has(self.secretRef) && self.secretRef.name != "")
+                            || (has(self.insecure) && self.insecure) || (has(self.issue)
+                            && self.issue)
+                        - message: internalTLS.secretRef and internalTLS.insecure
+                            are mutually exclusive
+                          rule: '!((has(self.secretRef) && self.secretRef.name !=
+                            "") && has(self.insecure) && self.insecure)'
+                        - message: 'internalTLS.issue is exclusive with secretRef
+                            and insecure: the operator either issues the certificates
+                            or is given them'
+                          rule: '!(has(self.issue) && self.issue) || (!(has(self.secretRef)
+                            && self.secretRef.name != "") && !(has(self.insecure)
+                            && self.insecure))'
+                        - message: 'internalTLS.agentMTLS needs secretRef or issue:
+                            the agents require certificates from somewhere'
+                          rule: '!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef)
+                            && self.secretRef.name != "") || (has(self.issue) && self.issue)'
+                    required:
+                    - phase
+                    - target
+                    type: object
+                type: object
               observedGeneration:
                 format: int64
                 type: integer

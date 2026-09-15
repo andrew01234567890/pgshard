@@ -4,31 +4,42 @@ package operator
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/andrew01234567890/pgshard/test/e2e"
 )
 
-// TestAnIssuedTLSClusterRoutesAndFailsOver runs a cluster whose internal
-// certificates the operator issues -- the mode internal TLS is to be
-// required in everywhere -- through the paths that each cross an mTLS hop:
-// a statement through the router (router -> pooler), and a failover (operator
-// -> agent). Every other suite runs insecure, which is how an issuing cluster
-// that could do neither went unnoticed (PGS-860).
-func TestAnIssuedTLSClusterRoutesAndFailsOver(t *testing.T) {
+var writerError = regexp.MustCompile(`[0-9]+`)
+
+// TestAnIssuedTLSClusterReachedFromPlaintextUnderLoad runs a cluster whose
+// internal certificates the operator issues -- the mode internal TLS is to
+// be required in everywhere -- through the paths that each cross an mTLS
+// hop: a statement through the router (router -> pooler), and a failover
+// (operator -> agent). Every other suite runs insecure, which is how an
+// issuing cluster that could do neither went unnoticed (PGS-860).
+//
+// It gets there the way a running cluster does: created insecure and moved
+// to issue: true under a write load through the router, which is what the
+// staged move exists for (PGS-236). Once the move completes the cluster is
+// rendered exactly as one created with issue: true.
+func TestAnIssuedTLSClusterReachedFromPlaintextUnderLoad(t *testing.T) {
 	c := e2e.NewCluster(t)
 	c.GatherOnFailure(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Minute)
 	defer cancel()
 	root := repoRoot(t)
 	major := env("PG_MAJOR", "18")
 
 	deployOperator(ctx, t, c, root, env("OPERATOR_IMAGE", "pgshard-operator:e2e"))
-	manifest := clusterManifestTLS(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), "    issue: true\n")
+	manifest := clusterManifestTLS(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), "    insecure: true\n")
 	if err := c.Apply(ctx, manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -72,19 +83,6 @@ func TestAnIssuedTLSClusterRoutesAndFailsOver(t *testing.T) {
 	}
 	router := clusterName + "-router"
 
-	t.Run("MembersRequireMutualTLS", func(t *testing.T) {
-		out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", sel+",pgshard.io/group", "-o",
-			`jsonpath={range .items[*]}{.metadata.annotations.pgshard\.io/agent-mtls}{"\n"}{end}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, v := range strings.Fields(out) {
-			if v != "true" {
-				t.Fatalf("a member of an issuing cluster was started without requiring agent mTLS: %q", out)
-			}
-		}
-	})
-
 	// A database the router routes to shard 0, set up on the shard and
 	// registered in the catalog directly, so the statements below are the
 	// router's own.
@@ -98,6 +96,213 @@ func TestAnIssuedTLSClusterRoutesAndFailsOver(t *testing.T) {
 	if _, err := psql(ctx, c, clusterName+"-catalog-rw", "INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('"+appDatabase+"', 'unsharded', 0)"); err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("AnInsecureClusterMovesToIssuedTLSUnderLoad", func(t *testing.T) {
+		if _, err := psqlOn(ctx, c, clusterName+"-shard-0-rw", appDatabase, "CREATE TABLE tls_moves (id bigint PRIMARY KEY)"); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := psqlRetryOn(ctx, c, router, appDatabase, "SELECT 1", 5*time.Minute); err != nil {
+			t.Fatalf("the insecure cluster's router does not serve %s: %q %v", appDatabase, out, err)
+		}
+		status := func(path string) string {
+			return jsonpath(ctx, t, c, "pgshardcluster", clusterName, path)
+		}
+
+		// A writer through the router for the whole move: every hop a
+		// statement crosses -- router -> pooler, and the operator's
+		// switchovers through its agents -- changes transport during it.
+		var (
+			mu                     sync.Mutex
+			acked                  []int64
+			failures               int
+			streakStart, lastError time.Time
+			longestStreak          time.Duration
+			lastErr                string
+			errs                   = map[string]int{}
+		)
+		stop, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			for id := int64(1); ; id++ {
+				select {
+				case <-stop:
+					return
+				case <-ctx.Done():
+					return
+				default:
+				}
+				out, err := psqlOn(ctx, c, router, appDatabase, fmt.Sprintf("INSERT INTO tls_moves VALUES (%d)", id))
+				mu.Lock()
+				now := time.Now()
+				if err == nil && strings.Contains(out, "INSERT 0 1") {
+					acked = append(acked, id)
+					if !streakStart.IsZero() {
+						longestStreak = max(longestStreak, now.Sub(streakStart))
+						streakStart = time.Time{}
+					}
+				} else {
+					failures++
+					lastError, lastErr = now, strings.TrimSpace(out)+" "+fmt.Sprint(err)
+					errs[writerError.ReplaceAllString(lastErr, "N")]++
+					if streakStart.IsZero() {
+						streakStart = now
+					}
+				}
+				mu.Unlock()
+			}
+		}()
+		finish := func() {
+			close(stop)
+			<-done
+			mu.Lock()
+			defer mu.Unlock()
+			if !streakStart.IsZero() {
+				longestStreak = max(longestStreak, lastError.Sub(streakStart))
+			}
+		}
+
+		// Member pods by name, every uid each name has had, and the step each
+		// was rendered in: what shows the steps waited for the rolls rather
+		// than just reporting them.
+		type memberPod struct{ uid, phase string }
+		members := func() []memberPod {
+			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", sel+",pgshard.io/group", "-o",
+				`jsonpath={range .items[*]}{.metadata.name}={.metadata.uid}={.metadata.annotations.pgshard\.io/internal-tls-phase}{" "}{end}`)
+			if err != nil {
+				return nil
+			}
+			var pods []memberPod
+			for _, f := range strings.Fields(out) {
+				parts := strings.SplitN(f, "=", 3)
+				if len(parts) == 3 {
+					pods = append(pods, memberPod{uid: parts[0] + "/" + parts[1], phase: parts[2]})
+				}
+			}
+			return pods
+		}
+		uids := map[string]bool{}
+		before := members()
+		for _, m := range before {
+			uids[m.uid] = true
+		}
+		var notAcceptingAtDialing []string
+
+		phases := []string{}
+		patch := `{"spec":{"internalTLS":{"insecure":null,"issue":true}}}`
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "patch", "pgshardcluster", clusterName, "--type=merge", "-p", patch); err != nil {
+			finish()
+			t.Fatal(err)
+		}
+		started := time.Now()
+		lastLog := time.Time{}
+		waitFor(ctx, t, "the move to issued TLS to complete", 60*time.Minute, func() bool {
+			phase := status("{.status.internalTLS.move.phase}")
+			pods := members()
+			for _, m := range pods {
+				uids[m.uid] = true
+			}
+			if phase != "" && (len(phases) == 0 || phases[len(phases)-1] != phase) {
+				phases = append(phases, phase)
+				t.Logf("move reached %s after %s", phase, time.Since(started).Round(time.Second))
+				// A member replaced since the gate passed is rendered in
+				// Dialing and serves both; one rendered before the move
+				// serves plaintext only and must be gone.
+				if phase == "Dialing" {
+					for _, m := range pods {
+						if m.phase == "" {
+							notAcceptingAtDialing = append(notAcceptingAtDialing, m.uid)
+						}
+					}
+				}
+			}
+			if time.Since(lastLog) > 2*time.Minute {
+				lastLog = time.Now()
+				mu.Lock()
+				t.Logf("moving: %s; writer %d acknowledged, %d failed", status(`{.status.conditions[?(@.type=="InternalTLSMoving")].message}`), len(acked), failures)
+				mu.Unlock()
+			}
+			return phase == "" && status("{.status.internalTLS.mode}") == "issued" &&
+				status(`{.status.conditions[?(@.type=="RolloutInProgress")].status}`) == "False" &&
+				status(`{.status.conditions[?(@.type=="Ready")].status}`) == "True"
+		})
+		time.Sleep(10 * time.Second)
+		finish()
+		t.Logf("move took %s through %v; writer: %d acknowledged, %d failed, longest failing stretch %s, last error %q",
+			time.Since(started).Round(time.Second), phases, len(acked), failures, longestStreak.Round(time.Second), lastErr)
+
+		if !slices.Equal(phases, []string{"Accepting", "Dialing"}) {
+			t.Errorf("the move went through %v, want Accepting then Dialing", phases)
+		}
+		if len(notAcceptingAtDialing) > 0 {
+			t.Errorf("routers were switched to TLS while member pods rendered before the move still served plaintext only: %v", notAcceptingAtDialing)
+		}
+		// Every member restarts twice: into Accepting, and out of it once
+		// the move completes.
+		if want := 3 * len(before); len(uids) < want {
+			t.Errorf("member pods had %d incarnations over the move, want at least %d (%d members, each rolled into and out of Accepting)", len(uids), want, len(before))
+		}
+		if len(acked) == 0 {
+			t.Fatal("the writer acknowledged nothing through the router")
+		}
+		for e, n := range errs {
+			t.Logf("writer error x%d: %s", n, e)
+			// A switchover is retried and buffered; a caller dialling a
+			// transport its server refuses fails at the handshake, however
+			// briefly -- at kind's speed a roll is too quick for the length
+			// of a failing stretch to tell the two apart.
+			for _, sign := range []string{"handshake", "tls:", "x509", "certificate", "first record"} {
+				if strings.Contains(strings.ToLower(e), sign) {
+					t.Errorf("a write through the router failed on the transport during the move: %s", e)
+					break
+				}
+			}
+		}
+		// Each member roll switches the primary over once, and the router
+		// buffers writes across a switchover; a transport a caller cannot
+		// speak fails every statement until the next step, minutes later.
+		if longestStreak > 90*time.Second {
+			t.Errorf("writes through the router failed for %s at a stretch; a caller dialled a transport its server refused", longestStreak.Round(time.Second))
+		}
+		out, err := psqlRetryOn(ctx, c, router, appDatabase, "SELECT string_agg(id::text, ',' ORDER BY id) FROM tls_moves", 3*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		have := map[string]bool{}
+		for _, id := range strings.Split(out, ",") {
+			have[id] = true
+		}
+		for _, id := range acked {
+			if !have[strconv.FormatInt(id, 10)] {
+				t.Fatalf("acknowledged write %d is missing after the move", id)
+			}
+		}
+
+		args, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", sel, "-o",
+			`jsonpath={range .items[*]}{.metadata.name}{" "}{.spec.containers[*].args}{"\n"}{end}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(args, "\n") {
+			for _, flag := range []string{"--tls-accept-plaintext", "--tls-dial-plaintext", "--insecure-dev"} {
+				if strings.Contains(line, flag) {
+					t.Errorf("after the move a pod still runs %s: %s", flag, line)
+				}
+			}
+		}
+	})
+
+	t.Run("MembersRequireMutualTLS", func(t *testing.T) {
+		out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", sel+",pgshard.io/group", "-o",
+			`jsonpath={range .items[*]}{.metadata.annotations.pgshard\.io/agent-mtls}{"\n"}{end}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range strings.Fields(out) {
+			if v != "true" {
+				t.Fatalf("a member of an issuing cluster was started without requiring agent mTLS: %q", out)
+			}
+		}
+	})
 
 	t.Run("StatementsReachAShardThroughTheRouter", func(t *testing.T) {
 		if out, err := psqlRetryOn(ctx, c, router, appDatabase, "INSERT INTO tls_probe VALUES (1) ON CONFLICT DO NOTHING", 5*time.Minute); err != nil {

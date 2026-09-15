@@ -60,7 +60,7 @@ func issuedRoleNames() []string {
 // role current. It does nothing unless the spec asks the operator to issue
 // them; a cluster given a secretRef keeps using it untouched.
 func (r *ClusterReconciler) reconcilePKI(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
-	if !c.Spec.InternalTLS.Issue {
+	if !internalTLS(c).Issue {
 		return nil
 	}
 	ca, err := r.ensureCA(ctx, c)

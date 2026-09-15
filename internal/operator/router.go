@@ -116,7 +116,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 			"--pooler-tls-cert="+internalTLSMountPath+"/tls.crt",
 			"--pooler-tls-key="+internalTLSMountPath+"/tls.key",
 			"--pooler-tls-ca="+internalTLSMountPath+"/ca.crt")
-		if c.Spec.InternalTLS.Issue {
+		if internalTLS(c).Issue {
 			// Issued certificates name the cluster and its Services, not a
 			// member's headless-Service host or a peer's IP, which are what
 			// the router dials.
@@ -124,9 +124,15 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 				"--pooler-tls-server-name="+IssuedMemberServerName(c),
 				"--peer-tls-server-name="+RouterName(c.Name)+"."+c.Namespace+".svc")
 		}
+		switch internalTLSPhase(c) {
+		case pgshardv1alpha1.InternalTLSAccepting:
+			args = append(args, "--tls-accept-plaintext", "--tls-dial-plaintext")
+		case pgshardv1alpha1.InternalTLSDialing:
+			args = append(args, "--tls-accept-plaintext")
+		}
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
-	} else if c.Spec.InternalTLS.Insecure {
+	} else if internalTLS(c).Insecure {
 		args = append(args, "--insecure-dev")
 	}
 	if ref := c.Spec.Router.TLS.SecretRef; ref != nil && ref.Name != "" {
@@ -186,6 +192,9 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	// The routers are stateless, but a node taking all of them out at once
 	// is still a gap in service that spreading avoids.
 	applyPlacement(&dep.Spec.Template.Spec, c.Spec.Placement, labels)
+	if phase := internalTLSPhase(c); phase != "" {
+		dep.Spec.Template.Annotations[AnnotationInternalTLSPhase] = phase
+	}
 	return dep
 }
 
@@ -263,7 +272,7 @@ const AnnotationInternalTLSChecksum = "pgshard.io/internal-tls-checksum"
 // internalTLSChecksum digests the referenced internal TLS Secret; empty
 // when the cluster runs with the explicit insecure override.
 func (r *ClusterReconciler) internalTLSChecksum(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
-	if c.Spec.InternalTLS.Issue {
+	if internalTLS(c).Issue {
 		// Every issued Secret, not just the caller's own. One checksum
 		// serves the router annotation and the member template alike, and
 		// the certificates are issued and renewed together, so digesting

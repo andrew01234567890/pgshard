@@ -100,12 +100,15 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 			"--tls-cert="+internalTLSMountPath+"/tls.crt",
 			"--tls-key="+internalTLSMountPath+"/tls.key",
 			"--tls-ca="+internalTLSMountPath+"/ca.crt")
-		if c.Spec.InternalTLS.Issue {
+		if internalTLS(c).Issue {
 			args = append(args, "--tls-authorize-callers", "--agent-tls-server-name="+IssuedMemberServerName(c))
+		}
+		if internalTLSPhase(c) != "" {
+			args = append(args, "--tls-accept-plaintext")
 		}
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
-	} else if c.Spec.InternalTLS.Insecure {
+	} else if internalTLS(c).Insecure {
 		args = append(args, "--insecure-dev")
 	}
 	// Placement (spec.placement, PGS-497) is not applied here: that field
@@ -146,6 +149,12 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 				},
 			},
 		},
+	}
+	// The controller is rendered alike in both steps -- it serves TLS and
+	// plaintext and dials each agent by its pod -- so it records the first,
+	// and moving to the second does not roll it.
+	if internalTLSPhase(c) != "" {
+		dep.Spec.Template.Annotations[AnnotationInternalTLSPhase] = pgshardv1alpha1.InternalTLSAccepting
 	}
 	return dep
 }
