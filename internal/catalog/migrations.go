@@ -201,6 +201,12 @@ type ShardMigration struct {
 	// checking whether the work is already done and reporting it done
 	// without ever asking.
 	Ran bool `json:"ran,omitempty"`
+	// DropSchema is the schema an unqualified DROP's object resolved to on
+	// this shard, recorded before the statement was sent. A resumed step
+	// checks that schema: once the object is gone, a same-named one later
+	// in the search path is what the name resolves to, and running the DROP
+	// again would drop it.
+	DropSchema string `json:"drop_schema,omitempty"`
 }
 
 // DDLMigration is a row of pgshard.migrations.
