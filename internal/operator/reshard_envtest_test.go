@@ -417,4 +417,25 @@ func TestRevertingShardsClearsAFailedReshard(t *testing.T) {
 	if c.Status.Reshard != nil || c.Status.EffectiveShards != 1 {
 		t.Fatalf("cluster status after the revert: %+v", c.Status)
 	}
+
+	// The next reshard gets the next generation. The dropped set left no
+	// shard_sets row, and reusing g2 met the cancelled record of that name,
+	// which the operator refused to adopt, pass after pass.
+	three := 3
+	c.Spec.Shards = &three
+	if err := k8sClient.Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if next, ok := fp.shardSet("g3"); !ok || len(next.Ranges) != 3 {
+		t.Fatalf("the next reshard's set: %+v (present %v), want g3 with 3 ranges", next, ok)
+	}
+	if _, ok := fp.shardSet("g2"); ok {
+		t.Fatal("the next reshard reused the dropped generation")
+	}
+	var next pgshardv1alpha1.PgShardReshard
+	get(t, "rsf-reshard-g3", &next)
+	if next.Spec.TargetShards != 3 {
+		t.Fatalf("the next reshard's record: %+v", next.Spec)
+	}
 }
