@@ -36,6 +36,11 @@ func TestALocalSchemaAndADistributedTableCannotBothBeDeclared(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "local_schemas") {
 		t.Fatalf("refused for the wrong reason: %v", err)
 	}
+	for _, reserved := range []string{`'{pgshard}'`, `'{pg_catalog}'`, `'{information_schema}'`, `'{""}'`, `ARRAY[NULL]::text[]`} {
+		if err := exec(`UPDATE pgshard.databases SET local_schemas = ` + reserved + ` WHERE name = 'app'`); err == nil {
+			t.Errorf("local_schemas = %s was accepted; a reshard drops listed schemas on every shard but one", reserved)
+		}
+	}
 	if err := exec(`INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'audit', 'regions', 'reference')`); err != nil {
 		t.Fatal(err)
 	}

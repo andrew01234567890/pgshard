@@ -928,7 +928,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		r.hidden, r.visible = pl.HiddenColumns, pl.VisibleColumns
 		return r, nil
 	}
-	if w.sess.localSchema(r.schema) {
+	if rv.GetSchemaname() != "" && w.sess.localSchema(r.schema) {
 		return r, nil
 	}
 	if snap != nil {

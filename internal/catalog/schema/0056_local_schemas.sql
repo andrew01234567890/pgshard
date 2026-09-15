@@ -30,6 +30,16 @@ BEGIN
     IF cardinality(NEW.local_schemas) = 0 THEN
         RETURN NEW;
     END IF;
+    -- A reshard drops the listed schemas on every new shard but one, so a
+    -- name PostgreSQL or pgshard owns cannot be listed.
+    SELECT string_agg(s, ', ' ORDER BY s) INTO offending
+      FROM unnest(NEW.local_schemas) s
+     WHERE s IS NULL OR s = '' OR s LIKE 'pg\_%' OR s LIKE 'pgshard%' OR s = 'information_schema';
+    IF offending IS NOT NULL OR array_position(NEW.local_schemas, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'database % cannot list % in local_schemas: an empty name, or a schema PostgreSQL or pgshard owns',
+            NEW.name, coalesce(offending, 'NULL')
+            USING ERRCODE = 'raise_exception';
+    END IF;
     SELECT string_agg(format('%I.%I', schema_name, table_name), ', ' ORDER BY schema_name, table_name)
       INTO offending
       FROM pgshard.tables

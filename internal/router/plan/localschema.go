@@ -96,6 +96,19 @@ func statementSchemas(node *pgquerypb.Node) (schemas []string, eventTrigger bool
 			return []string{rv.GetSchemaname()}, false
 		}
 		return []string{objectSchema(n.AlterOwnerStmt.GetObjectType(), n.AlterOwnerStmt.GetObject())}, false
+	case *pgquerypb.Node_GrantStmt:
+		g := n.GrantStmt
+		for _, obj := range g.GetObjects() {
+			switch {
+			case obj.GetRangeVar() != nil:
+				schemas = append(schemas, obj.GetRangeVar().GetSchemaname())
+			case g.GetTargtype() == pgquerypb.GrantTargetType_ACL_TARGET_ALL_IN_SCHEMA:
+				schemas = append(schemas, obj.GetString_().GetSval())
+			default:
+				schemas = append(schemas, objectSchema(g.GetObjtype(), obj))
+			}
+		}
+		return schemas, false
 	case *pgquerypb.Node_DropStmt:
 		d := n.DropStmt
 		if d.GetRemoveType() == pgquerypb.ObjectType_OBJECT_EVENT_TRIGGER {

@@ -36,6 +36,9 @@ func TestAStatementAboutALocalSchemaRunsOnTheHomeShard(t *testing.T) {
 		`TRUNCATE TABLE "pgroll".pgroll_version`,
 		`INSERT INTO "pgroll".pgroll_version (version) VALUES ('v0.16.3')`,
 		`SELECT name FROM pgroll.migrations WHERE done = false`,
+		`GRANT USAGE ON SCHEMA "pgroll" TO reader`,
+		`GRANT SELECT ON ALL TABLES IN SCHEMA pgroll TO reader`,
+		`CREATE VIEW pgroll.active AS SELECT name FROM pgroll.migrations WHERE done = false`,
 	} {
 		pl, err := p.Plan(context.Background(), session(s), sql)
 		if err != nil {
@@ -61,6 +64,24 @@ func TestAStatementAboutALocalSchemaRunsOnTheHomeShard(t *testing.T) {
 		if err == nil && pl.Kind == Unsharded && pl.Migration == nil {
 			t.Errorf("%.70s ran on the home shard alone; its objects are not all in a local schema", sql)
 		}
+	}
+
+	// A view in a local schema runs on the home shard and is not recorded,
+	// so one over a sharded table would read one shard's rows.
+	if _, err := p.Plan(context.Background(), session(s), `CREATE VIEW pgroll.orders_v AS SELECT id, tenant_id FROM public.orders`); err == nil {
+		t.Error("a view in a local schema over a sharded table was planned; it would read the home shard alone")
+	}
+	// The listing names the schema, so renaming it is refused rather than
+	// leaving the listing behind.
+	if _, err := p.Plan(context.Background(), session(s), `ALTER SCHEMA pgroll RENAME TO pgroll_old`); err == nil {
+		t.Error("a local schema was renamed out from under its listing")
+	}
+	// An unqualified name is not taken to be in a local schema, even first
+	// on the search path: the router cannot know which schema it resolves to.
+	pathed := session(s)
+	pathed.SearchPath = []string{"pgroll", "public"}
+	if pl, err := p.Plan(context.Background(), pathed, `SELECT * FROM migrations`); err == nil && pl.Kind == Unsharded {
+		t.Error("an unqualified undeclared table was routed to the home shard through a local schema on the search path")
 	}
 
 	// Without the listing, pgroll's state is an ordinary schema again.

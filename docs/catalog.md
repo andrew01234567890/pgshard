@@ -131,8 +131,11 @@ UPDATE pgshard.databases SET local_schemas = '{pgroll}' WHERE name = 'app';
 - `CREATE EVENT TRIGGER` whose function is in a listed schema runs there too,
   and so do `DROP EVENT TRIGGER` and `ALTER EVENT TRIGGER`, which name no
   schema. PostgreSQL allows event triggers only to a superuser.
-- A table in a listed schema is unsharded whatever the database's default
-  placement, so reads and writes of it go to the home shard. A sharded or
+- A table named with a listed schema is unsharded whatever the database's
+  default placement, so reads and writes of it go to the home shard. A view
+  in a listed schema cannot read a sharded or reference table, and a listed
+  schema cannot be renamed. Names PostgreSQL or pgshard own (`pg_*`,
+  `pgshard*`, `information_schema`) cannot be listed. A sharded or
   reference table cannot be declared in a listed schema, and a schema holding
   one cannot be listed.
 - A reshard or upgrade copies the schema to every new shard from the home

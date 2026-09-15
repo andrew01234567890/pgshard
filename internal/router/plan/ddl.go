@@ -507,6 +507,10 @@ func shardKeyChangeError(r *rel) error {
 }
 
 func (w *walker) rename(s *pgquerypb.RenameStmt) error {
+	if s.GetRenameType() == pgquerypb.ObjectType_OBJECT_SCHEMA && w.sess.localSchema(s.GetSubname()) {
+		return notYet("renaming schema \""+s.GetSubname()+"\" is not available: it is listed in local_schemas, and the listing would go on naming a schema that no longer exists",
+			"remove it from pgshard.databases.local_schemas, rename it, and list the new name")
+	}
 	switch s.GetRenameType() {
 	case pgquerypb.ObjectType_OBJECT_TABLE:
 		r, err := w.lookup(s.GetRelation())
@@ -772,6 +776,17 @@ func (w *walker) createView(v *pgquerypb.ViewStmt) error {
 			scope = ScopeAll
 		}
 
+	}
+	// A view in a local schema runs on the home shard and is not recorded,
+	// so one over a sharded or reference table would answer with the home
+	// shard's rows and no error.
+	if w.inLocalSchemas && !w.sess.localOnly() {
+		for _, r := range inner.rels {
+			if r.kind != placeUnsharded {
+				return notYet("a view in local schema \""+v.GetView().GetSchemaname()+"\" cannot read sharded or reference table \""+r.name+"\": it would read the home shard's rows only",
+					"create the view outside the database's local_schemas")
+			}
+		}
 	}
 	m := Migration{Kind: "CREATE VIEW", Scope: scope, Object: relationRef(v.GetView(), objectPresent)}
 	m.View = viewChange(v, inner.rels)
