@@ -372,9 +372,9 @@ func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error 
 	// source that cannot be reached must not stop the workflow being marked
 	// failed, or the next pass tries again and the workflow never ends.
 	status := map[string]any{"stage": "failed", "copy": wf.copy, "message": cause.Error()}
-	if err := c.dropForwardReplication(ctx, wf); err != nil {
+	if err := c.dropReplication(ctx, wf); err != nil {
 		status["leaked"] = err.Error()
-		c.logger().Warn("failed reshard left replication objects behind; they pin WAL on the source until dropped",
+		c.logger().Warn("failed reshard left replication objects behind; their slots pin WAL until dropped",
 			"workflow", wf.id, "err", err)
 	}
 	if err := ownedExec(ctx, c.Pool, wf.owner,
@@ -388,10 +388,23 @@ func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error 
 	return nil
 }
 
-// dropForwardReplication removes the subscriptions, slots and publications a
-// copy created, on the source set it actually built them on. Unreachable
-// shards are collected rather than aborting: what can be dropped should be.
-func (c *Copier) dropForwardReplication(ctx context.Context, wf *copyWorkflow) error {
+// dropReplication removes the subscriptions, slots and publications a copy
+// created in either direction, on the source set it actually built them on.
+// Unreachable shards are collected rather than aborting: what can be dropped
+// should be.
+//
+// Both directions, because a switch that fails after its reverse step --
+// undone too often, or a fatal step -- has created reverse replication too:
+// publications and slots on the targets, disabled subscriptions on the
+// sources. Left behind, the subscriptions on a set a later workflow retires
+// read as another workflow's way back into it, and that workflow's Complete
+// leaves the set writable (PGS-846).
+//
+// Only a failure before the flip reaches here today -- every fatal a switch
+// raises comes before its journal. A fatal added after the flip would tear
+// down the reverse replication a switched workflow rolls back through, on a
+// target set that is serving.
+func (c *Copier) dropReplication(ctx context.Context, wf *copyWorkflow) error {
 	srcSet, srcIDs, err := c.pinSource(ctx, wf)
 	if err != nil {
 		return err
@@ -401,19 +414,63 @@ func (c *Copier) dropForwardReplication(ctx context.Context, wf *copyWorkflow) e
 		return err
 	}
 	var errs []error
+	// Every database connection writes through a write pause: a barrier's,
+	// or a retired set's, refuses DROP SUBSCRIPTION and DROP PUBLICATION
+	// with 25006, and whatever this leaves is left for good.
+	dialDatabase := func(set string, id int32, db string) (ShardConn, error) {
+		conn, err := c.Shards.DialDatabase(ctx, set, id, db)
+		if err != nil {
+			return nil, err
+		}
+		if err := writeThroughPause(ctx, conn); err != nil {
+			_ = conn.Close(ctx)
+			return nil, err
+		}
+		return conn, nil
+	}
+	// The reverse subscriptions first, as Complete does: they subscribe to
+	// the target publications and slots dropped below.
+	for _, s := range srcIDs {
+		for _, db := range dbs {
+			conn, err := dialDatabase(srcSet, s, db.name)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("source %d in %s: %w", s, db.name, err))
+				continue
+			}
+			if err := dropSubscriptionsLike(ctx, conn, fmt.Sprintf("pgshard\\_reshard\\_g%d\\_rev\\_s%d\\_%%", wf.gen, s)); err != nil {
+				errs = append(errs, fmt.Errorf("source %d reverse subscriptions in %s: %w", s, db.name, err))
+			}
+			_ = conn.Close(ctx)
+		}
+	}
+	// Then the forward subscriptions, before the source slots they read
+	// from, and the reverse publications and slots on the targets.
 	for _, db := range dbs {
 		for _, t := range wf.ids {
-			conn, err := c.Shards.DialDatabase(ctx, wf.set, t, db.name)
+			conn, err := dialDatabase(wf.set, t, db.name)
 			if err != nil {
-				// A target that is already gone took its subscriptions with
-				// it; the slots on the SOURCE are what matter here.
+				errs = append(errs, fmt.Errorf("target %d in %s: %w", t, db.name, err))
 				continue
 			}
 			if err := dropSubscriptions(ctx, conn, wf.gen, t); err != nil {
 				errs = append(errs, fmt.Errorf("target %d subscriptions in %s: %w", t, db.name, err))
 			}
+			if err := dropPublications(ctx, conn, wf.gen); err != nil {
+				errs = append(errs, fmt.Errorf("target %d reverse publications in %s: %w", t, db.name, err))
+			}
 			_ = conn.Close(ctx)
 		}
+	}
+	for _, t := range wf.ids {
+		conn, err := c.Shards.Dial(ctx, wf.set, t)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("target %d: %w", t, err))
+			continue
+		}
+		if err := dropSlots(ctx, conn, wf.gen); err != nil {
+			errs = append(errs, fmt.Errorf("target %d reverse slots: %w", t, err))
+		}
+		_ = conn.Close(ctx)
 	}
 	for _, s := range srcIDs {
 		conn, err := c.Shards.Dial(ctx, srcSet, s)
@@ -426,7 +483,7 @@ func (c *Copier) dropForwardReplication(ctx context.Context, wf *copyWorkflow) e
 		}
 		_ = conn.Close(ctx)
 		for _, db := range dbs {
-			conn, err := c.Shards.DialDatabase(ctx, srcSet, s, db.name)
+			conn, err := dialDatabase(srcSet, s, db.name)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("source %d in %s: %w", s, db.name, err))
 				continue
