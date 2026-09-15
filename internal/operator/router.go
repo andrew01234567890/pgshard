@@ -117,7 +117,12 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 			"--pooler-tls-key="+internalTLSMountPath+"/tls.key",
 			"--pooler-tls-ca="+internalTLSMountPath+"/ca.crt")
 		if c.Spec.InternalTLS.Issue {
-			args = append(args, "--tls-authorize-callers")
+			// Issued certificates name the cluster and its Services, not a
+			// member's headless-Service host or a peer's IP, which are what
+			// the router dials.
+			args = append(args, "--tls-authorize-callers",
+				"--pooler-tls-server-name="+IssuedMemberServerName(c),
+				"--peer-tls-server-name="+RouterName(c.Name)+"."+c.Namespace+".svc")
 		}
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})

@@ -356,3 +356,64 @@ func TestTheConsumerCertificateIsClientOnly(t *testing.T) {
 		t.Error("the consumer certificate cannot be used as a client, which is all it is for")
 	}
 }
+
+// TestEveryCallerVerifiesANameTheIssuedCertificateCarries (PGS-860): a
+// router dials a shard's pooler at the member's headless-Service host, peer
+// routers by IP, and the controller dials an agent at the member host too.
+// None of those is a name an issued certificate carries, so every such
+// handshake failed hostname verification and an issuing cluster could not
+// route a statement. The callers verify a role-wide name instead; this pins
+// that the name the operator hands each caller is one the server's issued
+// certificate is valid for -- and that the member address is not, which is
+// why the name is needed.
+func TestEveryCallerVerifiesANameTheIssuedCertificateCarries(t *testing.T) {
+	c := issuingCluster("names")
+	r := pkiReconciler(t, time.Now(), c)
+	if err := r.reconcilePKI(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	certOf := func(role string) *x509.Certificate {
+		t.Helper()
+		sec := secretOf(t, r, c.Namespace, RoleTLSSecretName(c.Name, role))
+		block, _ := pem.Decode(sec.Data["tls.crt"])
+		if block == nil {
+			t.Fatalf("%s: no certificate", role)
+		}
+		crt, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return crt
+	}
+	flag := func(args []string, name string) string {
+		t.Helper()
+		for _, a := range args {
+			if v, ok := strings.CutPrefix(a, "--"+name+"="); ok {
+				return v
+			}
+		}
+		t.Fatalf("no --%s in %v", name, args)
+		return ""
+	}
+	routerArgs := Renderer{}.RouterDeployment(c).Spec.Template.Spec.Containers[0].Args
+	controllerArgs := Renderer{}.ControllerDeployment(c).Spec.Template.Spec.Containers[0].Args
+	shard := Groups(c)[1]
+	member := shard.MemberHost(shard.MemberNames()[0], c.Namespace)
+	for _, check := range []struct {
+		caller, flag, role, dialled string
+		args                        []string
+	}{
+		{"router -> pooler", "pooler-tls-server-name", pki.RolePooler, member, routerArgs},
+		{"router -> peer router", "peer-tls-server-name", pki.RoleRouter, "10.0.0.7", routerArgs},
+		{"controller -> agent", "agent-tls-server-name", pki.RoleAgent, member, controllerArgs},
+	} {
+		crt := certOf(check.role)
+		name := flag(check.args, check.flag)
+		if err := crt.VerifyHostname(name); err != nil {
+			t.Errorf("%s verifies %q, which the %s certificate does not name: %v", check.caller, name, check.role, err)
+		}
+		if err := crt.VerifyHostname(check.dialled); err == nil {
+			t.Errorf("%s: the %s certificate names the dialled address %s, so the test no longer shows why the name is needed", check.caller, check.role, check.dialled)
+		}
+	}
+}

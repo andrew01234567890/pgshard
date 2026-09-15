@@ -80,6 +80,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	placementBuffer := fs.Duration("placement-buffer-timeout", controller.DefaultBufferTimeout, "longest table-scoped write pause of one placement swap attempt")
 	placementDropOld := fs.Duration("placement-drop-old-after", controller.DefaultDropOldAfter, "grace before a placement workflow drops the previous tables")
 	agentPort := fs.Int("agent-port", controller.DefaultAgentPort, "gRPC port of member agents (schema materialization)")
+	agentServerName := fs.String("agent-tls-server-name", "", "name an agent's certificate must carry, instead of the member address dialled; issued certificates name the cluster, not each member")
 	agentTokenFile := fs.String("agent-token-file", "", "file holding the cluster's agent control-plane token; agent RPCs are refused without it")
 	pgBin := fs.String("pg-bin", os.Getenv("PGSHARD_PG_BIN"), "directory with pg_dump and psql; when set, schemas are materialized from the controller host instead of through agents (PGSHARD_PG_BIN)")
 	var shardDSNs shardDSNFlag
@@ -226,7 +227,11 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		// only for a member that says it requires them.
 		var agentCreds credentials.TransportCredentials
 		if *certFile != "" || *keyFile != "" || *caFile != "" {
-			agentCreds, err = grpccreds.Dialer(*certFile, *keyFile, *caFile, "", false)
+			var opts []grpccreds.Option
+			if *authorizeCallers {
+				opts = append(opts, grpccreds.Authorize(pki.Serves(pki.RoleAgent)))
+			}
+			agentCreds, err = grpccreds.Dialer(*certFile, *keyFile, *caFile, *agentServerName, false, opts...)
 			if err != nil {
 				fmt.Fprintf(stderr, "pgshard-controller run: agent credentials: %v\n", err)
 				return cli.ExitUsage

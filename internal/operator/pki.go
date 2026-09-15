@@ -154,6 +154,14 @@ func currentFor(sec corev1.Secret, ca *pki.CA, now time.Time) bool {
 	return !pki.NeedsRenewal(sec.Data["tls.crt"], now)
 }
 
+// IssuedMemberServerName is the name callers verify a member's pooler or
+// agent certificate against. Members are dialled at their headless-Service
+// host (or IP), which no issued certificate names; every pooler and agent
+// certificate names the cluster's own Service host.
+func IssuedMemberServerName(c *pgshardv1alpha1.PgShardCluster) string {
+	return c.Name + "." + c.Namespace + ".svc"
+}
+
 // roleDNSNames are the names a role's listener is reached by, and none for
 // a role that only dials. A client certificate valid to serve some name is
 // a certificate that can impersonate that name.
