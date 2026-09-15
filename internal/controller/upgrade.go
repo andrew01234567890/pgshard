@@ -60,13 +60,6 @@ func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, src
 			}
 		}
 	}
-	var placements int
-	if err := c.Pool.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflows WHERE kind = $1 AND state = ANY($2)`, KindTablePlacement, activeStates).Scan(&placements); err != nil {
-		return err
-	}
-	if placements > 0 {
-		failures = append(failures, fmt.Sprintf("%d table placement workflow(s) in flight", placements))
-	}
 	if len(failures) > 0 {
 		return fatal("upgrade preconditions failed: %s", strings.Join(failures, "; "))
 	}

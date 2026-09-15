@@ -77,7 +77,8 @@ clear message (controller) otherwise:
 
 - the target image names the new major (or the default image is used);
 - backups are healthy when a backup policy is bound;
-- no reshard or table placement workflow is in flight;
+- no reshard is in flight (a table placement that holds the serving set is
+  waited for at `ready_for_copy`, as for a reshard);
 - every extension installed in **every database on every source shard**
   appears in `pg_available_extensions` on **every** target shard. Extensions
   are per-database objects and availability is per installation, so one
