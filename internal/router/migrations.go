@@ -143,7 +143,10 @@ func gucOn(v string) bool {
 func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.ResultWriter) error {
 	m := pl.Migration
 	if e.tx == pgwire.TxIdle {
-		return e.queueMigration(ctx, m, w)
+		if err := e.queueMigration(ctx, m, w); err != nil {
+			return err
+		}
+		return w.CommandComplete(m.Kind)
 	}
 	if err := e.refuseDDLInTransaction(m); err != nil {
 		return err
@@ -153,7 +156,18 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 		Hint:    fmt.Sprintf("database %q runs DDL transactions sequentially: a ROLLBACK does not undo it", e.info.Database)}); err != nil {
 		return err
 	}
-	if err := e.queueMigration(ctx, m, w); err != nil {
+	// The transaction has run nothing but its prelude, so its backend does
+	// not wait out the migration inside it: idle_in_transaction_session_timeout
+	// would end it, and a barrier's drain would wait for it. The prelude
+	// opens it again before the statement is answered.
+	err := e.releaseUntouchedTxn(ctx)
+	if err == nil {
+		err = e.queueMigration(ctx, m, w)
+	}
+	if err == nil {
+		err = e.replayPrelude(ctx)
+	}
+	if err != nil {
 		// PostgreSQL fails the transaction a statement errors in. The
 		// transaction holds nothing on a shard yet, so its backend goes and
 		// the router answers for the failed transaction until it ends.
@@ -162,13 +176,16 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 		return err
 	}
 	e.txnRanDDL = true
-	return nil
+	return w.CommandComplete(m.Kind)
 }
 
 // refuseDDLInTransaction refuses DDL inside a transaction, unless the
 // database runs DDL transactions sequentially and the transaction has run
 // nothing on a shard.
 func (e *Executor) refuseDDLInTransaction(m *plan.Migration) error {
+	if e.tx == pgwire.TxFailed {
+		return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+	}
 	sequential := e.ddlRunsSequentially()
 	if sequential && !e.txnTouched && !e.multiShardTxn() {
 		return nil
@@ -212,6 +229,8 @@ func (e *Executor) ddlRunsSequentially() bool {
 	return snap != nil && snap.Databases[e.info.Database].DDLTransactions == catalog.DDLTransactionsSequential
 }
 
+// queueMigration queues m and waits for the applier to finish it (or not,
+// under pgshard.ddl_async); the caller answers the statement.
 func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwire.ResultWriter) error {
 	if e.r.cfg.Migrations == nil {
 		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available: the router has no migration queue")
@@ -240,7 +259,7 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 			Hint:    "SELECT state, per_shard FROM pgshard.migrations WHERE id = '" + id + "'"}); err != nil {
 			return err
 		}
-		return w.CommandComplete(m.Kind)
+		return nil
 	}
 	done, err := e.r.cfg.Migrations.Wait(ctx, id)
 	if err != nil {
@@ -261,7 +280,7 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 			return err
 		}
 	}
-	return w.CommandComplete(m.Kind)
+	return nil
 }
 
 // migrationRefreshTimeout bounds how long an applied migration waits for

@@ -643,6 +643,59 @@ func TestASequentialDatabaseRunsATransactionsDDLStatementByStatement(t *testing.
 		t.Fatal("DDL after a statement on a shard was queued")
 	}
 
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "select bad"); err == nil {
+		t.Fatal("the fake pooler's failing statement succeeded")
+	}
+	before = len(kinds(0))
+	_, err = tx.Exec(ctx, "create table t6 (id int primary key)")
+	var aborted *pgconn.PgError
+	if !errors.As(err, &aborted) || aborted.Code != "25P02" {
+		t.Fatalf("DDL in a transaction a statement already failed: %v, want 25P02", err)
+	}
+	if len(kinds(0)) != before {
+		t.Fatal("DDL in an aborted transaction was queued")
+	}
+	_ = tx.Rollback(ctx)
+
+	// The migration does not wait inside an idle transaction on a backend:
+	// the backend's transaction is ended for the wait and opened again.
+	sent := func() []int {
+		var n []int
+		for _, fp := range h.poolers {
+			qs, _ := fp.numbered()
+			n = append(n, len(qs))
+		}
+		return n
+	}
+	mark := sent()
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "create table t7 (id int primary key)"); err != nil {
+		t.Fatal(err)
+	}
+	if s := conn.PgConn().TxStatus(); s != 'T' {
+		t.Fatalf("after DDL in a transaction the session is in status %q, want in transaction", s)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for i, fp := range h.poolers {
+		qs, _ := fp.numbered()
+		for _, q := range qs[mark[i]:] {
+			got = append(got, strings.ToLower(q.sql))
+		}
+	}
+	if joined := strings.Join(got, ";"); !strings.Contains(joined, "begin;rollback;begin") {
+		t.Fatalf("the shards saw %q, want the transaction ended for the wait and reopened", joined)
+	}
+
 	q.outcome = func(m catalog.DDLMigration) catalog.DDLMigration {
 		m.State, m.Error = catalog.MigrationFailed, "relation already exists"
 		return m

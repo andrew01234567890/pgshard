@@ -97,7 +97,12 @@ installs its trigger function and trigger in one transaction. In a
 - A statement that runs on a shard after DDL in the same transaction, or DDL
   after one, is refused (`0A000`): the two could not commit together.
 - DDL that fails fails the transaction, as in PostgreSQL: later statements
-  get `25P02` and `COMMIT` answers `ROLLBACK`.
+  get `25P02` and `COMMIT` answers `ROLLBACK`. DDL in a transaction that a
+  statement has already failed is refused with `25P02` and not applied.
+- While the migration applies, the transaction's backend is not held open:
+  its (empty) transaction is ended and opened again before the statement is
+  answered, so `idle_in_transaction_session_timeout` does not end it and a
+  barrier's drain does not wait for it.
 
 ```sql
 UPDATE pgshard.databases SET ddl_transactions = 'sequential' WHERE name = 'app';
