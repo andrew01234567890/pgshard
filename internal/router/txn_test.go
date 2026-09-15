@@ -1077,11 +1077,9 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
 		t.Fatal(err)
 	}
-	// The commit's own return is not asserted: the transaction commits, but
-	// the client is told 08006 because the release after it runs on the
-	// cancelled statement context (PGS-814). What this test is about is
-	// what the coordinator did with the transaction.
-	_ = tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		t.Errorf("the transaction committed but the client was told %v: a cancel that arrives once the commit is decided must not turn its success into a failure", err)
+	}
 	if cancelLanded.Load() {
 		t.Error("the decision was written on the statement's own context: a cancel arriving between PREPARE and the decision reaches it")
 	}
@@ -1109,4 +1107,15 @@ func TestTheDecisionSurvivesAStatementCancel(t *testing.T) {
 	}
 	waitFor(t, 10*time.Second, func() bool { return h.log.preparedCount() == 0 },
 		"participants left prepared after the decision")
+
+	next, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("the session refused the statement after a cancelled commit: %v", err)
+	}
+	if _, err := next.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 3)", a); err != nil {
+		t.Fatalf("the session refused the statement after a cancelled commit: %v", err)
+	}
+	if err := next.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -1985,7 +1985,11 @@ func (e *Executor) afterBatch(ctx context.Context, err error) error {
 	}
 	if e.txnEnded && e.pinned {
 		e.txnEnded = false
-		if rerr := e.release(ctx); rerr != nil && err == nil {
+		// The transaction's outcome is already on the wire. A cancel or
+		// deadline that reached the statement after that must neither
+		// report it as a connection failure nor leave the pooler holding
+		// the backend the next statement expects to be fresh.
+		if rerr := e.release(context.WithoutCancel(ctx)); rerr != nil && err == nil {
 			err = rerr
 		}
 	}
