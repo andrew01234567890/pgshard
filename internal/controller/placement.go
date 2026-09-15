@@ -82,6 +82,14 @@ type placementState struct {
 	// controller keeps the rights it needs while it is still building.
 	Owner  string   `json:"owner,omitempty"`
 	Grants []string `json:"grants,omitempty"`
+	// Policies are the statements that recreate the source table's
+	// row-level security policies on the table clients see. Applied at the
+	// SWAP, after the renames: a policy's expression names tables, its own
+	// among them, and only then does every name mean the new table.
+	// PoliciesAtSwap marks a workflow that captured them; one prepared by an
+	// earlier version created its policies on the shadow instead.
+	Policies       []string `json:"policies,omitempty"`
+	PoliciesAtSwap bool     `json:"policies_at_swap,omitempty"`
 	// Triggers is each user trigger's pg_trigger.tgenabled on the source.
 	// Applied at the SWAP for the same reason: a trigger firing while the
 	// copy writes the shadow runs for every copied row, which is a row the

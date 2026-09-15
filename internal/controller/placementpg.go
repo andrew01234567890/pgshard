@@ -100,6 +100,10 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if wf.st.Triggers, err = triggerStates(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
 		return err
 	}
+	if wf.st.Policies, err = tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.spec.TableName)); err != nil {
+		return err
+	}
+	wf.st.PoliciesAtSwap = true
 	if wf.st.Owner, wf.st.Grants, err = tableOwnerAndGrants(ctx, conn, wf.spec.SchemaName, wf.spec.TableName,
 		wf.shape.qualified(wf.spec.TableName)); err != nil {
 		return err
@@ -968,11 +972,15 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 					return oerr
 				}
 				// LIKE INCLUDING ALL carries no row-level security policy
-				// and neither RLS flag, so a swap without these would leave
-				// the table looking correct and enforcing nothing.
-				pols, perr := tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
-				if perr != nil {
-					return perr
+				// and neither RLS flag. A workflow prepared by an earlier
+				// version recreates the policies here; one that captured
+				// them does so at the swap.
+				var pols []string
+				if !wf.st.PoliciesAtSwap {
+					var perr error
+					if pols, perr = tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow())); perr != nil {
+						return perr
+					}
 				}
 				tgs, terr := tableTriggers(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
 				if terr != nil {
@@ -1271,11 +1279,13 @@ func extendedStatistics(ctx context.Context, conn ShardConn, wf *placementWorkfl
 		out = append(out, stmt+" ON "+st.Columns+" FROM "+wf.shape.qualified(wf.shadow()))
 	}
 	// Same for the remote path: a shadow built from the catalog carries no
-	// policies either, and the swap enables row-level security on whatever
-	// it finds.
-	pols, err := tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
-	if err != nil {
-		return nil, err
+	// policies either.
+	var pols []string
+	if !wf.st.PoliciesAtSwap {
+		var err error
+		if pols, err = tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow())); err != nil {
+			return nil, err
+		}
 	}
 	tgs, err := tableTriggers(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
 	if err != nil {
@@ -1311,19 +1321,22 @@ func tableRowSecurity(ctx context.Context, conn ShardConn, schema, table string)
 	return f.Enabled, f.Forced, nil
 }
 
-// tablePolicies renders the source table's row-level security policies onto
-// the shadow.
+// tablePolicies renders the source table's row-level security policies as
+// statements creating them on target.
 //
 // PostgreSQL has no pg_get_policydef(), so they are rebuilt from pg_policy.
-// They are created on the shadow while row-level security is still DISABLED
-// there, which makes them inert until the swap enables it, in the
-// transaction that renames the table.
+// The swap runs them after the renames, while row-level security is still
+// off on the renamed table, and then enables it. Created on the shadow
+// instead, an expression that names the table -- a correlated subquery
+// ("notes.region"), a whole-row reference -- fails there, and a subquery
+// reading the table binds to the source by OID and goes on reading the
+// retired table.
 //
-// The order matters for two reasons. A policy in force during the copy
-// filters the copier's own rows -- how much depends on the role it holds,
-// and pgshard's DDL role is NOBYPASSRLS -- and losing rows that way is
-// silent. And a shadow is not the table clients see, so nothing should be
-// enforcing on it before it is.
+// Row-level security stays off until then for two reasons. A policy in force
+// during the copy filters the copier's own rows -- how much depends on the
+// role it holds, and pgshard's DDL role is NOBYPASSRLS -- and losing rows
+// that way is silent. And a shadow is not the table clients see, so nothing
+// should be enforcing on it before it is.
 func tablePolicies(ctx context.Context, conn ShardConn, schema, table, shadow string) ([]string, error) {
 	rows, err := conn.Query(ctx, `SELECT p.polname, p.polcmd::text, p.polpermissive,
 			(SELECT coalesce(string_agg(CASE WHEN u.oid = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END, ', '), '')
@@ -2345,6 +2358,9 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		if err := restorePrivileges(ctx, conn, wf); err != nil {
 			return err
 		}
+		if err := restorePolicies(ctx, conn, wf); err != nil {
+			return err
+		}
 		if err := enableRowSecurity(ctx, conn, wf); err != nil {
 			return err
 		}
@@ -2368,6 +2384,21 @@ func restorePrivileges(ctx context.Context, conn ShardConn, wf *placementWorkflo
 	}
 	_, err := conn.Exec(ctx, "ALTER TABLE "+wf.shape.qualified(wf.spec.TableName)+" OWNER TO "+wf.st.Owner)
 	return err
+}
+
+// restorePolicies recreates the source table's policies on the table clients
+// now see, in the swap's transaction and before row-level security is
+// enabled, so the table is never enforcing without them.
+func restorePolicies(ctx context.Context, conn ShardConn, wf *placementWorkflow) error {
+	if !wf.st.PoliciesAtSwap {
+		return nil
+	}
+	for _, stmt := range wf.st.Policies {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("%s: %w", stmt, err)
+		}
+	}
+	return nil
 }
 
 // restoreTriggers puts each user trigger back into the state the source had,

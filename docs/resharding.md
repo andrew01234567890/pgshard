@@ -508,12 +508,14 @@ that ended within a day).
   rendered from `aclexplode`, including column grants and `WITH GRANT
   OPTION`; their grantor is the controller's role rather than the source's
   owner, which a later `REVOKE` by the owner is unaffected by.
-- **Row-level security is reproduced**, not refused: the policies are
-  recreated on the shadow (from `pg_policy`, since PostgreSQL has no
-  `pg_get_policydef()`) while RLS is still off there, so the copy is not
-  filtered by the policies it is copying, and the swap enables `ROW LEVEL
-  SECURITY` and `FORCE ROW LEVEL SECURITY` in the transaction that renames
-  the table.
+- **Row-level security is reproduced**, not refused: the policies are read
+  at prepare (from `pg_policy`, since PostgreSQL has no
+  `pg_get_policydef()`) and recreated in the swap's transaction, after the
+  renames, and only then does the swap enable `ROW LEVEL SECURITY` and
+  `FORCE ROW LEVEL SECURITY`. The copy is never filtered by the policies it
+  is copying, and an expression that names a table -- a correlated subquery
+  on the table's own columns, a subquery reading the table itself -- binds
+  to the table clients see.
 - **User triggers are reproduced** from `pg_get_triggerdef`, retargeted onto
   the shadow, and then **disabled for the copy**: a `BEFORE` trigger would
   rewrite every copied row and an `AFTER` trigger would fire for a row the
