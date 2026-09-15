@@ -345,8 +345,12 @@ func TestController(t *testing.T) {
 		if status.Code(err) != codes.FailedPrecondition {
 			t.Fatalf("cancelling a workflow paused from running: %v", err)
 		}
-		if !strings.Contains(err.Error(), "paused from running") || !strings.Contains(err.Error(), "Resume it") {
-			t.Errorf("the refusal must say which paused it is and what to do: %v", err)
+		// Asserted on what the message must CONVEY, not on the exact words:
+		// which paused it is, and an action that actually works. The first
+		// version of this said "cancel the running workflow", which is
+		// itself refused -- so the test must not lock that phrasing in.
+		if !strings.Contains(err.Error(), "paused while it was running") || !strings.Contains(err.Error(), "undo the change that started it") {
+			t.Errorf("the refusal must say which paused it is and name an action that works: %v", err)
 		}
 		if st := queryOne[string](t, conn, `SELECT state FROM pgshard.workflows WHERE id::text = $1`, id); st != "paused" {
 			t.Errorf("the workflow is %q after a refused cancel, want it still paused", st)

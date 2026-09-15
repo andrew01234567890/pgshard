@@ -233,6 +233,13 @@ func (s *Server) GetWorkflow(ctx context.Context, req *pgshardv1.GetWorkflowRequ
 
 // PauseWorkflow moves a pending or running workflow to paused, remembering
 // the state to resume into.
+//
+// Not at a stage that holds what the rest of the cluster waits on until its
+// step finishes: a paused workflow is not driven. A switch that is switching,
+// rolling back or completing holds the range fence or a write pause, or is
+// half way through dropping replication; a table placement that is buffering
+// or swapping holds the table's fence. Paused there, the writes stay refused
+// for as long as nobody resumes it. pauseBefore is the pause a switch has.
 func (s *Server) PauseWorkflow(ctx context.Context, req *pgshardv1.PauseWorkflowRequest) (*pgshardv1.PauseWorkflowResponse, error) {
 	if err := s.requireLeader(); err != nil {
 		return nil, err
@@ -240,7 +247,16 @@ func (s *Server) PauseWorkflow(ctx context.Context, req *pgshardv1.PauseWorkflow
 	if err := s.transition(ctx, req.GetId(), `
 		UPDATE pgshard.workflows
 		SET status = status || jsonb_build_object('paused_from', state), state = $2, updated_at = now()
-		WHERE id::text = $1 AND state IN ($3, $4)`, StatePaused, StatePending, StateRunning); err != nil {
+		WHERE id::text = $1 AND state IN ($3, $4)
+		  AND NOT ((kind = ANY($5) AND coalesce(status->>'stage', '') = ANY($6))
+		        OR (kind = $7 AND coalesce(status->>'stage', '') = ANY($8)))`,
+		StatePaused, StatePending, StateRunning, copyKinds, switchHoldingStages, KindTablePlacement, placementHoldingStages); err != nil {
+		var stage string
+		if status.Code(err) == codes.FailedPrecondition && s.Pool.QueryRow(ctx, `SELECT coalesce(status->>'stage', '') FROM pgshard.workflows
+			WHERE id::text = $1 AND state = $2`, req.GetId(), StateRunning).Scan(&stage) == nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"workflow %s is at stage %s, which holds a fence or a write pause until its step finishes; a paused workflow is not driven, so it cannot be paused here", req.GetId(), stage)
+		}
 		return nil, err
 	}
 	w, err := s.getWorkflow(ctx, req.GetId())
@@ -266,6 +282,9 @@ func (s *Server) PauseWorkflow(ctx context.Context, req *pgshardv1.PauseWorkflow
 // and the row said "cancelled before it started", which was not true. The
 // state it was paused FROM is the thing that matters, so that is what is
 // read.
+//
+// Past its switch the same cancel left a RETIRED SET STILL REPLICATING,
+// which is the shape PGS-852 found.
 //
 // Without this, an in-place reshard created by editing pgshard.shard_ranges
 // stayed pending for ever with no way to remove it: pgshard_admin is
@@ -322,8 +341,17 @@ func (s *Server) explainCancel(ctx context.Context, id string, err error) error 
 		return err
 	}
 	return status.Errorf(codes.FailedPrecondition,
-		"workflow %s is paused from running: it holds shadow tables, replication slots and a fence, so cancelling it here would abandon them. Resume it and cancel the running workflow, which unwinds what it holds.", id)
+		"workflow %s was paused while it was running and has built what a running workflow builds; cancelling it here would leave that behind. "+
+			"Resume it and undo the change that started it -- remove a reshard's target shard set, or revert a table's placement -- to have it unwound.", id)
 }
+
+// switchHoldingStages and placementHoldingStages are the stages at which a
+// workflow of that kind holds something the rest of the cluster waits on
+// until its current step finishes.
+var (
+	switchHoldingStages    = []string{StageSwitching, StageRollingBack, StageCompleting}
+	placementHoldingStages = []string{StagePlacementBuffering, StagePlacementSwapping}
+)
 
 func (s *Server) transition(ctx context.Context, id, sql string, args ...any) error {
 	tag, err := s.Pool.Exec(ctx, sql, append([]any{id}, args...)...)

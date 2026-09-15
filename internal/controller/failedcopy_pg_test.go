@@ -11,7 +11,8 @@ import (
 // TestAFailedCopyDropsItsReplicationObjects.
 //
 // A failed workflow is NEVER revisited: listCopyWorkflows selects pending,
-// running and cancelling, and CancelWorkflow accepts only pending or paused.
+// running and cancelling, and CancelWorkflow accepts only pending, or paused
+// while pending.
 // So a slot left on a serving SOURCE is left for good -- and once the targets
 // are torn down it goes inactive and pins WAL on a primary until pg_wal fills
 // the disk. A shard outage, caused by a failed copy nobody was watching.

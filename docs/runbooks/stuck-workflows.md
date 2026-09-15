@@ -25,6 +25,14 @@ state). `PgShardReshard.status` mirrors progress on the Kubernetes side.
 `ResumeWorkflow` puts it back. `spec.resharding.pauseBefore: switchWrites`
 pauses automatically before the traffic switch.
 
+A switch that is `switching`, `rolling_back` or `completing` cannot be
+paused: a paused workflow is not driven, and in those stages it holds the
+range fence or a write pause, or is half way through dropping replication.
+`CancelWorkflow` ends only a workflow that has not started — `pending`, or
+paused while pending. One paused while it was running has built replication
+and is refused: resume it and remove the change that started it (a reshard's
+target shard set) to have it unwound.
+
 ## A workflow that never starts
 
 Check that the controller leader is alive (it holds a catalog advisory lock; the log says who leads)

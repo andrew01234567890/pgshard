@@ -121,7 +121,9 @@ One pass runs in a single `REPEATABLE READ` transaction:
 Workflows are exposed through the `pgshard.v1.Controller` gRPC service:
 `ListWorkflows` (filter by kind and state), `GetWorkflow`, `PauseWorkflow`
 (pending or running to paused; the previous state is kept in
-`status.paused_from`) and `ResumeWorkflow` (back to that state).
+`status.paused_from`; refused while a placement is `buffering` or `swapping`,
+or a switch is `switching`, `rolling_back` or `completing`) and
+`ResumeWorkflow` (back to that state).
 `ResolveTransactions` is served when the controller runs a resolver, and
 `CreateBarrier` when it runs a barrier; each answers `UNIMPLEMENTED` when its
 component is not configured.
