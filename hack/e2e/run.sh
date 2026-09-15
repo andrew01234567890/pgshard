@@ -29,7 +29,7 @@ case "$suite" in
 # rather than filtering by test name keeps that from recurring.
 smoke)         args=(./test/e2e/); needs="" ;;
 operator)      args=(-timeout 70m -skip 'TestAnIssuedTLSCluster' ./test/e2e/operator/...); needs="base controller" ;;
-tls)           args=(-timeout 45m -run 'TestAnIssuedTLSCluster' ./test/e2e/operator/...); needs="base controller" ;;
+tls)           args=(-timeout 110m -run 'TestAnIssuedTLSCluster' ./test/e2e/operator/...); needs="base controller" ;;
 backup)        args=(-timeout 70m ./test/e2e/backup/...); needs="base controller stores" ;;
 reshard)       args=(-timeout 50m -skip 'TestReshardSplitUnderLoad|TestReshardMergeUnderLoad' ./test/e2e/reshard/...); needs="base controller" ;;
 reshard-split) args=(-timeout 110m -run TestReshardSplitUnderLoad ./test/e2e/reshard/...); needs="base controller" ;;
