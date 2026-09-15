@@ -257,35 +257,16 @@ func migrationError(m catalog.DDLMigration) error {
 	return err
 }
 
-// migrationBatch answers an extended-protocol batch whose statement is a
-// migration: Describe reports no parameters and no rows, Execute runs it.
-func (e *Executor) migrationBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, parsed []string, w pgwire.ResultWriter) (bool, error) {
-	var mig *prepared
-	other := false
-	stmtOf := func(portal string) string { return e.portals[portal] }
-	for _, req := range batch {
-		var stmt string
-		switch r := req.Message.(type) {
-		case *pgshardv1.ExecuteRequest_Parse:
-			if len(parsed) == 0 {
-				continue
-			}
-			stmt, parsed = parsed[0], parsed[1:]
-		case *pgshardv1.ExecuteRequest_Bind:
-			stmt = stmtOf(r.Bind.Portal)
-		case *pgshardv1.ExecuteRequest_Execute:
-			stmt = stmtOf(r.Execute.Portal)
-		default:
-			continue
-		}
-		st, ok := e.stmts[stmt]
-		if ok && st.plan.Kind == plan.MigrationKind {
-			mig = &st
-		} else {
-			other = true
-		}
+// migrationBatch answers an extended-protocol batch whose statements are
+// migrations: Describe reports no parameters and no rows, and each Execute
+// runs the migration its own portal was bound to. ddl is Executor.batchDDL.
+func (e *Executor) migrationBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, ddl []*plan.Plan, w pgwire.ResultWriter) (bool, error) {
+	var ddlSeen, other bool
+	for _, pl := range ddl {
+		ddlSeen = ddlSeen || pl != nil
+		other = other || pl == nil
 	}
-	if mig == nil {
+	if !ddlSeen {
 		return false, nil
 	}
 	if other {
@@ -293,8 +274,11 @@ func (e *Executor) migrationBatch(ctx context.Context, batch []*pgshardv1.Execut
 		err.Hint = "send a Sync before and after it"
 		return true, err
 	}
+	next := 0
 	for _, req := range batch {
 		switch r := req.Message.(type) {
+		case *pgshardv1.ExecuteRequest_Parse, *pgshardv1.ExecuteRequest_Bind:
+			next++
 		case *pgshardv1.ExecuteRequest_Describe:
 			if r.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
 				if err := w.ParameterDescription(nil); err != nil {
@@ -305,7 +289,9 @@ func (e *Executor) migrationBatch(ctx context.Context, batch []*pgshardv1.Execut
 				return true, err
 			}
 		case *pgshardv1.ExecuteRequest_Execute:
-			if err := e.runMigration(ctx, mig.plan, w); err != nil {
+			pl := ddl[next]
+			next++
+			if err := e.runMigration(ctx, *pl, w); err != nil {
 				return true, err
 			}
 		}

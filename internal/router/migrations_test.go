@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
@@ -413,5 +414,140 @@ func TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt(t *testing.T) {
 	}
 	if len(notices) != 1 || !strings.HasPrefix(notices[0], "WARNING: ") || !strings.Contains(notices[0], "catalog unreachable") {
 		t.Fatalf("notices after a failed refresh: %q", notices)
+	}
+}
+
+// TestEachDDLOfAPipelinedBatchRunsItsOwnStatement (PGS-896): the batch
+// handler ran the last DDL it saw for every Execute, so a client pipelining
+// two before one Sync queued the second twice and never the first. The
+// messages go on the wire by hand: pgx's pipeline reader also checks the
+// order of the replies, which is PGS-897.
+func TestEachDDLOfAPipelinedBatchRunsItsOwnStatement(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	conn := h.connect(t, h.dsn())
+	stmts := []string{"create table notes_a (id int primary key)", "create table notes_b (id int primary key)"}
+	for _, named := range []bool{false, true} {
+		q.mu.Lock()
+		q.queued = nil
+		q.mu.Unlock()
+		fe := conn.PgConn().Frontend()
+		for i, sql := range stmts {
+			name := ""
+			if named {
+				name = fmt.Sprintf("ddl_%d", i)
+			}
+			fe.Send(&pgproto3.Parse{Name: name, Query: sql})
+			fe.Send(&pgproto3.Bind{PreparedStatement: name})
+			fe.Send(&pgproto3.Describe{ObjectType: 'P'})
+			fe.Send(&pgproto3.Execute{})
+		}
+		fe.Send(&pgproto3.Sync{})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		completed := 0
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e, ok := msg.(*pgproto3.ErrorResponse); ok {
+				t.Fatalf("named %v: %s", named, e.Message)
+			}
+			if _, ok := msg.(*pgproto3.CommandComplete); ok {
+				completed++
+			}
+			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				break
+			}
+		}
+		q.mu.Lock()
+		var got []string
+		for _, m := range q.queued {
+			got = append(got, m.Statement)
+		}
+		q.mu.Unlock()
+		if completed != 2 || len(got) != 2 || got[0] != stmts[0] || got[1] != stmts[1] {
+			t.Fatalf("named %v: %d completions, queued %q, want %q in order", named, completed, got, stmts)
+		}
+	}
+}
+
+// A portal runs the statement it was bound to, even when the name was parsed
+// again before its Execute.
+func TestADDLPortalRunsTheStatementItWasBoundTo(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	conn := h.connect(t, h.dsn())
+	fe := conn.PgConn().Frontend()
+	fe.Send(&pgproto3.Parse{Query: "create table notes_a (id int primary key)"})
+	fe.Send(&pgproto3.Bind{DestinationPortal: "p1"})
+	fe.Send(&pgproto3.Parse{Query: "create table notes_b (id int primary key)"})
+	fe.Send(&pgproto3.Bind{DestinationPortal: "p2"})
+	fe.Send(&pgproto3.Execute{Portal: "p1"})
+	fe.Send(&pgproto3.Execute{Portal: "p2"})
+	fe.Send(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok {
+			t.Fatal(e.Message)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.queued) != 2 || !strings.Contains(q.queued[0].Statement, "notes_a") || !strings.Contains(q.queued[1].Statement, "notes_b") {
+		t.Fatalf("queued %+v, want notes_a then notes_b", q.queued)
+	}
+}
+
+// A DDL statement pipelined with anything else is refused whole: the
+// migration and the other statement cannot share a batch's transaction.
+func TestADDLBatchWithAnotherStatementIsRefused(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	conn := h.connect(t, h.dsn())
+	for _, order := range [][]string{{"create table notes_c (id int primary key)", "select 1"}, {"select 1", "create table notes_c (id int primary key)"}} {
+		fe := conn.PgConn().Frontend()
+		for _, sql := range order {
+			fe.Send(&pgproto3.Parse{Query: sql})
+			fe.Send(&pgproto3.Bind{})
+			fe.Send(&pgproto3.Execute{})
+		}
+		fe.Send(&pgproto3.Sync{})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		var refused *pgproto3.ErrorResponse
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e, ok := msg.(*pgproto3.ErrorResponse); ok && refused == nil {
+				refused = e
+			}
+			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				break
+			}
+		}
+		if refused == nil || refused.Code != "0A000" || !strings.Contains(refused.Message, "only statement of its batch") {
+			t.Fatalf("%q: got %+v, want the batch refused", order, refused)
+		}
+		q.mu.Lock()
+		n := len(q.queued)
+		q.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("%q: %d migrations queued from a refused batch", order, n)
+		}
 	}
 }
