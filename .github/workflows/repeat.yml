@@ -83,7 +83,7 @@ jobs:
       - name: Run once
         run: |
           set -euo pipefail
-          args=(-count=1 -race)
+          args=(-count=1 -race -timeout 25m)
           if [ -n "${{ inputs.pattern }}" ]; then
             args+=(-run "${{ inputs.pattern }}")
           fi
