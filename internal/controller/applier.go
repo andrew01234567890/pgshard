@@ -263,6 +263,10 @@ type Applier struct {
 	// a window in which the table it created cannot be used.
 	KeyCheck *ShardKeyCheck
 	Logger   *slog.Logger
+	// heldLogged remembers, per held migration, the workflow it was last
+	// logged as held by, so a copy that holds it for hours logs it once.
+	heldMu     sync.Mutex
+	heldLogged map[string]string
 	// DDLRole is the non-superuser login every client statement runs
 	// through (SET ROLE into the client role from there), so a function a
 	// statement evaluates can RESET ROLE only into a plain role. It
@@ -475,13 +479,18 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 		}
 	}
 	done := 0
+	stillHeld := map[string]bool{}
 	for _, m := range pending {
 		if wf, locked := held[m.Database]; locked && m.State == catalog.MigrationQueued {
-			a.logger().Info("holding a migration while a workflow has the database's DDL lock",
-				"migration", m.ID, "database", m.Database, "workflow", wf)
+			stillHeld[m.ID] = true
+			a.logHeld(m, wf)
 			continue
 		}
-		if err := a.drive(ctx, m); err != nil {
+		if err := a.drive(ctx, m); errors.Is(err, errMigrationHeld) {
+			stillHeld[m.ID] = true
+			a.logHeld(m, "")
+			continue
+		} else if err != nil {
 			if errors.Is(err, catalog.ErrNotLeaderTerm) {
 				a.logger().Info("stopping: leadership passed to another controller", "migration", m.ID)
 				return done, nil
@@ -490,7 +499,44 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 		}
 		done++
 	}
+	a.forgetReleased(stillHeld)
 	return done, nil
+}
+
+// errMigrationHeld is drive's report of a start the catalog refused because
+// a workflow holds the migration; it is not a failure and not a migration
+// finished.
+var errMigrationHeld = errors.New("applier: migration held")
+
+// logHeld logs a held migration the first time it is held, and again only
+// when a different workflow holds it: a copy holds every queued migration
+// for as long as it runs, and one line per migration per pass for hours
+// buries everything else. workflow is empty when the hold was found by the
+// statement that would have started it.
+func (a *Applier) logHeld(m catalog.DDLMigration, workflow string) {
+	a.heldMu.Lock()
+	defer a.heldMu.Unlock()
+	if prev, seen := a.heldLogged[m.ID]; seen && prev == workflow {
+		return
+	}
+	if a.heldLogged == nil {
+		a.heldLogged = map[string]string{}
+	}
+	a.heldLogged[m.ID] = workflow
+	a.logger().Info("holding a migration: it waits its turn in the operation queue, for a workflow that holds its database's DDL lock, or for the shard set or home shard it planned against to serve",
+		"migration", m.ID, "database", m.Database, "workflow", workflow)
+}
+
+// forgetReleased drops the log memory of migrations no longer held, so a
+// later hold of the same migration is logged again.
+func (a *Applier) forgetReleased(stillHeld map[string]bool) {
+	a.heldMu.Lock()
+	defer a.heldMu.Unlock()
+	for id := range a.heldLogged {
+		if !stillHeld[id] {
+			delete(a.heldLogged, id)
+		}
+	}
 }
 
 // drive runs one migration to a final state.
@@ -538,8 +584,7 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		}
 		m.State, m.Meta.ShardSet = catalog.MigrationRunning, serving
 		if err := a.Store.Save(ctx, m, a.term()); errors.Is(err, catalog.ErrMigrationHeld) {
-			logger.Info("holding a migration: it waits its turn in the operation queue, or for the shard set or home shard it planned against to serve")
-			return nil
+			return errMigrationHeld
 		} else if err != nil {
 			return err
 		}

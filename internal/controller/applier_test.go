@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1926,5 +1927,54 @@ func TestAPassKeepsTheTermItBeganUnderWhenLeadershipDrops(t *testing.T) {
 	}
 	if m := f.store.get(t, id); m.State != catalog.MigrationRunning {
 		t.Fatalf("the old pass wrote a final state: %s %q", m.State, m.Error)
+	}
+}
+
+// heldStartStore refuses every start as held, as the catalog does while a
+// reshard copies.
+type heldStartStore struct{ *memStore }
+
+func (s heldStartStore) Save(ctx context.Context, m catalog.DDLMigration, term int64) error {
+	if m.State == catalog.MigrationRunning {
+		return catalog.ErrMigrationHeld
+	}
+	return s.memStore.Save(ctx, m, term)
+}
+
+// TestAHeldMigrationIsLoggedOncePerHoldAndNotCountedDone (PGS-877): a copy
+// holds every queued migration for as long as it runs. Each pass logged
+// every held migration again, and a start the catalog refused as held was
+// counted as a migration finished.
+func TestAHeldMigrationIsLoggedOncePerHoldAndNotCountedDone(t *testing.T) {
+	f := newApplierFixture(t)
+	var logs bytes.Buffer
+	f.app.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	locked := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all", Database: "app"})
+	f.store.ddlLocks = map[string]string{"app": "11111111-1111-1111-1111-111111111111"}
+	holds := func() int { return strings.Count(logs.String(), "holding a migration") }
+
+	for range 3 {
+		if done, err := f.app.RunOnce(context.Background()); err != nil || done != 0 {
+			t.Fatalf("a pass over a held migration: done %d, %v", done, err)
+		}
+	}
+	if n := holds(); n != 1 {
+		t.Fatalf("a migration held for three passes was logged %d times, want once", n)
+	}
+
+	f.store.mu.Lock()
+	f.store.ddlLocks = nil
+	f.store.mu.Unlock()
+	f.app.Store = heldStartStore{f.store}
+	for range 3 {
+		if done, err := f.app.RunOnce(context.Background()); err != nil || done != 0 {
+			t.Fatalf("a pass whose start the catalog held: done %d, %v", done, err)
+		}
+	}
+	if n := holds(); n != 2 {
+		t.Fatalf("a hold by another workflow was logged %d times in all, want a second line for it and no more", n)
+	}
+	if m := f.store.get(t, locked); m.State != catalog.MigrationQueued {
+		t.Fatalf("the held migration is %s", m.State)
 	}
 }
