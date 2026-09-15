@@ -1469,7 +1469,14 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 				c.logger().Info("reshard cancel: target unreachable, skipping subscription cleanup", "workflow", wf.id, "target", t, "err", err)
 				continue
 			}
-			err = dropSubscriptions(ctx, conn, wf.gen, t)
+			// Targets rolled back to carry this workflow's claimed pause
+			// refuse ALTER SUBSCRIPTION too. Waiting for the sweep to lift
+			// that pause first would make the target writable while its
+			// replication is still attached (PGS-840).
+			err = writeThroughPause(ctx, conn)
+			if err == nil {
+				err = dropSubscriptions(ctx, conn, wf.gen, t)
+			}
 			_ = conn.Close(ctx)
 			if err != nil {
 				return err
