@@ -2,6 +2,7 @@ package pooler
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -79,19 +80,17 @@ func TestEveryWaiterHearsTheFlush(t *testing.T) {
 
 // The wait is woken by the flush, not by a clock. A poll would return up to
 // its own interval late, so what this measures is the delay between the
-// flush happening and the wait returning -- which a ten-millisecond poll
-// cannot keep under a millisecond, and a signal does not notice.
+// flush happening and the wait returning.
 //
-// Worst of several attempts, because a poll that happens to tick just after
-// the flush looks like a signal once.
+// The flushes are spread across a ten-millisecond cycle, starting just past
+// its first tick, so a 10ms poll is late by about 9, 8, ... 1ms: a median near
+// 5ms. The median rather than the worst, because one slow wake-up on a busy
+// runner is not a poll, and the whole cycle rather than one point, because a
+// poll that happens to tick just after the flush looks like a signal once.
 func TestTheWaitIsWokenByTheFlushRatherThanAClock(t *testing.T) {
-	var worst time.Duration
+	lateness := make([]time.Duration, 0, 9)
 	for i := range 9 {
 		r := &streamReader{wake: make(chan struct{}, 1)}
-		// Spread across a ten-millisecond cycle, starting just past its
-		// first tick. A poll that has just looked has to wait most of an
-		// interval before it looks again; sampling only inside the first
-		// interval would let one look like a signal.
 		delay := 11*time.Millisecond + time.Duration(i)*time.Millisecond
 		flushed := make(chan time.Time, 1)
 		go func() {
@@ -102,12 +101,11 @@ func TestTheWaitIsWokenByTheFlushRatherThanAClock(t *testing.T) {
 		if err := r.awaitSent(context.Background(), 100, 5*time.Second); err != nil {
 			t.Fatal(err)
 		}
-		if late := time.Since(<-flushed); late > worst {
-			worst = late
-		}
+		lateness = append(lateness, time.Since(<-flushed))
 	}
-	if worst > 5*time.Millisecond {
-		t.Fatalf("the wait returned %v after the flush at worst; a signal returns at once and a 10ms poll does not", worst)
+	slices.Sort(lateness)
+	if median := lateness[len(lateness)/2]; median > 2*time.Millisecond {
+		t.Fatalf("the wait returned %v after the flush at the median (all: %v); a signal returns at once and a 10ms poll does not", median, lateness)
 	}
 }
 
