@@ -264,6 +264,9 @@ func NewController(reg *prometheus.Registry) *Controller {
 type Operator struct {
 	Failovers      prometheus.Counter
 	RollingUpdates *prometheus.GaugeVec
+	// PrimaryConnectionSlotsFull is how long each group's primary has been
+	// running with no connection slot left for the control plane.
+	PrimaryConnectionSlotsFull *prometheus.GaugeVec
 }
 
 // NewOperator registers the operator metric set on reg.
@@ -273,7 +276,10 @@ func NewOperator(reg prometheus.Registerer) *Operator {
 			Name: "pgshard_operator_failovers_total", Help: "Primary failovers the operator drove."}),
 		RollingUpdates: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgshard_operator_rolling_update_pending", Help: "Pods still awaiting the current rolling update, by cluster."}, []string{"cluster"}),
+		PrimaryConnectionSlotsFull: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_operator_primary_connection_slots_full_seconds",
+			Help: "Seconds a group's primary has been running with no connection slot left for the control plane (SQLSTATE 53300); 0 when it has one."}, []string{"cluster", "group"}),
 	}
-	reg.MustRegister(m.Failovers, m.RollingUpdates)
+	reg.MustRegister(m.Failovers, m.RollingUpdates, m.PrimaryConnectionSlotsFull)
 	return m
 }

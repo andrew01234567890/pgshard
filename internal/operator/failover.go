@@ -394,6 +394,30 @@ func (r *ClusterReconciler) unhealthyFor(c *pgshardv1alpha1.PgShardCluster, g Gr
 	return r.now().Sub(since)
 }
 
+// primaryFullReportAfter is how long a primary stays out of connection slots
+// before the cluster status says so: briefly full is ordinary under load.
+const primaryFullReportAfter = time.Minute
+
+// fullFor is unhealthyFor for a primary that is running but full.
+func (r *ClusterReconciler) fullFor(c *pgshardv1alpha1.PgShardCluster, g Group, full bool) time.Duration {
+	key := groupTimerKey(c, g)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fullSince == nil {
+		r.fullSince = map[string]time.Time{}
+	}
+	if !full {
+		delete(r.fullSince, key)
+		return 0
+	}
+	since, ok := r.fullSince[key]
+	if !ok {
+		since = r.now()
+		r.fullSince[key] = since
+	}
+	return r.now().Sub(since)
+}
+
 // fenceLease takes the group Lease for the operator (or hands it to holder)
 // and publishes the epoch and primary as annotations. It refuses when the
 // Lease is renewed by anyone but the old primary or the operator.

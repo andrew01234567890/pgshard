@@ -16,6 +16,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/metrics"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // healthyCluster reconciles a cluster to Ready with fake agents: member 0
@@ -1027,5 +1031,91 @@ func TestTheFenceIsRenewedWhileQuiescing(t *testing.T) {
 	// count stops at those two.
 	if updates < 3 {
 		t.Fatalf("the fence Lease was written %d times during a failover whose quiesce ran to its deadline; it is not being renewed", updates)
+	}
+}
+
+// TestAPrimaryThatStaysFullSaysSo (PGS-832): a primary running with no
+// connection slot left for the control plane is not failed over (PGS-819),
+// so nothing else ends it -- and the cluster status said only
+// "ProbeFailed", as for a primary that is down. Past a minute it says what
+// it is, and the metric carries how long.
+func TestAPrimaryThatStaysFullSaysSo(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "stayfull")
+	r.Metrics = metrics.NewOperator(prometheus.NewRegistry())
+	now := time.Now()
+	r.Now = func() time.Time { return now }
+	promotes := len(fa.promotes)
+
+	// The shard primary's agent is refused a slot; the catalog's agent keeps
+	// one, and only the probe through its Service is refused -- which must
+	// count just the same.
+	full := &AgentStatusError{SQLState: "53300", Message: "sorry, too many clients already"}
+	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true}, full)
+	fp.mu.Lock()
+	fp.err = &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}
+	fp.mu.Unlock()
+
+	reconcile(t, r, c)
+	if cond := condition(t, "stayfull", pgshardv1alpha1.ConditionPrimaryHealthy); cond.Reason == "ConnectionSlotsExhausted" {
+		t.Fatalf("a primary full for a moment already reported as exhausted: %+v", cond)
+	}
+
+	now = now.Add(2 * time.Minute)
+	reconcile(t, r, c)
+	cond := condition(t, "stayfull", pgshardv1alpha1.ConditionPrimaryHealthy)
+	if cond.Status != metav1.ConditionFalse || cond.Reason != "ConnectionSlotsExhausted" ||
+		!strings.Contains(cond.Message, "shard-0 for") || !strings.Contains(cond.Message, "53300") {
+		t.Fatalf("a primary full for two minutes must say so, naming the group: %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "catalog for") {
+		t.Fatalf("a primary whose agent keeps a slot but whose probe is refused must be reported too: %+v", cond)
+	}
+	if got := fullSeconds(t, r, c); got < 120 {
+		t.Fatalf("the metric reports the shard primary full for %gs, want at least 120", got)
+	}
+	if len(fa.promotes) != promotes {
+		t.Fatalf("a full primary must not be failed over: %v", fa.promotes[promotes:])
+	}
+
+	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true}, nil)
+	fp.mu.Lock()
+	fp.err = nil
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	if cond := condition(t, "stayfull", pgshardv1alpha1.ConditionPrimaryHealthy); cond.Status != metav1.ConditionTrue || cond.Reason != "AcceptingSQL" {
+		t.Fatalf("once it has a slot again the condition must recover: %+v", cond)
+	}
+	if got := fullSeconds(t, r, c); got != 0 {
+		t.Fatalf("the metric still reports %gs full after the primary got a slot", got)
+	}
+}
+
+func fullSeconds(t *testing.T, r *ClusterReconciler, c *pgshardv1alpha1.PgShardCluster) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := r.Metrics.PrimaryConnectionSlotsFull.WithLabelValues(c.Namespace+"/"+c.Name, "shard-0").Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetGauge().GetValue()
+}
+
+// TestAFullPrimaryDoesNotHideADownOne: the condition's reason names the full
+// primary only when that is all that is wrong; a group down for another
+// reason keeps the generic reason, with the full group still in the message.
+func TestAFullPrimaryDoesNotHideADownOne(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "fullanddown")
+	now := time.Now()
+	r.Now = func() time.Time { return now }
+	full := &AgentStatusError{SQLState: "53300", Message: "sorry, too many clients already"}
+	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true}, full)
+	fp.mu.Lock()
+	fp.err = errors.New("dial tcp: connection refused")
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	now = now.Add(2 * time.Minute)
+	reconcile(t, r, c)
+	cond := condition(t, "fullanddown", pgshardv1alpha1.ConditionPrimaryHealthy)
+	if cond.Reason != "ProbeFailed" || !strings.Contains(cond.Message, "shard-0 for") {
+		t.Fatalf("with the catalog's probe failing for another reason, the reason must stay ProbeFailed and still name the full shard: %+v", cond)
 	}
 }

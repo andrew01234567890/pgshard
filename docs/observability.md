@@ -92,8 +92,12 @@ These gauges are polled from the catalog on the reconcile interval.
 
 controller-runtime's built-in `controller_runtime_reconcile_total` and
 `controller_runtime_reconcile_errors_total` cover reconcile counts/errors.
-pgshard adds `pgshard_operator_failovers_total` and
-`pgshard_operator_rolling_update_pending{cluster}` on the same registry.
+pgshard adds `pgshard_operator_failovers_total`,
+`pgshard_operator_rolling_update_pending{cluster}` and
+`pgshard_operator_primary_connection_slots_full_seconds{cluster,group}` (how
+long a group's primary has been running with no connection slot left for the
+control plane; alerted on as `PgshardPrimaryConnectionSlotsExhausted` past five
+minutes) on the same registry.
 
 ## Alerts
 
