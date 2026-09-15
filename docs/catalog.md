@@ -51,6 +51,7 @@ definition of the max over `roles`, `role_members`, `grants` and
 | `home_shard` | Shard that holds unsharded tables. |
 | `local_only` | Every object lives on `home_shard`, and DDL runs on the client's own connection instead of fanning out. See below. |
 | `ddl_transactions` | `atomic` (default) or `sequential`: how DDL inside a client transaction runs. See below. |
+| `local_schemas` | Schemas whose objects all live on `home_shard`, in a database that is not local. See below. |
 | `created_at`, `updated_at` | Timestamps. |
 
 #### Local databases
@@ -107,6 +108,37 @@ installs its trigger function and trigger in one transaction. In a
 ```sql
 UPDATE pgshard.databases SET ddl_transactions = 'sequential' WHERE name = 'app';
 ```
+
+#### Local schemas
+
+A migration tool that keeps its state in a schema of its own needs that
+schema's DDL to be ordinary PostgreSQL even in a database that also holds
+sharded tables: pgroll's `init` creates the `pgroll` schema, its tables,
+functions and event triggers in one transaction. Listing the schema makes it
+local:
+
+```sql
+UPDATE pgshard.databases SET local_schemas = '{pgroll}' WHERE name = 'app';
+```
+
+- A DDL statement whose objects are all named with a listed schema
+  (`CREATE TABLE pgroll.migrations`, `CREATE FUNCTION pgroll.f()`,
+  `COMMENT ON TABLE pgroll.migrations`, `DROP TABLE pgroll.a, pgroll.b`) runs
+  on the home shard on the client's own connection, as in a local database.
+  An object named without its schema is not taken to be in one, since the
+  router cannot know which schema of the search path an unqualified `CREATE`
+  lands in.
+- `CREATE EVENT TRIGGER` whose function is in a listed schema runs there too,
+  and so do `DROP EVENT TRIGGER` and `ALTER EVENT TRIGGER`, which name no
+  schema. PostgreSQL allows event triggers only to a superuser.
+- A table in a listed schema is unsharded whatever the database's default
+  placement, so reads and writes of it go to the home shard. A sharded or
+  reference table cannot be declared in a listed schema, and a schema holding
+  one cannot be listed.
+- A reshard or upgrade copies the schema to every new shard from the home
+  shard; every new shard but the one that becomes home drops the listed
+  schemas again (with their event triggers), and the home one gets their rows
+  with the other unsharded tables.
 
 ### `pgshard.tables`
 

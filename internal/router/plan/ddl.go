@@ -120,6 +120,12 @@ const (
 // fan-out and to say which shard is behind, and neither question exists
 // here. New shards get these objects the way they get every other physical
 // object, from the schema dump the copy takes.
+// homeOnly reports whether the statement has exactly one place to run: the
+// database is local, or the statement is about its local schemas.
+func (w *walker) homeOnly() bool {
+	return w.sess.localOnly() || w.inLocalSchemas
+}
+
 func (w *walker) homeStatement() error {
 	w.plan.Kind, w.plan.Shards, w.plan.Migration = Unsharded, []int32{w.sess.HomeShard}, nil
 	return nil
@@ -137,8 +143,8 @@ func (w *walker) migration(m Migration) error {
 			"retry once the reshard completes, or once a failed reshard's shard set is removed")
 	}
 	// Every DDL the planner recognises arrives here, so this is where a
-	// local database stops being a fan-out.
-	if w.sess.localOnly() {
+	// local database, or a local schema, stops being a fan-out.
+	if w.homeOnly() {
 		return w.homeStatement()
 	}
 	if m.Strategy == "" {
@@ -272,7 +278,7 @@ func (w *walker) alterTable(a *pgquerypb.AlterTableStmt) error {
 	// refusals that come with them -- exists to keep several shards in
 	// agreement about a table. A rewrite here takes the lock PostgreSQL
 	// takes and is over when PostgreSQL says it is.
-	if w.sess.localOnly() {
+	if w.homeOnly() {
 		return w.homeStatement()
 	}
 	switch a.GetObjtype() {
@@ -565,7 +571,7 @@ func (w *walker) rename(s *pgquerypb.RenameStmt) error {
 // either a refusal or a plain home-shard statement, depending on whether
 // the database has anywhere else the object could be.
 func (w *walker) unfannable(what string) error {
-	if w.sess.localOnly() {
+	if w.homeOnly() {
 		return w.homeStatement()
 	}
 	return refuseUnfannable(what)

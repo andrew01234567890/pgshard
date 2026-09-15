@@ -669,6 +669,8 @@ type dbPlan struct {
 	home      int32
 	sharded   []catalog.Table
 	reference []catalog.Table
+	// localSchemas live on the home shard alone.
+	localSchemas []string
 }
 
 func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
@@ -685,7 +687,7 @@ func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
 	}
 	var out []dbPlan
 	for _, d := range dbs {
-		p := dbPlan{name: d.Name, home: d.HomeShard}
+		p := dbPlan{name: d.Name, home: d.HomeShard, localSchemas: d.LocalSchemas}
 		for _, t := range byDatabase[d.Name] {
 			switch t.Placement {
 			case "sharded":
@@ -821,6 +823,11 @@ func (c *Copier) materializeSchemas(ctx context.Context, wf *copyWorkflow, srcSe
 				}
 				return fmt.Errorf("schema of %s on %s/%d: %w", db.name, wf.set, t, err)
 			}
+			if t != wf.ids[HomeTarget(wf.ranges)] {
+				if err := c.dropLocalSchemas(ctx, wf.set, t, db); err != nil {
+					return fmt.Errorf("local schemas of %s on %s/%d: %w", db.name, wf.set, t, err)
+				}
+			}
 			if wf.copy.Schema[db.name] == nil {
 				wf.copy.Schema[db.name] = map[string]bool{}
 			}
@@ -828,6 +835,29 @@ func (c *Copier) materializeSchemas(ctx context.Context, wf *copyWorkflow, srcSe
 			if err := c.save(ctx, wf, "", fmt.Sprintf("schema of %s materialized on %s/%d", db.name, wf.set, t)); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// dropLocalSchemas removes a database's local schemas from a target that
+// will not be its home shard. The schema copy is taken from the home shard,
+// so it carries them to every target, with the event triggers that call
+// their functions; left on another shard, such a trigger fires on every
+// migration the applier runs there, into state that lives only on the home
+// shard. Dropping the schema with CASCADE drops those triggers too.
+func (c *Copier) dropLocalSchemas(ctx context.Context, set string, t int32, db dbPlan) error {
+	if len(db.localSchemas) == 0 {
+		return nil
+	}
+	conn, err := c.Shards.DialDatabase(ctx, set, t, db.name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, schema := range db.localSchemas {
+		if _, err := conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+QuoteIdent(schema)+" CASCADE"); err != nil {
+			return err
 		}
 	}
 	return nil

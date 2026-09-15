@@ -144,8 +144,11 @@ record under `status.copy` is informational except for the schema flags.
    `pg_dump --schema-only --no-publications --no-subscriptions` against the
    database's home shard piped into `psql -v ON_ERROR_STOP=1`. Tables,
    indexes, constraints, sequences, types, views and grants come across;
-   roles already exist on every group. `status.copy.schema[db][target]`
-   records success; a database without the flag is dropped and recreated
+   roles already exist on every group. On every target but the one that
+   receives the home shard's unsharded tables, the database's
+   `local_schemas` are then dropped with `CASCADE`, taking the event
+   triggers that call their functions (see `docs/catalog.md`).
+   `status.copy.schema[db][target]` records success; a database without the flag is dropped and recreated
    before the next attempt so a half-applied dump never survives. With
    `--pg-bin` (or `PGSHARD_PG_BIN`) the controller runs the binaries
    itself instead of calling agents.

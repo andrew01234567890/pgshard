@@ -142,7 +142,8 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 		return refusalErr(notYet(scan.advisoryLock+"() is not available through the router: a session advisory lock outlives the statement, but the backend holding it does not stay with the session, so the lock would be left on a backend another session then uses",
 			"use the transaction-scoped form (pg_advisory_xact_lock and friends), which PostgreSQL releases at the end of the transaction the router has already pinned"))
 	}
-	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql, hiddenName: scan.hiddenName}
+	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql, hiddenName: scan.hiddenName,
+		inLocalSchemas: sess.inLocalSchemas(raw.GetStmt())}
 	// Before planning: a statement asking a sequence question pgshard
 	// cannot answer truthfully is refused whatever else it does, and the
 	// answer depends on the snapshot, so it cannot live in the memoised
@@ -810,6 +811,9 @@ type walker struct {
 	outer *pgquerypb.SelectStmt
 	// target is the relation an INSERT, UPDATE or DELETE writes.
 	target *rel
+	// inLocalSchemas says the statement's objects all live in the
+	// database's local schemas, so it runs on the home shard.
+	inLocalSchemas bool
 	// root is the statement being planned; raw wraps it and sql is its text.
 	root *pgquerypb.Node
 	raw  *pgquerypb.RawStmt
@@ -922,6 +926,9 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 			return nil, err
 		}
 		r.hidden, r.visible = pl.HiddenColumns, pl.VisibleColumns
+		return r, nil
+	}
+	if w.sess.localSchema(r.schema) {
 		return r, nil
 	}
 	if snap != nil {
@@ -1093,10 +1100,12 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		return nil
 	}
 	// A local database has one shard, so "the planner does not know how to
-	// spread this" is not a question about it: CREATE EVENT TRIGGER, CREATE
-	// AGGREGATE and the like all run there as they would on any PostgreSQL. The refusal below is about there being more than
-	// one place to run a statement, not about the statement.
-	if w.sess.localOnly() {
+	// spread this" is not a question about it: CREATE FUNCTION, CREATE
+	// TRIGGER, COMMENT, CREATE EVENT TRIGGER and CREATE AGGREGATE all run
+	// there as they would on any PostgreSQL. The refusal below is about
+	// there being more than one place to run a statement, not about the
+	// statement. The same holds for a statement about a local schema.
+	if w.homeOnly() {
 		return w.homeStatement()
 	}
 	// Fail closed: a statement shape the planner does not recognise could

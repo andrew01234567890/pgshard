@@ -323,6 +323,7 @@ func (s *Snapshot) fingerprint() uint64 {
 		str(d.Name)
 		str(d.DefaultPlacement)
 		num(int64(d.HomeShard))
+		strs(d.LocalSchemas)
 		num(d.DesiredGeneration)
 	}
 	for _, k := range slices.SortedFunc(maps.Keys(s.Tables), compareTableKeys) {

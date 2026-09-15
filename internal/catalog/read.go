@@ -36,7 +36,9 @@ type Database struct {
 	// its DDL runs on the client's connection instead of fanning out.
 	LocalOnly bool
 	// DDLTransactions is DDLTransactionsAtomic or DDLTransactionsSequential.
-	DDLTransactions   string
+	DDLTransactions string
+	// LocalSchemas are the schemas whose objects all live on HomeShard.
+	LocalSchemas      []string
 	DesiredGeneration int64
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
@@ -127,7 +129,7 @@ type ShardStatus struct {
 // ListDatabases returns every desired database ordered by name.
 func ListDatabases(ctx context.Context, q Querier) ([]Database, error) {
 	rows, err := q.Query(ctx, `
-		SELECT name, default_placement, home_shard, local_only, ddl_transactions, desired_generation, created_at, updated_at
+		SELECT name, default_placement, home_shard, local_only, ddl_transactions, local_schemas, desired_generation, created_at, updated_at
 		FROM pgshard.databases ORDER BY name`)
 	if err != nil {
 		return nil, err
