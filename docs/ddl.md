@@ -69,6 +69,17 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    it by schema and name). One statement cannot mix sharded and unsharded
    tables (`DROP TABLE a, b`, `GRANT … ON a, b`).
 
+   A pgroll migration is refused at its start (`ADD COLUMN
+   _pgroll_new_<column>`) when pgshard could not let it complete: on a
+   sharded table's shard key, since completing it drops and renames the
+   shard key, and on any column of a reference table, since its triggers
+   would write each shard's copy on its own. Refused at complete instead, it
+   would leave pgroll holding a migration it can neither finish nor run
+   another beside. pgroll's `rename_column` and `drop_column` send nothing
+   at start, so on a shard key they are refused only at complete, after
+   pgroll has dropped the previous version schema; the table is untouched
+   and pgroll's rollback succeeds.
+
    **Strategies.** Forms that would hold a strong lock for the length of a
    table scan or an index build are rewritten so no step takes a long
    `ACCESS EXCLUSIVE`/`SHARE ROW EXCLUSIVE` lock; the client sends the plain
