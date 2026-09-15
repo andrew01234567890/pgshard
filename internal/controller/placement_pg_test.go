@@ -1908,3 +1908,51 @@ func TestAMoveStopsBeforeItsSwapWhenTheTableGainedADependent(t *testing.T) {
 	// stop that left the fence up would leave the table refusing writes.
 	mustExec(t, home, `INSERT INTO ledger VALUES (21, 'after-the-stopped-move')`)
 }
+
+// TestAFailedPlacementCleansUpItsSourceThroughAWritePause (PGS-858): a
+// placement's release of its fence and cleanup on its source -- dropping the
+// fence triggers and its publication, and putting back the replica identity
+// it widened -- ran without writing through a write pause. A barrier's pause, or a switch's on the same shards, refused
+// both with 25006; the fail path records the residue and ends anyway, so
+// REPLICA IDENTITY FULL stayed on the user's table for good.
+func TestAFailedPlacementCleansUpItsSourceThroughAWritePause(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+	mustExec(t, admin, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, admin, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	wf := &placementWorkflow{id: "66666666-6666-6666-6666-666666666666", stage: StageFailed,
+		spec:  placementSpec{Database: "postgres", TableName: "ledger"},
+		st:    placementState{SourceSet: "default", ReplicaIdentityFull: []int32{0}},
+		from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+		rt:    &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0, ids: []int32{0}},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	mustExec(t, admin, `CREATE PUBLICATION `+wf.publicationName()+` FOR TABLE ledger`)
+	if err := fenceTables(ctx, pgxShardConn{admin}, "public", wf.shape.qualified("ledger")); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, admin, `SELECT pg_reload_conf()`)
+	waitReadOnly(t, dsn, true)
+
+	// In the order the fail path runs them.
+	p := &Placer{Shards: realShards{dsn}}
+	if err := p.releaseShardFence(ctx, wf); err != nil {
+		t.Fatalf("releasing the fence on a paused source: %v", err)
+	}
+	if err := p.dropReplication(ctx, wf); err != nil {
+		t.Fatalf("cleanup on a paused source: %v", err)
+	}
+	check := connect(t, dsn)
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.ledger'::regclass AND NOT tgisinternal`); n != 0 {
+		t.Fatalf("%d fence trigger(s) left on the table", n)
+	}
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_publication WHERE pubname = $1`, wf.publicationName()); n != 0 {
+		t.Fatalf("the placement's publication survived its cleanup")
+	}
+	if ident := queryOne[string](t, check, `SELECT relreplident::text FROM pg_class WHERE oid = 'public.ledger'::regclass`); ident != "d" {
+		t.Fatalf("replica identity is %q after the cleanup, want the default back", ident)
+	}
+	waitReadOnly(t, dsn, true)
+}

@@ -2247,7 +2247,12 @@ func (p *Placer) releaseShardFence(ctx context.Context, wf *placementWorkflow) e
 			failed = errors.Join(failed, err)
 			continue
 		}
-		err = unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
+		// A barrier's or a switch's pause refuses DROP TRIGGER too, and the
+		// cleanup that follows a release is never reached while it does.
+		err = writeThroughPause(ctx, conn)
+		if err == nil {
+			err = unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
+		}
 		_ = conn.Close(ctx)
 		if err != nil {
 			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err))
@@ -2870,6 +2875,13 @@ func (p *Placer) dropReplication(ctx context.Context, wf *placementWorkflow) err
 			return err
 		}
 		err = func() error {
+			// A source under a barrier's pause, or a switch's, refuses DROP
+			// PUBLICATION and ALTER TABLE with 25006, and the fail path does
+			// not come back: the replica identity would stay widened for
+			// good. This session writes through; the shard stays paused.
+			if err := writeThroughPause(ctx, conn); err != nil {
+				return err
+			}
 			if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, wf.slotName(s)); err != nil {
 				return err
 			}
