@@ -30,7 +30,24 @@ import (
 type Option func(*options)
 
 type options struct {
-	allow func(pki.Identity) bool
+	allow           func(pki.Identity) bool
+	acceptPlaintext bool
+}
+
+// AcceptPlaintext makes a TLS listener also serve plaintext connections on
+// the same port, for the length of a move from plaintext to mutual TLS.
+//
+// A cluster cannot switch every caller and every listener at once: members
+// roll one at a time and routers roll as a Deployment, so for a while some
+// callers still dial plaintext while others dial TLS. A listener that
+// accepts both is what lets that mixed cluster keep serving. A connection
+// that opens with a TLS record gets the full handshake -- client
+// certificate required and verified, Authorize applied -- and one that does
+// not is served as --insecure-dev serves it. It is a transition setting:
+// until it is removed the listener is no more protected than a plaintext
+// one.
+func AcceptPlaintext() Option {
+	return func(o *options) { o.acceptPlaintext = true }
 }
 
 // Authorize restricts a listener to peers whose certificate carries a
@@ -83,9 +100,13 @@ func verifyIdentity(allow func(pki.Identity) bool) func([][]byte, [][]*x509.Cert
 // plaintext. A server that serves unauthenticated traffic because a flag
 // was missing is the failure this shape prevents.
 func Listener(certFile, keyFile, caFile string, insecureDev bool, opts ...Option) (credentials.TransportCredentials, error) {
+	o := apply(opts)
 	if insecureDev {
 		if certFile != "" || keyFile != "" || caFile != "" {
 			return nil, errors.New("--insecure-dev cannot be combined with TLS flags")
+		}
+		if o.acceptPlaintext {
+			return nil, errors.New("accepting plaintext alongside TLS needs TLS material; --insecure-dev serves plaintext only")
 		}
 		return insecure.NewCredentials(), nil
 	}
@@ -96,7 +117,7 @@ func Listener(certFile, keyFile, caFile string, insecureDev bool, opts ...Option
 	if err != nil {
 		return nil, err
 	}
-	verify := verifyIdentity(apply(opts).allow)
+	verify := verifyIdentity(o.allow)
 	config := func(cert tls.Certificate, pool *x509.CertPool) *tls.Config {
 		return &tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
 			ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13,
@@ -105,6 +126,9 @@ func Listener(certFile, keyFile, caFile string, insecureDev bool, opts ...Option
 	cfg := config(m.current())
 	cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		return config(m.current()), nil
+	}
+	if o.acceptPlaintext {
+		return eitherListener{tls: credentials.NewTLS(cfg)}, nil
 	}
 	return credentials.NewTLS(cfg), nil
 }

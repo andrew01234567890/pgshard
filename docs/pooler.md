@@ -20,6 +20,9 @@
   `PermissionDenied`. mTLS is not the only thing separating roles.
   Consequently the gRPC listener refuses to start without
   `--tls-cert/--tls-key/--tls-ca` unless `--insecure-dev` is passed.
+  `--tls-accept-plaintext` also serves plaintext callers on the same port
+  for the length of a move to mutual TLS; a TLS caller still gets the full
+  check (see [router.md](router.md#running)).
 - **Backend authentication.** A backend connection is accepted only after
   a complete SCRAM-SHA-256 exchange whose server signature verified against
   the forwarded ServerKey; an `AuthenticationOk` without it (trust or

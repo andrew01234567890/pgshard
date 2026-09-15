@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -73,5 +74,33 @@ func TestNoInterceptorsWithoutIdentityAuthorization(t *testing.T) {
 	}
 	if u, s := MethodInterceptors("", true); u != nil || s != nil {
 		t.Error("interceptors installed for a listener with no role")
+	}
+}
+
+// TestAListenerAcceptingPlaintextPassesAPlaintextCallerThrough (PGS-236): a
+// caller still dialling plaintext mid-transition has no identity to judge,
+// and refusing it would refuse every such caller. A TLS caller without an
+// identity is still refused, and so is a plaintext one on a listener that
+// does not accept plaintext.
+func TestAListenerAcceptingPlaintextPassesAPlaintextCallerThrough(t *testing.T) {
+	_, plain, err := insecure.NewCredentials().ServerHandshake(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintextCtx := peer.NewContext(context.Background(), &peer.Peer{AuthInfo: plain})
+	tlsNoIdentity := peer.NewContext(context.Background(), &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+	info := &grpc.UnaryServerInfo{FullMethod: "/pgshard.v1.Controller/CancelWorkflow"}
+	handler := func(context.Context, any) (any, error) { return "ok", nil }
+
+	accepting, _ := MethodInterceptors(pki.RoleController, true, AcceptPlaintext())
+	if _, err := accepting(plaintextCtx, nil, info, handler); err != nil {
+		t.Fatalf("a plaintext caller on a listener accepting plaintext: %v", err)
+	}
+	if _, err := accepting(tlsNoIdentity, nil, info, handler); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a TLS caller with no identity on a listener accepting plaintext: %v", err)
+	}
+	requiring, _ := MethodInterceptors(pki.RoleController, true)
+	if _, err := requiring(plaintextCtx, nil, info, handler); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a plaintext caller on a listener requiring TLS: %v", err)
 	}
 }

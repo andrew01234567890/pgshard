@@ -55,6 +55,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	caFile := fs.String("tls-ca", "", "CA bundle that client (router) certificates must chain to")
 	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
+	acceptPlaintext := fs.Bool("tls-accept-plaintext", false, "also serve plaintext callers on this listener while the cluster moves to mutual TLS; a TLS caller still gets the full check (needs the TLS flags)")
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN; when set, generation and epoch come from the catalog")
 	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn")
 	shardSet := fs.String("shard-set", "", "shard set of this shard (with --catalog-dsn)")
@@ -82,7 +83,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "pgshard-pooler run: unexpected argument %q\n", fs.Arg(0))
 		return cli.ExitUsage
 	}
-	creds, err := grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev, authorize(*authorizeCallers, pki.RolePooler)...)
+	creds, err := grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev, listenerOptions(*authorizeCallers, *acceptPlaintext, pki.RolePooler)...)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
 		return cli.ExitUsage
@@ -228,6 +229,9 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if *insecureDev {
 		mode = "INSECURE plaintext"
 	}
+	if *acceptPlaintext {
+		mode = "mTLS, and plaintext while moving to mTLS"
+	}
 	fmt.Fprintf(stdout, "pgshard-pooler run: listening on %s (%s), postgres at %s\n", l.Addr(), mode, addr)
 	errc := make(chan error, 1)
 	go func() { errc <- g.Serve(l) }()
@@ -313,13 +317,16 @@ func withPasswordFile(dsn, path, what string) (string, error) {
 // nothing at all, so a cluster whose certificates were supplied rather
 // than issued keeps working: those certificates carry no pgshard identity,
 // and a fail-closed check would refuse every caller.
-func authorize(on bool, role string) []grpccreds.Option {
-	if !on {
-		return nil
+func listenerOptions(authorizeCallers, acceptPlaintext bool, role string) []grpccreds.Option {
+	var opts []grpccreds.Option
+	if acceptPlaintext {
+		opts = append(opts, grpccreds.AcceptPlaintext())
 	}
-	allow, ok := pki.AllowedCallers(role)
-	if !ok {
-		return nil
+	if !authorizeCallers {
+		return opts
 	}
-	return []grpccreds.Option{grpccreds.Authorize(allow)}
+	if allow, ok := pki.AllowedCallers(role); ok {
+		opts = append(opts, grpccreds.Authorize(allow))
+	}
+	return opts
 }

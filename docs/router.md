@@ -982,6 +982,19 @@ certificates it issues -- `<cluster>.<namespace>.svc` and the router Service
 host -- because issued certificates name the cluster and its Services, not
 each member.
 
+Moving a running cluster from plaintext to mutual TLS cannot switch every
+process at once, so two flags cover the mixed period (PGS-236).
+`--tls-dial-plaintext` keeps the router dialling poolers, peers and the
+controller in plaintext while it already holds the `--pooler-tls-*` material,
+for as long as the servers it reaches may not accept TLS yet.
+`--tls-accept-plaintext` makes its peer-cancel and change-stream listeners
+serve plaintext callers alongside TLS ones on the same port: a connection that
+opens with a TLS record gets the full handshake, identity check included, and
+any other connection is served as `--insecure-dev` serves it. The pooler,
+the controller (`--tls-accept-plaintext`) and the agent (`grpcTLS.acceptPlaintext`)
+accept the same setting. Until it is removed a listener is no better protected
+than a plaintext one.
+
 `--tls-cert` **requires** TLS: once a certificate is configured, a client that
 never sends `SSLRequest` is refused with `28000` rather than served in the
 clear, so a misconfigured or downgraded client cannot send its SCRAM exchange

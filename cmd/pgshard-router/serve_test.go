@@ -28,6 +28,8 @@ func TestServeUsageErrors(t *testing.T) {
 		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--peer-service", "h:1"},
 		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--peer-cancel-listen", "127.0.0.1:0", "--peer", "zero=h:1"},
 		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--instance-id", "4294967296"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--tls-dial-plaintext"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--tls-accept-plaintext"},
 	}
 	for _, args := range cases {
 		var out, errb bytes.Buffer

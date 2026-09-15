@@ -87,6 +87,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	peerServerName := fs.String("peer-tls-server-name", "", "name a peer router's certificate must carry, instead of the address dialled; peers are dialled by IP")
 	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener, and servers this process dials that are not the role it means to reach; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "talk plaintext gRPC to poolers (development only)")
+	acceptPlaintext := fs.Bool("tls-accept-plaintext", false, "also serve plaintext callers on the peer-cancel and change-stream listeners while the cluster moves to mutual TLS; a TLS caller still gets the full check (needs the --pooler-tls-* flags)")
+	dialPlaintext := fs.Bool("tls-dial-plaintext", false, "dial poolers, peer routers and the controller in plaintext although the --pooler-tls-* flags are set, while the servers they reach may not accept TLS yet")
 	rolesTTL := fs.Duration("roles-ttl", 5*time.Second, "how long catalog role verifiers are cached")
 	snapshotWait := fs.Duration("snapshot-wait", 30*time.Second, "time to wait for the first catalog snapshot")
 	startupTimeout := fs.Duration("startup-timeout", 10*time.Second, "time a connection may spend before authentication completes")
@@ -142,21 +144,25 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, "pgshard-router serve: --tls-cert and --tls-key must be given together")
 		return cli.ExitUsage
 	}
+	if *insecureDev && (*acceptPlaintext || *dialPlaintext) {
+		fmt.Fprintln(stderr, "pgshard-router serve: --tls-accept-plaintext and --tls-dial-plaintext are for a move to mutual TLS and need the --pooler-tls-* flags; --insecure-dev is plaintext already")
+		return cli.ExitUsage
+	}
 	if *catalogDSN == "" {
 		fmt.Fprintln(stderr, "pgshard-router serve: --catalog-dsn is required")
 		return cli.ExitUsage
 	}
-	creds, err := dialCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *poolerServerName, *authorizeCallers, pki.RolePooler)
+	creds, err := dialCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *dialPlaintext, *poolerServerName, *authorizeCallers, pki.RolePooler)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 		return cli.ExitUsage
 	}
-	peerCreds, err := dialCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *peerServerName, *authorizeCallers, pki.RoleRouter)
+	peerCreds, err := dialCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *dialPlaintext, *peerServerName, *authorizeCallers, pki.RoleRouter)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 		return cli.ExitUsage
 	}
-	controllerCreds, err := dialCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, "", *authorizeCallers, pki.RoleController)
+	controllerCreds, err := dialCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *dialPlaintext, "", *authorizeCallers, pki.RoleController)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 		return cli.ExitUsage
@@ -302,7 +308,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	// traffic to a router that cannot say it is unwell.
 	errc := make(chan error, 4)
 	if *peerListen != "" {
-		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *authorizeCallers, pki.RoleRouter)
+		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *acceptPlaintext, *authorizeCallers, pki.RoleRouter)
 		if err != nil {
 			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 			return cli.ExitUsage
@@ -318,7 +324,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		}})
 		serveAux(ctx, errc, "peer cancels", func() error { return g.Serve(pl) })
 		defer g.Stop()
-		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)\n", pl.Addr(), srv.InstanceID())
+		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)%s\n", pl.Addr(), srv.InstanceID(), alsoPlaintext(*acceptPlaintext))
 	}
 	if *vstreamListen != "" {
 		// The change stream's callers are the cluster's consumers, which
@@ -327,7 +333,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		// workload certificate -- the router's own included -- being a
 		// change-stream credential, and stops a consumer's being anything
 		// else: the consumer role is in no other listener's rule.
-		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *authorizeCallers, pki.ListenerVStream)
+		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *acceptPlaintext, *authorizeCallers, pki.ListenerVStream)
 		if err != nil {
 			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 			return cli.ExitUsage
@@ -357,7 +363,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		pgshardv1.RegisterVStreamServer(g, vs)
 		serveAux(ctx, errc, "vstream", func() error { return g.Serve(vl) })
 		defer g.Stop()
-		fmt.Fprintf(stdout, "pgshard-router serve: vstream on %s\n", vl.Addr())
+		fmt.Fprintf(stdout, "pgshard-router serve: vstream on %s%s\n", vl.Addr(), alsoPlaintext(*acceptPlaintext))
 	}
 	if *pprofListen != "" {
 		pa, err := pprofserve.Serve(ctx, *pprofListen)
@@ -389,6 +395,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintf(stdout, "pgshard-router serve: health on %s\n", hl.Addr())
 	}
 	mode := "pooler mTLS"
+	if *dialPlaintext {
+		mode = "plaintext to poolers while moving to mTLS"
+	}
 	if *insecureDev {
 		mode = "INSECURE plaintext to poolers"
 	}
@@ -492,14 +501,24 @@ func waitSnapshot(ctx context.Context, w *snapshot.Watcher, wait time.Duration) 
 // roles, when non-empty, is the listener's role, and its callers are
 // authorised by identity; the change-stream listener passes none, because
 // its callers are consumers outside the cluster and hold no identity.
-func peerCredentials(certFile, keyFile, caFile string, insecureDev, authorizeCallers bool, role string) (credentials.TransportCredentials, error) {
+func peerCredentials(certFile, keyFile, caFile string, insecureDev, acceptPlaintext, authorizeCallers bool, role string) (credentials.TransportCredentials, error) {
 	var opts []grpccreds.Option
+	if acceptPlaintext {
+		opts = append(opts, grpccreds.AcceptPlaintext())
+	}
 	if authorizeCallers && role != "" {
 		if allow, ok := pki.AllowedCallers(role); ok {
 			opts = append(opts, grpccreds.Authorize(allow))
 		}
 	}
 	return grpccreds.Listener(certFile, keyFile, caFile, insecureDev, opts...)
+}
+
+func alsoPlaintext(accept bool) string {
+	if accept {
+		return " (mTLS, and plaintext while moving to mTLS)"
+	}
+	return ""
 }
 
 // dialCredentials are what the router dials one internal role with.
@@ -511,7 +530,11 @@ func peerCredentials(certFile, keyFile, caFile string, insecureDev, authorizeCal
 // peer (PGS-860). A role-wide name is then only as specific as the role, so
 // with authorizeCallers -- certificates that carry identities -- the server
 // must also be the role this caller means to reach.
-func dialCredentials(certFile, keyFile, caFile string, insecureDev bool, serverName string, authorizeCallers bool, role string) (credentials.TransportCredentials, error) {
+//
+// dialPlaintext keeps the router dialling plaintext while it already holds
+// the material its own listeners serve TLS with: the first step of a move
+// to mutual TLS, before every server it reaches accepts TLS.
+func dialCredentials(certFile, keyFile, caFile string, insecureDev, dialPlaintext bool, serverName string, authorizeCallers bool, role string) (credentials.TransportCredentials, error) {
 	if insecureDev {
 		if certFile != "" || keyFile != "" || caFile != "" {
 			return nil, errors.New("--insecure-dev cannot be combined with --pooler-tls-* flags")
@@ -520,6 +543,9 @@ func dialCredentials(certFile, keyFile, caFile string, insecureDev bool, serverN
 	}
 	if certFile == "" || keyFile == "" || caFile == "" {
 		return nil, errors.New("--pooler-tls-cert, --pooler-tls-key and --pooler-tls-ca are required (or --insecure-dev)")
+	}
+	if dialPlaintext {
+		return insecure.NewCredentials(), nil
 	}
 	var opts []grpccreds.Option
 	if authorizeCallers {

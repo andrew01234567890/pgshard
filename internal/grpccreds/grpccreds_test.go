@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"os"
@@ -495,5 +496,116 @@ func TestEmptyFilesAreRefusedAtStart(t *testing.T) {
 	}
 	if _, err := grpccreds.Dialer(certFile, keyFile, caFile, "localhost", false); err == nil {
 		t.Error("a dialer started from empty files")
+	}
+}
+
+// TestAListenerAcceptingPlaintextServesBothAndStillAuthorisesTLS (PGS-236):
+// while a cluster moves from plaintext to mutual TLS, a listener serves
+// callers still dialling plaintext and callers already dialling TLS on one
+// port. A TLS caller gets the full check: a certificate is required, it
+// must chain to the CA, and its identity must be one the listener serves.
+func TestAListenerAcceptingPlaintextServesBothAndStillAuthorisesTLS(t *testing.T) {
+	ca, err := pki.NewCA("demo", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	caFile := writeFile(t, dir, "ca.crt", ca.CertPEM)
+	issue := func(name, role string, req pki.Request) (string, string) {
+		req.Identity = pki.Identity{Namespace: "ns", Cluster: "demo", Role: role}
+		m, err := ca.Issue(req, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return writeFile(t, dir, name+".crt", m.CertPEM), writeFile(t, dir, name+".key", m.KeyPEM)
+	}
+	srvCert, srvKey := issue("pooler", pki.RolePooler, pki.Request{DNSNames: []string{"pooler.ns.svc"}, Server: true})
+	routerCert, routerKey := issue("router", pki.RoleRouter, pki.Request{Client: true})
+	agentCert, agentKey := issue("agent", pki.RoleAgent, pki.Request{Client: true})
+	onlyRouters := grpccreds.Authorize(func(id pki.Identity) bool { return id.Role == pki.RoleRouter })
+
+	either, err := grpccreds.Listener(srvCert, srvKey, caFile, false, onlyRouters, grpccreds.AcceptPlaintext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsOnly, err := grpccreds.Listener(srvCert, srvKey, caFile, false, onlyRouters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eitherAddr, tlsOnlyAddr := serve(t, either), serve(t, tlsOnly)
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(ca.CertPEM)
+	dialAs := func(cert, key string) credentials.TransportCredentials {
+		d, err := grpccreds.Dialer(cert, key, caFile, "pooler.ns.svc", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	reached := func(err error) bool { return status.Code(err) == codes.Unimplemented }
+
+	for _, tc := range []struct {
+		name  string
+		addr  string
+		creds credentials.TransportCredentials
+		want  bool
+	}{
+		{"a plaintext caller reaches a listener accepting plaintext", eitherAddr, insecure.NewCredentials(), true},
+		{"a router dialling TLS reaches it", eitherAddr, dialAs(routerCert, routerKey), true},
+		{"an agent dialling TLS is still refused its identity", eitherAddr, dialAs(agentCert, agentKey), false},
+		{"a TLS caller with no certificate is still refused", eitherAddr, credentials.NewTLS(&tls.Config{RootCAs: roots, ServerName: "pooler.ns.svc", MinVersion: tls.VersionTLS13}), false},
+		{"a plaintext caller does not reach a listener that requires TLS", tlsOnlyAddr, insecure.NewCredentials(), false},
+		{"a router dialling TLS reaches a listener that requires it", tlsOnlyAddr, dialAs(routerCert, routerKey), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := call(t, tc.addr, tc.creds); reached(err) != tc.want {
+				t.Fatalf("reached the service = %v, want %v: %v", reached(err), tc.want, err)
+			}
+		})
+	}
+
+	if _, err := grpccreds.Listener("", "", "", true, grpccreds.AcceptPlaintext()); err == nil {
+		t.Error("accepting plaintext alongside TLS without TLS material must be refused")
+	}
+}
+
+// TestAListenerAcceptingPlaintextDropsAConnectionThatSendsNothing: the
+// listener reads before it knows which handshake to run, and that read must
+// be bounded like a handshake, or a client that connects and waits holds a
+// server goroutine for good.
+func TestAListenerAcceptingPlaintextDropsAConnectionThatSendsNothing(t *testing.T) {
+	dir := t.TempDir()
+	ca := newTestCA(t)
+	srvCert, srvKey := ca.issue(t, "server", 2)
+	creds, err := grpccreds.Listener(writeFile(t, dir, "tls.crt", srvCert), writeFile(t, dir, "tls.key", srvKey),
+		writeFile(t, dir, "ca.crt", ca.pem), false, grpccreds.AcceptPlaintext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := grpc.NewServer(grpc.Creds(creds), grpc.ConnectionTimeout(300*time.Millisecond))
+	pgshardv1.RegisterAgentServer(g, &pgshardv1.UnimplementedAgentServer{})
+	go func() { _ = g.Serve(ln) }()
+	t.Cleanup(g.Stop)
+
+	silent, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silent.Close() }()
+	if err := silent.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var ne net.Error
+	if _, err := silent.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the server sent something to a client that never spoke")
+	} else if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatal("the server still held a connection that sent nothing past its connection timeout")
+	}
+	if err := call(t, ln.Addr().String(), insecure.NewCredentials()); status.Code(err) != codes.Unimplemented {
+		t.Fatalf("the listener stopped serving after dropping a silent connection: %v", err)
 	}
 }

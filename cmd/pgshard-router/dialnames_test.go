@@ -67,7 +67,7 @@ func TestTheRouterReachesAnIssuedPoolerByTheNameItsCertificateCarries(t *testing
 	routerCert, routerKey := issue(pki.RoleRouter, "demo-router.default.svc")
 	call := func(addr, serverName string) error {
 		t.Helper()
-		creds, err := dialCredentials(routerCert, routerKey, caFile, false, serverName, true, pki.RolePooler)
+		creds, err := dialCredentials(routerCert, routerKey, caFile, false, false, serverName, true, pki.RolePooler)
 		if err != nil {
 			t.Fatal(err)
 		}

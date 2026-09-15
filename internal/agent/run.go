@@ -17,9 +17,7 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
-	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
-	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 // Run bootstraps and supervises the instance until ctx ends or a fatal
@@ -213,11 +211,9 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	//
 	// Until it is configured the bearer token travels in clear, which is
 	// what PGS-235 and PGS-421 are about.
-	var authz []grpccreds.Option
-	if cfg.GRPCTLS.AuthorizeCallers {
-		if allow, ok := pki.AllowedCallers(pki.RoleAgent); ok {
-			authz = append(authz, grpccreds.Authorize(allow))
-		}
+	if cfg.GRPCTLS.AcceptPlaintext {
+		log.Warn("agent gRPC also accepts PLAINTEXT callers while the cluster moves to mutual TLS",
+			"until", "the operator renders the member without acceptPlaintext")
 	}
 	plaintext := cfg.GRPCTLS.Plaintext()
 	if plaintext {
@@ -231,7 +227,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		log.Warn("agent gRPC is PLAINTEXT: Promote, Demote, SetWriteFence, Reclone and DropSlot are authorised by a bearer token sent in clear",
 			"enable", "spec.internalTLS.agentMTLS", "reachable_by", "every peer spec.networkPolicy.clients admits to the agent port")
 	}
-	grpcCreds, err := grpccreds.Listener(cfg.GRPCTLS.CertFile, cfg.GRPCTLS.KeyFile, cfg.GRPCTLS.CAFile, plaintext, authz...)
+	grpcCreds, err := cfg.GRPCTLS.listenerCredentials()
 	if err != nil {
 		return fmt.Errorf("agent gRPC credentials: %w", err)
 	}
