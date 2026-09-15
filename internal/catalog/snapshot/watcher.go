@@ -34,8 +34,10 @@ type Watcher struct {
 	subs    map[chan Change]struct{}
 	kick    chan struct{}
 	// refresh carries Refresh's requests to Run, which owns the connection
-	// reloads use.
+	// reloads use; stopped is closed when Run returns, so a request made
+	// after that fails at once rather than at its caller's deadline.
 	refresh chan chan error
+	stopped chan struct{}
 	logf    func(format string, args ...any)
 
 	// servingKick records that the pending kick was raised by a serving
@@ -122,6 +124,7 @@ func NewWatcher(dsn string, opts Options) *Watcher {
 		subs:           map[chan Change]struct{}{},
 		kick:           make(chan struct{}, 1),
 		refresh:        make(chan chan error),
+		stopped:        make(chan struct{}),
 		logf:           opts.Logf,
 		desired:        budget{tokens: notifyBurst},
 		serving:        budget{tokens: notifyBurst},
@@ -167,6 +170,8 @@ func (w *Watcher) Refresh(ctx context.Context) error {
 	reply := make(chan error, 1)
 	select {
 	case w.refresh <- reply:
+	case <-w.stopped:
+		return errWatcherStopped
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -177,6 +182,8 @@ func (w *Watcher) Refresh(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+var errWatcherStopped = errors.New("the catalog watcher has stopped")
 
 // Subscribe returns a channel that receives generation changes. Slow
 // receivers miss intermediate changes but always get the latest one.
@@ -195,6 +202,7 @@ func (w *Watcher) Subscribe() (<-chan Change, func()) {
 // Run blocks until ctx is done. It returns after the first snapshot fails to
 // load so callers can fail fast at startup.
 func (w *Watcher) Run(ctx context.Context) error {
+	defer close(w.stopped)
 	defer w.closeConn(ctx)
 	// The first reload used to be fatal. A router or pooler that started
 	// before the catalog accepted connections lost its watcher there and then

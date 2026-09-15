@@ -1,6 +1,8 @@
 package snapshot
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -75,5 +77,23 @@ func TestServingNotificationsHaveTheirOwnBudget(t *testing.T) {
 	// settles to the refill like any other.
 	if d := w.notifyDelay(true); d < notifyRefill/2 {
 		t.Fatalf("serving notifications past the burst waited %s, want about %s", d, notifyRefill)
+	}
+}
+
+// TestRefreshOnAStoppedWatcherFailsAtOnce: after Run returns nothing will
+// ever serve a refresh, and a router answering a migration then waited out
+// its whole bound on every DDL before saying so.
+func TestRefreshOnAStoppedWatcherFailsAtOnce(t *testing.T) {
+	w := NewWatcher("postgres://nobody@127.0.0.1:1/x?connect_timeout=1", Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = w.Run(ctx); close(done) }()
+	cancel()
+	<-done
+	start := time.Now()
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	if err := w.Refresh(rctx); !errors.Is(err, errWatcherStopped) || time.Since(start) > time.Second {
+		t.Fatalf("Refresh on a stopped watcher: %v after %s", err, time.Since(start))
 	}
 }

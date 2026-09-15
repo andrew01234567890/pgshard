@@ -219,7 +219,9 @@ func (e *Executor) refreshAfterMigration(ctx context.Context) error {
 	if e.r.cfg.RefreshSnapshot == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, migrationRefreshTimeout)
+	// Not cut short by the client: the migration is already applied, and the
+	// bound is short.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrationRefreshTimeout)
 	defer cancel()
 	return e.r.cfg.RefreshSnapshot(ctx)
 }
