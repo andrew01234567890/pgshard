@@ -543,7 +543,7 @@ func saveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, t
 // migration, so a pass that read no hold cannot start one after it is taken.
 const MigrationHeldPredicate = `(EXISTS (SELECT 1 FROM pgshard.workflow_locks l WHERE l.kind = 'ddl' AND l.key = pgshard.migrations.database)
 	OR EXISTS (SELECT 1 FROM pgshard.workflows w WHERE w.kind IN ('reshard', 'upgrade') AND w.state IN ('running', 'paused')
-		AND w.status->>'stage' IN ('copying', 'catch_up_done', 'awaiting_switch_writes', 'switching')))`
+		AND w.status->>'stage' IN ('copying', 'catch_up_done', 'awaiting_switch_writes', 'switching', 'rolling_back')))`
 
 // ErrMigrationHeld reports a queued migration that was not started because
 // it is held (see MigrationHeldPredicate). It stays queued.

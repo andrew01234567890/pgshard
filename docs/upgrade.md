@@ -124,6 +124,13 @@ The workflow ends `cancelled` / `rolled_back`; the new-major groups are
 retired for the operator to delete. After retirement the old groups are
 gone and rollback is a restore, not a flip.
 
+Logical replication carries no DDL, so a migration applied after the switch
+reached only the new set. A rollback checks for that before it fences
+anything and refuses when the schema changed: the run stays `switched`,
+`status.cutover.rollback_refused` and the workflow message say why, and it
+retires the old groups as scheduled. Withdrawing the request clears the
+refusal. No migration starts while a rollback is in progress.
+
 ### Catalog group
 
 The catalog group is not part of a shard set, so the reshard machinery

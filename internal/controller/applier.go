@@ -180,7 +180,7 @@ func (s *PGMigrationStore) Databases(ctx context.Context) ([]string, error) {
 // ddlHoldStages are the stages of a reshard or upgrade during which no
 // migration starts: from the copy until the switch. They are spelled out
 // again in catalog.MigrationHeldPredicate, which cannot import them.
-var ddlHoldStages = []string{StageCopying, StageCatchUpDone, StageAwaitingSwitch, StageSwitching}
+var ddlHoldStages = []string{StageCopying, StageCatchUpDone, StageAwaitingSwitch, StageSwitching, StageRollingBack}
 
 // LockedDatabases implements MigrationStore. A reshard or upgrade cutover
 // takes these when it fences, precisely so that schema does not move under

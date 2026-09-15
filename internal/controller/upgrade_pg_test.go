@@ -374,6 +374,10 @@ func TestUpgradeRollbackRefusesAfterSchemaDrift(t *testing.T) {
 		mustExec(t, c, `ALTER TABLE orders ADD COLUMN priority integer NOT NULL DEFAULT 0`)
 	}
 
+	// A claim this run already holds -- from an earlier pass of the same
+	// rollback, or a controller that fenced before looking for drift -- is
+	// lifted by the refusal too.
+	mustExec(t, f.catalog, `UPDATE pgshard.shard_status SET migrating = true, migrating_by = $1::uuid WHERE shard_set IN ('default', 'g2')`, id)
 	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"rollback": true}' WHERE id = $1::uuid`, id)
 	for range 8 {
 		f.pass()
@@ -388,6 +392,29 @@ func TestUpgradeRollbackRefusesAfterSchemaDrift(t *testing.T) {
 	}
 	if set := queryOne[string](t, f.catalog, `SELECT shard_set FROM pgshard.shard_sets WHERE state = 'serving'`); set != "g2" {
 		t.Fatalf("serving set moved to %s despite the refusal", set)
+	}
+	// The refusal must leave the serving set writable (PGS-875): the
+	// rollback claimed the write fence on both sets before it looked for
+	// drift, and the refusal returned without lifting it, so every write to
+	// the set still serving waited on a fence nothing would release.
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 0 {
+		t.Fatalf("the refused rollback left %d shards fenced", n)
+	}
+	if stage != StageSwitched {
+		t.Fatalf("the refused rollback left the workflow at %s, want it switched so it can complete", stage)
+	}
+	refused := func() string {
+		return queryOne[string](t, f.catalog, `SELECT coalesce(status->'cutover'->>'rollback_refused', '') FROM pgshard.workflows WHERE id = $1::uuid`, id)
+	}
+	if !strings.Contains(refused(), "schema changed since the switch") {
+		t.Fatalf("the refusal is not recorded: %q", refused())
+	}
+	// Withdrawing the request clears the refusal, so a later request is
+	// looked at afresh.
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"rollback": false}' WHERE id = $1::uuid`, id)
+	f.pass()
+	if r := refused(); r != "" {
+		t.Fatalf("the withdrawn request's refusal is still recorded: %q", r)
 	}
 }
 

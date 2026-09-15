@@ -89,7 +89,7 @@ func TestAMigrationDoesNotStartWhileAReshardCopies(t *testing.T) {
 		t.Fatalf("the refused start left the migration %s", got)
 	}
 
-	for _, stage := range []string{StageCatchUpDone, StageAwaitingSwitch, StageSwitching} {
+	for _, stage := range []string{StageCatchUpDone, StageAwaitingSwitch, StageSwitching, StageRollingBack} {
 		mustExec(t, cat, `UPDATE pgshard.workflows SET status = jsonb_build_object('stage', $2::text) WHERE id = $1`, reshard, stage)
 		if err := catalog.SaveMigrationProgress(ctx, pool, m, 0); !errors.Is(err, catalog.ErrMigrationHeld) {
 			t.Fatalf("starting a migration while the reshard is at %s: %v, want it held", stage, err)

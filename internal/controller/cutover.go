@@ -99,6 +99,10 @@ type cutoverState struct {
 	// running rather than skipped.
 	DisablingAt *time.Time `json:"disabling_at,omitempty"`
 	Gate        string     `json:"gate,omitempty"`
+	// RollbackRefused is why a requested rollback was refused before it
+	// touched anything. The run stays switched and completes as scheduled;
+	// withdrawing the request clears it, so a new one is looked at afresh.
+	RollbackRefused string `json:"rollback_refused,omitempty"`
 	// Pause names the configured pause holding the workflow
 	// (PauseSwitchWrites or PauseComplete) and PausedAt when it began.
 	// A configured pause leaves the workflow running -- only an operator
@@ -311,6 +315,10 @@ func isFatal(err error) bool {
 // errRetry marks a step that should run again next pass.
 var errRetry = errors.New("retry next pass")
 
+// errRollbackRefused reports a rollback that cannot be done safely and was
+// refused before it fenced, paused or flipped anything.
+var errRollbackRefused = errors.New("rollback refused")
+
 func retryf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", errRetry, fmt.Sprintf(format, args...))
 }
@@ -352,7 +360,10 @@ func (c *Copier) cutover(ctx context.Context, wf *copyWorkflow, ops cutoverOps) 
 	case StageSwitching:
 		return c.switchWrites(ctx, wf, ops)
 	case StageSwitched:
-		if wf.spec.Rollback {
+		if !wf.spec.Rollback {
+			wf.cutover.RollbackRefused = ""
+		}
+		if wf.spec.Rollback && wf.cutover.RollbackRefused == "" {
 			wf.stage = StageRollingBack
 			return true, c.saveCutover(ctx, wf, "rollback requested: returning serving to "+wf.sourceSet())
 		}
@@ -398,6 +409,11 @@ func (c *Copier) rollback(ctx context.Context, wf *copyWorkflow, ops cutoverOps)
 	if err := ops.Rollback(ctx); err != nil {
 		if errors.Is(err, errRetry) {
 			return false, c.saveCutover(ctx, wf, "rolling back: "+err.Error())
+		}
+		if errors.Is(err, errRollbackRefused) {
+			wf.stage = StageSwitched
+			wf.cutover.RollbackRefused = err.Error()
+			return true, c.saveCutover(ctx, wf, err.Error()+"; the run stays switched and completes as scheduled")
 		}
 		return false, err
 	}
@@ -948,7 +964,11 @@ func (c *Copier) retire(ctx context.Context, wf *copyWorkflow) (bool, error) {
 		retireAt := wf.cutover.SwitchedAt.Add(wf.spec.retireAfter())
 		wf.cutover.RetireAt = &retireAt
 		if remaining := retireAt.Sub(c.now()); remaining > 0 {
-			return false, c.saveCutover(ctx, wf, fmt.Sprintf("switched: old groups retire in %s", remaining.Round(time.Second)))
+			msg := fmt.Sprintf("switched: old groups retire in %s", remaining.Round(time.Second))
+			if wf.cutover.RollbackRefused != "" {
+				msg += " (" + wf.cutover.RollbackRefused + ")"
+			}
+			return false, c.saveCutover(ctx, wf, msg)
 		}
 	}
 	if wf.spec.paused(PauseComplete) {
