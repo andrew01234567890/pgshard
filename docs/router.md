@@ -506,7 +506,9 @@ indexes, schemas, views, sequences and types, `CREATE`/`DROP DATABASE`,
 `pgshard.migrations` as a *migration* and applied on every target shard by
 the controller's applier (`docs/ddl.md`). The client waits, as with
 PostgreSQL, until the statement is done everywhere and gets the command tag,
-or the error of the shard that failed. `SET pgshard.ddl_async = on` makes the
+or the error of the shard that failed. It is answered once this router has
+reloaded its catalog snapshot, so the session's next statement already sees
+what the migration recorded. `SET pgshard.ddl_async = on` makes the
 session return at once with a NOTICE that names the migration id.
 
 The planner decides the *scope* from the catalog: a statement on sharded or

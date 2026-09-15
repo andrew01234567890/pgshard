@@ -33,6 +33,9 @@ type Watcher struct {
 	mu      sync.Mutex
 	subs    map[chan Change]struct{}
 	kick    chan struct{}
+	// refresh carries Refresh's requests to Run, which owns the connection
+	// reloads use.
+	refresh chan chan error
 	logf    func(format string, args ...any)
 
 	// servingKick records that the pending kick was raised by a serving
@@ -118,6 +121,7 @@ func NewWatcher(dsn string, opts Options) *Watcher {
 		debounce:       50 * time.Millisecond,
 		subs:           map[chan Change]struct{}{},
 		kick:           make(chan struct{}, 1),
+		refresh:        make(chan chan error),
 		logf:           opts.Logf,
 		desired:        budget{tokens: notifyBurst},
 		serving:        budget{tokens: notifyBurst},
@@ -148,6 +152,31 @@ func (w *Watcher) AgeSeconds(now time.Time) float64 {
 
 // SetForTest installs a snapshot without a catalog behind it.
 func (w *Watcher) SetForTest(s *Snapshot) { w.current.Store(s) }
+
+// Refresh reloads the snapshot now, outside the notification budget, and
+// returns once a load that began after the call has been published.
+//
+// A router that has just applied a migration answers its client only after
+// this: a notification-driven reload can be waiting out a drained budget --
+// every per-shard step of a migration notifies -- so the next statement on
+// the same session could be planned without the view or column the
+// migration just recorded, and a view missing from the snapshot is read from
+// one shard with no error (PGS-871). It is not charged to the budget: it is
+// asked for by the session that ran the DDL, at the rate DDL completes.
+func (w *Watcher) Refresh(ctx context.Context) error {
+	reply := make(chan error, 1)
+	select {
+	case w.refresh <- reply:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Subscribe returns a channel that receives generation changes. Slow
 // receivers miss intermediate changes but always get the latest one.
@@ -199,10 +228,13 @@ func (w *Watcher) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.reloadInterval)
 	defer ticker.Stop()
 	for {
+		var asked []chan error
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+		case reply := <-w.refresh:
+			asked = append(asked, reply)
 		case <-w.kick:
 			time.Sleep(w.debounce)
 			select {
@@ -231,6 +263,10 @@ func (w *Watcher) Run(ctx context.Context) error {
 						break waiting
 					case <-timer.C:
 						break waiting
+					case reply := <-w.refresh:
+						timer.Stop()
+						asked = append(asked, reply)
+						break waiting
 					case <-w.kick:
 						// Only its own budget can cut the wait short. If
 						// the serving bucket is empty too, the remaining
@@ -245,8 +281,23 @@ func (w *Watcher) Run(ctx context.Context) error {
 				}
 			}
 		}
-		if err := w.reload(ctx); err != nil && ctx.Err() == nil {
+		// Every request already waiting shares this reload: each began
+		// before it, so it answers all of them.
+	drain:
+		for {
+			select {
+			case reply := <-w.refresh:
+				asked = append(asked, reply)
+			default:
+				break drain
+			}
+		}
+		err := w.reload(ctx)
+		if err != nil && ctx.Err() == nil {
 			w.logf("snapshot reload: %v", err)
+		}
+		for _, reply := range asked {
+			reply <- err
 		}
 	}
 }

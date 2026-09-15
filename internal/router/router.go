@@ -56,6 +56,11 @@ type Config struct {
 	Sequences *SequenceAllocator
 	// Migrations queues DDL for the controller's applier; nil refuses DDL.
 	Migrations MigrationQueue
+	// RefreshSnapshot reloads Snapshot now and returns once the reload has
+	// been published. A migration is answered only after it, so the next
+	// statement on the session is planned with what the migration recorded.
+	// Nil skips it.
+	RefreshSnapshot func(context.Context) error
 	// MaxSessions caps the authenticated sessions this router holds at
 	// once, whatever role they belong to. The pre-authentication cap
 	// releases its slot the moment a session authenticates, and a role

@@ -111,7 +111,12 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    the statement text, the client's role (`meta.run_as`) and the object it
    creates or drops (`meta.object`), then polls the row until it is
    `complete` or `failed` and answers the client with the command tag or the
-   error. `SET pgshard.ddl_async = on` returns immediately after the insert
+   error. A completed migration is answered only after the router has reloaded
+   its catalog snapshot (bounded at 5s, a WARNING if the reload fails), so the
+   session's next statement is planned with the view, table or column the
+   migration recorded rather than on a snapshot the notification budget has
+   not refreshed yet. Other routers pick it up on their own reload, normally
+   within a second. `SET pgshard.ddl_async = on` returns immediately after the insert
    with the tag and a NOTICE naming the migration id; `RESET` restores
    synchronous DDL. Cancelling a waiting statement leaves the migration
    running in the background (`57014` names the id).
