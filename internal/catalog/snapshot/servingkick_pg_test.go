@@ -2,7 +2,9 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,8 +25,9 @@ import (
 // the point is that the flip does not queue behind the throttle, and the
 // margin is wide (measured worst case 64ms with the wake, 905ms without).
 func TestAFlipIsSeenWhileDesiredStateChurns(t *testing.T) {
-	flipSeenDuringChurn(t, func(ctx context.Context, c *pgx.Conn) {
-		_, _ = c.Exec(ctx, `SELECT pg_notify($1, 'churn')`, catalog.DesiredChannel)
+	flipSeenDuringChurn(t, false, func(ctx context.Context, c *pgx.Conn) error {
+		_, err := c.Exec(ctx, `SELECT pg_notify($1, 'churn')`, catalog.DesiredChannel)
+		return err
 	})
 }
 
@@ -32,12 +35,16 @@ func TestAFlipIsSeenWhileDesiredStateChurns(t *testing.T) {
 // a migration updates its pgshard.migrations row. Those notifications went
 // out on the serving channel and spent the budget a flip needs.
 func TestAFlipIsSeenWhileMigrationsProgress(t *testing.T) {
-	flipSeenDuringChurn(t, func(ctx context.Context, c *pgx.Conn) {
-		_, _ = c.Exec(ctx, `UPDATE pgshard.migrations SET updated_at = now()`)
+	flipSeenDuringChurn(t, true, func(ctx context.Context, c *pgx.Conn) error {
+		tag, err := c.Exec(ctx, `UPDATE pgshard.migrations SET updated_at = now()`)
+		if err == nil && tag.RowsAffected() == 0 {
+			err = errors.New("no migration row to update")
+		}
+		return err
 	})
 }
 
-func flipSeenDuringChurn(t *testing.T, churnOnce func(context.Context, *pgx.Conn)) {
+func flipSeenDuringChurn(t *testing.T, withMigration bool, churnOnce func(context.Context, *pgx.Conn) error) {
 	t.Helper()
 	dsn := startPostgres(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -50,9 +57,11 @@ func flipSeenDuringChurn(t *testing.T, churnOnce func(context.Context, *pgx.Conn
 	if err := catalog.Migrate(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := catalog.EnqueueMigration(ctx, conn, catalog.DDLMigration{Database: "app", Statement: "ALTER TABLE orders ADD COLUMN extra int",
-		Kind: "ALTER TABLE", Strategy: "direct", Scope: "all"}); err != nil {
-		t.Fatal(err)
+	if withMigration {
+		if _, err := catalog.EnqueueMigration(ctx, conn, catalog.DDLMigration{Database: "app", Statement: "ALTER TABLE orders ADD COLUMN extra int",
+			Kind: "ALTER TABLE", Strategy: "direct", Scope: "all"}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	w := NewWatcher(dsn, Options{Logf: func(string, ...any) {}})
 	go func() { _ = w.Run(ctx) }()
@@ -60,11 +69,14 @@ func flipSeenDuringChurn(t *testing.T, churnOnce func(context.Context, *pgx.Conn
 
 	churn, stopChurn := context.WithCancel(ctx)
 	var wg sync.WaitGroup
+	var churned atomic.Int64
+	var churnErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		c, err := pgx.Connect(churn, dsn)
 		if err != nil {
+			churnErr = err
 			return
 		}
 		defer func() { _ = c.Close(context.WithoutCancel(churn)) }()
@@ -72,7 +84,13 @@ func flipSeenDuringChurn(t *testing.T, churnOnce func(context.Context, *pgx.Conn
 		// size-1 channel, so back-to-back notifications cost one token
 		// between them and drain nothing.
 		for churn.Err() == nil {
-			churnOnce(churn, c)
+			if err := churnOnce(churn, c); err != nil {
+				if churn.Err() == nil {
+					churnErr = err
+				}
+				return
+			}
+			churned.Add(1)
 			time.Sleep(120 * time.Millisecond)
 		}
 	}()
@@ -103,5 +121,10 @@ func flipSeenDuringChurn(t *testing.T, churnOnce func(context.Context, *pgx.Conn
 		if saw > notifyRefill/2 {
 			t.Fatalf("flip %d took %s to be seen during churn; that wait is the window a straggling write to a retiring source lives in", i, saw)
 		}
+	}
+	stopChurn()
+	wg.Wait()
+	if churnErr != nil || churned.Load() == 0 {
+		t.Fatalf("the churn did not run (%d rounds, %v), so the flips were not measured against it", churned.Load(), churnErr)
 	}
 }
