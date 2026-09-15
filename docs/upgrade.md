@@ -128,8 +128,12 @@ Logical replication carries no DDL, so a migration applied after the switch
 reached only the new set. A rollback checks for that before it fences
 anything and refuses when the schema changed: the run stays `switched`,
 `status.cutover.rollback_refused` and the workflow message say why, and it
-retires the old groups as scheduled. Withdrawing the request clears the
-refusal. No migration starts while a rollback is in progress.
+retires the old groups as scheduled. The refusal holds for the run: the
+fingerprints recorded at the switch still differ after the two sets are
+reconciled by hand, so withdrawing the request only clears the message. A
+rollback waits for a migration already applying, and no migration starts
+while a rollback is in progress; withdrawing the request does not stop a
+rollback under way -- cancelling the run does.
 
 ### Catalog group
 

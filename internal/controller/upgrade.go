@@ -351,16 +351,31 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	// the change, so refuse rather than guess which -- and before claiming
 	// the fence. Refused after it, the claim stayed on both sets and every
 	// write to the set still serving waited on a fence nothing lifted.
+	//
+	// A migration already running when the rollback began is waited for
+	// first: the hold stops only migrations that have not started, and one
+	// finishing after the check would land on the set being left.
+	if applying, err := migrationsApplying(ctx, o.c.Pool); err != nil {
+		return err
+	} else if len(applying) > 0 {
+		return fmt.Errorf("%w: a migration is still applying on %s", errRetry, strings.Join(applying, ", "))
+	}
 	drifted, err := o.schemaDrift(ctx)
 	if err != nil {
 		return err
 	}
 	if len(drifted) > 0 {
+		// What an earlier pass of this rollback claimed goes with the
+		// refusal: the fence, and a pause whose lift that pass could not
+		// make (a cancelled context, a shard that did not answer).
 		if _, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = false, migrating_by = NULL, updated_at = now()
 			WHERE shard_set = ANY($1) AND migrating_by = $2::uuid`, []string{o.srcSet, o.wf.set}, o.wf.id); err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: schema changed since the switch on %s, and rolling back would restore a set that never received it", errRollbackRefused, strings.Join(drifted, ", "))
+		if err := o.pauseSetClaimed(ctx, o.wf.set, o.wf.ids, false); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: schema changed since the switch on %s, and rolling back would restore a set that differs from the one serving", errRollbackRefused, strings.Join(drifted, ", "))
 	}
 	// Claim the fence on both sets, as the forward cutover does: a fence
 	// with no owner is one any workflow can drop, and the release below

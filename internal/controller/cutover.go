@@ -315,8 +315,9 @@ func isFatal(err error) bool {
 // errRetry marks a step that should run again next pass.
 var errRetry = errors.New("retry next pass")
 
-// errRollbackRefused reports a rollback that cannot be done safely and was
-// refused before it fenced, paused or flipped anything.
+// errRollbackRefused reports a rollback that cannot be done safely. It is
+// refused before this pass fences, pauses or flips anything, and what an
+// earlier pass of the same rollback claimed is released with it.
 var errRollbackRefused = errors.New("rollback refused")
 
 func retryf(format string, args ...any) error {
