@@ -124,7 +124,9 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
 5. **Apply.** The controller leader's applier (`internal/controller/applier.go`)
    holds a queued migration while a reshard or upgrade copies (from the copy
    to its switch; logical replication carries no DDL) or holds the database's
-   DDL lock, and the router refuses new DDL for that time. Otherwise it
+   DDL lock. The router refuses new DDL from the moment a reshard's new
+   shards are provisioned until its switch, and after a failed reshard until
+   its shard set is removed. Otherwise it
    takes queued and running migrations oldest first, one at a time, and
    runs each on its targets in shard order. Client statements never run on
    a superuser session: the applier logs into the shard's primary as

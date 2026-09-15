@@ -82,8 +82,22 @@ func (s *PGMigrationStore) Pending(ctx context.Context) ([]catalog.DDLMigration,
 }
 
 // Save implements MigrationStore.
+//
+// A save that may start a migration takes the move gate first, as a reshard
+// or upgrade does to begin its copy. Its hold check then reads a snapshot
+// taken after any copy that began first has committed its stage; without the
+// gate a start whose snapshot predates that commit could lock the row before
+// the copier's look and begin unseen.
 func (s *PGMigrationStore) Save(ctx context.Context, m catalog.DDLMigration, term int64) error {
-	return catalog.SaveMigrationProgress(ctx, s.Pool, m, term)
+	if m.State != catalog.MigrationRunning {
+		return catalog.SaveMigrationProgress(ctx, s.Pool, m, term)
+	}
+	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		if err := lockMoveGate(ctx, tx); err != nil {
+			return err
+		}
+		return catalog.SaveMigrationProgress(ctx, tx, m, term)
+	})
 }
 
 // Shards implements MigrationStore.

@@ -204,10 +204,14 @@ record under `status.copy` is informational except for the schema flags.
 
 Tables registered or created after the publications exist are not picked
 up, and logical replication carries no DDL, so schema does not move during
-a copy. From the moment a copy is recorded until the switch, the router
-refuses DDL (`0A000`, retry once the reshard completes) and the applier
-holds any queued migration; a migration already applying when the copy
-begins is waited for before the targets' schema is materialized. Sequences come across with their definitions only; values
+a copy. From the moment the new shards are provisioned until the switch,
+the router refuses DDL (`0A000`); from the copy until the switch the applier
+holds any queued migration, and a migration already applying when the copy
+begins is waited for before the targets' schema is materialized. A reshard
+that failed keeps its new shards, so the router keeps refusing DDL until
+that shard set is removed. A held role or grant migration does not stop
+the role verifier, which puts the managed roles on the new shards before
+their schema is restored. Sequences come across with their definitions only; values
 are not replicated.
 
 ## Cancel

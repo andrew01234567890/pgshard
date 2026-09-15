@@ -444,9 +444,15 @@ func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, t
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	// A start refused under a hold that ended before this look still reports
+	// held: the row is untouched either way, and the next pass starts it.
 	if rows.CommandTag().RowsAffected() == 0 && m.State == MigrationRunning {
-		var held bool
-		if err := db.QueryRow(ctx, `SELECT `+MigrationHeldPredicate+` FROM pgshard.migrations WHERE id = $1 AND state = 'queued'`, m.ID).Scan(&held); err == nil && held {
+		var current, queued bool
+		if err := db.QueryRow(ctx, `SELECT ($2::bigint IS NULL OR $2 = (SELECT term FROM pgshard.leader_term)),
+			EXISTS (SELECT 1 FROM pgshard.migrations WHERE id = $1 AND state = 'queued')`, m.ID, termArg(term)).Scan(&current, &queued); err != nil {
+			return err
+		}
+		if current && queued {
 			return ErrMigrationHeld
 		}
 	}

@@ -204,6 +204,157 @@ func TestACopyDoesNotMaterializeUnderAnApplyingMigration(t *testing.T) {
 	}
 }
 
+func holdCatalog(t *testing.T) (context.Context, *pgxpool.Pool, func(sql string, args ...any)) {
+	t.Helper()
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
+	return ctx, pool, func(sql string, args ...any) { mustExec(t, cat, sql, args...) }
+}
+
+// TestAHeldRoleMigrationDoesNotStopTheRoleVerifier (PGS-872): a reshard's
+// new shards get the managed roles from the role verifier, before their
+// schema copy restores objects owned by those roles. The verifier waits
+// while a role or grant migration is pending, and the copy holds queued
+// migrations, so a role migration queued as a reshard began held the roles
+// the copy needed, and the copy held the migration. A held migration has
+// touched no group and no longer counts; one that is running, or queued and
+// free to start, still does.
+func TestAHeldRoleMigrationDoesNotStopTheRoleVerifier(t *testing.T) {
+	ctx, pool, exec := holdCatalog(t)
+	const reshard = "00000000-0000-0000-0000-0000000008a4"
+	exec(`INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, 'reshard', 'running', '{"shard_set": "g2", "generation": 2}', '{"stage": "copying"}')`, reshard)
+	store := &PGRoleStore{Pool: pool}
+	pending := func() bool {
+		t.Helper()
+		got, err := store.RoleMigrationsPending(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	for _, kind := range []string{"CREATE ROLE", "GRANT"} {
+		id, err := catalog.EnqueueMigration(ctx, pool, catalog.DDLMigration{Database: "app", Statement: kind + " ...", Kind: kind, Strategy: "direct", Scope: "all"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending() {
+			t.Fatalf("a queued %s held by a reshard copy stops the role verifier, which the copy needs to restore its schema", kind)
+		}
+		exec(`UPDATE pgshard.migrations SET state = 'running' WHERE id = $1`, id)
+		if !pending() {
+			t.Fatalf("a running %s does not stop the role verifier", kind)
+		}
+		exec(`UPDATE pgshard.migrations SET state = 'complete' WHERE id = $1`, id)
+	}
+	if _, err := catalog.EnqueueMigration(ctx, pool, catalog.DDLMigration{Database: "app", Statement: "DROP ROLE r", Kind: "DROP ROLE", Strategy: "direct", Scope: "all"}); err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE pgshard.workflows SET status = '{"stage": "switched"}' WHERE id = $1`, reshard)
+	if !pending() {
+		t.Fatal("a queued role migration free to start does not stop the role verifier")
+	}
+}
+
+// TestAMigrationStartWaitsForACopyThatIsStarting (PGS-872): the start's
+// hold check and the copy's start are separate transactions. A start that
+// read its snapshot before the copy committed its stage would begin unseen,
+// so the start takes the move gate the copy holds while it begins.
+func TestAMigrationStartWaitsForACopyThatIsStarting(t *testing.T) {
+	ctx, pool, _ := holdCatalog(t)
+	id, err := catalog.EnqueueMigration(ctx, pool, catalog.DDLMigration{Database: "app", Statement: "ALTER TABLE orders ADD COLUMN extra int",
+		Kind: "ALTER TABLE", Strategy: "direct", Scope: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := catalog.LoadMigration(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.State = catalog.MigrationRunning
+
+	copier, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = copier.Rollback(ctx) }()
+	if err := lockMoveGate(ctx, copier); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := copier.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ('00000000-0000-0000-0000-0000000008a5', 'reshard', 'running', '{"shard_set": "g2", "generation": 2}', '{"stage": "copying"}')`); err != nil {
+		t.Fatal(err)
+	}
+
+	saved := make(chan error, 1)
+	go func() { saved <- (&PGMigrationStore{Pool: pool}).Save(ctx, m, 0) }()
+	waitFor(t, time.Minute, func() bool {
+		select {
+		case err := <-saved:
+			t.Fatalf("the start returned (%v) while a copy was beginning under the move gate", err)
+		default:
+		}
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		return waiting
+	}, "the start never waited on the move gate")
+	if err := copier.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-saved; !errors.Is(err, catalog.ErrMigrationHeld) {
+		t.Fatalf("a start that waited for a copy to begin: %v, want it held", err)
+	}
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM pgshard.migrations WHERE id = $1`, id).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != catalog.MigrationQueued {
+		t.Fatalf("the migration is %s, want it left queued", state)
+	}
+}
+
+// TestAHeldStartFromAStaleLeaderSaysLeadershipPassed: a start refused both
+// for a hold and for a term that has passed reports the term, so the pass
+// stops rather than carrying on as the leader.
+func TestAHeldStartFromAStaleLeaderSaysLeadershipPassed(t *testing.T) {
+	ctx, pool, exec := holdCatalog(t)
+	exec(`INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ('00000000-0000-0000-0000-0000000008a6', 'reshard', 'running', '{"shard_set": "g2", "generation": 2}', '{"stage": "copying"}')`)
+	id, err := catalog.EnqueueMigration(ctx, pool, catalog.DDLMigration{Database: "app", Statement: "ALTER TABLE orders ADD COLUMN extra int",
+		Kind: "ALTER TABLE", Strategy: "direct", Scope: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := catalog.LoadMigration(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.State = catalog.MigrationRunning
+	stale, err := catalog.TakeLeaderTerm(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveMigrationProgress(ctx, pool, m, stale); !errors.Is(err, catalog.ErrMigrationHeld) {
+		t.Fatalf("a held start from the current leader: %v, want it held", err)
+	}
+	if _, err := catalog.TakeLeaderTerm(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveMigrationProgress(ctx, pool, m, stale); !errors.Is(err, catalog.ErrNotLeaderTerm) {
+		t.Fatalf("a held start from a leader whose term has passed: %v, want ErrNotLeaderTerm", err)
+	}
+}
+
 // lockBlindStore reads no DDL locks, as a pass that looked just before a
 // copy was recorded.
 type lockBlindStore struct{ *PGMigrationStore }
@@ -226,6 +377,11 @@ func TestTheCatalogHoldNamesTheStagesTheApplierHolds(t *testing.T) {
 	for _, kind := range copyKinds {
 		if !named(kind) {
 			t.Errorf("catalog.MigrationHeldPredicate does not hold workflow kind %q", kind)
+		}
+	}
+	for _, state := range []string{StateRunning, StatePaused} {
+		if !named(state) {
+			t.Errorf("catalog.MigrationHeldPredicate does not hold workflow state %q", state)
 		}
 	}
 }

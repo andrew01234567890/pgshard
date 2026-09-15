@@ -133,7 +133,7 @@ func (w *walker) migration(m Migration) error {
 	// shard directly and would break the copy the same way.
 	if w.sess.Snapshot != nil && w.sess.Snapshot.Resharding() {
 		return notYet("DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply",
-			"retry once the reshard completes")
+			"retry once the reshard completes, or once a failed reshard's shard set is removed")
 	}
 	// Every DDL the planner recognises arrives here, so this is where a
 	// local database stops being a fan-out.
