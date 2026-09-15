@@ -211,3 +211,77 @@ func TestAReleaseForAnEarlierReservationIsIgnored(t *testing.T) {
 		t.Fatal("an unnumbered release, which is what a session ending sends, did not end the reservation")
 	}
 }
+
+// TestACancelAheadOfItsStatementWaitsForIt (PGS-827): a Cancel travels on its
+// own connection and can overtake its statement's first request on the
+// Execute stream. Delivered at once, it reached an idle backend, and
+// PostgreSQL drops a cancel that arrives while it is reading a command -- the
+// statement then ran uncancelled. It is now held, and goes once the
+// statement's messages are on their way to the backend.
+func TestACancelAheadOfItsStatementWaitsForIt(t *testing.T) {
+	port := startCancelPort(t, nil)
+	h := startHarnessWithCancels(t, PoolConfig{}, port.dialer())
+	ctx := context.Background()
+	stream := reservedSession(t, h)
+
+	if _, err := h.client.Cancel(ctx, &pgshardv1.CancelRequest{SessionId: "s", Statement: 2}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := port.received.Load(); got != 0 {
+		t.Fatalf("a cancel for statement 2 reached PostgreSQL before statement 2 did: %d packet(s)", got)
+	}
+
+	roundTrip(t, stream, numbered(queryReq("s", "select 2", gen(7, 3), nil), 2))
+	select {
+	case <-port.arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held cancel was never delivered once its statement reached the backend")
+	}
+	if !h.pg.sawQuery("select 2") {
+		t.Fatal("the held cancel was delivered, but not behind its statement")
+	}
+}
+
+// TestAHeldCancelWhoseStatementIsNeverSentIsDropped: a cancel held for a
+// statement that never reaches the backend must not land on a later one.
+func TestAHeldCancelWhoseStatementIsNeverSentIsDropped(t *testing.T) {
+	port := startCancelPort(t, nil)
+	h := startHarnessWithCancels(t, PoolConfig{}, port.dialer())
+	ctx := context.Background()
+	stream := reservedSession(t, h)
+
+	if _, err := h.client.Cancel(ctx, &pgshardv1.CancelRequest{SessionId: "s", Statement: 2}); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, stream, numbered(queryReq("s", "select 3", gen(7, 3), nil), 3))
+	roundTrip(t, stream, numbered(queryReq("s", "select 4", gen(7, 3), nil), 4))
+	time.Sleep(300 * time.Millisecond)
+	if got := port.received.Load(); got != 0 {
+		t.Fatalf("a cancel held for statement 2, which never came, was delivered to a later statement: %d packet(s)", got)
+	}
+}
+
+// TestAHeldCancelWaitsPastAnEarlierStatement: a cancel held for statement 3
+// is not spent on statement 2's batch; it goes when statement 3's does.
+func TestAHeldCancelWaitsPastAnEarlierStatement(t *testing.T) {
+	port := startCancelPort(t, nil)
+	h := startHarnessWithCancels(t, PoolConfig{}, port.dialer())
+	ctx := context.Background()
+	stream := reservedSession(t, h)
+
+	if _, err := h.client.Cancel(ctx, &pgshardv1.CancelRequest{SessionId: "s", Statement: 3}); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, stream, numbered(queryReq("s", "select 2", gen(7, 3), nil), 2))
+	time.Sleep(200 * time.Millisecond)
+	if got := port.received.Load(); got != 0 {
+		t.Fatalf("a cancel held for statement 3 was delivered on statement 2's batch: %d packet(s)", got)
+	}
+	roundTrip(t, stream, numbered(queryReq("s", "select 3", gen(7, 3), nil), 3))
+	select {
+	case <-port.arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancel held for statement 3 was never delivered once statement 3 was sent")
+	}
+}

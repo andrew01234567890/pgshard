@@ -126,6 +126,17 @@ type session struct {
 	// Release numbered below it was meant for an earlier one. Guarded by
 	// Server.mu.
 	reservedFor uint64
+	// pendingCancel is a Cancel numbered ahead of every statement the stream
+	// has carried: it overtook its statement's first request, which travels
+	// on the Execute stream while the Cancel has a connection of its own.
+	// Delivered then, it would reach an idle backend, and PostgreSQL drops
+	// a cancel that arrives while it is reading a command (PGS-827). The
+	// relay delivers it once that statement is on its way to the backend.
+	// Guarded by cancelMu.
+	pendingCancel uint64
+	// sent is the highest statement whose messages have been written to the
+	// backend. A Cancel above it is held. Guarded by cancelMu.
+	sent uint64
 }
 
 // staleStatement reports whether a Cancel or Release numbered n was sent for
@@ -299,6 +310,9 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 }
 
 func (s *Server) detach(se *session) {
+	se.cancelMu.Lock()
+	se.pendingCancel, se.sent = 0, se.statement.Load()
+	se.cancelMu.Unlock()
 	s.mu.Lock()
 	se.attached = false
 	b := se.b
@@ -398,6 +412,9 @@ type relay struct {
 	// else now holds would set a deadline on their connection, and its own
 	// stop would clear one they had just set.
 	unwatch func()
+	// batchStart is the first statement sent to the backend since its last
+	// flush; a pending cancel for a statement before it was never sent.
+	batchStart uint64
 	// copyBytes counts CopyData buffered for the backend since the last
 	// write to it. COPY IN produces no reply until it ends, so nothing
 	// else would move the upload out of memory before CopyDone.
@@ -692,6 +709,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		if err := b.flush(); err != nil {
 			return r.backendLost(b, err)
 		}
+		r.flushed(ctx, b)
 		return r.pumpFlush(b)
 	}
 	r.forward(b, fm)
@@ -703,6 +721,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 				if err := b.flush(); err != nil {
 					return r.backendLost(b, err)
 				}
+				r.flushed(ctx, b)
 			}
 		}
 		return nil
@@ -711,6 +730,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	if err := b.flush(); err != nil {
 		return r.backendLost(b, err)
 	}
+	r.flushed(ctx, b)
 	return r.pump(b)
 }
 
@@ -724,6 +744,48 @@ func (r *relay) moveToStatement(n uint64) {
 	r.se.cancelMu.Lock()
 	r.se.statement.Store(n)
 	r.se.cancelMu.Unlock()
+	if r.batchStart == 0 {
+		r.batchStart = n
+	}
+}
+
+// flushed is called once the batch buffered for b has been written to it.
+// A cancel held for a statement in that batch goes now, behind the
+// statement's own messages; one held for a statement further on waits for
+// it, and one for a statement before the batch was never sent and is
+// dropped. The signal can still reach the backend before it has read what was
+// just flushed; that window is the cancel connection's dial against a local
+// read, where before this the cancel reached an idle backend every time.
+func (r *relay) flushed(ctx context.Context, b *Backend) {
+	start := r.batchStart
+	r.batchStart = 0
+	r.se.cancelMu.Lock()
+	n, cur := r.se.pendingCancel, r.se.statement.Load()
+	r.se.sent = cur
+	if n == 0 || n > cur {
+		r.se.cancelMu.Unlock()
+		return
+	}
+	r.se.pendingCancel = 0
+	r.se.cancelMu.Unlock()
+	if n < start {
+		return
+	}
+	still := func() bool {
+		r.srv.mu.Lock()
+		defer r.srv.mu.Unlock()
+		return r.se.b == b && !b.released && r.se.statement.Load() == cur
+	}
+	// Not on the relay's goroutine: that one is about to read the
+	// statement's answers, and delivering holds cancelMu, which a later
+	// statement waits on anyway.
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.srv.cfg.Dialer.Timeout+5*time.Second)
+	go func() {
+		defer cancel()
+		if err := b.cancel(dctx, r.srv.cfg.Dialer, &r.se.cancelMu, still); err != nil {
+			r.srv.cfg.Logger.Warn("held cancel failed", "session", r.se.id, "statement", n, "err", err)
+		}
+	}()
 }
 
 // stopWatch ends the deadline watcher for the message in flight, if one is
@@ -1117,6 +1179,13 @@ func (s *Server) Cancel(ctx context.Context, req *pgshardv1.CancelRequest) (*pgs
 	if se == nil || se.staleStatement(req.Statement) {
 		return &pgshardv1.CancelResponse{}, nil
 	}
+	se.cancelMu.Lock()
+	if req.Statement > se.sent {
+		se.pendingCancel = max(se.pendingCancel, req.Statement)
+		se.cancelMu.Unlock()
+		return &pgshardv1.CancelResponse{}, nil
+	}
+	se.cancelMu.Unlock()
 	s.mu.Lock()
 	b := se.b
 	s.mu.Unlock()
