@@ -76,6 +76,44 @@ type PGMigrationStore struct {
 	Pool *pgxpool.Pool
 }
 
+// Queued reports whether the catalog has the operation queue, so the
+// applier waits its turn in it rather than reading DDL locks.
+func (s *PGMigrationStore) Queued(ctx context.Context) (bool, error) {
+	return queueOn(ctx, s.Pool)
+}
+
+// DatabaseHomeShard implements homeShards.
+func (s *PGMigrationStore) DatabaseHomeShard(ctx context.Context, database string) (int32, error) {
+	var home int32
+	err := s.Pool.QueryRow(ctx, `SELECT home_shard FROM pgshard.databases WHERE name = $1`, database).Scan(&home)
+	return home, err
+}
+
+// Beat implements heartbeater.
+func (s *PGMigrationStore) Beat(ctx context.Context, term int64) error {
+	if queued, err := s.Queued(ctx); err != nil || !queued {
+		return err
+	}
+	return catalog.BeatController(ctx, s.Pool, catalog.HeartbeatApplier, term)
+}
+
+// queueAware is a store that knows whether its catalog has the operation
+// queue; a store that does not is treated as one without it.
+type queueAware interface {
+	Queued(ctx context.Context) (bool, error)
+}
+
+// homeShards reads a database's home shard as the catalog has it now.
+type homeShards interface {
+	DatabaseHomeShard(ctx context.Context, database string) (int32, error)
+}
+
+// heartbeater records that the applier is alive, for a router waiting on a
+// migration to tell a long queue from no controller.
+type heartbeater interface {
+	Beat(ctx context.Context, term int64) error
+}
+
 // Pending implements MigrationStore.
 func (s *PGMigrationStore) Pending(ctx context.Context) ([]catalog.DDLMigration, error) {
 	return catalog.PendingMigrations(ctx, s.Pool)
@@ -89,14 +127,20 @@ func (s *PGMigrationStore) Pending(ctx context.Context) ([]catalog.DDLMigration,
 // gate a start whose snapshot predates that commit could lock the row before
 // the copier's look and begin unseen.
 func (s *PGMigrationStore) Save(ctx context.Context, m catalog.DDLMigration, term int64) error {
+	save := catalog.SaveMigrationProgress
+	if queued, err := s.Queued(ctx); err != nil {
+		return err
+	} else if queued {
+		save = catalog.SaveQueuedMigrationProgress
+	}
 	if m.State != catalog.MigrationRunning {
-		return catalog.SaveMigrationProgress(ctx, s.Pool, m, term)
+		return save(ctx, s.Pool, m, term)
 	}
 	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
 		if err := lockMoveGate(ctx, tx); err != nil {
 			return err
 		}
-		return catalog.SaveMigrationProgress(ctx, tx, m, term)
+		return save(ctx, tx, m, term)
 	})
 }
 
@@ -355,11 +399,48 @@ func (a *Applier) now() time.Time {
 // Run drives pending migrations every interval while leader() is true.
 func (a *Applier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	a.leader = leader
+	if hb, ok := a.Store.(heartbeater); ok {
+		go a.beat(ctx, hb, leader)
+	}
 	runLoopStoppable(ctx, interval, leader, a.logger, "applier", func(ctx context.Context) {
 		if _, err := a.RunOnce(ctx); err != nil && ctx.Err() == nil {
 			a.logger().Warn("applier pass failed", "err", err)
 		}
 	})
+}
+
+// heartbeatInterval is how often a leading applier records it is alive.
+const heartbeatInterval = 15 * time.Second
+
+// beat records the applier alive while it leads, on its own clock rather
+// than per pass: one migration can hold a pass for hours.
+func (a *Applier) beat(ctx context.Context, hb heartbeater, leader func() bool) {
+	t := time.NewTicker(heartbeatInterval)
+	defer t.Stop()
+	for {
+		if leader == nil || leader() {
+			term := int64(0)
+			if a.Term != nil {
+				term = a.Term()
+			}
+			if err := hb.Beat(ctx, term); err != nil && ctx.Err() == nil {
+				a.logger().Warn("recording the applier heartbeat failed", "err", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// queued reports whether the store's catalog has the operation queue.
+func (a *Applier) queued(ctx context.Context) (bool, error) {
+	if q, ok := a.Store.(queueAware); ok {
+		return q.Queued(ctx)
+	}
+	return false, nil
 }
 
 // RunOnce drives every pending migration to completion or failure and
@@ -385,9 +466,13 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 	// locks were being written and never read: the migration simply ran.
 	// A migration already part-applied is driven to a final state rather
 	// than abandoned half-way, since stopping there is worse.
-	held, err := a.Store.LockedDatabases(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("applier: ddl locks: %w", err)
+	held := map[string]string{}
+	if queued, err := a.queued(ctx); err != nil {
+		return 0, fmt.Errorf("applier: operation queue: %w", err)
+	} else if !queued {
+		if held, err = a.Store.LockedDatabases(ctx); err != nil {
+			return 0, fmt.Errorf("applier: ddl locks: %w", err)
+		}
 	}
 	done := 0
 	for _, m := range pending {
@@ -428,6 +513,18 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		m.State, m.Meta.ShardSet = catalog.MigrationQueued, ""
 	}
 	if m.State == catalog.MigrationQueued {
+		if hs, ok := a.Store.(homeShards); ok && m.Scope == "home" {
+			if queued, err := a.queued(ctx); err != nil {
+				return err
+			} else if queued {
+				if m.HomeShard, err = hs.DatabaseHomeShard(ctx, m.Database); errors.Is(err, pgx.ErrNoRows) {
+					m.State, m.Error = catalog.MigrationFailed, fmt.Sprintf("database %s is not registered: it was dropped after the migration was queued", m.Database)
+					return a.Store.Save(ctx, m, a.term())
+				} else if err != nil {
+					return fmt.Errorf("applier: home shard of %s: %w", m.Database, err)
+				}
+			}
+		}
 		targets, err := a.targets(ctx, m, serving)
 		if err != nil {
 			return err
@@ -441,7 +538,7 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		}
 		m.State, m.Meta.ShardSet = catalog.MigrationRunning, serving
 		if err := a.Store.Save(ctx, m, a.term()); errors.Is(err, catalog.ErrMigrationHeld) {
-			logger.Info("holding a migration while a reshard or upgrade copies")
+			logger.Info("holding a migration: it waits its turn in the operation queue, or for the shard set or home shard it planned against to serve")
 			return nil
 		} else if err != nil {
 			return err

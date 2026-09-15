@@ -144,7 +144,17 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 			}
 			kind := KindReshard
 			spec := map[string]any{"shard_set": ss.Name, "generation": ss.Generation, "desired_generation": ss.DesiredGeneration, "ranges": specRanges(ranges), "source_set": source}
+			sourceRanges, err := catalog.ListShardRanges(ctx, tx, source)
+			if err != nil {
+				return err
+			}
+			// What the run changes, kept with it: the source set's ranges are
+			// dropped when it retires, and the queue still names the run.
+			spec["source_shards"] = len(sourceRanges)
 			srv := setByName[source]
+			if srv.PGMajor != nil {
+				spec["source_pg_major"] = *srv.PGMajor
+			}
 			if upgradeSet(ss, &srv) {
 				kind = KindUpgrade
 				spec["pg_major"] = *ss.PGMajor

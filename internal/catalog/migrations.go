@@ -442,6 +442,34 @@ func collectMigrations(rows pgx.Rows) ([]DDLMigration, error) {
 // start, and a pass or controller that loads the migration later needs it
 // to tell a resume from a straddled cutover.
 func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, term int64) error {
+	return saveMigrationProgress(ctx, db, m, term, `UPDATE pgshard.migrations SET state = $2, per_shard = $3, error = $4, updated_at = now(),
+		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END,
+		meta = CASE WHEN $6 = '' THEN meta ELSE jsonb_set(meta, '{shard_set}', to_jsonb($6::text)) END
+		WHERE id = $1 AND `+leaderTermPredicate+`
+		  AND NOT (state = 'queued' AND $2 = 'running' AND `+MigrationHeldPredicate+`)`)
+}
+
+// SaveQueuedMigrationProgress is SaveMigrationProgress for a catalog with
+// the operation queue. A migration starts only when it waits for nothing
+// (pgshard.operation_blockers), against the shard set that is serving, and
+// a home-scope one on the home shard its database has now: one queued
+// before a cutover and held through it was recorded with the retired set's
+// home shard. The start is stamped in started_at.
+func SaveQueuedMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, term int64) error {
+	return saveMigrationProgress(ctx, db, m, term, `UPDATE pgshard.migrations SET state = $2, per_shard = $3, error = $4, updated_at = now(),
+		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END,
+		meta = CASE WHEN $6 = '' THEN meta ELSE jsonb_set(meta, '{shard_set}', to_jsonb($6::text)) END,
+		started_at = CASE WHEN state = 'queued' AND $2 = 'running' THEN now() WHEN $2 = 'queued' THEN NULL ELSE started_at END,
+		home_shard = CASE WHEN state = 'queued' AND $2 = 'running' AND scope = 'home' THEN $7 ELSE home_shard END
+		WHERE id = $1 AND `+leaderTermPredicate+`
+		  AND NOT (state = 'queued' AND $2 = 'running' AND (
+		      EXISTS (SELECT 1 FROM pgshard.operation_blockers('ddl', pgshard.migrations.id))
+		      OR $6 IS DISTINCT FROM coalesce((SELECT shard_set FROM pgshard.shard_sets WHERE state = 'serving' ORDER BY generation DESC LIMIT 1), 'default')
+		      OR (scope = 'home' AND $7::int IS DISTINCT FROM (SELECT d.home_shard FROM pgshard.databases d WHERE d.name = pgshard.migrations.database))))`,
+		m.HomeShard)
+}
+
+func saveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, term int64, sql string, extra ...any) error {
 	perShard, err := json.Marshal(m.PerShard)
 	if err != nil {
 		return err
@@ -450,11 +478,8 @@ func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, t
 	if m.Error != "" {
 		errText = &m.Error
 	}
-	rows, err := db.Query(ctx, `UPDATE pgshard.migrations SET state = $2, per_shard = $3, error = $4, updated_at = now(),
-		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END,
-		meta = CASE WHEN $6 = '' THEN meta ELSE jsonb_set(meta, '{shard_set}', to_jsonb($6::text)) END
-		WHERE id = $1 AND `+leaderTermPredicate+`
-		  AND NOT (state = 'queued' AND $2 = 'running' AND `+MigrationHeldPredicate+`)`, m.ID, m.State, perShard, errText, termArg(term), m.Meta.ShardSet)
+	args := append([]any{m.ID, m.State, perShard, errText, termArg(term), m.Meta.ShardSet}, extra...)
+	rows, err := db.Query(ctx, sql, args...)
 	if err != nil {
 		return err
 	}

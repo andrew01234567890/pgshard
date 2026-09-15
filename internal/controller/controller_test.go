@@ -364,9 +364,9 @@ func TestController(t *testing.T) {
 		if st := queryOne[string](t, conn, `SELECT state FROM pgshard.shard_sets WHERE shard_set = 'g2'`); st != catalog.ShardSetProvisioning {
 			t.Fatalf("shard set state %s", st)
 		}
-		wf := queryOne[string](t, conn, `SELECT state || ':' || (status->>'stage') || ':' || (spec->>'shard_set') || ':' || jsonb_array_length(spec->'ranges')
+		wf := queryOne[string](t, conn, `SELECT state || ':' || (status->>'stage') || ':' || (spec->>'shard_set') || ':' || jsonb_array_length(spec->'ranges') || ':' || (spec->>'source_shards')
 			FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'`)
-		if wf != "provisioning:provisioning:g2:2" {
+		if wf != "provisioning:provisioning:g2:2:3" {
 			t.Fatalf("workflow %s", wf)
 		}
 		if res := reconcile(t, conn); res.WorkflowsCreated != 0 || res.ReshardsAdvanced != 0 {
