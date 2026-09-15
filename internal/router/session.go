@@ -288,6 +288,9 @@ type Executor struct {
 	// would hold the drain that is waiting for it.
 	txnOnBackend bool
 	txnPreFence  bool
+	// txnRanDDL says the open transaction applied DDL on its own, in a
+	// database that runs DDL transactions sequentially.
+	txnRanDDL bool
 
 	// stmtSnap is the snapshot the statement in flight was planned
 	// against; nil between statements.
@@ -797,6 +800,7 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.staged, e.stagedMark = nil, 0
 		e.txnPrelude, e.txnTouched = nil, false
 		e.txnOnBackend, e.txnPreFence = false, false
+		e.txnRanDDL = false
 		// finishTxn is what lowers uncancellable, and a panic skips it. Left
 		// up, every later cancel on this session would be swallowed: the
 		// client waits out the cancel grace and gets 08006 instead of 57014,
@@ -899,6 +903,13 @@ func (e *Executor) refuseTxnControlInBatch(class StmtClass) error {
 	if e.localOnly() {
 		return nil
 	}
+	// Nor where the transaction holds nothing on a shard and DDL runs
+	// statement by statement: then there is no work of the client's that a
+	// COMMIT here could commit without it. pgroll sends its version views as
+	// "BEGIN; DROP VIEW ...; CREATE VIEW ...; COMMIT".
+	if e.ddlRunsSequentially() && !e.txnTouched && !e.multiShardTxn() {
+		return nil
+	}
 	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
 		"a transaction control statement is not available inside a multi-statement simple query")
 	// Not "put it inside BEGIN and COMMIT": the batch that trips this
@@ -965,6 +976,9 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		return e.afterBatch(ctx, err)
 	}
 	if err := e.checkFanout(pl); err != nil {
+		return e.afterBatch(ctx, err)
+	}
+	if err := e.refuseShardStatementAfterDDL(pl); err != nil {
 		return e.afterBatch(ctx, err)
 	}
 	if pl.Kind == plan.MigrationKind {
@@ -1246,9 +1260,9 @@ func (e *Executor) dropStream() {
 //
 // PostgreSQL answers 'E' and 25P02 for every statement until the
 // transaction is ended, which is what this makes the router do.
-// It is called only where decideFailover answered failoverFailTxn, which
-// it does only when a transaction is open (failover.go:88-93), so there is
-// no second condition to check here.
+// It is called only where a transaction is open -- where decideFailover
+// answered failoverFailTxn (failover.go:88-93), and where DDL a transaction
+// ran on its own failed -- so there is no second condition to check here.
 func (e *Executor) failTxn() { e.tx = pgwire.TxFailed }
 
 // endFailedTxn ends a transaction that was killed under the client, without
@@ -1633,6 +1647,10 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 			e.staged = append(e.staged, g)
 			defer e.injectSearchPath(g)
 		}
+		if err := e.refuseShardStatementAfterDDL(st.plan); err != nil {
+			e.failBatch()
+			return err
+		}
 		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class, tables: st.plan.Tables})
 	}
 	e.batch = append(e.batch, executeReq(portal, maxRows))
@@ -2008,6 +2026,7 @@ func (e *Executor) afterBatch(ctx context.Context, err error) error {
 	if e.tx == pgwire.TxIdle {
 		e.txnPrelude, e.txnTouched = nil, false
 		e.txnOnBackend, e.txnPreFence = false, false
+		e.txnRanDDL = false
 		e.wroteHere, e.gid = false, ""
 		e.savepoints = nil
 		e.dropParked()

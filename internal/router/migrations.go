@@ -142,18 +142,102 @@ func gucOn(v string) bool {
 // applier has finished it (or at once under pgshard.ddl_async).
 func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.ResultWriter) error {
 	m := pl.Migration
-	if e.tx != pgwire.TxIdle {
-		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s inside a transaction block is not available through the router: DDL fans out to every shard and cannot be rolled back with the transaction", m.Kind)
-		err.Hint = "run DDL outside BEGIN/COMMIT; each shard applies it in its own transaction"
-		if e.implicitTx {
-			// The client sent no BEGIN, so a hint about its own is a hint
-			// about something it did not do. What it sent is a batch, and
-			// the transaction is the one this router opened around it.
-			err = pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s is not available inside a multi-statement simple query: it fans out to every shard and cannot be rolled back with the transaction the batch runs in", m.Kind)
-			err.Hint = "send the DDL as its own query, not as one statement of a semicolon-separated batch"
+	if e.tx == pgwire.TxIdle {
+		if err := e.queueMigration(ctx, m, w); err != nil {
+			return err
 		}
+		return w.CommandComplete(m.Kind)
+	}
+	if err := e.refuseDDLInTransaction(m); err != nil {
 		return err
 	}
+	if err := w.Notice(&pgproto3.NoticeResponse{Severity: "NOTICE", SeverityUnlocalized: "NOTICE", Code: "00000",
+		Message: fmt.Sprintf("%s is applied on its own, not as part of this transaction", m.Kind),
+		Hint:    fmt.Sprintf("database %q runs DDL transactions sequentially: a ROLLBACK does not undo it", e.info.Database)}); err != nil {
+		return err
+	}
+	// The transaction has run nothing but its prelude, so its backend does
+	// not wait out the migration inside it: idle_in_transaction_session_timeout
+	// would end it, and a barrier's drain would wait for it. The prelude
+	// opens it again before the statement is answered.
+	err := e.releaseUntouchedTxn(ctx)
+	if err == nil {
+		err = e.queueMigration(ctx, m, w)
+	}
+	if err == nil {
+		if rerr := e.replayPrelude(ctx); rerr != nil {
+			// The DDL is in; a client told only that the connection failed
+			// would send it again and be told it already exists.
+			perr := pgwire.Errorf(codeConnectionFailure, "%s was applied, but opening the transaction again afterwards failed: %v", m.Kind, rerr)
+			perr.Hint = "the DDL stays applied; end this transaction and do not send it again"
+			err = perr
+		}
+	}
+	if err != nil {
+		// PostgreSQL fails the transaction a statement errors in. The
+		// transaction holds nothing on a shard yet, so its backend goes and
+		// the router answers for the failed transaction until it ends.
+		e.dropStream()
+		e.failTxn()
+		return err
+	}
+	e.txnRanDDL = true
+	return w.CommandComplete(m.Kind)
+}
+
+// refuseDDLInTransaction refuses DDL inside a transaction, unless the
+// database runs DDL transactions sequentially and the transaction has run
+// nothing on a shard.
+func (e *Executor) refuseDDLInTransaction(m *plan.Migration) error {
+	if e.tx == pgwire.TxFailed {
+		return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+	}
+	sequential := e.ddlRunsSequentially()
+	if sequential && !e.txnTouched && !e.multiShardTxn() {
+		return nil
+	}
+	if sequential {
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s is not available in a transaction that has already run a statement on a shard: DDL here is applied on its own, so it cannot commit together with that statement", m.Kind)
+		err.Hint = "run the DDL in a transaction of its own"
+		return err
+	}
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s inside a transaction block is not available through the router: DDL fans out to every shard and cannot be rolled back with the transaction", m.Kind)
+	err.Hint = "run DDL outside BEGIN/COMMIT; each shard applies it in its own transaction"
+	if e.implicitTx {
+		// The client sent no BEGIN, so a hint about its own is a hint
+		// about something it did not do. What it sent is a batch, and
+		// the transaction is the one this router opened around it.
+		err = pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s is not available inside a multi-statement simple query: it fans out to every shard and cannot be rolled back with the transaction the batch runs in", m.Kind)
+		err.Hint = "send the DDL as its own query, not as one statement of a semicolon-separated batch"
+	}
+	return err
+}
+
+// refuseShardStatementAfterDDL refuses a statement that would run on a
+// shard in a transaction that has already applied DDL on its own: the two
+// could not commit or roll back together.
+func (e *Executor) refuseShardStatementAfterDDL(pl plan.Plan) error {
+	if !e.txnRanDDL || pl.Kind == plan.MigrationKind || pl.Kind == plan.SessionLocal || pl.Class.Txn != plan.TxnNone {
+		return nil
+	}
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "a statement that runs on a shard is not available after DDL in the same transaction: the DDL was applied on its own, so the two cannot commit together")
+	err.Hint = "commit the transaction that ran the DDL, and run this statement in another"
+	return err
+}
+
+// ddlRunsSequentially reports whether the session's database runs a
+// transaction's DDL statement by statement (pgshard.databases.ddl_transactions).
+func (e *Executor) ddlRunsSequentially() bool {
+	if e.catalogSession() {
+		return false
+	}
+	snap := e.r.cfg.Snapshot()
+	return snap != nil && snap.Databases[e.info.Database].DDLTransactions == catalog.DDLTransactionsSequential
+}
+
+// queueMigration queues m and waits for the applier to finish it (or not,
+// under pgshard.ddl_async); the caller answers the statement.
+func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwire.ResultWriter) error {
 	if e.r.cfg.Migrations == nil {
 		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available: the router has no migration queue")
 		err.Hint = "start the router with a catalog connection that may write pgshard.migrations"
@@ -181,7 +265,7 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 			Hint:    "SELECT state, per_shard FROM pgshard.migrations WHERE id = '" + id + "'"}); err != nil {
 			return err
 		}
-		return w.CommandComplete(m.Kind)
+		return nil
 	}
 	done, err := e.r.cfg.Migrations.Wait(ctx, id)
 	if err != nil {
@@ -202,7 +286,7 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 			return err
 		}
 	}
-	return w.CommandComplete(m.Kind)
+	return nil
 }
 
 // migrationRefreshTimeout bounds how long an applied migration waits for
