@@ -365,9 +365,9 @@ func (r *ClusterReconciler) mirrorCutoverSpec(ctx context.Context, c *pgshardv1a
 			proceed = append(proceed, p)
 		}
 	}
-	var retire int64
+	var retire *time.Duration
 	if d := c.Spec.Resharding.RetireOldGroupsAfter; d != nil {
-		retire = int64(d.Seconds())
+		retire = &d.Duration
 	}
 	if err := r.Prober.SetReshardCutoverSpec(ctx, dsn, wf.ID, c.Spec.Resharding.PauseBefore, proceed, retire); err != nil {
 		return wf, fmt.Errorf("mirror cutover spec: %w", err)

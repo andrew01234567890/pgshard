@@ -42,8 +42,12 @@ import (
 
 const (
 	requeueNotReady = 10 * time.Second
-	requeueReady    = 30 * time.Second
-	requeueFailover = 2 * time.Second
+	requeueRetiring = 5 * time.Second
+	// pauseBeforeComplete is spec.resharding.pauseBefore's manual gate
+	// before a run completes.
+	pauseBeforeComplete = "complete"
+	requeueReady        = 30 * time.Second
+	requeueFailover     = 2 * time.Second
 )
 
 // ClusterReconciler reconciles PgShardCluster objects into groups of pods
@@ -383,6 +387,19 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	requeue := requeueReady
+	// A reshard switched with a short retirement window completes within a
+	// pass or two of the controller, and its old groups are deleted on the
+	// operator's next look; waiting out the usual interval would keep them
+	// running for it. A run held for a manual proceed is not about to
+	// complete, however short its window, and looking six times as often
+	// until someone annotates it costs the whole cluster a reconcile each
+	// time.
+	if rs := cluster.Status.Reshard; rs != nil && rs.Phase == pgshardv1alpha1.ReshardPhaseCompleting &&
+		cluster.Spec.Resharding.PauseBefore != pauseBeforeComplete {
+		if d := cluster.Spec.Resharding.RetireOldGroupsAfter; d != nil && d.Duration < requeue {
+			requeue = requeueRetiring
+		}
+	}
 	for _, o := range slices.Concat(observations, targets, retired) {
 		if o.failing {
 			return ctrl.Result{RequeueAfter: requeueFailover}, nil

@@ -1532,7 +1532,14 @@ spec:
                         type: string
                       retireOldGroupsAfter:
                         default: 24h
+                        description: |-
+                          RetireOldGroupsAfter is how long the old groups stay after the write
+                          switch, keeping a rollback possible. 0 deletes them as soon as the
+                          reshard completes.
                         type: string
+                        x-kubernetes-validations:
+                        - message: retireOldGroupsAfter must not be negative
+                          rule: duration(self) >= duration('0s')
                     type: object
                   resources:
                     description: ResourceRequirements describes the compute resource

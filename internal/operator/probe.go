@@ -97,7 +97,7 @@ type Prober interface {
 	PlacementWorkflows(ctx context.Context, dsn string) ([]PlacementWorkflowInfo, error)
 	// SetReshardCutoverSpec mirrors spec.resharding and the proceed
 	// annotation into the workflow spec the controller's cutover reads.
-	SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error
+	SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfter *time.Duration) error
 	// DropSlot removes one replication slot, terminating whatever is using
 	// it first, and reports an error if it is still there afterwards.
 	//
@@ -554,7 +554,7 @@ func (PgxProber) SetWorkflowRollback(ctx context.Context, dsn, workflowID string
 }
 
 // SetReshardCutoverSpec merges the cutover keys into the workflow spec.
-func (PgxProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error {
+func (PgxProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfter *time.Duration) error {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return err
@@ -566,7 +566,16 @@ func (PgxProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pau
 	if proceed == nil {
 		proceed = []string{}
 	}
-	body, err := json.Marshal(map[string]any{"pause_before": pauseBefore, "proceed": proceed, "retire_after_seconds": retireAfterSeconds})
+	// retire_after_seconds is what a controller from before retire_after_ms
+	// reads, with 0 meaning its 24h default; a newer one reads the
+	// milliseconds, whose presence alone says the window was set, so 0
+	// means no window at all.
+	keys := map[string]any{"pause_before": pauseBefore, "proceed": proceed, "retire_after_seconds": int64(0)}
+	if retireAfter != nil {
+		keys["retire_after_seconds"] = int64(retireAfter.Seconds())
+		keys["retire_after_ms"] = retireAfter.Milliseconds()
+	}
+	body, err := json.Marshal(keys)
 	if err != nil {
 		return err
 	}
@@ -1242,10 +1251,10 @@ func (b boundedProber) PlacementWorkflows(ctx context.Context, dsn string) ([]Pl
 	return b.Inner.PlacementWorkflows(ctx, dsn)
 }
 
-func (b boundedProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error {
+func (b boundedProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfter *time.Duration) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.SetReshardCutoverSpec(ctx, dsn, workflowID, pauseBefore, proceed, retireAfterSeconds)
+	return b.Inner.SetReshardCutoverSpec(ctx, dsn, workflowID, pauseBefore, proceed, retireAfter)
 }
 
 func (b boundedProber) DropSlot(ctx context.Context, dsn, name string) error {

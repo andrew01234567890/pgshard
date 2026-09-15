@@ -272,10 +272,14 @@ func (f *fakeProber) SetWorkflowRollback(_ context.Context, _, id string) error 
 	return nil
 }
 
-func (f *fakeProber) SetReshardCutoverSpec(_ context.Context, _ string, id, pause string, proceed []string, retire int64) error {
+func (f *fakeProber) SetReshardCutoverSpec(_ context.Context, _ string, id, pause string, proceed []string, retire *time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.cutoverSpecs = append(f.cutoverSpecs, fmt.Sprintf("%s:%s:%s:%d", id, pause, strings.Join(proceed, "+"), retire))
+	window := "unset"
+	if retire != nil {
+		window = retire.String()
+	}
+	f.cutoverSpecs = append(f.cutoverSpecs, fmt.Sprintf("%s:%s:%s:%s", id, pause, strings.Join(proceed, "+"), window))
 	return nil
 }
 

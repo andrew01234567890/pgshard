@@ -337,3 +337,31 @@ func TestReshardPagesEscapeUntrustedText(t *testing.T) {
 		}
 	}
 }
+
+// The admin reads the retirement window as the controller does: a mirrored
+// 0 is no window, not the default, and a recorded retire_at is taken as is.
+func TestTheRetireTimeFollowsTheMirroredWindow(t *testing.T) {
+	zero, hour := int64(0), int64(3600000)
+	switched := reshardFenced.Add(3 * time.Second)
+	recorded := switched.Add(90 * time.Minute)
+	for _, c := range []struct {
+		spec   reshardSpec
+		retire *time.Time
+		want   time.Time
+	}{
+		{reshardSpec{RetireAfterSeconds: 0}, nil, switched.Add(24 * time.Hour)},
+		{reshardSpec{RetireAfterMS: &zero}, nil, switched},
+		{reshardSpec{RetireAfterSeconds: 3600, RetireAfterMS: &hour}, nil, switched.Add(time.Hour)},
+		{reshardSpec{RetireAfterMS: &zero}, &recorded, recorded},
+	} {
+		if c.retire != nil {
+			if got := *c.retire; !got.Equal(c.want) {
+				t.Errorf("recorded retire_at %s, want %s", got, c.want)
+			}
+			continue
+		}
+		if got := switched.Add(retireAfter(c.spec)); !got.Equal(c.want) {
+			t.Errorf("%+v: retire at %s, want %s", c.spec, got, c.want)
+		}
+	}
+}

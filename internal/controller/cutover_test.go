@@ -679,6 +679,49 @@ func TestCutoverSpecDefaults(t *testing.T) {
 	}
 }
 
+// TestTheRetirementWindowIsReadAsTheOperatorMirroredIt (PGS-901): the
+// operator mirrored retireOldGroupsAfter as whole seconds, and 0 was read as
+// the 24h default, so asking for no window gave a day. The milliseconds,
+// when mirrored, say the window was set; a spec written before them keeps
+// the old reading.
+func TestTheRetirementWindowIsReadAsTheOperatorMirroredIt(t *testing.T) {
+	ms := func(v int64) *int64 { return &v }
+	for _, c := range []struct {
+		spec string
+		want time.Duration
+	}{
+		{`{"retire_after_seconds": 0}`, DefaultRetireAfter},
+		{`{"retire_after_seconds": 0, "retire_after_ms": 0}`, 0},
+		{`{"retire_after_seconds": 0, "retire_after_ms": 500}`, 500 * time.Millisecond},
+		{`{"retire_after_seconds": 3600, "retire_after_ms": 3600000}`, time.Hour},
+		{`{"retire_after_ms": -5}`, DefaultRetireAfter},
+	} {
+		var s cutoverSpec
+		if err := json.Unmarshal([]byte(c.spec), &s); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.retireAfter(); got != c.want {
+			t.Errorf("%s: window %s, want %s", c.spec, got, c.want)
+		}
+	}
+	h := newCutoverHarness(t)
+	h.wf.spec.RetireAfterSeconds, h.wf.spec.RetireAfterMS = 0, ms(0)
+	h.runUntil(t, StageSwitched)
+	if !h.pass(t) || h.wf.stage != StageCompleting {
+		t.Fatalf("with no window the switched run is at %s, want completing on the next pass", h.wf.stage)
+	}
+	if h.wf.cutover.RetireAt == nil || !h.wf.cutover.RetireAt.Equal(*h.wf.cutover.SwitchedAt) {
+		t.Fatalf("retire_at %v, want the switch time %v", h.wf.cutover.RetireAt, h.wf.cutover.SwitchedAt)
+	}
+
+	h = newCutoverHarness(t)
+	h.wf.spec.RetireAfterMS, h.wf.spec.PauseBefore = ms(0), PauseComplete
+	h.runUntil(t, StageSwitched)
+	if h.pass(t) || h.wf.stage != StageSwitched {
+		t.Fatalf("pauseBefore complete must still hold a run with no window: at %s", h.wf.stage)
+	}
+}
+
 func TestCutoverSwapWaitsUntilTargetsCaughtUp(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitching)

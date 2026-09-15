@@ -339,6 +339,7 @@ type reshardStatus struct {
 		Gate       string     `json:"gate"`
 		FencedAt   *time.Time `json:"fenced_at"`
 		SwitchedAt *time.Time `json:"switched_at"`
+		RetireAt   *time.Time `json:"retire_at"`
 		FlippedAt  *time.Time `json:"flipped_at"`
 		ReleasedAt *time.Time `json:"released_at"`
 		PauseMS    int64      `json:"pause_ms"`
@@ -360,6 +361,7 @@ type reshardSpec struct {
 	PauseBefore        string   `json:"pause_before"`
 	Proceed            []string `json:"proceed"`
 	RetireAfterSeconds int64    `json:"retire_after_seconds"`
+	RetireAfterMS      *int64   `json:"retire_after_ms"`
 }
 
 func convertReshard(r *pgshardv1alpha1.PgShardReshard, byID map[string]WorkflowRecord) Reshard {
@@ -469,8 +471,10 @@ func applyWorkflow(out *Reshard, w WorkflowRecord) {
 		if c.FenceMS > 0 {
 			cv.Fence = (time.Duration(c.FenceMS) * time.Millisecond).String()
 		}
-		if c.SwitchedAt != nil {
-			retire := c.SwitchedAt.Add(retireAfter(spec.RetireAfterSeconds))
+		if c.RetireAt != nil {
+			cv.RetireAt = c.RetireAt
+		} else if c.SwitchedAt != nil {
+			retire := c.SwitchedAt.Add(retireAfter(spec))
 			cv.RetireAt = &retire
 		}
 		if c.Verify != nil {
@@ -491,9 +495,15 @@ func applyWorkflow(out *Reshard, w WorkflowRecord) {
 	}
 }
 
-func retireAfter(seconds int64) time.Duration {
-	if seconds > 0 {
-		return time.Duration(seconds) * time.Second
+// retireAfter reads the retirement window the way the controller does: the
+// milliseconds when present, 0 meaning none, else the seconds with 0 meaning
+// the default.
+func retireAfter(spec reshardSpec) time.Duration {
+	if spec.RetireAfterMS != nil && *spec.RetireAfterMS >= 0 {
+		return time.Duration(*spec.RetireAfterMS) * time.Millisecond
+	}
+	if spec.RetireAfterSeconds > 0 {
+		return time.Duration(spec.RetireAfterSeconds) * time.Second
 	}
 	return controller.DefaultRetireAfter
 }

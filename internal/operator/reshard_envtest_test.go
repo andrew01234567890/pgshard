@@ -262,7 +262,7 @@ func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
 	fp.mu.Lock()
 	last := fp.cutoverSpecs[len(fp.cutoverSpecs)-1]
 	fp.mu.Unlock()
-	if last != "wf-2:switchWrites::86400" {
+	if last != "wf-2:switchWrites::24h0m0s" {
 		t.Fatalf("mirrored spec: %q", last)
 	}
 
@@ -291,8 +291,21 @@ func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
 	fp.mu.Lock()
 	last = fp.cutoverSpecs[len(fp.cutoverSpecs)-1]
 	fp.mu.Unlock()
-	if last != "wf-2:switchWrites:switchWrites+complete:86400" {
+	if last != "wf-2:switchWrites:switchWrites+complete:24h0m0s" {
 		t.Fatalf("proceed annotation must reach the workflow: %q", last)
+	}
+	// No window at all is mirrored as one, not as the default (PGS-901).
+	get(t, "rsw", c)
+	c.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{}
+	if err := k8sClient.Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	last = fp.cutoverSpecs[len(fp.cutoverSpecs)-1]
+	fp.mu.Unlock()
+	if last != "wf-2:switchWrites:switchWrites+complete:0s" {
+		t.Fatalf("retireOldGroupsAfter: 0 mirrored as %q", last)
 	}
 
 	fp.setShardSetState(catalog.DefaultShardSet, catalog.ShardSetRetired)
