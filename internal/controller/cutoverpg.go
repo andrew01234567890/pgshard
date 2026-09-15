@@ -1351,17 +1351,30 @@ func (o *pgCutover) abandonPauseClaim(ctx context.Context, set string, ids []int
 // after it; the pause alone stops new writers, not the ones already in
 // flight.
 func (o *pgCutover) drainWriters(ctx context.Context, set string, ids []int32) error {
-	deadline := o.c.now().Add(writerDrainTimeout)
+	// Before the journal the switch is undone once the fence has been held
+	// for the cutover timeout, so waiting past that only holds the fence
+	// longer for an undo that is already due (PGS-845).
+	wait := writerDrainTimeout
+	if left, ok := o.fenceRemaining(); ok && left < wait {
+		wait = left
+	}
+	deadline := o.c.now().Add(wait)
 	for {
 		busy, err := o.writingBackends(ctx, set, ids)
 		if err != nil {
 			return err
 		}
-		if busy == 0 {
+		if len(busy) == 0 {
 			return nil
 		}
 		if o.c.now().After(deadline) {
-			return fmt.Errorf("%d write transactions on %s still open after %s", busy, set, writerDrainTimeout)
+			// Named, because the operator is the one who has to find them:
+			// "N transactions still open" says nothing about whose.
+			named := busy
+			if len(named) > drainNamed {
+				named = append(named[:drainNamed:drainNamed], fmt.Sprintf("+%d more", len(busy)-drainNamed))
+			}
+			return fmt.Errorf("%d write transactions on %s still open after %s: %s", len(busy), set, wait.Round(time.Millisecond), strings.Join(named, "; "))
 		}
 		select {
 		case <-ctx.Done():
@@ -1392,33 +1405,36 @@ func (o *pgCutover) drainWriters(ctx context.Context, set string, ids []int32) e
 // for SET TRANSACTION READ WRITE. It is deliberately overriding the pause,
 // and the router's own fence is what refuses it, but if it has reached the
 // point of writing here it must still be drained.
-func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32) (int, error) {
-	total := 0
+func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32) ([]string, error) {
+	var busy []string
 	for _, s := range ids {
 		conn, err := o.c.Shards.Dial(ctx, set, s)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		// A zero instant means this set was never paused -- the rollback
 		// path drains without pausing -- so fall back to the written-only
 		// question rather than waiting for every open transaction.
 		since := o.pausedAt[pausedShard{set, s}]
-		rows, err := conn.Query(ctx, `SELECT count(*)::int FROM pg_stat_activity
-			WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
-			  AND (backend_xid IS NOT NULL
-			       OR ($1::timestamptz IS NOT NULL AND xact_start IS NOT NULL AND xact_start < $1::timestamptz))`,
-			nullTime(since))
-		var n int
+		rows, err := conn.Query(ctx, `SELECT format('%s/%s pid %s (%s, %s, open %s)', $2::text, $3::int, pid,
+			       coalesce(nullif(application_name, ''), usename, '?'), state, date_trunc('second', clock_timestamp() - xact_start))
+			  FROM pg_stat_activity
+			 WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+			   AND (backend_xid IS NOT NULL
+			        OR ($1::timestamptz IS NOT NULL AND xact_start IS NOT NULL AND xact_start < $1::timestamptz))
+			 ORDER BY xact_start`,
+			nullTime(since), set, s)
+		var found []string
 		if err == nil {
-			n, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int])
+			found, err = pgx.CollectRows(rows, pgx.RowTo[string])
 		}
 		_ = conn.Close(ctx)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		total += n
+		busy = append(busy, found...)
 	}
-	return total, nil
+	return busy, nil
 }
 
 // nullTime renders a zero instant as SQL NULL, so an unpaused set falls back
@@ -1429,6 +1445,10 @@ func nullTime(t time.Time) any {
 	}
 	return t
 }
+
+// drainNamed caps how many open transactions a drain's error names: the
+// message lands in the workflow's status and in every recorded undo.
+const drainNamed = 10
 
 // writerDrainTimeout bounds the wait for in-flight write transactions to
 // end once new ones are refused.
