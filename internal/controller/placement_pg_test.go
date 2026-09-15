@@ -1992,9 +1992,8 @@ func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
 		return queryOne[string](t, connect(t, dsn), `SELECT relreplident::text FROM pg_class WHERE oid = 'public.ledger'::regclass`)
 	}
 
-	holder := connect(t, dsn)
 	holdLedger := func() pgx.Tx {
-		tx, err := holder.Begin(ctx)
+		tx, err := connect(t, dsn).Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2006,12 +2005,16 @@ func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
 
 	t.Run("a reader that ends while it retries", func(t *testing.T) {
 		tx := holdLedger()
+		committed := make(chan error, 1)
 		go func() {
 			time.Sleep(replicaIdentityLockWait + replicaIdentityLockWait/2)
-			_ = tx.Commit(ctx)
+			committed <- tx.Commit(ctx)
 		}()
 		if err := p.dropReplication(ctx, wf); err != nil {
 			t.Fatalf("the restore gave up although the reader ended before its last try: %v", err)
+		}
+		if err := <-committed; err != nil {
+			t.Fatal(err)
 		}
 		if got := identity(); got != "d" {
 			t.Fatalf("replica identity is %q, want the default back", got)
@@ -2027,8 +2030,16 @@ func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- p.dropReplication(runCtx, wf) }()
 
-		time.Sleep(replicaIdentityLockWait / 5)
-		readCtx, cancelRead := context.WithTimeout(ctx, replicaIdentityLockWait+2*time.Second)
+		// Only a reader arriving while the ALTER waits queues behind it.
+		watch := connect(t, dsn)
+		for queued := false; !queued; {
+			if runCtx.Err() != nil {
+				t.Fatal("the restore never waited for its lock")
+			}
+			queued = queryOne[bool](t, watch, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'public.ledger'::regclass AND NOT granted)`)
+			time.Sleep(20 * time.Millisecond)
+		}
+		readCtx, cancelRead := context.WithTimeout(ctx, 2*replicaIdentityLockWait)
 		defer cancelRead()
 		var n int64
 		if err := connect(t, dsn).QueryRow(readCtx, `SELECT count(*) FROM ledger`).Scan(&n); err != nil {
