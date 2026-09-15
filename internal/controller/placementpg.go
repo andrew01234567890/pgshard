@@ -449,71 +449,124 @@ func (p *Placer) checkTriggerFunctions(ctx context.Context, source ShardConn, wf
 // fenced -- and a move past its swap cannot be cancelled. So the question is
 // asked at prepare, and again before the first rename.
 func (p *Placer) checkPolicyDependencies(ctx context.Context, source ShardConn, wf *placementWorkflow) error {
-	if source == nil {
+	recheck := source == nil
+	if recheck {
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, wf.from.Sources()[0], wf.spec.Database)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = conn.Close(ctx) }()
 		source = conn
+		// The swap runs the statements captured at prepare, so those are
+		// what has to be checked. A policy created, altered or dropped since
+		// would be recreated wrong, or checked for what it no longer uses.
+		now, err := tablePolicies(ctx, source, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.spec.TableName))
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(now, wf.st.Policies) {
+			return fatal("the row-level security policies of %s changed during the move; retry the move", wf.spec.table())
+		}
 	}
-	rows, err := source.Query(ctx, `SELECT DISTINCT kind, name FROM (
-			SELECT pol.polname AS policy, CASE d.refclassid
-					WHEN 'pg_class'::regclass THEN 'relation'
+	rows, err := source.Query(ctx, `SELECT DISTINCT kind, name, col FROM (
+			SELECT CASE d.refclassid
+					WHEN 'pg_class'::regclass THEN CASE WHEN d.refobjsubid = 0 THEN 'relation' ELSE 'column' END
 					WHEN 'pg_proc'::regclass THEN 'function'
-					ELSE 'type' END AS kind,
+					WHEN 'pg_type'::regclass THEN 'type'
+					WHEN 'pg_operator'::regclass THEN 'operator'
+					WHEN 'pg_collation'::regclass THEN 'collation'
+					ELSE 'unchecked' END AS kind,
 				CASE d.refclassid
 					WHEN 'pg_class'::regclass THEN d.refobjid::regclass::text
 					WHEN 'pg_proc'::regclass THEN d.refobjid::regprocedure::text
-					ELSE d.refobjid::regtype::text END AS name
+					WHEN 'pg_type'::regclass THEN d.refobjid::regtype::text
+					WHEN 'pg_operator'::regclass THEN d.refobjid::regoperator::text
+					WHEN 'pg_collation'::regclass THEN d.refobjid::regcollation::text
+					ELSE pg_describe_object(d.refclassid, d.refobjid, d.refobjsubid) END AS name,
+				CASE WHEN d.refclassid = 'pg_class'::regclass AND d.refobjsubid > 0
+					THEN (SELECT attname FROM pg_attribute WHERE attrelid = d.refobjid AND attnum = d.refobjsubid) ELSE '' END AS col
 			FROM pg_policy pol
 			JOIN pg_depend d ON d.classid = 'pg_policy'::regclass AND d.objid = pol.oid
-			WHERE pol.polrelid = $1::regclass
-			  AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass, 'pg_type'::regclass)
+			WHERE pol.polrelid = $1::regclass AND d.deptype = 'n'
 			  AND NOT (d.refclassid = 'pg_class'::regclass AND d.refobjid = pol.polrelid)
 			UNION ALL
-			SELECT pol.polname, 'role', r.rolname
+			SELECT 'role', r.rolname, ''
 			FROM pg_policy pol, unnest(pol.polroles) AS u(oid) JOIN pg_roles r ON r.oid = u.oid
 			WHERE pol.polrelid = $1::regclass
-		) x ORDER BY 1, 2`, wf.shape.qualified(wf.spec.TableName))
+		) x ORDER BY 1, 2, 3`, wf.shape.qualified(wf.spec.TableName))
 	if err != nil {
 		return err
 	}
-	type need struct{ Kind, Name string }
+	type need struct{ Kind, Name, Col string }
 	needed, err := pgx.CollectRows(rows, pgx.RowToStructByPos[need])
 	if err != nil || len(needed) == 0 {
 		return err
 	}
+	var kinds, names, cols []string
+	for _, n := range needed {
+		if n.Kind == "unchecked" {
+			return fatal("table %s has row-level security policies using %s, which a move cannot check the shards of its new placement for; drop the policy before moving the table",
+				wf.spec.table(), n.Name)
+		}
+		kinds, names, cols = append(kinds, n.Kind), append(names, n.Name), append(cols, n.Col)
+	}
+	describe := func(i int, noRelation bool) string {
+		if cols[i] != "" && !noRelation {
+			return fmt.Sprintf("column %s.%s", names[i], cols[i])
+		}
+		if cols[i] != "" {
+			return "relation " + names[i]
+		}
+		return kinds[i] + " " + names[i]
+	}
+	var mu sync.Mutex
 	var missing []string
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(verifyPlacementConcurrency)
 	for _, t := range wf.rt.Holders() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
-		if err != nil {
-			return err
-		}
-		for _, n := range needed {
-			rows, qerr := conn.Query(ctx, `SELECT CASE $1
-					WHEN 'relation' THEN to_regclass($2) IS NOT NULL
-					WHEN 'function' THEN to_regprocedure($2) IS NOT NULL
-					WHEN 'type' THEN to_regtype($2) IS NOT NULL
-					ELSE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $2) END`, n.Kind, n.Name)
-			if qerr != nil {
-				_ = conn.Close(ctx)
-				return qerr
+		g.Go(func() error {
+			conn, err := p.Shards.DialDatabase(gctx, wf.st.SourceSet, t, wf.spec.Database)
+			if err != nil {
+				return err
 			}
-			have, cerr := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
-			if cerr != nil {
-				_ = conn.Close(ctx)
-				return cerr
+			defer func() { _ = conn.Close(gctx) }()
+			rows, err := conn.Query(gctx, `SELECT i::int, kind = 'column' AND to_regclass(name) IS NULL FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS u(kind, name, col, i)
+				WHERE NOT CASE kind
+					WHEN 'relation' THEN to_regclass(name) IS NOT NULL
+					WHEN 'column' THEN EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(name) AND attname = col AND NOT attisdropped)
+					WHEN 'function' THEN to_regprocedure(name) IS NOT NULL
+					WHEN 'type' THEN to_regtype(name) IS NOT NULL
+					WHEN 'operator' THEN to_regoperator(name) IS NOT NULL
+					WHEN 'collation' THEN to_regcollation(name) IS NOT NULL
+					ELSE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = name) END
+				ORDER BY i`, kinds, names, cols)
+			if err != nil {
+				return err
 			}
-			if !have {
-				missing = append(missing, fmt.Sprintf("%s %s on %s/%d", n.Kind, n.Name, wf.st.SourceSet, t))
+			type lack struct {
+				I          int
+				NoRelation bool
 			}
-		}
-		_ = conn.Close(ctx)
+			lacking, err := pgx.CollectRows(rows, pgx.RowToStructByPos[lack])
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, l := range lacking {
+				missing = append(missing, fmt.Sprintf("%s on %s/%d", describe(l.I-1, l.NoRelation), wf.st.SourceSet, t))
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	if len(missing) == 0 {
 		return nil
 	}
+	slices.Sort(missing)
+	missing = slices.Compact(missing)
 	return fatal("table %s has row-level security policies using what a shard of its new placement does not have (%s); create it there, or move it first, then retry the move",
 		wf.spec.table(), strings.Join(missing, "; "))
 }

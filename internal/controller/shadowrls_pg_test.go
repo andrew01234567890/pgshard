@@ -234,3 +234,54 @@ func TestAMoveRechecksPolicyDependenciesBeforeItsSwap(t *testing.T) {
 		t.Fatal("the refused move left the table fenced")
 	}
 }
+
+// TestAMoveRefusesAPolicyUsingAColumnAShardLacks: a lookup table present on
+// every shard is not enough when the policy reads a column one copy lacks.
+func TestAMoveRefusesAPolicyUsingAColumnAShardLacks(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	mustExec(t, f.app(0), `CREATE TABLE open_regions (region text PRIMARY KEY, active boolean NOT NULL DEFAULT true)`)
+	mustExec(t, f.app(1), `CREATE TABLE open_regions (region text PRIMARY KEY)`)
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE notes (id bigint PRIMARY KEY, region text NOT NULL)`)
+	mustExec(t, src, `CREATE POLICY notes_open ON notes FOR SELECT TO PUBLIC USING (region IN (SELECT region FROM open_regions WHERE active))`)
+	mustExec(t, src, `ALTER TABLE notes ENABLE ROW LEVEL SECURITY`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'notes', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'notes'`)
+	f.reconcile()
+	if _, stage := f.driveUntil("notes", 2*time.Minute, StageFailed, StagePlacementSwapping, StageCompleted); stage != StageFailed {
+		t.Fatalf("the move reached %s", stage)
+	}
+	if msg := queryOne[string](t, f.catalog, `SELECT coalesce(error, '') FROM pgshard.workflows WHERE spec->>'table_name' = 'notes'`); !strings.Contains(msg, "column open_regions.active on default/1") {
+		t.Fatalf("refused with %q, want it to name the missing column", msg)
+	}
+}
+
+// TestAMoveFailsWhenItsPoliciesChangeBeforeTheSwap: the swap recreates the
+// policies captured at prepare. One created since would be lost, so the
+// move fails before its first rename instead.
+func TestAMoveFailsWhenItsPoliciesChangeBeforeTheSwap(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE notes (id bigint PRIMARY KEY, region text NOT NULL)`)
+	mustExec(t, src, `INSERT INTO notes SELECT g, 'r' || (g % 5) FROM generate_series(1, 20) g`)
+	mustExec(t, src, `CREATE POLICY notes_r1 ON notes FOR SELECT TO PUBLIC USING (region = 'r1')`)
+	mustExec(t, src, `ALTER TABLE notes ENABLE ROW LEVEL SECURITY`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'notes', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'notes'`)
+	f.reconcile()
+	f.driveUntil("notes", 2*time.Minute, StagePlacementCatchUp)
+	mustExec(t, src, `CREATE POLICY notes_r2 ON notes FOR SELECT TO PUBLIC USING (region = 'r2')`)
+	if _, stage := f.driveUntil("notes", 2*time.Minute, StageFailed, StageCompleted); stage != StageFailed {
+		t.Fatalf("the move reached %s with a policy created after prepare", stage)
+	}
+	if msg := queryOne[string](t, f.catalog, `SELECT coalesce(error, '') FROM pgshard.workflows WHERE spec->>'table_name' = 'notes'`); !strings.Contains(msg, "changed during the move") {
+		t.Fatalf("failed with %q", msg)
+	}
+	if n := queryOne[int64](t, src, `SELECT count(*) FROM pg_policy WHERE polrelid = 'public.notes'::regclass`); n != 2 {
+		t.Fatalf("the source table has %d policies, want both", n)
+	}
+}
