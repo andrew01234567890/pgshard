@@ -1012,6 +1012,12 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		return w.rename(n.RenameStmt)
 	case *pgquerypb.Node_ViewStmt:
 		return w.createView(n.ViewStmt)
+	case *pgquerypb.Node_CreateFunctionStmt:
+		return w.createFunction(n.CreateFunctionStmt)
+	case *pgquerypb.Node_CreateTrigStmt:
+		return w.createTrigger(n.CreateTrigStmt)
+	case *pgquerypb.Node_CommentStmt:
+		return w.comment(n.CommentStmt)
 	case *pgquerypb.Node_CreateTableAsStmt:
 		return w.derived(n.CreateTableAsStmt.GetInto().GetRel(), n.CreateTableAsStmt.GetQuery(), "CREATE TABLE AS")
 	case *pgquerypb.Node_TruncateStmt:
@@ -1087,9 +1093,8 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		return nil
 	}
 	// A local database has one shard, so "the planner does not know how to
-	// spread this" is not a question about it: CREATE FUNCTION, CREATE
-	// TRIGGER, COMMENT and CREATE EVENT TRIGGER all run there as they would
-	// on any PostgreSQL. The refusal below is about there being more than
+	// spread this" is not a question about it: CREATE EVENT TRIGGER, CREATE
+	// AGGREGATE and the like all run there as they would on any PostgreSQL. The refusal below is about there being more than
 	// one place to run a statement, not about the statement.
 	if w.sess.localOnly() {
 		return w.homeStatement()

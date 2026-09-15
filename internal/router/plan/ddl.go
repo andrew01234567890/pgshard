@@ -95,7 +95,8 @@ type Check struct {
 
 // ObjectRef names the object a migration creates or drops.
 type ObjectRef struct {
-	// Kind is "relation", "schema", "type", "role" or "database".
+	// Kind is "relation", "schema", "type", "role", "database" or
+	// "function" (Name is then the signature to_regprocedure reads).
 	Kind   string
 	Schema string
 	Name   string
@@ -551,6 +552,10 @@ func (w *walker) unfannable(what string) error {
 // A local database has no other shard to be left behind, so this refusal
 // does not apply to one -- see walker.unfannable.
 func refuseUnfannable(what string) error {
+	if strings.Contains(what, "FUNCTION") || strings.Contains(what, "PROCEDURE") || strings.Contains(what, "ROUTINE") {
+		return notYet(what+" is not available through the router",
+			"functions and procedures are created on every shard: change one with CREATE OR REPLACE, or DROP it and CREATE it again")
+	}
 	return notYet(what+" is not available through the router",
 		"pgshard does not manage these objects: the matching CREATE is refused too, so change it on each group the way it was created")
 }
@@ -664,16 +669,16 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 	case pgquerypb.ObjectType_OBJECT_TRIGGER, pgquerypb.ObjectType_OBJECT_POLICY,
 		pgquerypb.ObjectType_OBJECT_RULE:
 		return w.dropOnRelation(kind, d)
+	case pgquerypb.ObjectType_OBJECT_FUNCTION, pgquerypb.ObjectType_OBJECT_PROCEDURE, pgquerypb.ObjectType_OBJECT_ROUTINE:
+		return w.dropFunction(kind, d)
 	}
-	// Everything else -- a function, an aggregate, an extension, a domain,
-	// an operator, a collation, a cast, a text search object, extended
-	// statistics, a foreign server -- exists in EVERY group, because a
-	// database does. Dropping it
-	// on the home shard alone leaves the other shards holding it, silently,
-	// and pgshard cannot fan the drop out because it never created the
-	// object: CREATE FUNCTION, CREATE AGGREGATE and CREATE EXTENSION are
-	// all refused here. It is dropped the way it was created, on each
-	// group.
+	// Everything else -- an aggregate, an extension, a domain, an operator,
+	// a collation, a cast, a text search object, extended statistics, a
+	// foreign server -- exists in EVERY group, because a database does.
+	// Dropping it on the home shard alone leaves the other shards holding
+	// it, silently, and pgshard cannot fan the drop out because it never
+	// created the object: CREATE AGGREGATE and CREATE EXTENSION are refused
+	// here. It is dropped the way it was created, on each group.
 	return w.unfannable(kind)
 }
 

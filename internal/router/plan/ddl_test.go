@@ -162,6 +162,26 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "alter role analyst replication", refuse: "roles with the REPLICATION attribute are not available through the router"},
 		{sql: "create user x bypassrls", refuse: "roles with the BYPASSRLS attribute are not available through the router"},
 		{sql: "create user x nosuperuser", mig: "CREATE ROLE all", object: "role:x:present"},
+		// PGS-867: a function exists per database, so everywhere, and a
+		// trigger or comment lives where its table does.
+		{sql: "create function f() returns trigger language plpgsql as 'begin return new; end'", mig: "CREATE FUNCTION all", object: `function:"f"():present`},
+		{sql: "create function app.f(a int, b text[], out c int) returns int language sql as 'select 1'", mig: "CREATE FUNCTION all", object: `function:"app"."f"("pg_catalog"."int4", "text"[]):present`},
+		{sql: "create or replace function f() returns int language sql as 'select 1'", mig: "CREATE FUNCTION all"},
+		{sql: "create procedure p(a int) language sql as 'select 1'", mig: "CREATE PROCEDURE all", object: `function:"p"("pg_catalog"."int4"):present`},
+		{sql: "create function f(a orders.note%type) returns int language sql as 'select 1'", mig: "CREATE FUNCTION all"},
+		{sql: "drop function if exists f() cascade", mig: "DROP FUNCTION all", object: `function:"f"():absent`},
+		{sql: "drop function f(int)", mig: "DROP FUNCTION existing", object: `function:"f"("pg_catalog"."int4"):absent`},
+		{sql: "drop function f", mig: "DROP FUNCTION existing"},
+		{sql: "drop procedure if exists p(int)", mig: "DROP PROCEDURE all", object: `function:"p"("pg_catalog"."int4"):absent`},
+		{sql: "drop routine f(int)", mig: "DROP ROUTINE existing", object: `function:"f"("pg_catalog"."int4"):absent`},
+		{sql: "create function f(variadic a int[]) returns int language sql as 'select 1'", mig: "CREATE FUNCTION all", object: `function:"f"("pg_catalog"."int4"[]):present`},
+		{sql: "create procedure p(out a int) language sql as 'select 1'", mig: "CREATE PROCEDURE all", object: `function:"p"():present`},
+		{sql: "create trigger t before insert or update on orders for each row execute function f()", mig: "CREATE TRIGGER all"},
+		{sql: "create or replace trigger t before insert on items for each row execute function f()", mig: "CREATE TRIGGER home"},
+		{sql: "create trigger t before insert on regions for each row execute function f()", refuse: "CREATE TRIGGER on a reference table is not available"},
+		{sql: "comment on column orders.note is 'x'", mig: "COMMENT all"},
+		{sql: "comment on table items is 'x'", mig: "COMMENT home"},
+		{sql: "comment on function f() is 'x'", refuse: "COMMENT ON FUNCTION is not available through the router"},
 		{sql: "alter default privileges in schema public grant select on tables to analyst", refuse: "ALTER DEFAULT PRIVILEGES is not available through the router"},
 		{sql: "reassign owned by analyst to app", refuse: "REASSIGN OWNED is not available through the router"},
 		{sql: "drop owned by analyst", refuse: "DROP OWNED is not available through the router"},
@@ -205,7 +225,11 @@ func TestDDLClassification(t *testing.T) {
 			o := pl.Migration.Object
 			got := ""
 			if o.Kind != "" {
-				got = o.Kind + ":" + o.Name + ":" + o.Expect
+				name := o.Name
+				if o.Kind == "function" && o.Schema != "" {
+					name = `"` + o.Schema + `".` + name
+				}
+				got = o.Kind + ":" + name + ":" + o.Expect
 			}
 			if got != c.object {
 				t.Fatalf("object = %q, want %q", got, c.object)

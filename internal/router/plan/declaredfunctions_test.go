@@ -16,8 +16,9 @@ import (
 // extension scalar with it, on any multi-shard read.
 //
 // pgshard.functions is how an operator says yes. It is the only way the
-// router can be told: CREATE FUNCTION, CREATE AGGREGATE and CREATE EXTENSION
-// are all refused through the router, so there is no DDL path to learn from.
+// router can be told: CREATE AGGREGATE and CREATE EXTENSION are refused
+// through the router, and a fanned-out CREATE FUNCTION does not say whether
+// concatenating its per-shard results is right.
 func TestADeclaredScalarIsProjectedByAScatter(t *testing.T) {
 	snap := fixture(t)
 	const sql = "select st_astext(geom), tenant_id from orders"

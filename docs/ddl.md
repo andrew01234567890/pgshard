@@ -24,16 +24,37 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
 
    | Statement | Scope |
    |---|---|
-   | tables declared sharded or reference; schemas, sequences, types, views over sharded tables; databases; roles; `GRANT`/`REVOKE` not limited to unsharded tables | `all` — every shard of the set |
+   | tables declared sharded or reference; schemas, sequences, types, views over sharded tables; `CREATE [OR REPLACE] FUNCTION`/`PROCEDURE` and `DROP FUNCTION`/`PROCEDURE`/`ROUTINE IF EXISTS`; databases; roles; `GRANT`/`REVOKE` not limited to unsharded tables | `all` — every shard of the set |
    | unsharded tables and views/grants over them only | `home` — the database's home shard |
-   | `DROP`/`ALTER`/`REINDEX INDEX`, `DROP`/`ALTER VIEW` (owning table unknown to the router) | `existing` — every shard, shards without the object are skipped; failed if no shard had it |
+   | `DROP`/`ALTER`/`REINDEX INDEX`, `DROP`/`ALTER VIEW` (owning table unknown to the router), `DROP FUNCTION`/`PROCEDURE`/`ROUTINE` without `IF EXISTS` | `existing` — every shard, shards without the object are skipped; failed if no shard had it |
 
-   An object that belongs to a table follows the table: `DROP`/`ALTER … RENAME`
-   of a `TRIGGER`, `POLICY` or `RULE`, and `ALTER TABLE … RENAME CONSTRAINT`,
-   take the table's scope like any other statement over it.
+   An object that belongs to a table follows the table: `CREATE [OR REPLACE]
+   TRIGGER`, `COMMENT ON TABLE|VIEW|COLUMN`, `DROP`/`ALTER … RENAME` of a
+   `TRIGGER`, `POLICY` or `RULE`, and `ALTER TABLE … RENAME CONSTRAINT`, take
+   the table's scope like any other statement over it. `CREATE TRIGGER` on a
+   reference table is refused: the router refuses writes to a reference
+   table that has a trigger, so the trigger would make the table read-only.
+   A function is fanned out, not declared: it is not added to
+   `pgshard.functions`, so a scatter still refuses to project it until an
+   operator lists it there.
+
+   A function or trigger runs on one shard, with that shard's rows. `SELECT
+   f()` with no table routes to the home shard, so a function body that
+   reads a sharded table answers from the home shard alone. A trigger body
+   that writes another table writes it on the shard the triggering row is
+   on, so a reference table written that way diverges between shards. A
+   `BEFORE` trigger that changes the shard key leaves the row on the shard
+   the router chose from the statement's key.
+
+   A plain `CREATE FUNCTION` (without `OR REPLACE`) records the function's
+   signature so a migration resumed after a crash recognises the function
+   it made. A signature with a `%TYPE` argument cannot be recorded; such a
+   CREATE resumed on a shard where it had already committed fails with
+   `42723`.
 
    Every other `DROP`, `RENAME`, `OWNER TO` and `SET SCHEMA` the router does
-   not list explicitly — `FUNCTION`, `AGGREGATE`, `EXTENSION`, `DOMAIN`,
+   not list explicitly — `ALTER FUNCTION`/`PROCEDURE`/`ROUTINE` (change
+   a function with `CREATE OR REPLACE`, or drop and create it), `AGGREGATE`, `EXTENSION`, `DOMAIN`,
    `OPERATOR`, `COLLATION`, `CAST`, the text search objects, `STATISTICS`,
    `SERVER`, `PUBLICATION` — is **refused**. A database exists in every
    group, so the objects inside one do too, and pgshard cannot fan the

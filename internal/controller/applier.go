@@ -1301,6 +1301,13 @@ func objectMatchesIn(ctx context.Context, conn ShardConn, o catalog.MigrationObj
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`
 	case "database":
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`
+	case "function":
+		// A CREATE naming no schema makes the function in current_schema().
+		// Resolving the bare name through the whole search_path would find
+		// one of the same signature in a later schema and call the CREATE
+		// applied.
+		sql = `SELECT to_regprocedure(CASE WHEN $2 <> '' THEN quote_ident($2) || '.' WHEN $3 THEN quote_ident(current_schema()) || '.' ELSE '' END || $1) IS NOT NULL`
+		args = append(args, o.Schema, o.Expect == "present")
 	default:
 		return false, nil
 	}

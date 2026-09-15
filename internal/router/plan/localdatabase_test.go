@@ -81,8 +81,8 @@ func TestALocalDatabaseRunsItsOwnDDL(t *testing.T) {
 	if pl.Migration == nil {
 		t.Fatal("CREATE SCHEMA in an ordinary database must still be a fanned-out migration")
 	}
-	if _, err := p.Plan(context.Background(), session(shared), `COMMENT ON COLUMN items.name IS 'x'`); err == nil {
-		t.Fatal("COMMENT in an ordinary database must still be refused; there is more than one place it would have to run")
+	if _, err := p.Plan(context.Background(), session(shared), `CREATE EVENT TRIGGER e ON ddl_command_end EXECUTE FUNCTION f()`); err == nil {
+		t.Fatal("CREATE EVENT TRIGGER in an ordinary database must still be refused; there is more than one place it would have to run")
 	} else if !strings.Contains(err.Error(), "not supported through the router") {
 		t.Fatalf("refused for the wrong reason: %v", err)
 	}
