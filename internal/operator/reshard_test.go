@@ -20,6 +20,7 @@ func TestOnlyPreSwitchReshardsAreDroppedOnRevert(t *testing.T) {
 		pgshardv1alpha1.ReshardPhaseProvisioning: true,
 		pgshardv1alpha1.ReshardPhaseCopying:      true,
 		pgshardv1alpha1.ReshardPhaseVerifying:    true,
+		pgshardv1alpha1.ReshardPhaseFailed:       true,
 	}
 	for _, phase := range []string{
 		pgshardv1alpha1.ReshardPhasePending, pgshardv1alpha1.ReshardPhaseProvisioning,

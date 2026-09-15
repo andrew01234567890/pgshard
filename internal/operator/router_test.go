@@ -409,7 +409,8 @@ func TestCancellableOnRevert(t *testing.T) {
 		{pgshardv1alpha1.ReshardPhaseCompleting, false},
 		{pgshardv1alpha1.ReshardPhaseCompleted, false},
 		{pgshardv1alpha1.ReshardPhaseCancelled, false},
-		{pgshardv1alpha1.ReshardPhaseFailed, false},
+		// A failed run never served (PGS-876).
+		{pgshardv1alpha1.ReshardPhaseFailed, true},
 	} {
 		if got := cancellableOnRevert(c.phase); got != c.want {
 			t.Errorf("cancellableOnRevert(%s) = %v, want %v", c.phase, got, c.want)

@@ -364,3 +364,57 @@ func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
 	reconcile(t, r, c)
 	get(t, "rsw-shard-0-g2", &pgshardv1alpha1.PgShardGroup{})
 }
+
+// TestRevertingShardsClearsAFailedReshard (PGS-876): a failed reshard kept
+// its target set, and routers refuse DDL while a reshard's set exists, so
+// every DDL statement was refused until someone edited the catalog by hand.
+// A failed run never served, so reverting spec.shards drops it and deletes
+// its groups, as it does for a run still copying.
+func TestRevertingShardsClearsAFailedReshard(t *testing.T) {
+	r, fp, c := setup(t, "rsf")
+	bringUp(t, r, fp, c)
+	get(t, "rsf", c)
+	two := 2
+	c.Spec.Shards = &two
+	if err := k8sClient.Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	fp.workflows = map[string]WorkflowInfo{"g2": {ID: "wf-f", State: "failed", Stage: "failed", Message: "copy of app.public.orders failed"}}
+	fp.mu.Unlock()
+	fp.setShardSetState("g2", catalog.ShardSetProvisioning)
+	reconcile(t, r, c)
+	var rec pgshardv1alpha1.PgShardReshard
+	get(t, "rsf-reshard-g2", &rec)
+	if rec.Status.Phase != pgshardv1alpha1.ReshardPhaseFailed {
+		t.Fatalf("record before the revert: %+v", rec.Status)
+	}
+	if _, ok := fp.shardSet("g2"); !ok {
+		t.Fatal("a failed reshard's set went away before anything asked for it")
+	}
+
+	one := 1
+	get(t, "rsf", c)
+	c.Spec.Shards = &one
+	if err := k8sClient.Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if _, ok := fp.shardSet("g2"); ok {
+		t.Fatal("reverting spec.shards left the failed reshard's set in place")
+	}
+	get(t, "rsf-reshard-g2", &rec)
+	if rec.Status.Phase != pgshardv1alpha1.ReshardPhaseCancelled || !strings.Contains(rec.Status.Message, "after the reshard failed (copy of app.public.orders failed)") {
+		t.Fatalf("record after the revert: %+v", rec.Status)
+	}
+	for _, name := range []string{"rsf-shard-0-g2", "rsf-shard-1-g2"} {
+		if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: name}, &pgshardv1alpha1.PgShardGroup{}); !apierrors.IsNotFound(err) {
+			t.Errorf("target group %s must be deleted: %v", name, err)
+		}
+	}
+	get(t, "rsf", c)
+	if c.Status.Reshard != nil || c.Status.EffectiveShards != 1 {
+		t.Fatalf("cluster status after the revert: %+v", c.Status)
+	}
+}
