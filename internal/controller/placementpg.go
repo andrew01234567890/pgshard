@@ -86,6 +86,9 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if err := p.checkTriggerFunctions(ctx, conn, wf); err != nil {
 		return err
 	}
+	if err := p.checkPolicyDependencies(ctx, conn, wf); err != nil {
+		return err
+	}
 	if err := p.checkForeignKeys(ctx, conn, wf); err != nil {
 		return err
 	}
@@ -433,6 +436,86 @@ func (p *Placer) checkTriggerFunctions(ctx context.Context, source ShardConn, wf
 	}
 	return fatal("table %s has triggers calling functions its target shards do not have (%s); create them there, then retry the move",
 		wf.spec.table(), strings.Join(parts, "; "))
+}
+
+// checkPolicyDependencies refuses a move whose row-level security policies
+// use something a holder of the new placement does not have: a table the
+// expression reads (a lookup table left on the home shard, say), a function
+// or type it calls, or a role it applies to.
+//
+// The policies are created in the swap's transaction, under the fence. One
+// that cannot be created there fails that shard's swap on every pass while
+// the shards that already swapped serve the new table and the table stays
+// fenced -- and a move past its swap cannot be cancelled. So the question is
+// asked at prepare, and again before the first rename.
+func (p *Placer) checkPolicyDependencies(ctx context.Context, source ShardConn, wf *placementWorkflow) error {
+	if source == nil {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, wf.from.Sources()[0], wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		source = conn
+	}
+	rows, err := source.Query(ctx, `SELECT DISTINCT kind, name FROM (
+			SELECT pol.polname AS policy, CASE d.refclassid
+					WHEN 'pg_class'::regclass THEN 'relation'
+					WHEN 'pg_proc'::regclass THEN 'function'
+					ELSE 'type' END AS kind,
+				CASE d.refclassid
+					WHEN 'pg_class'::regclass THEN d.refobjid::regclass::text
+					WHEN 'pg_proc'::regclass THEN d.refobjid::regprocedure::text
+					ELSE d.refobjid::regtype::text END AS name
+			FROM pg_policy pol
+			JOIN pg_depend d ON d.classid = 'pg_policy'::regclass AND d.objid = pol.oid
+			WHERE pol.polrelid = $1::regclass
+			  AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass, 'pg_type'::regclass)
+			  AND NOT (d.refclassid = 'pg_class'::regclass AND d.refobjid = pol.polrelid)
+			UNION ALL
+			SELECT pol.polname, 'role', r.rolname
+			FROM pg_policy pol, unnest(pol.polroles) AS u(oid) JOIN pg_roles r ON r.oid = u.oid
+			WHERE pol.polrelid = $1::regclass
+		) x ORDER BY 1, 2`, wf.shape.qualified(wf.spec.TableName))
+	if err != nil {
+		return err
+	}
+	type need struct{ Kind, Name string }
+	needed, err := pgx.CollectRows(rows, pgx.RowToStructByPos[need])
+	if err != nil || len(needed) == 0 {
+		return err
+	}
+	var missing []string
+	for _, t := range wf.rt.Holders() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		for _, n := range needed {
+			rows, qerr := conn.Query(ctx, `SELECT CASE $1
+					WHEN 'relation' THEN to_regclass($2) IS NOT NULL
+					WHEN 'function' THEN to_regprocedure($2) IS NOT NULL
+					WHEN 'type' THEN to_regtype($2) IS NOT NULL
+					ELSE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $2) END`, n.Kind, n.Name)
+			if qerr != nil {
+				_ = conn.Close(ctx)
+				return qerr
+			}
+			have, cerr := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+			if cerr != nil {
+				_ = conn.Close(ctx)
+				return cerr
+			}
+			if !have {
+				missing = append(missing, fmt.Sprintf("%s %s on %s/%d", n.Kind, n.Name, wf.st.SourceSet, t))
+			}
+		}
+		_ = conn.Close(ctx)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fatal("table %s has row-level security policies using what a shard of its new placement does not have (%s); create it there, or move it first, then retry the move",
+		wf.spec.table(), strings.Join(missing, "; "))
 }
 
 // triggerFunctions are the functions the table's user triggers call, as
