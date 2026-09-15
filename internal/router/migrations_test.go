@@ -551,3 +551,134 @@ func TestADDLBatchWithAnotherStatementIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestASequentialDatabaseRunsATransactionsDDLStatementByStatement
+// (PGS-869): pgroll sends DDL inside transactions that hold nothing else --
+// its version views as one query, "BEGIN; DROP VIEW; CREATE VIEW; COMMIT",
+// and batches of ALTER TABLE joined with semicolons. A database declared
+// ddl_transactions = 'sequential' runs each such statement as if it had
+// been sent on its own, and says so; a transaction that also runs a
+// statement on a shard is still refused, whichever comes first.
+func TestASequentialDatabaseRunsATransactionsDDLStatementByStatement(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	app := h.snap.Databases["app"]
+	app.DDLTransactions = catalog.DDLTransactionsSequential
+	h.snap.Databases["app"] = app
+	ctx := context.Background()
+	var notices []string
+	cfg, err := pgx.ParseConfig(h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) { notices = append(notices, n.Message) }
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	kinds := func(from int) []string {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		var out []string
+		for _, m := range q.queued[from:] {
+			out = append(out, m.Kind)
+		}
+		return out
+	}
+	idle := func(what string) {
+		t.Helper()
+		if s := conn.PgConn().TxStatus(); s != 'I' {
+			t.Fatalf("after %s the session is in transaction status %q, want idle", what, s)
+		}
+	}
+
+	results, err := conn.PgConn().Exec(ctx, "BEGIN; DROP VIEW IF EXISTS v; CREATE VIEW v AS SELECT id FROM orders; COMMIT").ReadAll()
+	if err != nil {
+		t.Fatalf("pgroll's version-view query: %v", err)
+	}
+	if got := kinds(0); strings.Join(got, ",") != "DROP VIEW,CREATE VIEW" || len(results) != 4 {
+		t.Fatalf("queued %q from %d results", got, len(results))
+	}
+	if len(notices) != 2 || !strings.Contains(notices[0], "applied on its own") {
+		t.Fatalf("notices %q", notices)
+	}
+	idle("the version-view query")
+
+	if _, err := conn.PgConn().Exec(ctx, "ALTER TABLE orders ADD COLUMN a int; ALTER TABLE orders ADD COLUMN b int").ReadAll(); err != nil {
+		t.Fatalf("a batch of ALTER TABLE: %v", err)
+	}
+	if got := kinds(2); strings.Join(got, ",") != "ALTER TABLE,ALTER TABLE" {
+		t.Fatalf("queued %q", got)
+	}
+	idle("a batch of ALTER TABLE")
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "create table t2 (id int primary key)"); err != nil {
+		t.Fatalf("DDL in a transaction: %v", err)
+	}
+	_, err = tx.Exec(ctx, "select * from items")
+	_ = expectRefusal(t, err, "a statement that runs on a shard is not available after DDL in the same transaction")
+	_, err = tx.Exec(ctx, "select * from items where id = $1", 1)
+	_ = expectRefusal(t, err, "a statement that runs on a shard is not available after DDL in the same transaction")
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "select * from items"); err != nil {
+		t.Fatal(err)
+	}
+	before := len(kinds(0))
+	_, err = tx.Exec(ctx, "create table t3 (id int primary key)")
+	_ = expectRefusal(t, err, "CREATE TABLE is not available in a transaction that has already run a statement on a shard")
+	_ = tx.Rollback(ctx)
+	if len(kinds(0)) != before {
+		t.Fatal("DDL after a statement on a shard was queued")
+	}
+
+	q.outcome = func(m catalog.DDLMigration) catalog.DDLMigration {
+		m.State, m.Error = catalog.MigrationFailed, "relation already exists"
+		return m
+	}
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "create table t4 (id int primary key)"); err == nil {
+		t.Fatal("a failed migration answered success")
+	}
+	_, err = tx.Exec(ctx, "create table t5 (id int primary key)")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "25P02" {
+		t.Fatalf("a statement after the failed DDL: %v, want 25P02", err)
+	}
+	if err := tx.Commit(ctx); !errors.Is(err, pgx.ErrTxCommitRollback) {
+		t.Fatalf("COMMIT of the failed transaction: %v, want it rolled back", err)
+	}
+	idle("the failed transaction")
+}
+
+// TestAnAtomicDatabaseStillRefusesDDLInATransaction: the default is
+// unchanged, including for pgroll's version-view query.
+func TestAnAtomicDatabaseStillRefusesDDLInATransaction(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	app := h.snap.Databases["app"]
+	app.DDLTransactions = catalog.DDLTransactionsAtomic
+	h.snap.Databases["app"] = app
+	conn := h.connect(t, h.dsn())
+	_, err := conn.PgConn().Exec(context.Background(), "BEGIN; DROP VIEW IF EXISTS v; CREATE VIEW v AS SELECT id FROM orders; COMMIT").ReadAll()
+	_ = expectRefusal(t, err, "a transaction control statement is not available inside a multi-statement simple query")
+	_, err = conn.PgConn().Exec(context.Background(), "ALTER TABLE orders ADD COLUMN a int; ALTER TABLE orders ADD COLUMN b int").ReadAll()
+	_ = expectRefusal(t, err, "ALTER TABLE is not available inside a multi-statement simple query")
+	if len(q.queued) != 0 {
+		t.Fatalf("queued %d migrations", len(q.queued))
+	}
+}
