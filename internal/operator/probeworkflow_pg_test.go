@@ -274,15 +274,20 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 		name   string
 		want   bool
 		groups []string
+		// identified is whether the manifest says which catalog system its
+		// restore point belongs to. A manifest written before that was
+		// recorded does not, and the caller -- which knows whether this
+		// cluster's catalog has been rebuilt -- decides what to do about it.
+		identified bool
 	}{
-		{"nightly", true, []string{"catalog", "shard-0"}},
-		{"before-an-upgrade", true, []string{"shard-0"}},
-		{"after-an-upgrade", true, []string{"catalog", "shard-0"}},
-		{"aborted", false, []string{}},
-		{"never-taken", false, nil},
+		{"nightly", true, []string{"catalog", "shard-0"}, false},
+		{"before-an-upgrade", true, []string{"shard-0"}, true},
+		{"after-an-upgrade", true, []string{"catalog", "shard-0"}, true},
+		{"aborted", false, []string{}, false},
+		{"never-taken", false, nil, false},
 		// The name the recovery target uses, which is not what the row is
 		// keyed by. This is the case the fake could never fail on.
-		{BarrierRestorePoint("nightly"), false, nil},
+		{BarrierRestorePoint("nightly"), false, nil, false},
 	} {
 		rec, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
 		if err != nil {
@@ -290,6 +295,9 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 		}
 		if rec.Certified != c.want || !slices.Equal(rec.Groups, c.groups) {
 			t.Errorf("CertifiedBarrier(%q) = %v %v, want %v %v", c.name, rec.Certified, rec.Groups, c.want, c.groups)
+		}
+		if rec.CatalogIdentified != c.identified {
+			t.Errorf("CertifiedBarrier(%q) reports the catalog identified = %v, want %v", c.name, rec.CatalogIdentified, c.identified)
 		}
 		if c.name == "before-an-upgrade" && len(rec.LSNs) != 0 {
 			t.Errorf("CertifiedBarrier(%q) kept restore point LSNs %v from a catalog system that is gone", c.name, rec.LSNs)

@@ -275,6 +275,20 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		if refusal != "" {
 			return ctrl.Result{}, r.fail(ctx, rs, refusal)
 		}
+		// A manifest from before the catalog identifier was recorded names
+		// "catalog" and says nothing about which catalog system that was. On
+		// a cluster whose catalog has been rebuilt by a major upgrade it is
+		// the barrier most likely to be wrong: the rows travelled with the
+		// catalog, while the group a restore recovers was initdb'd since and
+		// holds none of its restore points. Treated as covering the catalog
+		// it recovers the new group to a name only the old stanza has, which
+		// ends in "recovery ended before configured recovery target was
+		// reached" and a crash-looping member -- the late failure this whole
+		// gate exists to turn into an up-front refusal.
+		if !rec.CatalogIdentified && CatalogGeneration(&source) > 1 {
+			rec.Groups = slices.DeleteFunc(rec.Groups, func(g string) bool { return g == "catalog" })
+			delete(rec.LSNs, "catalog")
+		}
 		if missing := groupsWithoutBarrier(Groups(&source), rec.Groups); len(missing) > 0 {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q on %s has no restore point on group(s) %s, which this restore would recover to it; take a new barrier that covers every serving group",
 				name, source.Name, strings.Join(missing, ", ")))

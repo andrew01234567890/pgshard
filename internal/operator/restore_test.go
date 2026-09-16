@@ -472,10 +472,14 @@ type fakeCertifier struct {
 	// when the catalog recorded it.
 	groups    []string
 	createdAt time.Time
-	lsns      map[string]uint64
-	err       error
-	asked     string
-	password  string
+	// unidentifiedCatalog makes the manifest one written before the catalog
+	// system identifier was recorded, which says nothing about which
+	// catalog its restore point belongs to.
+	unidentifiedCatalog bool
+	lsns                map[string]uint64
+	err                 error
+	asked               string
+	password            string
 	// unfenced records that the restore lifted the fence through the
 	// catalog rather than the owner-gated agent RPC; unfenceErr makes that
 	// call fail, as a catalog that is not reachable yet would.
@@ -485,7 +489,8 @@ type fakeCertifier struct {
 
 func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, password, name string) (BarrierRecord, error) {
 	f.asked, f.password = name, password
-	return BarrierRecord{Certified: f.certified, Groups: f.groups, CreatedAt: f.createdAt, LSNs: f.lsns}, f.err
+	return BarrierRecord{Certified: f.certified, Groups: f.groups, CreatedAt: f.createdAt, LSNs: f.lsns,
+		CatalogIdentified: !f.unidentifiedCatalog}, f.err
 }
 
 func (f *fakeCertifier) ClearWriteFenceAfterRestore(_ context.Context, _, _ string) error {
@@ -615,7 +620,8 @@ func TestRestoreRefusesABarrierWithoutEveryGroup(t *testing.T) {
 	}
 
 	// The catalog's manifest key does not carry its generation, so an
-	// upgraded catalog is still covered by "catalog".
+	// upgraded catalog is still covered by "catalog" -- when the manifest
+	// says which catalog system that point belongs to and it is this one.
 	source := boundCluster("old")
 	one := 1
 	source.Spec.Shards = &one
@@ -630,6 +636,46 @@ func TestRestoreRefusesABarrierWithoutEveryGroup(t *testing.T) {
 		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
 	if _, got := reconcileRestore(t, r, "r1"); got.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
 		t.Fatalf("an upgraded catalog's restore did not start: phase %q, %s", got.Status.Phase, got.Status.Error)
+	}
+
+	// The same barrier from a manifest written before the identifier was
+	// recorded says nothing about which catalog it covers, and this
+	// cluster's catalog has been rebuilt since. Taken at its word it
+	// recovers the new catalog group to a name only the old stanza holds,
+	// which ends in "recovery ended before configured recovery target was
+	// reached" and a crash-looping member -- after the cluster has been
+	// created. It is refused up front instead.
+	old := newRestore("r2", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new2",
+		BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	cl = restoreClient(t, source, newPolicy(), b, old, superuserSecret("old"))
+	r = &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil),
+		Barriers: &fakeCertifier{certified: true, groups: []string{"catalog", "shard-0"}, unidentifiedCatalog: true},
+		Now:      func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+	_, got := reconcileRestore(t, r, "r2")
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed || !strings.Contains(got.Status.Error, "catalog-g2") {
+		t.Fatalf("a barrier that cannot say which catalog it covers was accepted on a rebuilt catalog: phase %q, %s", got.Status.Phase, got.Status.Error)
+	}
+	var made pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new2"}, &made); err == nil {
+		t.Fatal("the restore created a cluster despite refusing the barrier")
+	}
+
+	// And it is refused only where it is doubtful. Every manifest written
+	// before the identifier existed carries none, so refusing them all would
+	// take the recovery path away from every cluster running today. A
+	// catalog that has never been rebuilt is the same catalog the barrier
+	// was taken on, whatever the manifest does or does not say.
+	plain := boundCluster("plain")
+	plain.Spec.Shards = &one
+	fresh := newRestore("r3", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "plain", NewClusterName: "new3",
+		BackupID: "b2", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	pb := completedBackup("b2", "plain")
+	cl = restoreClient(t, plain, newPolicy(), pb, fresh, superuserSecret("plain"))
+	r = &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil),
+		Barriers: &fakeCertifier{certified: true, groups: []string{"catalog", "shard-0"}, unidentifiedCatalog: true},
+		Now:      func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+	if _, got := reconcileRestore(t, r, "r3"); got.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
+		t.Fatalf("a barrier from a manifest with no identifier was refused on a catalog that was never rebuilt: phase %q, %s", got.Status.Phase, got.Status.Error)
 	}
 }
 

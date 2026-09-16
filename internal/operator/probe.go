@@ -531,8 +531,12 @@ func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name strin
 	// its rows travel with the catalog through a major upgrade. So a
 	// barrier from before one reads back here as covering the catalog,
 	// while the catalog group a restore recovers was initdb'd since and has
-	// none of its restore points. The system identifier tells them apart;
-	// a manifest written before it was recorded is taken at its word.
+	// none of its restore points. The system identifier tells them apart.
+	// A manifest written before it was recorded carries none, and whether
+	// that one can be trusted depends on something only the caller knows --
+	// whether this cluster's catalog has been rebuilt since -- so it is
+	// reported rather than decided here.
+	rec.CatalogIdentified = recordedSystem != ""
 	if recordedSystem != "" && recordedSystem != system {
 		rec.Groups = slices.DeleteFunc(rec.Groups, func(g string) bool { return g == "catalog" })
 		// Its LSN is in the old catalog system's WAL, not comparable with
@@ -551,6 +555,11 @@ type BarrierRecord struct {
 	CreatedAt time.Time
 	// LSNs is each group's restore point, by the manifest's group key.
 	LSNs map[string]uint64
+	// CatalogIdentified reports that the manifest recorded which catalog
+	// system its restore point belongs to. A manifest written before that
+	// was recorded says nothing about it, so a caller that knows the
+	// catalog has been rebuilt since cannot take it at its word.
+	CatalogIdentified bool
 }
 
 // ClearWriteFenceAfterRestore lifts the fence on a restored catalog,
