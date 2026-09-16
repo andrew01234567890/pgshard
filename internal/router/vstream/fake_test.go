@@ -23,6 +23,8 @@ type fakePooler struct {
 	pgshardv1.UnimplementedPoolerServer
 	mu      sync.Mutex
 	feeds   map[string]chan feedItem
+	slots   map[string]chan struct{}
+	taken   map[string]int
 	starts  []uint64
 	acks    map[string][]uint64
 	ackWake chan struct{}
@@ -125,7 +127,7 @@ type feedItem struct {
 
 func newFakePooler(t *testing.T) *fakePooler {
 	t.Helper()
-	f := &fakePooler{feeds: map[string]chan feedItem{}, acks: map[string][]uint64{}, ackWake: make(chan struct{}, 64), copyStart: make(chan struct{}, 64)}
+	f := &fakePooler{feeds: map[string]chan feedItem{}, slots: map[string]chan struct{}{}, taken: map[string]int{}, acks: map[string][]uint64{}, ackWake: make(chan struct{}, 64), copyStart: make(chan struct{}, 64)}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +155,22 @@ func (f *fakePooler) feedOf(stream string) chan feedItem {
 	return ch
 }
 
+// slotOf is held by the one Stream reading a stream name, as a replication
+// slot admits one walsender at a time. A batch fed while a Stream that has
+// been cancelled still holds it is lost, where a real slot would send it
+// again to the next reader; a test that feeds across a hand-over waits for
+// the new reader to take the slot first.
+func (f *fakePooler) slotOf(stream string) chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	slot, ok := f.slots[stream]
+	if !ok {
+		slot = make(chan struct{}, 1)
+		f.slots[stream] = slot
+	}
+	return slot
+}
+
 func (f *fakePooler) feed(stream string, b *pgshardv1.ChangeBatch) {
 	f.feedOf(stream) <- feedItem{batch: b}
 }
@@ -163,6 +181,16 @@ func (f *fakePooler) fail(err error) { f.feedOf("plain") <- feedItem{err: err} }
 func (f *fakePooler) Stream(req *pgshardv1.StreamRequest, srv pgshardv1.Pooler_StreamServer) error {
 	f.mu.Lock()
 	f.starts = append(f.starts, req.GetStartLsn())
+	f.mu.Unlock()
+	slot := f.slotOf(req.GetStream())
+	select {
+	case slot <- struct{}{}:
+	case <-srv.Context().Done():
+		return nil
+	}
+	defer func() { <-slot }()
+	f.mu.Lock()
+	f.taken[req.GetStream()]++
 	f.mu.Unlock()
 	ch := f.feedOf(req.GetStream())
 	for {
@@ -189,6 +217,13 @@ func (f *fakePooler) Ack(_ context.Context, req *pgshardv1.AckRequest) (*pgshard
 	default:
 	}
 	return &pgshardv1.AckResponse{}, nil
+}
+
+// slotTaken counts the Streams that have held the stream's slot.
+func (f *fakePooler) slotTaken(stream string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.taken[stream]
 }
 
 func (f *fakePooler) startLSNs() []uint64 {
