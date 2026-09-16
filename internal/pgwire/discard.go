@@ -20,6 +20,9 @@ func (discardWriter) EmptyQueryResponse() error                        { return 
 func (discardWriter) ParameterDescription([]uint32) error              { return nil }
 func (discardWriter) NoData() error                                    { return nil }
 func (discardWriter) PortalSuspended() error                           { return nil }
+func (discardWriter) ParseComplete() error                             { return nil }
+func (discardWriter) BindComplete() error                              { return nil }
+func (discardWriter) CloseComplete() error                             { return nil }
 func (discardWriter) Notice(*pgproto3.NoticeResponse) error            { return nil }
 func (discardWriter) Notification(*pgproto3.NotificationResponse) error {
 	return nil

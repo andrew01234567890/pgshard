@@ -292,6 +292,13 @@ message ParseComplete {}
 // BindComplete mirrors pgwire BindComplete.
 message BindComplete {}
 
+// CloseComplete mirrors pgwire CloseComplete. The pooler answers some of a
+// backend's CloseCompletes itself, for the closes it makes on its own
+// account; the ones belonging to a client's Close are forwarded, so that
+// the router can relay them in the order the backend answered rather than
+// answering them as the messages arrive.
+message CloseComplete {}
+
 // NoData mirrors pgwire NoData.
 message NoData {}
 
@@ -374,6 +381,7 @@ message ExecuteResponse {
     PortalSuspended portal_suspended = 27;
     FlushComplete flush_complete = 28;
     DataRows data_rows = 29;
+    CloseComplete close_complete = 30;
   }
 }
 

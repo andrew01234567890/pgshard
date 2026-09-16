@@ -1054,6 +1054,9 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 			if m.Close.Kind == pgshardv1.Close_KIND_STATEMENT {
 				delete(b.stmts, m.Close.Name)
 			}
+			if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_CloseComplete{CloseComplete: &pgshardv1.CloseComplete{}}}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

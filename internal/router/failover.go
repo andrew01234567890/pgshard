@@ -274,6 +274,14 @@ func (c *countingWriter) ParameterDescription(o []uint32) error {
 }
 func (c *countingWriter) NoData() error          { return c.w.NoData() }
 func (c *countingWriter) PortalSuspended() error { c.wrote = true; return c.w.PortalSuspended() }
+
+// ParseComplete, BindComplete and CloseComplete say that a statement was
+// prepared, bound or closed, not that it produced anything. A statement
+// retried after them has still told the client nothing about its outcome,
+// so like ParameterDescription they do not count as output.
+func (c *countingWriter) ParseComplete() error { return c.w.ParseComplete() }
+func (c *countingWriter) BindComplete() error  { return c.w.BindComplete() }
+func (c *countingWriter) CloseComplete() error { return c.w.CloseComplete() }
 func (c *countingWriter) Notice(n *pgproto3.NoticeResponse) error {
 	c.wrote = true
 	return c.w.Notice(n)

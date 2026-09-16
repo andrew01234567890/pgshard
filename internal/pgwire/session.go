@@ -935,22 +935,16 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		s.reportError(Errorf(CodeFeatureNotSupported, "the function call sub-protocol is not supported"))
 		return true, s.readyForQuery()
 	case *pgproto3.Parse:
-		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Parse(qctx, m.Name, m.Query, m.ParameterOIDs) })
+		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Parse(qctx, m.Name, m.Query, m.ParameterOIDs, w) })
 		if err != nil {
 			return true, s.extendedError(err)
-		}
-		if err := s.sendMsg(&pgproto3.ParseComplete{}); err != nil {
-			return true, err
 		}
 	case *pgproto3.Bind:
 		err := s.runQuery(ctx, func(qctx context.Context) error {
-			return s.exec.Bind(qctx, m.DestinationPortal, m.PreparedStatement, m.ParameterFormatCodes, m.Parameters, m.ResultFormatCodes)
+			return s.exec.Bind(qctx, m.DestinationPortal, m.PreparedStatement, m.ParameterFormatCodes, m.Parameters, m.ResultFormatCodes, w)
 		})
 		if err != nil {
 			return true, s.extendedError(err)
-		}
-		if err := s.sendMsg(&pgproto3.BindComplete{}); err != nil {
-			return true, err
 		}
 	case *pgproto3.Describe:
 		err := s.runQuery(ctx, func(qctx context.Context) error { return s.exec.Describe(qctx, DescribeKind(m.ObjectType), m.Name, w) })
@@ -963,11 +957,8 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 			return true, s.extendedError(err)
 		}
 	case *pgproto3.Close:
-		if err := s.exec.Close(ctx, DescribeKind(m.ObjectType), m.Name); err != nil {
+		if err := s.exec.Close(ctx, DescribeKind(m.ObjectType), m.Name, w); err != nil {
 			return true, s.extendedError(err)
-		}
-		if err := s.sendMsg(&pgproto3.CloseComplete{}); err != nil {
-			return true, err
 		}
 	case *pgproto3.Flush:
 		// Flush must produce the answers to what has been staged, not only

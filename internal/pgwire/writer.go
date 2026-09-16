@@ -90,6 +90,9 @@ func (w *resultWriter) ParameterDescription(oids []uint32) error {
 func (w *resultWriter) NoData() error { return w.send(&pgproto3.NoData{}) }
 
 func (w *resultWriter) PortalSuspended() error { return w.send(&pgproto3.PortalSuspended{}) }
+func (w *resultWriter) ParseComplete() error   { return w.send(&pgproto3.ParseComplete{}) }
+func (w *resultWriter) BindComplete() error    { return w.send(&pgproto3.BindComplete{}) }
+func (w *resultWriter) CloseComplete() error   { return w.send(&pgproto3.CloseComplete{}) }
 
 func (w *resultWriter) ParameterStatus(name, value string) error {
 	return w.send(&pgproto3.ParameterStatus{Name: name, Value: value})
