@@ -1807,3 +1807,56 @@ func TestAPlacementStampsItsStartOnce(t *testing.T) {
 		t.Errorf("started_at moved from %q to %q on a later write", first, again)
 	}
 }
+
+// TestTheRegclassScanFindsItsConstantOnEveryMajor (PGS-936): the scan that
+// refuses a placement move over a stored expression naming the table as a
+// regclass constant works by decoding the constant's four bytes out of the
+// printed pg_node_tree, because PostgreSQL records no dependency for such a
+// constant to find.
+//
+// That is a bet on a format. If the node-tree text ever prints differently
+// -- another major is exactly when it would -- the regex matches nothing,
+// the refusal quietly stops firing, and a move silently leaves a constraint
+// comparing against a freed OID. Nothing would fail: the rest of the suite
+// runs on PostgreSQL 18 alone, so a change in 19 would not be noticed here
+// at all.
+//
+// So the scan is proved against every major pgshard supports, with a
+// constant planted for it to find. A failure here means the decode has
+// stopped working on that major, not that the schema is unusual.
+func TestTheRegclassScanFindsItsConstantOnEveryMajor(t *testing.T) {
+	for _, image := range []string{
+		"ghcr.io/andrew01234567890/pgshard-postgres:18",
+		"ghcr.io/andrew01234567890/pgshard-postgres:19",
+	} {
+		t.Run(image[strings.LastIndex(image, ":")+1:], func(t *testing.T) {
+			parallelPG(t)
+			ctx := context.Background()
+			conn := connect(t, startPostgresImage(t, image, nil))
+			// The table's OWN check constraint and generated column. These
+			// are the shapes that need the decode: for a table's own
+			// expressions PostgreSQL replaces the whole-object dependency
+			// with a sub-object one (eliminate_duplicate_dependencies), so
+			// the pg_depend branch of the scan does not see them and only
+			// the node-tree decode does. A constant in ANOTHER object -- a
+			// check on a second table -- is found by the dependency branch
+			// whatever the decode does, so it would prove nothing here.
+			mustExec(t, conn, `CREATE TABLE named (a int CHECK (a <> 'named'::regclass::int),
+				g int GENERATED ALWAYS AS (a + 'named'::regclass::int) STORED)`)
+			found, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "named")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var byOID int
+			for _, f := range found {
+				if strings.HasPrefix(f, "reference to the table by OID in ") {
+					byOID++
+				}
+			}
+			if byOID < 2 {
+				t.Errorf("the regclass scan found %d of the 2 constants the table stores about itself: %v\n"+
+					"the decode of the printed pg_node_tree has stopped matching on this major, so the refusal it drives is silently not firing", byOID, found)
+			}
+		})
+	}
+}
