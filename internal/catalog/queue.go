@@ -37,6 +37,18 @@ const EnqueueLockKey int64 = 0x7067736861726451
 // statement run again attaches to it instead of running again.
 const DefaultRetryWindow = 10 * time.Minute
 
+// RepeatableMigrationKinds are the kinds whose second run is the work
+// again rather than a repeat of a statement already applied: running one
+// of them is asking for its effect now, against the state now.
+//
+// A statement of any other kind that completed a moment ago stands for one
+// sent again, which is what makes a client's retry after a timeout build
+// an index once. One of these does not: ALTER SEQUENCE ... RESTART sent
+// again after the application has consumed a few thousand values is asking
+// for a restart from where the sequence is now, and answering it with the
+// earlier one reports success for work that did not happen.
+var RepeatableMigrationKinds = []string{"REINDEX", "VACUUM", "ALTER SEQUENCE"}
+
 // ClusterScopedMigrationKinds are the migration kinds about the whole
 // cluster rather than one database; pgshard.cluster_scoped_migration lists
 // the same.
@@ -139,8 +151,8 @@ func EnqueueMigrationOnce(ctx context.Context, db Beginner, m DDLMigration, wind
 		err := tx.QueryRow(ctx, `SELECT id::text, state, arrival FROM pgshard.migrations
 			WHERE dedup_key = $1
 			  AND (state IN ('queued', 'running')
-			       OR (state = 'complete' AND finished_at >= now() - make_interval(secs => $2) AND kind NOT IN ('REINDEX', 'VACUUM')))
-			ORDER BY arrival DESC LIMIT 1`, m.DedupKey, window.Seconds()).Scan(&id, &state, &arrival)
+			       OR (state = 'complete' AND finished_at >= now() - make_interval(secs => $2) AND kind <> ALL ($3)))
+			ORDER BY arrival DESC LIMIT 1`, m.DedupKey, window.Seconds(), RepeatableMigrationKinds).Scan(&id, &state, &arrival)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 		case err != nil:
