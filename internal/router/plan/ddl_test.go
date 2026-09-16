@@ -481,3 +481,47 @@ func TestCreateDatabaseRefusesConnectionSyntaxInTheName(t *testing.T) {
 		t.Fatalf("an ordinary name must still be accepted: %v", err)
 	}
 }
+
+// TestAMigrationNamesTheObjectItTouches (PGS-923): the operation queue
+// withholds the statement, so a migration that records no object reads as
+// its bare kind -- and the applier records an object only for the kinds it
+// has to check for when it resumes. Every DDL that names something now
+// carries that name for the queue to show.
+func TestAMigrationNamesTheObjectItTouches(t *testing.T) {
+	p := New()
+	snap := fixture(t)
+	for _, c := range []struct{ sql, target string }{
+		{"alter table orders add column extra int", "orders"},
+		{"alter table public.orders add column extra2 int", "public.orders"},
+		{"alter table items rename column note to remark", "items"},
+		{"alter index orders_note_idx rename to orders_note_ix", "orders_note_idx"},
+		{"alter sequence invoice_numbers restart", "invoice_numbers"},
+		{"comment on table orders is 'the orders'", "orders"},
+		{"comment on column public.orders.note is 'a note'", "public.orders.note"},
+		{"alter table orders owner to app", "orders"},
+		{"create index orders_note_idx2 on orders (note)", "orders"},
+		{"create table t2 (id int primary key)", "t2"},
+	} {
+		pl, err := p.Plan(context.Background(), session(snap), c.sql)
+		if err != nil {
+			t.Errorf("%s: %v", c.sql, err)
+			continue
+		}
+		if pl.Migration == nil {
+			t.Errorf("%s: planned as %v, not a migration", c.sql, pl.Kind)
+			continue
+		}
+		if pl.Migration.Target != c.target {
+			t.Errorf("%s: target %q, want %q", c.sql, pl.Migration.Target, c.target)
+		}
+	}
+	// A statement that names no object of its own keeps an empty target
+	// rather than inventing one.
+	pl, err := p.Plan(context.Background(), session(snap), "grant select on orders to app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.Migration == nil || pl.Migration.Target != "" {
+		t.Errorf("GRANT target %q, want none", pl.Migration.Target)
+	}
+}

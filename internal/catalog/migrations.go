@@ -91,6 +91,12 @@ type MigrationMeta struct {
 	// reshard or upgrade cutover must not read them against the set that
 	// is serving now.
 	ShardSet string `json:"shard_set,omitempty"`
+	// Target is the object the statement names, qualified when the client
+	// qualified it. It is for reading only -- the queue withholds the
+	// statement, and without a name every ALTER TABLE in it reads as
+	// "ALTER TABLE" -- so it is not part of a migration's identity and the
+	// dedup key leaves it out.
+	Target string `json:"target,omitempty"`
 }
 
 // MigrationStep is one statement of a multistep migration.
