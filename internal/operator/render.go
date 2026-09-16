@@ -806,8 +806,13 @@ func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
 		// no identity to authorise.
 		AuthorizeCallers: internalTLS(c).Issue,
 		// A caller that has not switched to TLS yet is still served while
-		// the cluster moves to it.
-		AcceptPlaintext: internalTLSPhase(c) != "",
+		// the cluster moves to it -- until the last step, where nothing
+		// dials plaintext any more and the listeners stop taking it. The
+		// operator and the controller dial every agent with mTLS from the
+		// first step onwards (AgentTLS.Set keys off the agent-mTLS
+		// annotation, not the phase), so by then there is no plaintext
+		// caller left to serve.
+		AcceptPlaintext: internalTLSAcceptsPlaintext(c),
 		CertFile:        internalTLSMountPath + "/tls.crt",
 		KeyFile:         internalTLSMountPath + "/tls.key",
 		CAFile:          internalTLSMountPath + "/ca.crt",

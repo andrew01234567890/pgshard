@@ -244,16 +244,23 @@ func TestEachStepOfAMoveRendersWhatItsCallersNeed(t *testing.T) {
 			t.Errorf("%q: router pods record phase %q", phase, got)
 		}
 		controller := Renderer{}.ControllerDeployment(c)
+		// The controller is rendered alike in the first two steps, so it
+		// records the first and does not roll between them; the last step
+		// takes its plaintext listener away, so it records that one.
 		want := phase
-		if phase != "" {
+		if phase == pgshardv1alpha1.InternalTLSDialing {
 			want = pgshardv1alpha1.InternalTLSAccepting
 		}
 		if got := controller.Spec.Template.Annotations[AnnotationInternalTLSPhase]; got != want {
 			t.Errorf("%q: controller pods record phase %q, want %q", phase, got, want)
 		}
 		controllers = append(controllers, controller.Spec.Template)
-		if got := agentGRPCTLS(c).AcceptPlaintext; got != (phase != "") {
-			t.Errorf("%q: agent accepts plaintext = %v", phase, got)
+		// The agent's listener follows the same rule as every other: it
+		// serves callers that have not switched yet, and stops in the step
+		// where nothing dials plaintext any more.
+		wantPlaintext := phase == pgshardv1alpha1.InternalTLSAccepting || phase == pgshardv1alpha1.InternalTLSDialing
+		if got := agentGRPCTLS(c).AcceptPlaintext; got != wantPlaintext {
+			t.Errorf("%q: agent accepts plaintext = %v, want %v", phase, got, wantPlaintext)
 		}
 		return tpl, pooler, router.Spec.Template.Spec.Containers[0].Args, controller.Spec.Template.Spec.Containers[0].Args
 	}
@@ -276,6 +283,13 @@ func TestEachStepOfAMoveRendersWhatItsCallersNeed(t *testing.T) {
 		t.Error("Dialing renders members or the controller differently from Accepting, so it rolls them again")
 	}
 
+	closeTpl, closePooler, closeRouter, closeController := render(pgshardv1alpha1.InternalTLSClosing)
+	if has(closePooler, "--tls-accept-plaintext") || has(closeRouter, "--tls-accept-plaintext") || has(closeController, "--tls-accept-plaintext") {
+		t.Errorf("Closing still renders --tls-accept-plaintext: pooler %v router %v controller %v", closePooler, closeRouter, closeController)
+	}
+	if closeTpl.Hash() == dialTpl.Hash() {
+		t.Error("Closing hashes like Dialing, so no member rolls out of accepting plaintext")
+	}
 	doneTpl, donePooler, doneRouter, doneController := render("")
 	for what, args := range map[string][]string{"pooler": donePooler, "router": doneRouter, "controller": doneController} {
 		if has(args, "--tls-accept-plaintext") || has(args, "--tls-dial-plaintext") {
