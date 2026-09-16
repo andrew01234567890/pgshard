@@ -33,7 +33,8 @@ Resharding is declared, not scripted:
 > so on itself — `status->>'message'` on the row explains that it is
 > recorded and not driven, and names what to do instead — so nobody has to
 > find this page to learn why nothing is happening. The rows stay in
-> `pgshard.workflows`; `CancelWorkflow` clears them. Tracked as PGS-508.
+> `pgshard.workflows`; `CancelWorkflow` clears them. They do not hold back
+> table placement workflows. Tracked as PGS-508.
 > Use `spec.shards` to change the shard count today, or declare a new
 > shard set and let the ranges move to it.
 

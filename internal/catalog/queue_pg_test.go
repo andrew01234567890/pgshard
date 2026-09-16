@@ -185,6 +185,32 @@ func TestOperationBlockersFollowTheQueueRule(t *testing.T) {
 			wait: map[string][]string{"index": {"reshard:started"}},
 		},
 		{
+			// PGS-866, the symptom itself: the row an in-place edit of
+			// pgshard.shard_ranges records. Nothing drives it -- it stays
+			// pending until somebody cancels it or reshards through
+			// spec.shards -- so a placement queued behind it waited at
+			// prepare for as long as the row stood.
+			what: "a placement does not wait for a reshard nothing drives",
+			ops: []queueOp{
+				{name: "edit", kind: OperationReshard, state: "pending", arrival: 1},
+				{name: "move", kind: OperationPlacement, state: "pending", stage: "preparing", database: "app", arrival: 2},
+			},
+			wait: map[string][]string{"move": nil},
+		},
+		{
+			// The contrast, and why the rule reads the source set and not
+			// the state alone: a reshard the controller has just created is
+			// pending too, for the pass that moves it on. Letting a
+			// placement past that one would start a move the copy about to
+			// begin then has to carry.
+			what: "but it does wait for a driven reshard still pending",
+			ops: []queueOp{
+				{name: "reshard", kind: OperationReshard, state: "pending", arrival: 1, sourceSet: true},
+				{name: "move", kind: OperationPlacement, state: "pending", stage: "preparing", database: "app", arrival: 2},
+			},
+			wait: map[string][]string{"move": {"reshard:earlier"}},
+		},
+		{
 			what: "a placement waits for a reshard that arrived first, a reshard for a placement that has started, placements not for each other",
 			ops: []queueOp{
 				{name: "reshard", kind: OperationReshard, state: "provisioning", stage: "provisioning", arrival: 1, sourceSet: true},
