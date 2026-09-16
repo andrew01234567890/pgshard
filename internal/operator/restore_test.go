@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -893,7 +894,11 @@ func TestRestoreRefusesABarrierItsSourceInheritedFromARestore(t *testing.T) {
 		name      string
 		recorded  time.Time
 		completed time.Time
-		refused   bool
+		// stamped is the cluster's own record of when its restore finished,
+		// used INSTEAD of a PgShardRestore object: that object is one-shot
+		// and routinely deleted, and the cut-off has to survive it.
+		stamped time.Time
+		refused bool
 	}{
 		{name: "recorded before the source was built", recorded: built.Add(-time.Hour), refused: true},
 		{name: "recorded on the source since", recorded: built.Add(time.Hour)},
@@ -901,6 +906,12 @@ func TestRestoreRefusesABarrierItsSourceInheritedFromARestore(t *testing.T) {
 		// cluster it came from until its restore completed.
 		{name: "recorded while the source was still replaying", recorded: built.Add(time.Hour), completed: built.Add(2 * time.Hour), refused: true},
 		{name: "recorded after the source's restore completed", recorded: built.Add(3 * time.Hour), completed: built.Add(2 * time.Hour)},
+		// The PgShardRestore has been deleted, as operators delete them.
+		// Without the cluster's own stamp the cut-off falls back to its
+		// creation time, which is BEFORE recovery ended, and every barrier
+		// inherited in that window is accepted again.
+		{name: "recorded while replaying, with the restore object deleted", recorded: built.Add(time.Hour), stamped: built.Add(2 * time.Hour), refused: true},
+		{name: "recorded after it finished, with the restore object deleted", recorded: built.Add(3 * time.Hour), stamped: built.Add(2 * time.Hour)},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			source := boundCluster("old")
@@ -908,6 +919,9 @@ func TestRestoreRefusesABarrierItsSourceInheritedFromARestore(t *testing.T) {
 			source.Spec.Shards = &one
 			source.Labels = map[string]string{LabelRestoredFrom: "before-purge"}
 			source.CreationTimestamp = metav1.NewTime(built)
+			if !c.stamped.IsZero() {
+				source.Annotations = map[string]string{AnnotationRestoreCompletedAt: c.stamped.UTC().Format(time.RFC3339)}
+			}
 			barrier := "nightly-2026"
 			rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new",
 				BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
@@ -1035,5 +1049,58 @@ func TestRestoreRefusesABackupThatEndedAfterTheBarrier(t *testing.T) {
 				t.Fatalf("the refusal must name %s, whose backup ended late: %s", c.refusedGroup, got.Status.Error)
 			}
 		})
+	}
+}
+
+// TestAnUnreachableRestoreObjectDoesNotLoosenTheCutOff (PGS-933): the
+// cut-off for an inherited barrier is read from the PgShardRestore that
+// built the source, and a deleted one is an answer -- there simply is no
+// sharper bound than the cluster's own stamp. An API failure is not an
+// answer: treating it as absence quietly loosened the cut-off for as long
+// as the failure lasted, which is the moment a restore is most likely to be
+// running.
+func TestAnUnreachableRestoreObjectDoesNotLoosenTheCutOff(t *testing.T) {
+	built := time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC)
+	source := boundCluster("old")
+	one := 1
+	source.Spec.Shards = &one
+	source.Labels = map[string]string{LabelRestoredFrom: "before-purge"}
+	source.CreationTimestamp = metav1.NewTime(built)
+	barrier := "nightly-2026"
+	rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new",
+		BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("apiserver is having a moment")
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(source, newPolicy(), completedBackup("b1", "old"), rs, superuserSecret("old")).
+		WithStatusSubresource(&pgshardv1alpha1.PgShardRestore{}, &pgshardv1alpha1.PgShardCluster{}, &pgshardv1alpha1.PgShardGroup{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*pgshardv1alpha1.PgShardRestore); ok && key.Name == "before-purge" {
+					return boom
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+	r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil),
+		// Recorded an hour after the cluster object appeared: accepted if
+		// the cut-off falls back to the creation time, refused or requeued
+		// if the unreadable object is treated as unknown.
+		Barriers: &fakeCertifier{certified: true, groups: []string{"catalog", "shard-0"}, createdAt: built.Add(time.Hour)},
+		Now:      func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+
+	_, rerr := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "default", Name: "r1"}})
+	if rerr == nil {
+		t.Fatal("an unreadable PgShardRestore was treated as a deleted one, and the barrier was judged against the cluster's creation time")
+	}
+	if !errors.Is(rerr, boom) {
+		t.Fatalf("reconcile failed with %v, want the API error surfaced", rerr)
+	}
+	var made pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &made); err == nil {
+		t.Fatal("the restore created a cluster while it could not read the cut-off")
 	}
 }

@@ -18,6 +18,18 @@ const AnnotationRestoreSource = "pgshard.io/restore-source"
 // LabelRestoredFrom marks a cluster with the PgShardRestore that created it.
 const LabelRestoredFrom = "pgshard.io/restored-from"
 
+// AnnotationRestoreCompletedAt records, on the cluster itself, when the
+// restore that built it finished recovering.
+//
+// The PgShardRestore carries the same time in its status, but it is a
+// one-shot object with no finalizer and nothing owning it: operators delete
+// them, and then the only remaining answer to "when did this cluster stop
+// replaying the other cluster's WAL?" is its own creation time, which is
+// earlier -- the object exists before recovery ends. Barriers recorded in
+// between are the source cluster's, and reading the cut-off from an object
+// that may be gone quietly let them back in.
+const AnnotationRestoreCompletedAt = "pgshard.io/restore-completed-at"
+
 // RestoreSource is the annotation payload: where the groups restore from
 // and the recovery target they all share.
 type RestoreSource struct {

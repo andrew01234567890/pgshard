@@ -263,11 +263,28 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// replaying that cluster's WAL after this one's object exists -- and
 		// its restore point is in that cluster's repository, not this one's.
 		if from := source.Labels[LabelRestoredFrom]; from != "" {
+			// The cluster's own stamp first: the PgShardRestore is a
+			// one-shot object operators delete, and without it the cut-off
+			// falls back to the cluster's creation time -- which is BEFORE
+			// recovery ended, so every barrier inherited in that window is
+			// accepted again. That is the window this check exists for.
 			built := source.CreationTimestamp.Time
-			var buildingRestore pgshardv1alpha1.PgShardRestore
-			if err := r.Get(ctx, types.NamespacedName{Namespace: source.Namespace, Name: from}, &buildingRestore); err == nil &&
-				buildingRestore.Spec.NewClusterName == source.Name && buildingRestore.Status.CompletedAt != nil {
-				built = buildingRestore.Status.CompletedAt.Time
+			if at, err := time.Parse(time.RFC3339, source.Annotations[AnnotationRestoreCompletedAt]); err == nil {
+				built = at
+			} else {
+				var buildingRestore pgshardv1alpha1.PgShardRestore
+				gerr := r.Get(ctx, types.NamespacedName{Namespace: source.Namespace, Name: from}, &buildingRestore)
+				switch {
+				case gerr == nil:
+					if buildingRestore.Spec.NewClusterName == source.Name && buildingRestore.Status.CompletedAt != nil {
+						built = buildingRestore.Status.CompletedAt.Time
+					}
+				case !apierrors.IsNotFound(gerr):
+					// Deleted is an answer; unreachable is not. Falling
+					// through on an API failure would loosen the cut-off
+					// for as long as the failure lasted.
+					return ctrl.Result{}, gerr
+				}
 			}
 			if rec.CreatedAt.Before(built) {
 				return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q was recorded at %s, before PgShardRestore %s finished building %s: it belongs to the cluster %s was restored from, whose repository holds its restore point; take a new barrier on %s",
@@ -483,6 +500,21 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	inProgress := rs.Status.Phase == pgshardv1alpha1.RestorePhaseRestoring || rs.Status.Phase == pgshardv1alpha1.RestorePhaseReconciling
 	if !inProgress {
 		rs.Status.CompletedAt = ptrTime(r.now())
+		// On the cluster too, because that is what outlives this object:
+		// a barrier recorded before recovery ended belongs to the cluster
+		// this one was restored from, and the check that refuses it needs
+		// the time long after anyone has deleted the PgShardRestore.
+		if c.Annotations == nil || c.Annotations[AnnotationRestoreCompletedAt] == "" {
+			stamped := c.DeepCopy()
+			if stamped.Annotations == nil {
+				stamped.Annotations = map[string]string{}
+			}
+			stamped.Annotations[AnnotationRestoreCompletedAt] = rs.Status.CompletedAt.UTC().Format(time.RFC3339)
+			if err := r.Patch(ctx, stamped, client.MergeFrom(c)); err != nil {
+				return ctrl.Result{}, err
+			}
+			c = stamped
+		}
 	}
 	msg := fmt.Sprintf("cluster %s: %d/%d groups recovered, ready=%v", c.Name, countReached(groups), len(groups), ready)
 	switch {
