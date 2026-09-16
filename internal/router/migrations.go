@@ -73,10 +73,30 @@ type PGMigrationQueue struct {
 	beat     func(ctx context.Context) (age time.Duration, found bool, err error)
 	queue    func(ctx context.Context) (bool, error)
 
+	// QueueProbeEvery is how long an answer of "this catalog has no
+	// operation queue" is trusted; default queueProbeEvery.
+	QueueProbeEvery time.Duration
+
 	mu           sync.Mutex
 	queuePresent bool
 	queueChecked time.Time
+	queueErr     error
+	// probing is closed by the session running the probe, and is what the
+	// others wait on instead of probing too.
+	probing chan struct{}
 }
+
+// queueProbeEvery is how long the absence of the operation queue is
+// trusted. Its presence is permanent and never re-read.
+const queueProbeEvery = 30 * time.Second
+
+// queueProbeErrorEvery is how long a failed probe is remembered. Short: a
+// catalog that has come back must not wait out the whole window, and one
+// probe per second for the whole router is not a storm.
+const queueProbeErrorEvery = time.Second
+
+// queueProbeTimeout bounds the probe itself.
+const queueProbeTimeout = 10 * time.Second
 
 // DefaultMigrationMaxWait is how long Wait tolerates no sign of a
 // controller before giving up: a flat overall deadline would abort a
@@ -120,24 +140,71 @@ func migrationProgress(m catalog.DDLMigration) string {
 
 // queued reports whether the catalog has the operation queue; once it has,
 // it always will.
+//
+// One PGMigrationQueue serves every session of a router, so this answer is
+// shared and the probe behind it is taken once: the lock is never held
+// across the catalog read, callers that arrive while a probe is in flight
+// wait for that one rather than issuing their own, and a probe that fails
+// is remembered too. The probe used to run under the mutex, and a failing
+// one cached nothing -- so against a catalog that was reachable but slow,
+// every 200ms poll of every waiting migration and every statement on a
+// local database re-issued it and queued behind the last, turning an outage
+// that should degrade in parallel into a convoy. sync.Mutex is not
+// cancellable, so a session parked there could not be cut short by its own
+// deadline, its statement_timeout or a client's cancel.
 func (q *PGMigrationQueue) queued(ctx context.Context) (bool, error) {
-	if q.queue != nil {
-		return q.queue(ctx)
+	probe := q.queue
+	if probe == nil {
+		if q.Pool == nil {
+			return false, nil
+		}
+		probe = func(ctx context.Context) (bool, error) { return catalog.QueueSchema(ctx, q.Pool) }
 	}
-	if q.Pool == nil {
-		return false, nil
+	every := q.QueueProbeEvery
+	if every <= 0 {
+		every = queueProbeEvery
 	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.queuePresent || (!q.queueChecked.IsZero() && time.Since(q.queueChecked) < 30*time.Second) {
-		return q.queuePresent, nil
+	for {
+		q.mu.Lock()
+		// A failure is trusted for much less time than an answer: it
+		// collapses a storm of retries without making a catalog that has
+		// come back wait out the window. Sessions arriving together share
+		// one probe whatever the outcome.
+		window := every
+		if q.queueErr != nil {
+			window = min(every, queueProbeErrorEvery)
+		}
+		if q.queuePresent || (!q.queueChecked.IsZero() && time.Since(q.queueChecked) < window) {
+			present, err := q.queuePresent, q.queueErr
+			q.mu.Unlock()
+			return present, err
+		}
+		if inFlight := q.probing; inFlight != nil {
+			q.mu.Unlock()
+			select {
+			case <-inFlight:
+				continue
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		q.probing = done
+		q.mu.Unlock()
+		// The probe is a fact about the catalog, not about this session,
+		// so it is not cut short by this caller going away -- and it is
+		// bounded, because the session context that used to carry it is
+		// unbounded unless the operator set --max-query-duration.
+		pctx, stop := context.WithTimeout(context.WithoutCancel(ctx), queueProbeTimeout)
+		present, err := probe(pctx)
+		stop()
+		q.mu.Lock()
+		q.queuePresent, q.queueErr, q.queueChecked = present, err, time.Now()
+		q.probing = nil
+		q.mu.Unlock()
+		close(done)
+		return present, err
 	}
-	present, err := catalog.QueueSchema(ctx, q.Pool)
-	if err != nil {
-		return false, err
-	}
-	q.queuePresent, q.queueChecked = present, time.Now()
-	return present, nil
 }
 
 // QueueSchema implements MigrationQueue.
