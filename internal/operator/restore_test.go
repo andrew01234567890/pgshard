@@ -480,6 +480,9 @@ type fakeCertifier struct {
 	err                 error
 	asked               string
 	password            string
+	// dsn records the address the barrier was read at, which must be the
+	// catalog group the restore recovers rather than the stable endpoint.
+	dsn string
 	// unfenced records that the restore lifted the fence through the
 	// catalog rather than the owner-gated agent RPC; unfenceErr makes that
 	// call fail, as a catalog that is not reachable yet would.
@@ -487,8 +490,8 @@ type fakeCertifier struct {
 	unfenceErr error
 }
 
-func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, password, name string) (BarrierRecord, error) {
-	f.asked, f.password = name, password
+func (f *fakeCertifier) CertifiedBarrier(_ context.Context, dsn, password, name string) (BarrierRecord, error) {
+	f.asked, f.password, f.dsn = name, password, dsn
 	return BarrierRecord{Certified: f.certified, Groups: f.groups, CreatedAt: f.createdAt, LSNs: f.lsns,
 		CatalogIdentified: !f.unidentifiedCatalog}, f.err
 }
@@ -658,6 +661,25 @@ func TestRestoreRefusesABarrierWithoutEveryGroup(t *testing.T) {
 	var made pgshardv1alpha1.PgShardCluster
 	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new2"}, &made); err == nil {
 		t.Fatal("the restore created a cluster despite refusing the barrier")
+	}
+
+	// The barrier is read at the catalog group's own address. The stable
+	// endpoint's selector follows whichever generation is active and is
+	// moved AFTER the status that names it, so for a window after a
+	// cutover it still answers as the old catalog -- and a barrier judged
+	// there is judged against a catalog the restore is not going to
+	// recover (PGS-932).
+	cert := &fakeCertifier{certified: true, groups: []string{"catalog", "shard-0"}}
+	upgraded := newRestore("r4", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new4",
+		BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	cl = restoreClient(t, source, newPolicy(), b, upgraded, superuserSecret("old"))
+	r = &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Barriers: cert,
+		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+	if _, got := reconcileRestore(t, r, "r4"); got.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
+		t.Fatalf("the restore did not start: phase %q, %s", got.Status.Phase, got.Status.Error)
+	}
+	if !strings.Contains(cert.dsn, "old-catalog-g2-rw") {
+		t.Errorf("the barrier was read at %q; want the generation's own address, not the stable endpoint", cert.dsn)
 	}
 
 	// And it is refused only where it is doubtful. Every manifest written

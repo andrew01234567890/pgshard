@@ -213,8 +213,10 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 	// this restore recovers are read from the cluster's status and the
 	// barrier from its catalog Service, and during the cutover and a
 	// rollback the two can name different generations for a pass. The
-	// retiring stage that follows a cutover keeps them in step, and lasts
-	// the whole retirement window, so it does not wait.
+	// retiring stage that follows one does not wait: it lasts the whole
+	// retirement window, and the barrier is read at the group's own address
+	// rather than the stable endpoint, so it does not depend on the
+	// endpoint having caught up.
 	if up := source.Status.CatalogUpgrade; rs.Spec.Target.Barrier != nil && r.Barriers != nil && up != nil &&
 		(up.Stage == CatalogUpgradeCutover || up.RollbackRequested || up.RollbackStarted) {
 		base := rs.DeepCopy()
@@ -235,7 +237,11 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// pgshard.restore_points is keyed by the barrier's own name; the
 		// pgshard- prefix belongs to the WAL restore point the recovery
 		// target names, not to the catalog row.
-		rec, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), password, name)
+		// The group's own address, not the stable endpoint: the endpoint
+		// moves after the status that names the new generation, so for a
+		// window after a cutover the stable one answers as the catalog the
+		// restore is NOT going to recover (PGS-932).
+		rec, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogGroupDSN(&source), password, name)
 		if cerr != nil {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
 		}
