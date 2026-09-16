@@ -451,7 +451,11 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 	})
 	if err != nil {
 		continues := fmt.Sprintf("Migration %s continues in the background.", id)
-		if req.DedupKey != "" {
+		// What the enqueue actually stored, not what this router asked
+		// for: a catalog with no operation queue has nowhere to keep a
+		// key, and promising the client its retry will wait is how the
+		// retry builds the index a second time.
+		if queued.Deduplicated {
 			continues += " Running the same statement again waits for it while it is queued or running."
 		}
 		var quiet errNoApplier

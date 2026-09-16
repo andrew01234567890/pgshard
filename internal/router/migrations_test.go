@@ -35,6 +35,9 @@ type fakeQueue struct {
 	// home and homeQueued answer HomeDDLBlockers.
 	home       []catalog.Blocker
 	homeQueued bool
+	// noQueue makes the catalog one without the operation queue at all,
+	// which is a router newer than its catalog mid-rollout.
+	noQueue bool
 }
 
 func (q *fakeQueue) Enqueue(_ context.Context, m catalog.DDLMigration) (catalog.EnqueueResult, error) {
@@ -50,7 +53,9 @@ func (q *fakeQueue) Enqueue(_ context.Context, m catalog.DDLMigration) (catalog.
 	}
 	m.ID = fmt.Sprintf("00000000-0000-0000-0000-%012d", len(q.queued)+1)
 	q.queued = append(q.queued, m)
-	return catalog.EnqueueResult{ID: m.ID, State: catalog.MigrationQueued}, nil
+	// As the real one does: a catalog with no queue has nowhere to store a
+	// key, whatever the caller asked for.
+	return catalog.EnqueueResult{ID: m.ID, State: catalog.MigrationQueued, Deduplicated: !q.noQueue && m.DedupKey != ""}, nil
 }
 
 func (q *fakeQueue) HomeDDLBlockers(context.Context, string) ([]catalog.Blocker, bool, error) {
@@ -59,10 +64,13 @@ func (q *fakeQueue) HomeDDLBlockers(context.Context, string) ([]catalog.Blocker,
 	return q.home, q.homeQueued, nil
 }
 
+// QueueSchema answers for a catalog that has the operation queue unless a
+// test says otherwise: that is the state the feature is about, and the
+// queue-less catalog is the rollout case two tests set explicitly.
 func (q *fakeQueue) QueueSchema(context.Context) (bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.homeQueued, nil
+	return !q.noQueue, nil
 }
 
 func (q *fakeQueue) Wait(ctx context.Context, id string, waiting func([]catalog.Blocker)) (catalog.DDLMigration, error) {
@@ -1126,12 +1134,11 @@ func TestOneStatementIsAnsweredOnce(t *testing.T) {
 // controller had been seen applying migrations, while one was running and
 // leading.
 func TestFanOutDDLDuringAReshardOnAQueuelessCatalogIsRefusedAtOnce(t *testing.T) {
-	q := &fakeQueue{}
+	q := &fakeQueue{noQueue: true}
 	h := newDDLHarness(t, q)
 	ctx := context.Background()
 	conn := h.connect(t, h.dsn())
 
-	// The catalog has no queue: q.homeQueued is false, so QueueSchema is.
 	base := *h.snap
 	resharding := base
 	resharding.Serving = map[snapshot.ShardKey]snapshot.Serving{}
@@ -1158,8 +1165,48 @@ func TestFanOutDDLDuringAReshardOnAQueuelessCatalogIsRefusedAtOnce(t *testing.T)
 
 	// With the queue there, the same statement is queued rather than
 	// refused: that is the whole point, and this is the control.
-	q.homeQueued = true
+	q.noQueue = false
 	if _, err := conn.Exec(ctx, "alter table orders add column extra2 int"); err != nil {
 		t.Fatalf("with the queue, the statement should be queued and applied: %v", err)
+	}
+}
+
+// TestATimeoutPromisesDedupOnlyWhereTheCatalogCanDoIt: the DETAIL on a
+// timed-out DDL tells the client the migration continues, and -- when the
+// statement carries a dedup key the catalog stored -- that sending it again
+// waits for that migration rather than queueing another.
+//
+// The sentence used to be chosen from the router's own request, which says
+// only what the router intended. A catalog without the operation queue has
+// no dedup_key column, so the enqueue drops the key, and the advised retry
+// queued a second migration: the index was built twice, on the advice of
+// the error that suggested it.
+func TestATimeoutPromisesDedupOnlyWhereTheCatalogCanDoIt(t *testing.T) {
+	const promise = "Running the same statement again waits for it"
+	for _, c := range []struct{ queue, promised bool }{{true, true}, {false, false}} {
+		name := "without the queue"
+		if c.queue {
+			name = "with the queue"
+		}
+		t.Run(name, func(t *testing.T) {
+			q := &fakeQueue{delay: time.Hour, noQueue: !c.queue}
+			h := newDDLHarness(t, q)
+			ctx := context.Background()
+			conn := h.connect(t, h.dsn())
+			if _, err := conn.Exec(ctx, "set statement_timeout = '300ms'"); err != nil {
+				t.Fatal(err)
+			}
+			_, err := conn.Exec(ctx, "create index concurrently orders_note_idx on orders (note)")
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "57014" {
+				t.Fatalf("want a statement timeout, got %v", err)
+			}
+			if !strings.Contains(pgErr.Detail, "continues in the background") {
+				t.Fatalf("detail %q", pgErr.Detail)
+			}
+			if got := strings.Contains(pgErr.Detail, promise); got != c.promised {
+				t.Fatalf("the detail promises dedup = %v, want %v: %q", got, c.promised, pgErr.Detail)
+			}
+		})
 	}
 }

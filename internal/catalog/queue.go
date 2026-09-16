@@ -128,6 +128,13 @@ type EnqueueResult struct {
 	Attached bool
 	// State is the state of the migration ID named when it was chosen.
 	State string
+	// Deduplicated reports that the stored row carries a dedup key, so the
+	// same statement sent again attaches to it rather than running twice.
+	// It is the enqueue's answer rather than the caller's intent: a
+	// catalog without the operation queue has nowhere to record a key, and
+	// telling a client its retry will wait is how the retry builds the
+	// index twice.
+	Deduplicated bool
 }
 
 // EnqueueMigrationOnce enqueues m unless an identical migration (the same
@@ -167,7 +174,7 @@ func EnqueueMigrationOnce(ctx context.Context, db Beginner, m DDLMigration, wind
 				return EnqueueResult{}, fmt.Errorf("catalog: enqueue migration: %w", err)
 			}
 			if !overtaken {
-				return EnqueueResult{ID: id, Attached: true, State: state}, tx.Commit(ctx)
+				return EnqueueResult{ID: id, Attached: true, State: state, Deduplicated: true}, tx.Commit(ctx)
 			}
 		}
 	}
@@ -175,7 +182,7 @@ func EnqueueMigrationOnce(ctx context.Context, db Beginner, m DDLMigration, wind
 	if err != nil {
 		return EnqueueResult{}, err
 	}
-	return EnqueueResult{ID: id, State: MigrationQueued}, tx.Commit(ctx)
+	return EnqueueResult{ID: id, State: MigrationQueued, Deduplicated: m.DedupKey != ""}, tx.Commit(ctx)
 }
 
 // HeartbeatApplier is the controller_heartbeat component the applier beats.
