@@ -1569,3 +1569,127 @@ func TestARouterLimitOnAWaitingDDLKeepsTheMigrationsDetail(t *testing.T) {
 		t.Fatalf("the wait ended after %s", took)
 	}
 }
+
+// TestTheQueueProbeIsTakenOnceAndDoesNotBlockOtherSessions (PGS-920): one
+// PGMigrationQueue serves every session of a router, and the probe for the
+// operation queue ran under its mutex with a failure that cached nothing.
+// Against a catalog that was reachable but slow, every 200ms poll of every
+// waiting migration re-issued it and queued behind the last.
+func TestTheQueueProbeIsTakenOnceAndDoesNotBlockOtherSessions(t *testing.T) {
+	var mu sync.Mutex
+	probes := 0
+	release := make(chan struct{})
+	var fail error
+	q := &PGMigrationQueue{QueueProbeEvery: 50 * time.Millisecond,
+		queue: func(ctx context.Context) (bool, error) {
+			mu.Lock()
+			probes++
+			hold, err := release, fail
+			mu.Unlock()
+			if hold != nil {
+				select {
+				case <-hold:
+				case <-ctx.Done():
+					return false, ctx.Err()
+				}
+			}
+			return err == nil, err
+		}}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return probes
+	}
+
+	// One session is in the probe. Another, with a budget of its own, must
+	// come back on that budget rather than on the first one's progress: a
+	// sync.Mutex is not cancellable, so a session parked in it could not be
+	// cut short by its own deadline or a client's cancel.
+	first := make(chan error, 1)
+	go func() {
+		_, err := q.queued(context.Background())
+		first <- err
+	}()
+	for count() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	short, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := q.queued(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a second session waiting on the probe ended with %v, want its own deadline", err)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the second session waited %s for the first session's probe", took)
+	}
+	// And it waited for the probe rather than starting one of its own.
+	if n := count(); n != 1 {
+		t.Fatalf("%d probes while one was in flight", n)
+	}
+
+	// Many sessions arriving together share the one probe.
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := q.queued(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if n := count(); n != 1 {
+		t.Fatalf("%d probes for one answer; the sessions did not share it", n)
+	}
+
+	// A catalog that has the queue is never asked again.
+	time.Sleep(80 * time.Millisecond)
+	if ok, err := q.queued(context.Background()); !ok || err != nil {
+		t.Fatalf("queued = %v, %v", ok, err)
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("%d probes; the queue's presence is permanent", n)
+	}
+
+	// A probe that fails is remembered too, so a slow catalog is not
+	// re-probed by every session on every poll -- but for a window of its
+	// own, far shorter than the one an answer earns, so a catalog that has
+	// come back does not wait the answer's window out. This queue trusts an
+	// answer for ten seconds; the failure must be re-read long before that.
+	var fmu sync.Mutex
+	fprobes := 0
+	var ferr error
+	ferr = errors.New("catalog restarting")
+	fq := &PGMigrationQueue{QueueProbeEvery: 10 * time.Second,
+		queue: func(context.Context) (bool, error) {
+			fmu.Lock()
+			defer fmu.Unlock()
+			fprobes++
+			return ferr == nil, ferr
+		}}
+	fcount := func() int {
+		fmu.Lock()
+		defer fmu.Unlock()
+		return fprobes
+	}
+	for range 5 {
+		if _, err := fq.queued(context.Background()); err == nil {
+			t.Fatal("a failing probe reported success")
+		}
+	}
+	if n := fcount(); n != 1 {
+		t.Fatalf("%d probes for one failure; it was not remembered", n)
+	}
+	time.Sleep(queueProbeErrorEvery + 100*time.Millisecond)
+	fmu.Lock()
+	ferr = nil
+	fmu.Unlock()
+	if ok, err := fq.queued(context.Background()); !ok || err != nil {
+		t.Fatalf("a catalog that came back answered %v, %v; the failure was kept for the whole answer window", ok, err)
+	}
+}
