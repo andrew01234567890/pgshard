@@ -1066,6 +1066,14 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			CREATE FUNCTION rowed_all() RETURNS SETOF rowed LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY SELECT * FROM rowed; END $$`, "rowed", "row type used by function rowed_all()"},
 		{`CREATE TABLE snapshotted (id bigint PRIMARY KEY); CREATE TABLE snapshot_log (s snapshotted[])`, "snapshotted", "row type used by column s of table snapshot_log"},
 		{`CREATE TABLE casted (id bigint PRIMARY KEY); CREATE VIEW casted_null AS SELECT NULL::casted AS r`, "casted", "row type used by column r of view casted_null"},
+		// A view that mentions the row type but exposes no column of it
+		// records only its own _RETURN rule, so excluding every _RETURN row
+		// let this through: after the swap the view is bound to the retired
+		// table's row shape for ever, and DROP TABLE on the retired table
+		// fails for as long as the view exists.
+		{`CREATE TABLE shredded_src (id bigint PRIMARY KEY, amount int); CREATE TABLE shredded_raw (data jsonb);
+			CREATE VIEW shredded AS SELECT to_jsonb(jsonb_populate_record(NULL::shredded_src, data)) AS j FROM shredded_raw`,
+			"shredded_src", "row type used by view shredded"},
 		// The table's OID as a regclass constant (PGS-888).
 		{`CREATE TABLE selfnamed (id bigint PRIMARY KEY, me regclass DEFAULT 'selfnamed'::regclass)`, "selfnamed", "reference to the table by OID in default value for column me of table selfnamed"},
 		{`CREATE TABLE pointed (id bigint PRIMARY KEY); CREATE TABLE pointer (y int CHECK (y <> 'pointed'::regclass::int))`, "pointed", "reference to the table by OID in constraint pointer_y_check on table pointer"},

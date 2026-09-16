@@ -946,11 +946,25 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 				) e, regexp_matches(e.expr, ':consttype 2205 [^{}]*:constisnull false [^{}]*:constvalue 4 \[ (-?\d+) (-?\d+) (-?\d+) (-?\d+) ', 'g') b
 				WHERE (b[1]::int + 256) % 256 + (b[2]::int + 256) % 256 * 256 + (b[3]::int + 256) % 256 * 65536
 					+ (b[4]::bigint + 256) % 256 * 16777216 = t.oid::bigint
-			UNION ALL SELECT DISTINCT 'row type used by ' || pg_describe_object(d.classid, d.objid, d.objsubid)
-				FROM pg_depend d, t
+			UNION ALL SELECT DISTINCT CASE
+					WHEN d.classid = 'pg_rewrite'::regclass AND r.rulename = '_RETURN'
+					THEN 'row type used by ' || pg_describe_object('pg_class'::regclass, r.ev_class, 0)
+					ELSE 'row type used by ' || pg_describe_object(d.classid, d.objid, d.objsubid) END
+				FROM pg_depend d
+				LEFT JOIN pg_rewrite r ON d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid, t
 				WHERE d.refclassid = 'pg_type'::regclass AND d.deptype = 'n'
 				  AND d.refobjid IN (t.reltype, (SELECT typarray FROM pg_type WHERE oid = t.reltype))
-				  AND NOT (d.classid = 'pg_rewrite'::regclass AND EXISTS (SELECT 1 FROM pg_rewrite WHERE oid = d.objid AND rulename = '_RETURN'))
+				  -- A view that has a column of the row type is named by that
+				  -- column, so its _RETURN rule would say the same thing twice.
+				  -- A view that only mentions the type -- jsonb_populate_record
+				  -- (NULL::t, ...) is the everyday shape -- records nothing
+				  -- else, so dropping every _RETURN row let it through the one
+				  -- check meant to catch it: after the swap its query is bound
+				  -- to the retired table's row type for ever, and the retired
+				  -- table can never be dropped.
+				  AND NOT (d.classid = 'pg_rewrite'::regclass AND r.rulename = '_RETURN' AND EXISTS (
+					SELECT 1 FROM pg_depend c WHERE c.classid = 'pg_class'::regclass AND c.objid = r.ev_class
+					  AND c.refclassid = 'pg_type'::regclass AND c.refobjid = d.refobjid))
 		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err
