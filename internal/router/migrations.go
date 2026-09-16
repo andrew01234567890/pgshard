@@ -63,6 +63,9 @@ type PGMigrationQueue struct {
 	// CatalogOutage bounds how long Wait keeps reading through catalog
 	// errors; default DefaultCatalogOutage.
 	CatalogOutage time.Duration
+	// BlockersEvery is how often a waiting session asks what its migration
+	// waits for; default blockersEvery.
+	BlockersEvery time.Duration
 
 	// Tests override the catalog reads.
 	load     func(ctx context.Context, id string) (catalog.DDLMigration, error)
@@ -198,6 +201,10 @@ func (q *PGMigrationQueue) Wait(ctx context.Context, id string, waiting func([]c
 			return catalog.ControllerHeartbeatAge(ctx, q.Pool, catalog.HeartbeatApplier)
 		}
 	}
+	every := q.BlockersEvery
+	if every <= 0 {
+		every = blockersEvery
+	}
 	deadline := time.Now().Add(maxWait)
 	last, lastBlockers := "", ""
 	var failingSince, blockersAt time.Time
@@ -227,7 +234,7 @@ func (q *PGMigrationQueue) Wait(ctx context.Context, id string, waiting func([]c
 			if found && age < maxWait {
 				deadline = time.Now().Add(maxWait - age)
 			}
-			if waiting != nil && m.State == catalog.MigrationQueued && time.Since(blockersAt) >= blockersEvery {
+			if waiting != nil && m.State == catalog.MigrationQueued && time.Since(blockersAt) >= every {
 				blockersAt = time.Now()
 				bs, err := blockers(ctx, id)
 				if err != nil {
