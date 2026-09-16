@@ -993,6 +993,9 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if handled, err := e.endFailedTxn(pl.Class, w); handled {
 		return e.afterBatch(ctx, err)
 	}
+	if handled, err := e.endNoTxn(pl.Class, w); handled {
+		return e.afterBatch(ctx, err)
+	}
 	if err := e.refuseInFailedTransaction(pl.Class); err != nil {
 		return e.afterBatch(ctx, err)
 	}
@@ -1300,6 +1303,37 @@ func (e *Executor) endFailedTxn(class StmtClass, w pgwire.ResultWriter) (bool, e
 	}
 	e.finishTxn("ROLLBACK")
 	return true, w.CommandComplete("ROLLBACK")
+}
+
+// endNoTxn answers a COMMIT or ROLLBACK sent when no transaction is in
+// progress, the way PostgreSQL answers it: a warning, and the statement's
+// own tag.
+//
+// It used to be routed to a shard, which is a round trip to learn what this
+// session already knows. It is also the statement a client sends after its
+// backend went away -- a retiring shard set takes its poolers with it, and
+// poolerLost leaves the session idle with no transaction and nothing parked
+// -- and routing it asked the shard that had just gone, so the client could
+// not even end the transaction it had been thrown out of.
+func (e *Executor) endNoTxn(class StmtClass, w pgwire.ResultWriter) (bool, error) {
+	if e.tx != pgwire.TxIdle || e.conn != nil || e.multiShardTxn() {
+		return false, nil
+	}
+	tag := ""
+	switch class.Txn {
+	case plan.TxnCommit:
+		tag = "COMMIT"
+	case plan.TxnRollback:
+		tag = "ROLLBACK"
+	default:
+		return false, nil
+	}
+	// PostgreSQL's own words and SQLSTATE (xact.c: ERRCODE_NO_ACTIVE_SQL_TRANSACTION).
+	if err := w.Notice(&pgproto3.NoticeResponse{Severity: "WARNING", SeverityUnlocalized: "WARNING", Code: "25P01",
+		Message: "there is no transaction in progress"}); err != nil {
+		return true, err
+	}
+	return true, w.CommandComplete(tag)
 }
 
 // refuseInFailedTransaction answers what PostgreSQL answers while a
