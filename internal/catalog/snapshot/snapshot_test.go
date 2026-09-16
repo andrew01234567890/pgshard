@@ -245,7 +245,15 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 			s.Tables[k] = p
 		},
 		"a database default": func(s *Snapshot) { s.Databases["app"] = catalog.Database{Name: "app", DefaultPlacement: "sharded"} },
-		"a global sequence":  func(s *Snapshot) { s.Sequences["app.public.new_id_seq"] = true },
+		// A table in a local schema routes to the home shard whatever the
+		// database default, so a plan cached before the schema was listed
+		// sends its statements somewhere else.
+		"a local schema": func(s *Snapshot) {
+			d := s.Databases["app"]
+			d.LocalSchemas = []string{"pgroll"}
+			s.Databases["app"] = d
+		},
+		"a global sequence": func(s *Snapshot) { s.Sequences["app.public.new_id_seq"] = true },
 		// Withdrawing one is the case that matters: an operator who
 		// mis-declared an aggregate as a scalar corrects it by adding the
 		// aggregate row, and a session that had already prepared the

@@ -751,3 +751,59 @@ func TestCancelDropsItsPublicationsOnARetiredSource(t *testing.T) {
 		t.Fatalf("%d reshard slots left on the sources after the cancel", n)
 	}
 }
+
+// TestAReshardCarriesLocalSchemasOnlyToItsHome (PGS-870): a schema listed in
+// local_schemas lives on the home shard alone, and so do the event triggers
+// calling its functions. The schema copy is taken from the home shard, so it
+// carried both to every target; on another shard an event trigger would
+// fire on every migration the applier runs there, into state that is not
+// there. Only the target that becomes home keeps them.
+func TestAReshardCarriesLocalSchemasOnlyToItsHome(t *testing.T) {
+	parallelPG(t)
+	f := newCopyFixture(t)
+	home := connect(t, f.appDSN("default", 0))
+	for _, sql := range []string{
+		`CREATE SCHEMA pgroll`,
+		`CREATE TABLE pgroll.migrations (name text PRIMARY KEY)`,
+		`INSERT INTO pgroll.migrations VALUES ('01_initial')`,
+		`CREATE FUNCTION pgroll.raw_migration() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM 1 FROM pgroll.migrations; END $$`,
+		`CREATE EVENT TRIGGER pg_roll_handle_ddl ON ddl_command_end EXECUTE FUNCTION pgroll.raw_migration()`,
+	} {
+		mustExec(t, home, sql)
+	}
+	mustExecPool(t, f.pool, `UPDATE pgshard.databases SET local_schemas = '{pgroll}' WHERE name = 'app'`)
+	f.startWorkflow()
+
+	homePub := HomePublicationName(2)
+	carried := map[int32]bool{}
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		f.pass()
+		subscribed, homeTarget := 0, int32(-1)
+		for id := range int32(2) {
+			tgt := connect(t, f.appDSN("g2", id))
+			schema := queryOne[int64](t, tgt, `SELECT count(*) FROM pg_namespace WHERE nspname = 'pgroll'`)
+			triggers := queryOne[int64](t, tgt, `SELECT count(*) FROM pg_event_trigger`)
+			if schema != triggers {
+				t.Fatalf("target %d carries %d pgroll schema and %d event triggers: the two go together", id, schema, triggers)
+			}
+			carried[id] = schema == 1
+			if queryOne[int64](t, tgt, `SELECT count(*) FROM pg_subscription`) > 0 {
+				subscribed++
+			}
+			if queryOne[int64](t, tgt, `SELECT count(*) FROM pg_subscription WHERE $1 = ANY (subpublications)`, homePub) > 0 {
+				homeTarget = id
+			}
+		}
+		if subscribed == 2 && homeTarget >= 0 {
+			if !carried[homeTarget] || carried[1-homeTarget] {
+				t.Fatalf("home target %d: local schema carried to %v, want only the home target", homeTarget, carried)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the copy never subscribed both targets; schema carried to %v", carried)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
