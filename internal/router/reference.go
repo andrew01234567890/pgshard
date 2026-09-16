@@ -32,6 +32,19 @@ func (e *Executor) referenceWrite(ctx context.Context, pl plan.Plan, reqs []*pgs
 	if e.catalogSession() {
 		return pgwire.Errorf(pgwire.CodeInternalError, "router: reference write on the catalog shard set")
 	}
+	// A row limit cannot be honoured here and must not be accepted. The
+	// write runs on every shard, and the router refuses to execute a
+	// multi-shard portal a later batch resumes, so the second Execute
+	// would be refused after the first had already written. Scatter reads
+	// refuse a row limit for the same reason; this path did not, and
+	// answered the first Execute as if the result had ended.
+	for _, req := range reqs {
+		if r, ok := req.Message.(*pgshardv1.ExecuteRequest_Execute); ok && r.Execute.MaxRows > 0 {
+			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "partial fetches (Execute with a row limit) from a reference table's portal are not available yet")
+			err.Hint = "execute the portal without a row limit"
+			return err
+		}
+	}
 	implicit := e.tx == pgwire.TxIdle
 	if err := e.acquire(ctx, nil); err != nil {
 		return err
