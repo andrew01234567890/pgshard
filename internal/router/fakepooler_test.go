@@ -85,6 +85,9 @@ type fakePooler struct {
 	// legacyRows answers with a Value submessage per column whatever the
 	// router asked for, as a pooler that predates the packed shape does.
 	legacyRows bool
+	// gone makes every call fail the way a pooler whose pod has been
+	// deleted does: the dial or the stream ends Unavailable.
+	gone atomic.Bool
 }
 
 // reserveGate holds every Reserve until gateWidth shards are reserving at
@@ -343,6 +346,9 @@ func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
 }
 
 func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgshardv1.ReserveResponse, error) {
+	if f.gone.Load() {
+		return nil, status.Error(codes.Unavailable, "connection refused")
+	}
 	f.gate.wait()
 	if e := f.fence(req.Generation); e != nil {
 		if f.legacyRefusal.Load() {
@@ -1092,6 +1098,9 @@ func (f *fakePooler) rowCount() int {
 }
 
 func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
+	if f.gone.Load() {
+		return status.Error(codes.Unavailable, "connection refused")
+	}
 	first, err := stream.Recv()
 	if err != nil {
 		return err
@@ -1139,6 +1148,11 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 		// mutex here -- see PGS-305.
 		if q := req.GetSimpleQuery(); q != nil && f.shouldDrop(q.Sql) {
 			return errors.New("fake pooler: dropping stream")
+		}
+		// A pod that has been deleted takes its open streams with it, not
+		// only its listener.
+		if f.gone.Load() {
+			return status.Error(codes.Unavailable, "connection refused")
 		}
 		s.packed = s.packed || (req.PackedRows && !f.legacyRows)
 		s.batched = s.batched || (req.BatchedRows && !f.legacyRows)

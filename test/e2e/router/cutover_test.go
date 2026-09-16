@@ -374,7 +374,16 @@ func TestReshardCutoverUnderLoad(t *testing.T) {
 	// window, and it is what retireOldGroupsAfter is for. Whether a
 	// retiring set should drain its sessions rather than close them is
 	// PGS-927.
-	spec := map[string]any{"shard_set": "g2", "generation": 2, "source_set": "default", "retire_after_seconds": 10,
+	// Out of reach while the load runs, and brought back within reach once
+	// it has stopped (below). A fixed short window is a race: it is counted
+	// from the switch the workflow made, while this test learns of the
+	// switch by POLLING, so on a slow runner it notices seconds late, sleeps
+	// two more with the load still running, and the window is gone. The old
+	// set then retires under sessions still pinned to it, every one is
+	// closed, and the test fails with "failed to deallocate cached
+	// statement(s): conn closed" -- which is PGS-927, the behaviour itself,
+	// not anything this test set out to measure.
+	spec := map[string]any{"shard_set": "g2", "generation": 2, "source_set": "default", "retire_after_seconds": 600,
 		"ranges": []map[string]any{{"shard_id": 0, "lower": ranges[0].Start, "upper": ranges[0].End}, {"shard_id": 1, "lower": ranges[1].Start, "upper": ranges[1].End}}}
 	var id string
 	if err := s.catalog.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES (gen_random_uuid(), 'reshard', 'running', $1, '{"stage": "ready_for_copy"}') RETURNING id::text`, spec).Scan(&id); err != nil {
@@ -388,6 +397,13 @@ func TestReshardCutoverUnderLoad(t *testing.T) {
 	s.driveUntil(t, id, "switched", 2*time.Minute)
 	time.Sleep(2 * time.Second)
 	load.halt()
+	// Nothing is pinned to the old set any more, so retirement can happen
+	// whenever it likes: the test needs it to, because it waits for the
+	// workflow to reach "completed" and checks that the replication objects
+	// are gone from the source and both targets.
+	if _, err := s.catalog.Exec(ctx, `UPDATE pgshard.workflows SET spec = spec || '{"retire_after_seconds": 1}' WHERE id = $1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
 	if load.commits.Load() <= before {
 		t.Fatal("no transfer committed during the switch")
 	}
