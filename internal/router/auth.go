@@ -219,7 +219,27 @@ func (c *RoleCache) loadLocked(ctx context.Context) (*rolesAt, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A read that succeeds and finds no roles at all does not replace a set
+	// that had some. Every cluster has at least the bootstrap credential it
+	// was first used with, so an empty answer is a read of something that
+	// is not the catalog -- a connection re-pointed mid-change, a database
+	// that is not there yet -- far more often than it is every role in the
+	// cluster being revoked at once.
+	//
+	// Publishing it would answer "password authentication failed" for every
+	// user, which is what a revoked role is deliberately indistinguishable
+	// from, and terminate every open session: the refresh loop ends the
+	// sessions of roles that may no longer log in, and after an empty load
+	// that is all of them.
+	if prev := c.cur.Load(); prev != nil && r.Len() == 0 && prev.roles.Len() > 0 {
+		return nil, errEmptyRoles
+	}
 	cur := &rolesAt{roles: r, at: c.now()}
 	c.cur.Store(cur)
 	return cur, nil
 }
+
+// errEmptyRoles is a role read that came back empty over a set that was
+// not. It is an error so that the caller keeps the roles it has and says
+// why, rather than silently serving a cluster nobody may log in to.
+var errEmptyRoles = errors.New("router: the catalog answered with no roles at all; keeping the ones already loaded")
