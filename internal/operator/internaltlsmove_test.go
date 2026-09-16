@@ -360,3 +360,39 @@ func acceptsPlaintext(t *testing.T, c *pgshardv1alpha1.PgShardCluster) bool {
 	}
 	return false
 }
+
+// TestTheTemplateHashSeesTheStepThatStopsAcceptingPlaintext (PGS-930): the
+// member template's hash is what classifyPod compares to decide a member is
+// stale, so a step the hash cannot see is a step no member ever rolls into
+// -- and the move then waits for pods to carry an annotation they are never
+// re-rendered with. It waited for ever, and the e2e cell sat in the suite
+// for thirty-five minutes rather than the usual five.
+//
+// The first two steps do render members alike and must NOT roll them. The
+// last one takes the plaintext listener away and must.
+func TestTheTemplateHashSeesTheStepThatStopsAcceptingPlaintext(t *testing.T) {
+	hashAt := func(phase string) string {
+		c := insecureCluster("hashing")
+		c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{Issue: true}
+		c.Status.InternalTLS = &pgshardv1alpha1.InternalTLSStatus{Mode: "insecure"}
+		if phase != "" {
+			c.Status.InternalTLS.Move = &pgshardv1alpha1.InternalTLSMove{Phase: phase, Target: c.Spec.InternalTLS}
+		} else {
+			c.Status.InternalTLS.Mode = "issued"
+		}
+		return Template(c, Groups(c)[1], nil, nil).Hash()
+	}
+	accepting := hashAt(pgshardv1alpha1.InternalTLSAccepting)
+	dialing := hashAt(pgshardv1alpha1.InternalTLSDialing)
+	closing := hashAt(pgshardv1alpha1.InternalTLSClosing)
+	done := hashAt("")
+	if accepting != dialing {
+		t.Errorf("Accepting and Dialing hash differently (%s, %s); members would roll for a step that renders them alike", accepting, dialing)
+	}
+	if closing == dialing {
+		t.Errorf("Dialing and Closing hash the same (%s); no member ever rolls out of accepting plaintext, and the move never finishes", closing)
+	}
+	if closing != done {
+		t.Errorf("Closing hashes %s and the finished move %s; the last step already renders what the finished cluster runs, so it must not roll twice", closing, done)
+	}
+}

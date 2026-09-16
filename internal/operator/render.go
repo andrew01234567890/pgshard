@@ -127,9 +127,14 @@ func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings
 		RestartToken: c.Annotations[AnnotationRestart],
 		InternalTLS:  internalTLSMode(c),
 	}
-	// Both steps of a move render members alike -- listening for TLS and
-	// plaintext -- so moving from the first to the second rolls none.
-	if internalTLSPhase(c) != "" {
+	// The first two steps of a move render members alike -- listening for
+	// TLS and plaintext -- so moving from the first to the second rolls
+	// none. The last one does NOT: it takes the plaintext listener away,
+	// and the hash has to say so or nothing rolls into it. This is what
+	// decides whether a member is stale (classifyPod), so a step the hash
+	// cannot see is a step that never happens: the move then waits for
+	// pods to carry an annotation they are never re-rendered with.
+	if internalTLSAcceptsPlaintext(c) {
 		tpl.InternalTLS += "+accepting-plaintext"
 	}
 	if pol != nil {
