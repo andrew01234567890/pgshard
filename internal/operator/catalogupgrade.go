@@ -172,6 +172,23 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			up.Message = "controller credential on the new catalog: " + err.Error()
 			break
 		}
+		// And the admin's own read-only login, for the same reason. Without
+		// it every catalog-backed admin page answers "password
+		// authentication failed" from the moment the endpoint moves until
+		// the next reconcile pass sets it -- and on the queue page that
+		// arrives as the raw error rather than as the friendly "no queue
+		// yet", because 28P01 is not 42P01.
+		if AdminEnabled(c) {
+			adminPW, err := r.ensureAdminCatalogSecret(ctx, c)
+			if err != nil {
+				up.Message = "admin credential: " + err.Error()
+				break
+			}
+			if err := r.Prober.SetLoginPassword(ctx, targetDSN, adminUILoginRole, adminPW); err != nil {
+				up.Message = "admin credential on the new catalog: " + err.Error()
+				break
+			}
+		}
 		up.Stage = CatalogUpgradeCopying
 		up.Message = ""
 	case CatalogUpgradeCopying:
