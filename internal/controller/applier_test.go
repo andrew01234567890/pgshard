@@ -386,6 +386,15 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		return &boolRows{vals: []bool{v}}, nil
 	case strings.Contains(sql, "DROP TRIGGER IF EXISTS %I"):
 		return &stringRows{vals: c.f.sweepDrops}, nil
+	case strings.Contains(sql, "NOT i.indisvalid"):
+		// invalidIndex answers with the SCHEMA of the invalid index, so its
+		// caller drops that one rather than whichever the search path
+		// resolves the bare name to (PGS-890). Matched before the general
+		// nspname case below, which this query's shape would otherwise hit.
+		if n, _ := args[0].(string); c.f.invalid != nil && c.f.invalid(c.id, n) {
+			return &stringRows{vals: []string{"public"}}, nil
+		}
+		return &stringRows{}, nil
 	case strings.Contains(sql, "SELECT n.nspname FROM"):
 		// recordDropSchema: the fake resolves no DROP's object to a schema.
 		return &stringRows{}, nil
@@ -1008,7 +1017,9 @@ func TestApplierRebuildsAnInvalidConcurrentIndexOnce(t *testing.T) {
 		t.Fatalf("%s %s %+v", m.State, states(m), m.PerShard)
 	}
 	got := strings.Join(f.shards.statements(0), ";")
-	want := "SET lock_timeout = '2000ms';create index concurrently i on t (x);DROP INDEX CONCURRENTLY IF EXISTS \"i\";create index concurrently i on t (x)"
+	// Schema-qualified: the drop names the schema the invalid index was
+	// found in, not the bare name the search path would resolve (PGS-890).
+	want := "SET lock_timeout = '2000ms';create index concurrently i on t (x);DROP INDEX CONCURRENTLY IF EXISTS \"public\".\"i\";create index concurrently i on t (x)"
 	if got != want {
 		t.Fatalf("shard 0 ran %q", got)
 	}
@@ -1255,7 +1266,7 @@ func TestApplierResumeRebuildsAnInvalidIndexAndSkipsAValidOne(t *testing.T) {
 		t.Fatalf("%s %s", m.State, states(m))
 	}
 	got := strings.Join(f.shards.statements(1), ";")
-	if !strings.Contains(got, `DROP INDEX CONCURRENTLY IF EXISTS "i";create index concurrently i on t (x)`) {
+	if !strings.Contains(got, `DROP INDEX CONCURRENTLY IF EXISTS "public"."i";create index concurrently i on t (x)`) {
 		t.Fatalf("invalid index on shard 1 was not rebuilt: %q", got)
 	}
 	if got := strings.Join(f.shards.statements(2), ";"); strings.Contains(got, "create index") || strings.Contains(got, "DROP INDEX") {
@@ -1384,7 +1395,7 @@ func TestApplierMultistepIndexFailureRebuildsOnceThenDropsTheInvalidIndex(t *tes
 		t.Fatalf("%s %+v", m.State, m.PerShard["0"])
 	}
 	got := strings.Join(f.shards.statements(0), "\n")
-	if strings.Count(got, "CREATE UNIQUE INDEX") != 2 || strings.Count(got, `DROP INDEX CONCURRENTLY IF EXISTS "t_pkey"`) != 3 || strings.Contains(got, "PRIMARY KEY") {
+	if strings.Count(got, "CREATE UNIQUE INDEX") != 2 || strings.Count(got, `DROP INDEX CONCURRENTLY IF EXISTS "public"."t_pkey"`) != 3 || strings.Contains(got, "PRIMARY KEY") {
 		t.Fatalf("statements:\n%s", got)
 	}
 }

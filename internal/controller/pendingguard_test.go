@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -181,4 +182,83 @@ func TestTheRowRecordsWhetherTheAttemptsReachedTheServer(t *testing.T) {
 			t.Fatalf("shard 0 = %+v, want failed with ran=true", got)
 		}
 	})
+}
+
+// TestAFailedIndexBuildDropsOnlyItsOwnIndex (PGS-890): when CREATE INDEX
+// CONCURRENTLY fails it leaves an invalid index behind, and the applier
+// drops that one and tries again. It looked for an invalid index of that
+// name anywhere on the search path and then dropped the name UNQUALIFIED --
+// which PostgreSQL resolves by search_path, to the FIRST schema. With a
+// valid index of the same name earlier on the path, the applier destroyed a
+// user's index on another table and the retry then failed 42P07 on the one
+// it had meant to drop.
+//
+// Against real PostgreSQL because the bug IS the name resolution: a fake
+// that is handed a name and asked for an answer cannot have it.
+func TestAFailedIndexBuildDropsOnlyItsOwnIndex(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	raw := connect(t, startPostgres(t))
+	conn := pgxShardConn{raw}
+	mustExec(t, raw, `CREATE SCHEMA app`)
+	mustExec(t, raw, `SET search_path = app, public`)
+	// The one that must survive: valid, on another table, earlier on the path.
+	mustExec(t, raw, `CREATE TABLE app.other (y int)`)
+	mustExec(t, raw, `CREATE INDEX idx ON app.other (y)`)
+	// The wreckage: a unique build over duplicate rows leaves public.idx invalid.
+	mustExec(t, raw, `CREATE TABLE public.t (x int)`)
+	mustExec(t, raw, `INSERT INTO public.t VALUES (1), (1)`)
+	if _, err := raw.Exec(ctx, `CREATE UNIQUE INDEX CONCURRENTLY idx ON public.t (x)`); err == nil {
+		t.Fatal("the unique build over duplicate rows was expected to fail")
+	}
+	invalidBefore := queryOne[int64](t, raw, `SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'idx' AND NOT i.indisvalid`)
+	if invalidBefore != 1 {
+		t.Fatalf("the premise is an invalid public.idx; found %d", invalidBefore)
+	}
+
+	// The object carries no schema of its own, which is the common case.
+	dropped, err := dropInvalidIndex(ctx, conn, catalog.MigrationObject{Kind: "relation", Name: "idx"})
+	if err != nil || !dropped {
+		t.Fatalf("dropInvalidIndex = %v, %v; want it to drop the invalid one", dropped, err)
+	}
+	if n := queryOne[int64](t, raw, `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relname = 'idx'`); n != 0 {
+		t.Errorf("the invalid public.idx survived its own cleanup")
+	}
+	if n := queryOne[int64](t, raw, `SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'app' AND c.relname = 'idx' AND i.indisvalid`); n != 1 {
+		t.Error("the valid app.idx on another table was dropped: an unqualified DROP resolved to it")
+	}
+}
+
+// TestAPartitionedParentIndexIsNotWreckage (PGS-891): CREATE INDEX ... ON
+// ONLY a partitioned table leaves the parent index invalid BY DESIGN until
+// every partition's index is attached. A resumed migration read that as the
+// wreckage of a failed build and ran DROP INDEX CONCURRENTLY, which
+// PostgreSQL refuses for a partitioned index with 0A000 -- not transient, so
+// the shard failed for good.
+func TestAPartitionedParentIndexIsNotWreckage(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	raw := connect(t, startPostgres(t))
+	conn := pgxShardConn{raw}
+	mustExec(t, raw, `CREATE TABLE parted (id int, v text) PARTITION BY RANGE (id)`)
+	mustExec(t, raw, `CREATE TABLE parted_1 PARTITION OF parted FOR VALUES FROM (0) TO (100)`)
+	mustExec(t, raw, `CREATE INDEX parted_v ON ONLY parted (v)`)
+	if valid := queryOne[bool](t, raw, `SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE c.relname = 'parted_v'`); valid {
+		t.Skip("this PostgreSQL marks an ON ONLY parent index valid; the premise does not hold")
+	}
+	dropped, err := dropInvalidIndex(ctx, conn, catalog.MigrationObject{Kind: "relation", Name: "parted_v"})
+	if err != nil {
+		t.Fatalf("a partitioned parent index was treated as wreckage: %v", err)
+	}
+	if dropped {
+		t.Error("the partitioned parent index was dropped; it is invalid by design until its partitions attach")
+	}
+	if n := queryOne[int64](t, raw, `SELECT count(*) FROM pg_class WHERE relname = 'parted_v'`); n != 1 {
+		t.Error("the partitioned parent index is gone")
+	}
 }

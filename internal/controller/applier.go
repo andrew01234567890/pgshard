@@ -1287,11 +1287,11 @@ func (a *Applier) concurrently(ctx context.Context, conn ShardConn, m *catalog.D
 	if err == nil || m.Kind != "CREATE INDEX" || m.Meta.Object.Name == "" {
 		return err
 	}
-	invalid, ierr := invalidIndex(ctx, conn, m.Meta.Object)
+	schema, invalid, ierr := invalidIndex(ctx, conn, m.Meta.Object)
 	if ierr != nil || !invalid {
 		return err
 	}
-	if _, derr := conn.Exec(context.WithoutCancel(ctx), "DROP INDEX CONCURRENTLY IF EXISTS "+qualified(m.Meta.Object.Schema, m.Meta.Object.Name)); derr != nil {
+	if _, derr := conn.Exec(context.WithoutCancel(ctx), "DROP INDEX CONCURRENTLY IF EXISTS "+qualified(schema, m.Meta.Object.Name)); derr != nil {
 		return err
 	}
 	_, err = conn.Exec(ctx, m.Statement)
@@ -1301,11 +1301,11 @@ func (a *Applier) concurrently(ctx context.Context, conn ShardConn, m *catalog.D
 // dropInvalidIndex removes idx when it exists but is invalid and reports
 // whether it did.
 func dropInvalidIndex(ctx context.Context, conn ShardConn, idx catalog.MigrationObject) (bool, error) {
-	invalid, err := invalidIndex(ctx, conn, idx)
+	schema, invalid, err := invalidIndex(ctx, conn, idx)
 	if err != nil || !invalid {
 		return false, err
 	}
-	_, err = conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+qualified(idx.Schema, idx.Name))
+	_, err = conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+qualified(schema, idx.Name))
 	return err == nil, err
 }
 
@@ -1316,23 +1316,36 @@ func qualified(schema, name string) string {
 	return pgx.Identifier{name}.Sanitize()
 }
 
-func invalidIndex(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (bool, error) {
-	rows, err := conn.Query(ctx, `SELECT NOT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+// invalidIndex reports the schema of an invalid index named o.Name, and
+// whether it found one.
+//
+// It returns the SCHEMA because the caller drops what it finds, and a
+// migration's object often carries no schema of its own: searching the whole
+// search path for the invalid one and then dropping the name unqualified let
+// PostgreSQL resolve the drop by search_path instead -- to the FIRST schema,
+// which may hold a perfectly valid index of that name on another table. A
+// failed CREATE INDEX CONCURRENTLY then destroyed a user's index and the
+// re-run failed 42P07 on the one it meant to drop (PGS-890).
+//
+// A partitioned index (relkind 'I') is not counted. CREATE INDEX ... ON ONLY
+// a partitioned table leaves the parent invalid BY DESIGN until every
+// partition's index is attached, so it is not the wreckage of a failed
+// build -- and DROP INDEX CONCURRENTLY refuses it with 0A000 anyway, which
+// made a resumed migration fail for good (PGS-891).
+func invalidIndex(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (string, bool, error) {
+	rows, err := conn.Query(ctx, `SELECT n.nspname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)`, o.Name, o.Schema)
+		WHERE c.relname = $1 AND NOT i.indisvalid AND c.relkind <> 'I'
+		  AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)
+		ORDER BY array_position(current_schemas(false), n.nspname) LIMIT 1`, o.Name, o.Schema)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	flags, err := pgx.CollectRows(rows, pgx.RowTo[bool])
-	if err != nil {
-		return false, err
+	schema, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(schema) == 0 {
+		return "", false, err
 	}
-	for _, f := range flags {
-		if f {
-			return true, nil
-		}
-	}
-	return false, nil
+	return schema[0], true, nil
 }
 
 // unqualifiedDrop reports a DROP whose object the statement names without a
