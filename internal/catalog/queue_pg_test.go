@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -757,8 +759,20 @@ func TestTheOperationQueueReadsAsPeopleNeedIt(t *testing.T) {
 	if _, err := rc.Exec(ctx, `SELECT * FROM pgshard.operation_queue_detail`); err == nil {
 		t.Error("a reader can read the queue with statements")
 	}
-	if got := queryOne[string](t, rc, `SELECT string_agg(row_to_json(q)::text, '') FROM pgshard.operation_queue q`); strings.Contains(got, "SCRAM") || strings.Contains(got, "secret") {
-		t.Errorf("the reader's queue carries a verifier: %s", got)
+	// Asked of the view, not of what the Go reader scanned. ListOperationQueue
+	// selects NULL::text for the statement when detail is off, so checking the
+	// scanned field cannot fail whatever the view exposes: adding statement to
+	// pgshard.operation_queue would hand every tenant's DDL to a reader and
+	// leave the whole suite green.
+	if _, err := rc.Exec(ctx, `SELECT statement FROM pgshard.operation_queue`); err == nil {
+		t.Error("the reader's queue has a statement column")
+	}
+	// And the whole row, against a marker that is in a plain statement rather
+	// than in a verifier: the verifier-carrying one is rewritten to a command
+	// before it reaches any view, so searching for SCRAM alone proves nothing
+	// about ordinary DDL text.
+	if got := queryOne[string](t, rc, `SELECT string_agg(row_to_json(q)::text, '') FROM pgshard.operation_queue q`); strings.Contains(got, "SCRAM") || strings.Contains(got, "secret") || strings.Contains(got, "ON orders (note)") {
+		t.Errorf("the reader's queue carries statement text: %s", got)
 	}
 
 	detail, _, err := ListOperationQueue(ctx, conn, true)
@@ -868,7 +882,6 @@ func TestTheAdminUILoginReadsWhatItShows(t *testing.T) {
 		`SELECT statement FROM pgshard.migrations`,
 		`SELECT verifier FROM pgshard.roles`,
 		`SELECT * FROM pgshard.operations`,
-		`INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, state) VALUES (gen_random_uuid(), 'app', 'x', 'CREATE TABLE', 'direct', 'all', 'queued')`,
 	} {
 		if _, err := ui.Exec(ctx, sql); err == nil {
 			t.Errorf("the admin UI login may run %q", sql)
@@ -876,5 +889,30 @@ func TestTheAdminUILoginReadsWhatItShows(t *testing.T) {
 	}
 	if ro := queryOne[string](t, ui, `SHOW default_transaction_read_only`); ro != "on" {
 		t.Errorf("the admin UI login's transactions are %s", ro)
+	}
+	// The read-only default is a convenience, not the boundary: it is
+	// PGC_USERSET, so the login can turn it off on its own connection. A
+	// write refused only by it is refused with "cannot execute INSERT in a
+	// read-only transaction" -- ExecCheckXactReadOnly runs before the
+	// privilege check ever does -- so granting this role INSERT would leave
+	// the assertion passing. The boundary is the grant, and it is asked for
+	// with the GUC out of the way.
+	if _, err := ui.Exec(ctx, `SET default_transaction_read_only = off`); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		`INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, state) VALUES (gen_random_uuid(), 'app', 'x', 'CREATE TABLE', 'direct', 'all', 'queued')`,
+		`UPDATE pgshard.migrations SET state = 'complete'`,
+		`DELETE FROM pgshard.workflows`,
+	} {
+		_, err := ui.Exec(ctx, sql)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Errorf("the admin UI login may run %q with writes on: %v", sql, err)
+			continue
+		}
+		if pgErr.Code != "42501" {
+			t.Errorf("%q was refused with %s, not a privilege denial: %s", sql, pgErr.Code, pgErr.Message)
+		}
 	}
 }
