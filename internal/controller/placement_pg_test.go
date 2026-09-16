@@ -2142,6 +2142,67 @@ func TestTheReplicaIdentityIsRecordedBeforeItIsWidened(t *testing.T) {
 	if !slices.Contains(atAlter, 0) {
 		t.Fatalf("when the replica identity was widened the workflow had recorded %v: a controller dying there leaves FULL behind unrecorded", atAlter)
 	}
+	// And the other half: the ALTER failed, so the record must not outlive
+	// it. The ALTER is bounded and gets one try, so a lock timeout is an
+	// ordinary outcome rather than the crash the record above is for -- and
+	// a record standing over a table this workflow never widened is a claim
+	// on somebody else's FULL. The swap's recheck would exempt it as its
+	// own, and the teardown would put the identity "back" to DEFAULT over a
+	// setting the move never made.
+	if after := recorded(); slices.Contains(after, 0) {
+		t.Errorf("the workflow still records %v after an ALTER that failed: it claims a FULL it never raised", after)
+	}
+}
+
+// TestTheRestoreLeavesAnIdentityTheMoveNoLongerOwns: the record says what
+// the move DID, not what the table IS. If the identity is no longer the
+// FULL this workflow raised -- somebody set USING INDEX, or put it back
+// themselves -- then putting "back" a DEFAULT over that changes the
+// table's replication semantics on the way out of a workflow that is
+// already failing.
+//
+// The swap's recheck refuses a table whose identity the move did not raise,
+// which makes the fail path the likely way to reach this; and now that the
+// teardown writes through a retired set's pause, the refusal that used to
+// stop it by accident is gone.
+func TestTheRestoreLeavesAnIdentityTheMoveNoLongerOwns(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, cat, `CREATE UNIQUE INDEX ledger_v_key ON ledger (v)`)
+	mustExec(t, cat, `ALTER TABLE ledger ALTER COLUMN v SET NOT NULL`)
+	// What the move raised, and then what somebody else set over it.
+	mustExec(t, cat, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	mustExec(t, cat, `ALTER TABLE ledger REPLICA IDENTITY USING INDEX ledger_v_key`)
+
+	const id = "77777777-7777-7777-7777-777777777777"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, '{}', '{}')`, id, KindTablePlacement, StateFailed)
+	wf := &placementWorkflow{id: id, state: StateFailed, stage: StageFailed,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default", ReplicaIdentityFull: []int32{0}},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	p := &Placer{Pool: pool, Shards: realShards{dsn}}
+
+	if err := p.dropSourceReplication(ctx, wf, 0); err != nil {
+		t.Fatalf("dropping the source replication: %v", err)
+	}
+	var ident string
+	if err := cat.QueryRow(ctx, `SELECT relreplident::text FROM pg_class WHERE oid = 'ledger'::regclass`).Scan(&ident); err != nil {
+		t.Fatal(err)
+	}
+	if ident != "i" {
+		t.Errorf("the replica identity is %q after the teardown, want \"i\": the move recorded a FULL it had raised, but the table had been set to USING INDEX since, and putting back DEFAULT changes what every UPDATE and DELETE ships to every subscriber", ident)
+	}
 }
 
 // alterReplicaIdentityDies stands in for a controller that dies as it

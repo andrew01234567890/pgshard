@@ -1846,13 +1846,28 @@ func (p *Placer) ensureReplication(ctx context.Context, wf *placementWorkflow, c
 		// Recorded before the ALTER, not after: an ALTER that committed while
 		// the controller died before saving left FULL on the user's table
 		// with nothing saying it was this workflow's to put back.
+		recorded := false
 		if !slices.Contains(wf.st.ReplicaIdentityFull, s) {
 			wf.st.ReplicaIdentityFull = append(wf.st.ReplicaIdentityFull, s)
 			if err := p.save(ctx, wf, fmt.Sprintf("widening the replica identity of %s on %s/%d", wf.spec.table(), wf.st.SourceSet, s)); err != nil {
 				return err
 			}
+			recorded = true
 		}
 		if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "FULL", 1); err != nil {
+			// The ALTER is bounded and gets one try, so failing it is an
+			// ordinary outcome, not the crash the record above is for. A
+			// record that outlives a failed ALTER is a claim this workflow
+			// raised a FULL it did not: the swap's recheck would then exempt
+			// somebody else's FULL as its own, and the teardown would put the
+			// identity "back" to DEFAULT over a setting the move never made.
+			// The ALTER changed nothing, so neither does the record.
+			if recorded {
+				wf.st.ReplicaIdentityFull = slices.DeleteFunc(wf.st.ReplicaIdentityFull, func(x int32) bool { return x == s })
+				if serr := p.save(ctx, wf, fmt.Sprintf("the replica identity of %s on %s/%d was not widened", wf.spec.table(), wf.st.SourceSet, s)); serr != nil {
+					return errors.Join(err, serr)
+				}
+			}
 			return err
 		}
 	}
@@ -2923,8 +2938,26 @@ func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflo
 	// UPDATE on the source log the whole old row for good. A few tries, as
 	// the fail path gets only this one pass.
 	if (wf.stage == StageCancelling || wf.stage == StageFailed) && slices.Contains(wf.st.ReplicaIdentityFull, s) {
-		if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "DEFAULT", 3); err != nil {
-			return fmt.Errorf("putting back the default replica identity of %s: %w", wf.spec.table(), err)
+		// Only while it is still the FULL this workflow raised. The record
+		// says what the move did, not what the table is now: somebody may
+		// have set USING INDEX or DEFAULT meanwhile, and putting "back" a
+		// DEFAULT over that would change the table's replication semantics
+		// on the way out of a workflow that is already failing. The swap's
+		// recheck refuses such a table, which makes this path the likely
+		// one to reach it, and writing through the pause has removed the
+		// refusal that used to stop it by accident.
+		rows, err := conn.Query(ctx, `SELECT relreplident::text FROM pg_class WHERE oid = $1::regclass`, wf.shape.qualified(wf.spec.TableName))
+		if err != nil {
+			return err
+		}
+		now, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		if now == "f" {
+			if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "DEFAULT", 3); err != nil {
+				return fmt.Errorf("putting back the default replica identity of %s: %w", wf.spec.table(), err)
+			}
 		}
 	}
 	return nil
