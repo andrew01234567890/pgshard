@@ -242,6 +242,139 @@ func TestPgrollAgainstAShardedDatabase(t *testing.T) {
 			t.Errorf("shard %d does not have the index pgroll created", id)
 		}
 	}
+
+	// The rest of what stage 1 claims (PGS-929). add_column and
+	// create_index above were the only two proved; these five are the
+	// remainder, and each is run to its complete and checked on EVERY
+	// shard, because reaching one shard is the failure this whole area is
+	// about.
+	//
+	// Each step records what pgroll actually did rather than what the
+	// design expects. A step that pgshard cannot carry is a finding, not a
+	// test failure to paper over: it is written down here and on the
+	// ticket, and the guide says untested rather than guaranteed.
+	step := func(name, body string, check func()) {
+		t.Helper()
+		file := dir + "/" + name + ".json"
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := run("start "+name, "start", file)
+		if err != nil || strings.Contains(out, "Run `pgroll baseline`") {
+			t.Errorf("pgroll start of %s on a sharded table: %v\n%s", name, err, out)
+			// Leave pgroll able to run the next one; a refused start holds
+			// the schema until it is rolled back.
+			_, _ = run("rollback "+name, "rollback")
+			return
+		}
+		if _, err := run("complete "+name, "complete"); err != nil {
+			t.Errorf("pgroll complete of %s: %v", name, err)
+			_, _ = run("rollback "+name, "rollback")
+			return
+		}
+		check()
+	}
+
+	step("04_drop_index", `{
+	  "operations": [
+	    {"drop_index": {"name": "orders_note_idx"}}
+	  ]
+	}`, func() {
+		for id := range s.shardDSNs {
+			if s.indexOn(t, id, "orders_note_idx") {
+				t.Errorf("shard %d still has the index after drop_index completed", id)
+			}
+		}
+	})
+
+	step("05_rename_column", `{
+	  "operations": [
+	    {"rename_column": {"table": "orders", "from": "note", "to": "remark"}}
+	  ]
+	}`, func() {
+		for id := range s.shardDSNs {
+			if !s.columnOn(t, id, "orders", "remark") {
+				t.Errorf("shard %d does not have the renamed column", id)
+			}
+			if s.columnOn(t, id, "orders", "note") {
+				t.Errorf("shard %d still has the old column name", id)
+			}
+		}
+	})
+
+	// create_constraint is REFUSED, and the reason is worth pinning: pgroll
+	// backfills the column to validate the constraint, and its backfill is a
+	// data-modifying CTE, which the router does not support. Asserted rather
+	// than skipped, so that this becoming possible -- or failing some other
+	// way -- is noticed here rather than in somebody's migration.
+	constraint := dir + "/06_create_constraint.json"
+	if err := os.WriteFile(constraint, []byte(`{
+	  "operations": [
+	    {"create_constraint": {"table": "orders", "name": "orders_remark_short", "type": "check",
+	      "check": "length(remark) < 100", "columns": ["remark"],
+	      "up": {"remark": "remark"}, "down": {"remark": "remark"}}}
+	  ]
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run("start create_constraint", "start", constraint)
+	switch {
+	case err == nil:
+		t.Error("pgroll create_constraint was accepted; it backfills, and the backfill is a data-modifying CTE the router does not support -- if this now works, the guide and PGS-929 are out of date")
+		_, _ = run("complete create_constraint", "complete")
+	case !strings.Contains(out, "backfill"):
+		t.Errorf("create_constraint failed for a reason other than the backfill, which is the documented limit: %s", out)
+	}
+
+	// The constraint the next step renames is made with plain DDL through
+	// the router, which fans it out: rename_constraint is a metadata change
+	// and is testable on its own, and blocking it behind an operation that
+	// cannot work would leave it untested for the wrong reason.
+	if _, err := conn.Exec(ctx, `ALTER TABLE orders ADD CONSTRAINT orders_remark_short CHECK (length(remark) < 100) NOT VALID`); err != nil {
+		t.Fatalf("adding the constraint through the router: %v", err)
+	}
+	for id := range s.shardDSNs {
+		if !s.constraintOn(t, id, "orders", "orders_remark_short") {
+			t.Fatalf("shard %d did not get the constraint, so the rename below would prove nothing", id)
+		}
+	}
+
+	step("07_rename_constraint", `{
+	  "operations": [
+	    {"rename_constraint": {"table": "orders", "from": "orders_remark_short", "to": "orders_remark_len"}}
+	  ]
+	}`, func() {
+		for id := range s.shardDSNs {
+			if !s.constraintOn(t, id, "orders", "orders_remark_len") {
+				t.Errorf("shard %d does not have the renamed constraint", id)
+			}
+			if s.constraintOn(t, id, "orders", "orders_remark_short") {
+				t.Errorf("shard %d still has the old constraint name", id)
+			}
+		}
+	})
+
+	// drop_column takes the constraint with it, which is the point: the
+	// column's dependents have to go on every shard, not just the home one.
+	step("08_drop_column", `{
+	  "operations": [
+	    {"drop_column": {"table": "orders", "column": "remark", "down": "''"}}
+	  ]
+	}`, func() {
+		for id := range s.shardDSNs {
+			if s.columnOn(t, id, "orders", "remark") {
+				t.Errorf("shard %d still has the column after drop_column completed", id)
+			}
+		}
+	})
+}
+
+// constraintOn reports whether one shard's copy of a table has a named
+// constraint.
+func (s *shardedStack) constraintOn(tb testing.TB, shard int, table, name string) bool {
+	tb.Helper()
+	return s.shardBool(tb, shard, `SELECT EXISTS (SELECT 1 FROM pg_constraint k
+		JOIN pg_class c ON c.oid = k.conrelid WHERE c.relname = $1 AND k.conname = $2)`, table, name)
 }
 
 // columnOn reports whether one shard's copy of a table has a column.
