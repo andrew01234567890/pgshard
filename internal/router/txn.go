@@ -448,15 +448,40 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 			if firstErr == nil {
 				firstErr = toPgwireError(m.Error.GetError())
 			}
+		case *pgshardv1.ExecuteResponse_PortalSuspended:
+			// The end of this Execute's response, in place of
+			// CommandComplete. Dropped, it left the client believing the
+			// result set had ended, so a row-limited fetch returned short
+			// with no error and the client never resumed. The single-shard
+			// pump learned that the same way.
+			werr = w.PortalSuspended()
 		case *pgshardv1.ExecuteResponse_Notice:
 			werr = w.Notice(toNotice(m.Notice.GetNotice()))
+		case *pgshardv1.ExecuteResponse_Notification:
+			n := m.Notification
+			werr = w.Notification(&pgproto3.NotificationResponse{PID: n.GetPid(), Channel: n.GetChannel(), Payload: n.GetPayload()})
+		case *pgshardv1.ExecuteResponse_ParameterStatus:
+			werr = e.reportParameter(w, m.ParameterStatus.GetName(), m.ParameterStatus.GetValue())
 		case *pgshardv1.ExecuteResponse_ParameterDescription:
-			werr = w.ParameterDescription(m.ParameterDescription.ParamOids)
+			// The client's parameters, not the shard's: a statement whose
+			// sequence columns the router fills carries parameters the
+			// client never wrote, and describing it has to answer for the
+			// statement the client sent. inferParams also advances the
+			// batch's describe queue, which the next description reads.
+			oids := e.clientOIDs(m.ParameterDescription.ParamOids)
+			e.inferParams(m.ParameterDescription.ParamOids)
+			werr = w.ParameterDescription(oids)
 		case *pgshardv1.ExecuteResponse_NoData:
 			werr = w.NoData()
 		case *pgshardv1.ExecuteResponse_ReadyForQuery:
 			p.tx = txStatus(m.ReadyForQuery.TxnStatus)
 			return firstErr
+		default:
+			// Every message a shard can answer with reaches a client
+			// through one of the cases above. A new one silently dropped
+			// is how this path lost PortalSuspended, so say so.
+			e.r.cfg.Logger.Warn("unexpected pooler response on a transaction part",
+				"session", e.sid, "shard", p.shard, "type", fmt.Sprintf("%T", resp.Message))
 		}
 		if werr != nil {
 			return werr
