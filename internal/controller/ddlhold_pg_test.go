@@ -183,8 +183,8 @@ func TestACopyDoesNotMaterializeUnderAnApplyingMigration(t *testing.T) {
 
 	f.pass()
 	_, stage, msg := f.workflow(wfID)
-	if stage != StageCopying || !strings.Contains(msg, "a migration is still applying on app") {
-		t.Fatalf("with a migration applying the copy is at %s (%q), want it recorded and waiting", stage, msg)
+	if stage != StageReadyForCopy || !strings.Contains(msg, "migration "+id+", in progress") {
+		t.Fatalf("with a migration applying the copy is at %s (%q), want it waiting for the migration before it starts", stage, msg)
 	}
 	for id := range 2 {
 		src := connect(t, f.appDSN("default", int32(id)))
@@ -195,7 +195,7 @@ func TestACopyDoesNotMaterializeUnderAnApplyingMigration(t *testing.T) {
 
 	mustExecPool(t, f.pool, `UPDATE pgshard.migrations SET state = 'complete' WHERE id = '`+id+`'`)
 	f.pass()
-	if _, _, msg := f.workflow(wfID); strings.Contains(msg, "a migration is still applying") {
+	if _, stage, msg := f.workflow(wfID); stage == StageReadyForCopy {
 		t.Fatalf("the copy still waits after the migration completed: %q", msg)
 	}
 	src0 := connect(t, f.appDSN("default", 0))
@@ -261,6 +261,10 @@ func TestAHeldRoleMigrationDoesNotStopTheRoleVerifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(`UPDATE pgshard.workflows SET status = '{"stage": "switched"}' WHERE id = $1`, reshard)
+	if pending() {
+		t.Fatal("a role migration queued behind a switched reshard stops the role verifier; it waits until the reshard completes")
+	}
+	exec(`UPDATE pgshard.workflows SET state = 'completed', status = '{"stage": "completed"}' WHERE id = $1`, reshard)
 	if !pending() {
 		t.Fatal("a queued role migration free to start does not stop the role verifier")
 	}

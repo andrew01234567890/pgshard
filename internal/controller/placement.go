@@ -137,6 +137,10 @@ type placementWorkflow struct {
 	rt    *placementRouter
 	from  *placementRouter
 	shape rowShape
+	// startError is why prepare could not start the workflow, for anything
+	// but waiting its turn: one whose own start keeps failing holds no
+	// place in the operation queue.
+	startError string
 }
 
 func (wf *placementWorkflow) shadow() string { return wf.spec.TableName + ShadowSuffix }
@@ -346,7 +350,7 @@ func (p *Placer) list(ctx context.Context) ([]placementWorkflow, error) {
 }
 
 func (p *Placer) save(ctx context.Context, wf *placementWorkflow, message string) error {
-	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message}
+	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message, "start_error": wf.startError}
 	if err := ownedExec(ctx, p.Pool, wf.owner,
 		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
 		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
@@ -360,7 +364,7 @@ func (p *Placer) save(ctx context.Context, wf *placementWorkflow, message string
 // saveTx is save inside a transaction, for a status change that must land
 // with the work it describes or not at all.
 func (p *Placer) saveTx(ctx context.Context, tx pgx.Tx, wf *placementWorkflow, message string) error {
-	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message}
+	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message, "start_error": wf.startError}
 	tag, err := tx.Exec(ctx,
 		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
 		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
@@ -560,29 +564,48 @@ func (p *Placer) advance(ctx context.Context, wf *placementWorkflow, stage, mess
 	return true, p.save(ctx, wf, message)
 }
 
-// prepare waits for reshards, validates the table against a source shard,
-// takes the per-table lock and records the routing plan.
+// prepare waits its turn, validates the table against a source shard, takes
+// the per-table lock and records the routing plan.
 func (p *Placer) prepare(ctx context.Context, wf *placementWorkflow) (bool, error) {
-	if reshards, err := activeCopies(ctx, p.Pool); err != nil || reshards > 0 {
-		return false, errors.Join(err, waitingForReshards(reshards))
+	err := p.prepareAndStart(ctx, wf)
+	if err != nil && !isWaitingInQueue(err) && !errors.Is(err, errNotOwner) {
+		wf.startError = err.Error()
+	}
+	return err == nil, err
+}
+
+func (p *Placer) prepareAndStart(ctx context.Context, wf *placementWorkflow) error {
+	queued, err := queueOn(ctx, p.Pool)
+	if err != nil {
+		return err
+	}
+	if queued {
+		if err := waitInQueue(ctx, p.Pool, KindTablePlacement, wf.id); err != nil {
+			return err
+		}
+	} else if reshards, err := activeCopies(ctx, p.Pool); err != nil || reshards > 0 {
+		return errors.Join(err, waitingForReshards(reshards))
+	}
+	var describedAt time.Time
+	if err := p.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&describedAt); err != nil {
+		return err
 	}
 	if err := p.load(ctx, wf); err != nil {
-		return false, err
+		return err
 	}
 	if err := p.describe(ctx, wf); err != nil {
-		return false, err
+		return err
 	}
-	if err := p.start(ctx, wf); err != nil {
-		return false, err
-	}
-	return true, nil
+	return p.start(ctx, wf, queued, describedAt)
 }
 
 // start takes the table's lock and records the workflow as running, in one
-// transaction that counts the reshards again under the lock a copy starts
-// under: a reshard that began its copy since prepare's first count is waited
-// for, and one still deciding waits for this.
-func (p *Placer) start(ctx context.Context, wf *placementWorkflow) error {
+// transaction that checks again, under the lock a copy and a migration start
+// under, that nothing it must wait for has started since prepare looked. On
+// a catalog with the operation queue it also refuses a start after a schema
+// change in the table's database finished while describe read the table:
+// the shape it captured would be restored over that change at the swap.
+func (p *Placer) start(ctx context.Context, wf *placementWorkflow, queued bool, describedAt time.Time) error {
 	tx, err := p.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -591,7 +614,21 @@ func (p *Placer) start(ctx context.Context, wf *placementWorkflow) error {
 	if err := lockMoveGate(ctx, tx); err != nil {
 		return err
 	}
-	if reshards, err := activeCopies(ctx, tx); err != nil || reshards > 0 {
+	if queued {
+		if err := waitInQueue(ctx, tx, KindTablePlacement, wf.id); err != nil {
+			return err
+		}
+		var changed bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.migrations m
+			WHERE (m.state = 'running' OR m.finished_at >= $1)
+			  AND (pgshard.cluster_scoped_migration(m.kind) OR $2 = ANY (array_remove(ARRAY[m.database, m.meta->>'database'], NULL))))`,
+			describedAt, wf.spec.Database).Scan(&changed); err != nil {
+			return err
+		}
+		if changed {
+			return errWaitingInQueue{reason: "a schema change on " + wf.spec.Database + " finished while the table was described; describing it again"}
+		}
+	} else if reshards, err := activeCopies(ctx, tx); err != nil || reshards > 0 {
 		return errors.Join(err, waitingForReshards(reshards))
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.workflow_locks (kind, key, workflow_id) VALUES ($1, $2, $3::uuid)
@@ -641,7 +678,13 @@ func (p *Placer) load(ctx context.Context, wf *placementWorkflow) error {
 		return fmt.Errorf("serving shard set: %w", err)
 	}
 	if wf.st.SourceSet != "" && wf.st.SourceSet != set {
-		return fatal("serving shard set changed from %s to %s during the workflow", wf.st.SourceSet, set)
+		if wf.stage != StagePlacementPreparing {
+			return fatal("serving shard set changed from %s to %s during the workflow", wf.st.SourceSet, set)
+		}
+		// A workflow still preparing has started nothing on the old set:
+		// it waited in the queue while a reshard moved the table's shards,
+		// and plans again on the set serving now.
+		wf.st = placementState{}
 	}
 	wf.st.SourceSet = set
 	ranges, err := catalog.ListShardRanges(ctx, p.Pool, set)

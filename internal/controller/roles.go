@@ -155,10 +155,17 @@ func (s *PGRoleStore) SaveGroupStatus(ctx context.Context, group string, generat
 // RoleMigrationsPending implements RoleStore. A held migration does not
 // count: it has touched no group, so the desired roles still describe every
 // group, and a reshard's targets need those roles before their schema copy
-// restores -- while that copy is what holds the migration (PGS-872).
+// restores -- while that copy is what holds the migration (PGS-872). With
+// the operation queue, held means waiting for anything in it.
 func (s *PGRoleStore) RoleMigrationsPending(ctx context.Context) (bool, error) {
+	held := catalog.MigrationHeldPredicate
+	if queued, err := queueOn(ctx, s.Pool); err != nil {
+		return false, err
+	} else if queued {
+		held = `EXISTS (SELECT 1 FROM pgshard.operation_blockers('ddl', pgshard.migrations.id))`
+	}
 	rows, err := s.Pool.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.migrations
-		WHERE (state = 'running' OR (state = 'queued' AND NOT `+catalog.MigrationHeldPredicate+`))
+		WHERE (state = 'running' OR (state = 'queued' AND NOT `+held+`))
 		AND kind IN ('CREATE ROLE', 'ALTER ROLE', 'DROP ROLE', 'GRANT ROLE', 'REVOKE ROLE', 'GRANT', 'REVOKE'))`)
 	if err != nil {
 		return false, err

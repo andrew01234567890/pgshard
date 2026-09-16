@@ -106,29 +106,41 @@ func (g *gateFixture) state(id string) (state, stage, message string) {
 // placement's prepare waited for every active reshard, and a reshard at
 // ready_for_copy waited for every active placement -- pending included. A
 // placement declared while a reshard provisioned therefore waited for the
-// reshard, which waited for the placement, and neither ever moved.
+// reshard, which waited for the placement, and neither ever moved. In the
+// operation queue whichever arrived first goes first, and a placement paused
+// before it started keeps no place.
 func TestAPendingPlacementDoesNotWedgeAReshardWaitingForIt(t *testing.T) {
 	parallelPG(t)
-	g := newGateFixture(t)
-	g.addReshard(g.catalog, StageReadyForCopy)
 	ctx := context.Background()
-	for range 3 {
+
+	t.Run("the reshard arrived first", func(t *testing.T) {
+		g := newGateFixture(t)
+		g.addReshard(g.catalog, StageReadyForCopy)
+		mustExec(t, g.catalog, `UPDATE pgshard.workflows SET arrival = 0 WHERE id = $1::uuid`, g.reshard)
+		for range 3 {
+			_, _ = g.copier.Pass(ctx)
+			_, _ = g.placer.Pass(ctx)
+			time.Sleep(50 * time.Millisecond)
+		}
+		_, rstage, rmsg := g.state(g.reshard)
+		pstate, _, pmsg := g.state(g.placement)
+		if rstage == StageReadyForCopy {
+			t.Fatalf("the reshard is still at %s (%q) and the placement is %s (%q): they wait on each other", rstage, rmsg, pstate, pmsg)
+		}
+		if pstate == StateRunning {
+			t.Fatalf("the placement started (%q) while a reshard copies", pmsg)
+		}
+	})
+
+	t.Run("a placement paused before it started holds nothing", func(t *testing.T) {
+		g := newGateFixture(t)
+		mustExec(t, g.catalog, `UPDATE pgshard.workflows SET state = $2, status = status || '{"stage": "preparing", "paused_from": "pending"}' WHERE id = $1::uuid`, g.placement, StatePaused)
+		g.addReshard(g.catalog, StageReadyForCopy)
 		_, _ = g.copier.Pass(ctx)
-		_, _ = g.placer.Pass(ctx)
-		time.Sleep(50 * time.Millisecond)
-	}
-	// Paused while it was still preparing, a placement holds nothing either.
-	mustExec(t, g.catalog, `UPDATE pgshard.workflows SET state = $2, status = status || '{"paused_from": "pending"}' WHERE id = $1::uuid`, g.placement, StatePaused)
-	mustExec(t, g.catalog, `UPDATE pgshard.workflows SET status = status || $2::jsonb WHERE id = $1::uuid`, g.reshard, mustJSON(map[string]any{"stage": StageReadyForCopy}))
-	_, _ = g.copier.Pass(ctx)
-	_, rstage, rmsg := g.state(g.reshard)
-	pstate, _, pmsg := g.state(g.placement)
-	if rstage == StageReadyForCopy {
-		t.Fatalf("the reshard is still at %s (%q) and the placement is %s (%q): they wait on each other", rstage, rmsg, pstate, pmsg)
-	}
-	if pstate == StateRunning {
-		t.Fatalf("the placement started (%q) while a reshard copies", pmsg)
-	}
+		if _, rstage, rmsg := g.state(g.reshard); rstage == StageReadyForCopy {
+			t.Fatalf("the reshard waits (%q) for a placement paused before it started", rmsg)
+		}
+	})
 }
 
 // TestACancellingPlacementHoldsBackAReshardsCopy (PGS-862): a cancelled
@@ -178,6 +190,9 @@ func TestACopyAndAPlacementDecidingTogetherDoNotBothStart(t *testing.T) {
 	t.Run("the copier waits for a placement starting under the gate", func(t *testing.T) {
 		g := newGateFixture(t)
 		g.addReshard(g.catalog, StageReadyForCopy)
+		// Ahead of the placement in the queue, so that only the placement's
+		// start under the gate, not its place, holds the copy back.
+		mustExec(t, g.catalog, `UPDATE pgshard.workflows SET arrival = 0 WHERE id = $1::uuid`, g.reshard)
 		tx, err := g.catalog.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)

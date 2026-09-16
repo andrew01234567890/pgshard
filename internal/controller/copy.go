@@ -138,6 +138,10 @@ type copyWorkflow struct {
 	// workflow taken over stops the old pass instead of racing the new one.
 	owner string
 	fence string
+	// startError is why this pass could not start the copy, for anything
+	// but waiting its turn: an operation whose own start keeps failing
+	// holds no place in the queue.
+	startError string
 }
 
 // sourceSet is the shard set the workflow copies from: recorded in the
@@ -351,7 +355,7 @@ func copyStatusPatch(wf *copyWorkflow, stage, message string) map[string]any {
 	// progress and targets are lifted to the top of status because that is
 	// where the admin panel and the operator read them; copy keeps the
 	// whole phase record.
-	patch := map[string]any{"copy": wf.copy, "message": message, "progress": wf.copy.Progress}
+	patch := map[string]any{"copy": wf.copy, "message": message, "progress": wf.copy.Progress, "start_error": wf.startError}
 	if len(wf.copy.Targets) > 0 {
 		patch["targets"] = wf.copy.Targets
 	}
@@ -361,9 +365,34 @@ func copyStatusPatch(wf *copyWorkflow, stage, message string) map[string]any {
 	return patch
 }
 
-// startCopy records the workflow as copying unless a table placement holds
-// the serving set, counting under the lock a placement starts under.
-func (c *Copier) startCopy(ctx context.Context, wf *copyWorkflow) error {
+// readyToStart takes a workflow at ready_for_copy through its checks and
+// into copying: its turn in the operation queue (or, on a catalog without
+// one, no table placement holding the serving set), an upgrade's
+// preconditions, then the start itself.
+func (c *Copier) readyToStart(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) error {
+	queued, err := queueOn(ctx, c.Pool)
+	if err != nil {
+		return err
+	}
+	if queued {
+		if err := waitInQueue(ctx, c.Pool, wf.kind, wf.id); err != nil {
+			return err
+		}
+	} else if placements, err := placementsHoldingTheSet(ctx, c.Pool); err != nil || placements > 0 {
+		return errors.Join(err, waitingForPlacements(placements))
+	}
+	if wf.kind == KindUpgrade {
+		if err := c.upgradePreconditions(ctx, wf, srcSet, srcIDs, dbs); err != nil {
+			return err
+		}
+	}
+	return c.startCopy(ctx, wf, queued)
+}
+
+// startCopy records the workflow as copying unless something it must wait
+// for holds the serving set, deciding under the lock a placement and a
+// migration start under.
+func (c *Copier) startCopy(ctx context.Context, wf *copyWorkflow, queued bool) error {
 	tx, err := c.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -372,10 +401,16 @@ func (c *Copier) startCopy(ctx context.Context, wf *copyWorkflow) error {
 	if err := lockMoveGate(ctx, tx); err != nil {
 		return err
 	}
-	if placements, err := placementsHoldingTheSet(ctx, tx); err != nil || placements > 0 {
+	if queued {
+		if err := waitInQueue(ctx, tx, wf.kind, wf.id); err != nil {
+			return err
+		}
+	} else if placements, err := placementsHoldingTheSet(ctx, tx); err != nil || placements > 0 {
 		return errors.Join(err, waitingForPlacements(placements))
 	}
-	tag, err := tx.Exec(ctx, saveCopySQL, wf.id, mustJSON(copyStatusPatch(wf, StageCopying, "copy started")), nullIfEmpty(wf.owner), wf.fence)
+	patch := copyStatusPatch(wf, StageCopying, "copy started")
+	patch["started_at"] = c.now().UTC()
+	tag, err := tx.Exec(ctx, saveCopySQL, wf.id, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
 	if err != nil {
 		return err
 	}
@@ -717,15 +752,10 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	}
 	advanced := false
 	if wf.stage == StageReadyForCopy {
-		if placements, err := placementsHoldingTheSet(ctx, c.Pool); err != nil || placements > 0 {
-			return false, errors.Join(err, waitingForPlacements(placements))
-		}
-		if wf.kind == KindUpgrade {
-			if err := c.upgradePreconditions(ctx, wf, srcSet, srcIDs, dbs); err != nil {
-				return false, err
+		if err := c.readyToStart(ctx, wf, srcSet, srcIDs, dbs); err != nil {
+			if !isWaitingInQueue(err) && !errors.Is(err, errNotOwner) {
+				wf.startError = err.Error()
 			}
-		}
-		if err := c.startCopy(ctx, wf); err != nil {
 			return false, err
 		}
 		wf.stage = StageCopying
