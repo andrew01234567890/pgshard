@@ -1693,3 +1693,55 @@ func TestTheQueueProbeIsTakenOnceAndDoesNotBlockOtherSessions(t *testing.T) {
 		t.Fatalf("a catalog that came back answered %v, %v; the failure was kept for the whole answer window", ok, err)
 	}
 }
+
+// TestAClosedPortalDoesNotRunTheUnnamedStatement (PGS-905): Execute named a
+// portal, and the router looked the name up in e.portals and fed the result
+// straight to e.stmts. A miss gives "", which is the UNNAMED statement -- so
+// executing a portal that was never bound, or one that has been closed, ran
+// whatever was last parsed without a name.
+//
+// The damage is not the missing error, it is the statement handled in its
+// place. Here the unnamed statement is DDL, and before the fix the closed
+// portal was answered as that DDL -- 0A000 "DDL must be the only statement
+// of its batch", about a statement this client never executed. In a batch
+// that allowed it, it would have run. PostgreSQL answers 34000
+// (postgres.c, ERRCODE_UNDEFINED_CURSOR).
+func TestAClosedPortalDoesNotRunTheUnnamedStatement(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	conn := h.connect(t, h.dsn())
+	fe := conn.PgConn().Frontend()
+
+	// The unnamed statement is a migration; the portal is bound to it and
+	// then closed, which is a sequence the protocol allows.
+	fe.Send(&pgproto3.Parse{Query: "create index orders_note_idx on orders (note)"})
+	fe.Send(&pgproto3.Bind{DestinationPortal: "p"})
+	fe.Send(&pgproto3.Close{ObjectType: 'P', Name: "p"})
+	fe.Send(&pgproto3.Execute{Portal: "p"})
+	fe.Send(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var refused *pgproto3.ErrorResponse
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok && refused == nil {
+			refused = e
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if refused == nil || refused.Code != "34000" || !strings.Contains(refused.Message, `portal "p" does not exist`) {
+		t.Fatalf("executing a closed portal answered %+v, want 34000 naming it", refused)
+	}
+	// The point of the fix: the unnamed statement did not run.
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.queued) != 0 {
+		t.Fatalf("the closed portal ran the unnamed statement: %d migration(s) queued", len(q.queued))
+	}
+}

@@ -30,10 +30,13 @@ import (
 
 const (
 	codeConnectionFailure = "08006"
-	maxIdentifierLen      = 63
-	releaseTimeout        = 5 * time.Second
-	releaseRetryDelay     = 250 * time.Millisecond
-	releaseRetries        = 6
+	// codeUndefinedCursor is what PostgreSQL answers for a portal that does
+	// not exist (postgres.c, ERRCODE_UNDEFINED_CURSOR).
+	codeUndefinedCursor = "34000"
+	maxIdentifierLen    = 63
+	releaseTimeout      = 5 * time.Second
+	releaseRetryDelay   = 250 * time.Millisecond
+	releaseRetries      = 6
 )
 
 type prepared struct {
@@ -1686,7 +1689,18 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 		return nil
 	}
 	e.batchWriter = w
-	if st, ok := e.stmts[e.portals[portal]]; ok {
+	// A portal that was never bound, or that has been closed, is not the
+	// unnamed one. Reading e.portals[portal] straight into e.stmts turned a
+	// miss into "", which IS the unnamed statement, so Parse ""; Bind p;
+	// Close p; Execute p was handled as that statement rather than refused
+	// -- answering for something the client never executed, and running it
+	// wherever the batch allowed. PostgreSQL answers 34000.
+	name, bound := e.portals[portal]
+	if !bound {
+		e.failBatch()
+		return pgwire.Errorf(codeUndefinedCursor, "portal %q does not exist", portal)
+	}
+	if st, ok := e.stmts[name]; ok {
 		if multiShard(st.plan) && e.batchScatter == nil {
 			e.failBatch()
 			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "a multi-shard portal must be bound and executed in the same batch")
