@@ -465,6 +465,10 @@ func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1
 // but it does not need the superuser to do that, and holding one made
 // anything that could read its environment direct write access to every
 // shard and the catalog, bypassing the router entirely.
+func (r *ClusterReconciler) ensureAdminCatalogSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	return r.ensureLoginSecret(ctx, c, AdminCatalogSecretName(c.Name), catalog.AdminUIRole)
+}
+
 func (r *ClusterReconciler) ensureControllerSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
 	return r.ensureLoginSecret(ctx, c, ControllerSecretName(c.Name), catalog.ControllerRole)
 }
@@ -1538,7 +1542,28 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 		if err != nil {
 			return err
 		}
-		return r.Prober.SetLoginPassword(ctx, dsn, controllerLoginRole, cpw)
+		if err := r.Prober.SetLoginPassword(ctx, dsn, controllerLoginRole, cpw); err != nil {
+			return err
+		}
+		if !AdminEnabled(c) {
+			// Disabling the admin deletes its Deployment, Service and
+			// Secret, which looks like revocation and is not: the role
+			// keeps the password it was last given and the agent's pg_hba
+			// line still admits it, so anyone who read the Secret while it
+			// existed keeps read access to the catalog indefinitely. An
+			// admin shut down for that reason is never re-enabled, which
+			// is the one thing that would have rotated it.
+			return r.Prober.RevokeLogin(ctx, dsn, adminUILoginRole)
+		}
+		// The admin UI reads the catalog as its own read-only login. Without
+		// it every catalog-backed page of an operator-deployed admin is
+		// empty, which is how the migrations panel and the operation queue
+		// were invisible in a real cluster.
+		apw, err := r.ensureAdminCatalogSecret(ctx, c)
+		if err != nil {
+			return err
+		}
+		return r.Prober.SetLoginPassword(ctx, dsn, adminUILoginRole, apw)
 	}
 	// The router authenticates against pgshard.roles and the migrations
 	// leave it empty, so without this nobody can reach the cluster through

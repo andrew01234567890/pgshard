@@ -1,0 +1,12 @@
+{{template "head" "Operation queue"}}
+<header>
+<h1><a href="/">clusters</a> / operation queue</h1>
+<span class="meta">DDL, reshards, major upgrades and table placements, in the order they run</span>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/queue" aria-current="page">Queue</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc">2PC</a><a href="/alerts">Alerts</a><a href="/reshards">Reshards</a><a href="/upgrades">Upgrades</a></nav>
+</header>
+<div id="queue" data-live hx-get="/queue/panel" hx-trigger="topology" hx-swap="innerHTML" aria-live="polite">
+{{template "queue_panel.html" .}}
+</div>
+<p class="notice"><a href="/api/v1/queue">JSON</a> · <code>SELECT position, kind, command, state, waiting_for, progress_bar, detail FROM pgshard.operation_queue</code></p>
+<script src="/static/app.js" defer></script>
+{{template "foot"}}

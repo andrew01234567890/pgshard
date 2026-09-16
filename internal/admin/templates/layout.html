@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.}} · pgshard admin</title>
 <link rel="stylesheet" href="/static/style.css">
+<!-- htmx injects a stylesheet of its own for the indicator class, which the
+     content security policy blocks; no page here uses that class. -->
+<meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
 <script src="/static/htmx.min.js" defer></script>
 </head>
 <body>

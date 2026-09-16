@@ -108,8 +108,10 @@ type fakeProber struct {
 	placements  []PlacementWorkflowInfo
 	// journal records fence writes and promotions in order.
 	journal *[]string
-	// routerPasswords records every ALTER ROLE the reconcile asked for.
+	// routerPasswords records every ALTER ROLE the reconcile asked for,
+	// and revokedLogins every login it took away.
 	routerPasswords  []string
+	revokedLogins    []string
 	replicationRoles []string
 	// replicationRoleErr is what a paused primary answers: CREATE ROLE,
 	// ALTER ROLE and GRANT are all writes.
@@ -625,6 +627,13 @@ func (f *fakeProber) SetLoginPassword(_ context.Context, dsn, role, password str
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"/"+role+"="+password)
+	return nil
+}
+
+func (f *fakeProber) RevokeLogin(_ context.Context, dsn, role string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revokedLogins = append(f.revokedLogins, hostOf(dsn)+"/"+role)
 	return nil
 }
 
@@ -1712,5 +1721,58 @@ func TestAPausedPrimaryDoesNotTakeThePassDownWithIt(t *testing.T) {
 	}
 	if !sawGroup {
 		t.Errorf("the pass stopped before the slots of the paused group: %v", slots)
+	}
+}
+
+// TestDisablingTheAdminRevokesItsCatalogLogin: turning the admin off deletes
+// its Deployment, Service and Secret, which looks like revocation and is
+// not. The role keeps the password it was last given, and the agent's
+// pg_hba line still admits it over the pod network, so anyone who read the
+// Secret while it existed keeps read access to the catalog -- indefinitely,
+// because an admin shut down for that reason is never re-enabled and
+// re-enabling is the only thing that rotated it.
+func TestDisablingTheAdminRevokesItsCatalogLogin(t *testing.T) {
+	r, fp, c := setup(t, "ar")
+	enabled := true
+	c.Spec.Admin.Enabled = &enabled
+	bringUp(t, r, fp, c)
+
+	fp.mu.Lock()
+	applied := append([]string(nil), fp.routerPasswords...)
+	revoked := append([]string(nil), fp.revokedLogins...)
+	fp.mu.Unlock()
+	gave := false
+	for _, a := range applied {
+		if strings.Contains(a, "/"+adminUILoginRole+"=") {
+			gave = true
+		}
+	}
+	if !gave {
+		t.Fatalf("the admin UI login was never given a password: %v", applied)
+	}
+	if len(revoked) != 0 {
+		t.Fatalf("a login was revoked while the admin was enabled: %v", revoked)
+	}
+
+	// The reconcile above wrote status, so the copy in hand is a version
+	// behind and an update of it is refused.
+	disabled := false
+	fresh := &pgshardv1alpha1.PgShardCluster{}
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(c), fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Spec.Admin.Enabled = &disabled
+	if err := k8sClient.Update(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	c = fresh
+	reconcile(t, r, c)
+
+	fp.mu.Lock()
+	revoked = append([]string(nil), fp.revokedLogins...)
+	fp.mu.Unlock()
+	want := "ar-catalog-rw.default.svc/" + adminUILoginRole
+	if !slices.Contains(revoked, want) {
+		t.Fatalf("disabling the admin revoked %v, want %q", revoked, want)
 	}
 }

@@ -13,7 +13,10 @@ import (
 // DefaultShardSet is the shard set the topology page shows from the catalog.
 const DefaultShardSet = "default"
 
-// PgxCatalog reads the shard status snapshot over a fresh connection per call.
+// PgxCatalog reads the shard status snapshot over a fresh connection per
+// call. Migrations are read through pgshard.migrations_detail: the admin's
+// own login is a reader, which the catalog deliberately keeps off the
+// migrations table because role DDL carries a verifier there.
 type PgxCatalog struct {
 	DSN      string
 	ShardSet string
@@ -76,7 +79,7 @@ func (p PgxCatalog) ListMigrations(ctx context.Context, f catalog.MigrationFilte
 		total int
 	}
 	out, err := withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) (page, error) {
-		rows, total, err := catalog.ListMigrations(ctx, conn, f)
+		rows, total, err := catalog.ListMigrationsFrom(ctx, conn, catalog.MigrationsDetailView, f)
 		return page{rows, total}, err
 	})
 	return out.rows, out.total, err
@@ -85,14 +88,14 @@ func (p PgxCatalog) ListMigrations(ctx context.Context, f catalog.MigrationFilte
 // LoadMigration implements MigrationSource.
 func (p PgxCatalog) LoadMigration(ctx context.Context, id string) (catalog.DDLMigration, error) {
 	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) (catalog.DDLMigration, error) {
-		return catalog.LoadMigration(ctx, conn, id)
+		return catalog.LoadMigrationFrom(ctx, conn, catalog.MigrationsDetailView, id)
 	})
 }
 
 // CountMigrations implements MigrationSource.
 func (p PgxCatalog) CountMigrations(ctx context.Context) (catalog.MigrationCounts, error) {
 	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) (catalog.MigrationCounts, error) {
-		return catalog.CountMigrations(ctx, conn)
+		return catalog.CountMigrationsFrom(ctx, conn, catalog.MigrationsDetailView)
 	})
 }
 

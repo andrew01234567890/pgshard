@@ -1,0 +1,21 @@
+{{define "wait"}}<div>{{if .Href}}<a href="{{.Href}}">{{.Label}}</a>{{else}}{{.Label}}{{end}} <span class="meta">({{.Reason}})</span></div>{{end}}
+{{if .Error}}<p class="bad">catalog: {{.Error}}</p>{{end}}
+{{if .Unavailable}}<p class="notice">{{.Unavailable}}</p>{{else if not .Error}}
+<p class="meta">{{.Total}} in the queue{{range .States}} · {{.Count}} {{.State}}{{end}}{{if gt .Total (len .Entries)}} · showing the first {{len .Entries}}{{end}}</p>
+{{if .Entries}}
+<table class="queue">
+<thead><tr><th>#</th><th>Kind</th><th>Operation</th><th>State</th><th>Waits for</th><th>Progress</th><th>Since</th></tr></thead>
+<tbody>{{range .Entries}}<tr>
+<td>{{.Position}}</td>
+<td>{{.KindLabel}}{{with .Database}}<br><span class="meta">{{.}}</span>{{end}}</td>
+<td>{{if eq .Kind "ddl"}}<a href="/migrations/{{.ID}}">{{end}}{{if .Truncated}}<details><summary><code>{{.Short}}</code></summary><pre>{{if .Statement}}{{.Statement}}{{else}}{{.Command}}{{end}}</pre></details>{{else}}<code>{{.Short}}</code>{{end}}{{if eq .Kind "ddl"}}</a>{{end}}</td>
+<td class="state-{{.State}}">{{.State}}{{with .Stage}}<br><span class="meta">{{.}}</span>{{end}}</td>
+<td>{{with .Waits}}{{template "wait" index . 0}}{{if gt (len .) 1}}<details><summary class="meta">and {{len (slice . 1)}} more</summary>{{range slice . 1}}{{template "wait" .}}{{end}}</details>{{end}}{{else}}<span class="meta">—</span>{{end}}</td>
+<td>{{if .HasProgress}}<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{.Percent}}" aria-label="{{.Percent}}% done">
+<svg viewBox="0 0 100 10" preserveAspectRatio="none" width="128" height="10" aria-hidden="true"><rect class="seg applied" x="0" width="{{.Percent}}" height="10"/></svg>
+</div><span class="meta">{{.Percent}}%{{with .Detail}} · {{.}}{{end}}</span>{{else}}<span class="meta">{{with .Detail}}{{.}}{{else}}—{{end}}</span>{{end}}</td>
+<td>{{.Since}}</td>
+</tr>{{end}}</tbody>
+</table>
+{{else}}<p class="notice">Nothing is queued or running.</p>{{end}}
+{{end}}

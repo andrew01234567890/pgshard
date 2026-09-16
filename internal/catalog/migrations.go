@@ -326,7 +326,12 @@ const migrationColumns = `id::text, database, statement, kind, strategy, scope, 
 
 // LoadMigration reads one migration by id.
 func LoadMigration(ctx context.Context, db RowQuerier, id string) (DDLMigration, error) {
-	rows, err := db.Query(ctx, `SELECT `+migrationColumns+` FROM pgshard.migrations WHERE id = $1`, id)
+	return LoadMigrationFrom(ctx, db, MigrationsTable, id)
+}
+
+// LoadMigrationFrom is LoadMigration over a chosen source.
+func LoadMigrationFrom(ctx context.Context, db RowQuerier, source, id string) (DDLMigration, error) {
+	rows, err := db.Query(ctx, `SELECT `+migrationColumns+` FROM `+source+` WHERE id = $1`, id)
 	if err != nil {
 		return DDLMigration{}, err
 	}
@@ -360,16 +365,30 @@ type MigrationFilter struct {
 // ListMigrations returns the newest migrations matching f and the total count
 // of matching rows, for paging.
 func ListMigrations(ctx context.Context, db RowQuerier, f MigrationFilter) ([]DDLMigration, int, error) {
+	return ListMigrationsFrom(ctx, db, MigrationsTable, f)
+}
+
+// MigrationsTable and MigrationsDetailView are the two places migrations
+// are read from: the table, for anything that holds the schema's own
+// privileges, and the view that redacts a password-setting statement and
+// drops the verifier, for the admin UI's login.
+const (
+	MigrationsTable      = "pgshard.migrations"
+	MigrationsDetailView = "pgshard.migrations_detail"
+)
+
+// ListMigrationsFrom is ListMigrations over a chosen source.
+func ListMigrationsFrom(ctx context.Context, db RowQuerier, source string, f MigrationFilter) ([]DDLMigration, int, error) {
 	where := `WHERE ($1 = '' OR database = $1) AND ($2 = '' OR state = $2)`
 	var total int
-	if err := db.QueryRow(ctx, `SELECT count(*) FROM pgshard.migrations `+where, f.Database, f.State).Scan(&total); err != nil {
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM `+source+` `+where, f.Database, f.State).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := db.Query(ctx, `SELECT `+migrationColumns+` FROM pgshard.migrations `+where+` ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`,
+	rows, err := db.Query(ctx, `SELECT `+migrationColumns+` FROM `+source+` `+where+` ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`,
 		f.Database, f.State, limit, f.Offset)
 	if err != nil {
 		return nil, 0, err
@@ -387,7 +406,12 @@ type MigrationCounts struct {
 
 // CountMigrations tallies queued, running and failed migrations.
 func CountMigrations(ctx context.Context, db Querier) (MigrationCounts, error) {
-	rows, err := db.Query(ctx, `SELECT state, count(*) FROM pgshard.migrations WHERE state IN ('queued', 'running', 'failed') GROUP BY state`)
+	return CountMigrationsFrom(ctx, db, MigrationsTable)
+}
+
+// CountMigrationsFrom is CountMigrations over a chosen source.
+func CountMigrationsFrom(ctx context.Context, db Querier, source string) (MigrationCounts, error) {
+	rows, err := db.Query(ctx, `SELECT state, count(*) FROM `+source+` WHERE state IN ('queued', 'running', 'failed') GROUP BY state`)
 	if err != nil {
 		return MigrationCounts{}, err
 	}

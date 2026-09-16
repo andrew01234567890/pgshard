@@ -77,8 +77,10 @@ func (r Renderer) AdminDeployment(c *pgshardv1alpha1.PgShardCluster, tokenKey st
 						Image:           image,
 						ImagePullPolicy: corev1.PullIfNotPresent,
 						Args:            adminArgs(c),
-						Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: adminPort}},
-						VolumeMounts:    adminMounts(c),
+						Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: AdminCatalogSecretName(c.Name)}, Key: secretKey}}}},
+						Ports:        []corev1.ContainerPort{{Name: "http", ContainerPort: adminPort}},
+						VolumeMounts: adminMounts(c),
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
 							PeriodSeconds: 10,
@@ -107,7 +109,11 @@ const (
 func adminArgs(c *pgshardv1alpha1.PgShardCluster) []string {
 	// One admin per cluster, one credential per admin: without --cluster
 	// that credential reads every cluster in the namespace.
-	args := []string{"serve", "--listen=:8081", "--namespace=" + c.Namespace, "--cluster=" + c.Name}
+	// The catalog is what the migrations, workflow, stream and queue pages
+	// read; without it they are empty, however healthy the cluster is. The
+	// password arrives in the environment, as the router's does, so it is
+	// in no argument list.
+	args := []string{"serve", "--listen=:8081", "--namespace=" + c.Namespace, "--cluster=" + c.Name, "--catalog-dsn=" + AdminCatalogDSN(c)}
 	if c.Spec.Admin.InsecureNoAuth {
 		return append(args, "--insecure-no-auth")
 	}
@@ -158,13 +164,14 @@ func (r *ClusterReconciler) reconcileAdmin(ctx context.Context, c *pgshardv1alph
 	dep := &appsv1.Deployment{ObjectMeta: adminMeta(c)}
 	svc := &corev1.Service{ObjectMeta: adminMeta(c)}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: AdminSecretName(c.Name), Namespace: c.Namespace}}
+	catalogSec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: AdminCatalogSecretName(c.Name), Namespace: c.Namespace}}
 	// A credential nothing mounts is a credential somebody can still read,
 	// so it goes when the admin does -- and when the admin is deliberately
 	// open.
 	if !AdminEnabled(c) || c.Spec.Admin.InsecureNoAuth {
 		gone := []client.Object{sec}
 		if !AdminEnabled(c) {
-			gone = []client.Object{dep, svc, rb, role, sa, sec}
+			gone = []client.Object{dep, svc, rb, role, sa, sec, catalogSec}
 		}
 		for _, obj := range gone {
 			if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
@@ -181,6 +188,13 @@ func (r *ClusterReconciler) reconcileAdmin(ctx context.Context, c *pgshardv1alph
 		if tokenKey, err = r.ensureAdminSecret(ctx, c); err != nil {
 			return err
 		}
+	}
+	// The catalog login's Secret is made here, before anything mounts it: a
+	// Deployment naming a Secret that does not exist yet never starts its
+	// pod. The password it holds is applied to the catalog when the catalog
+	// group is reachable, which may be later.
+	if _, err := r.ensureAdminCatalogSecret(ctx, c); err != nil {
+		return err
 	}
 	if err := r.ensureOwned(ctx, c, sa, func() error { sa.Labels = adminLabels(c); return nil }); err != nil {
 		return err

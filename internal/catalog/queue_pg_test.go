@@ -678,3 +678,203 @@ func TestQueueSchemaIsAbsentBeforeTheMigration(t *testing.T) {
 		t.Fatalf("before 0058 QueueSchema = %v, %v", ok, err)
 	}
 }
+
+// TestTheOperationQueueReadsAsPeopleNeedIt (PGS-903): the queue view names
+// each operation, says where it stands and what it waits for, draws a
+// progress bar, keeps statement text for administrators, and survives a
+// status it cannot read.
+func TestTheOperationQueueReadsAsPeopleNeedIt(t *testing.T) {
+	conn, _, dsn := queueCatalog(t)
+	ctx := context.Background()
+	const reshard, index, role, move, switched = "00000000-0000-0000-0000-000000000901", "00000000-0000-0000-0000-000000000902",
+		"00000000-0000-0000-0000-000000000903", "00000000-0000-0000-0000-000000000904", "00000000-0000-0000-0000-000000000905"
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status, arrival) VALUES
+		($1, 'reshard', 'running', '{"shard_set": "g2", "source_set": "default", "source_shards": 2, "ranges": [{}, {}, {}, {}]}',
+		 '{"stage": "copying", "message": "copying", "progress": {"tables_ready": 12, "tables_total": 40}}', 1)`, reshard)
+	mustExec(t, conn, `INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, state, meta, arrival) VALUES
+		($1, 'app', 'CREATE INDEX   orders_note_idx
+		   ON orders (note)', 'CREATE INDEX', 'concurrent', 'all', 'queued', '{"object": {"kind": "relation", "name": "orders_note_idx"}}', 2),
+		($2, 'app', 'ALTER ROLE app PASSWORD ''SCRAM-SHA-256$4096:secret''', 'ALTER ROLE', 'direct', 'all', 'queued', '{"role": "app", "verifier": "SCRAM-SHA-256$4096:secret"}', 3)`, index, role)
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status, arrival) VALUES
+		($1, 'table_placement', 'pending', '{"database": "app", "schema_name": "public", "table_name": "items", "to": {"placement": "sharded", "shard_key": "id"}}', '{"stage": "preparing"}', 4)`, move)
+
+	mustExec(t, conn, `CREATE ROLE queue_reader LOGIN PASSWORD 'reading' IN ROLE pgshard_reader`)
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.User, cfg.Password = "queue_reader", "reading"
+	rc, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Close(ctx) }()
+	entries, total, err := ListOperationQueue(ctx, rc, false)
+	if err != nil {
+		t.Fatalf("a reader reading the queue: %v", err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("%d entries, want 4: %+v", len(entries), entries)
+	}
+	if total != 4 {
+		t.Errorf("total %d, want 4", total)
+	}
+	byID := map[string]QueueEntry{}
+	for i, e := range entries {
+		if e.Position != int64(i+1) {
+			t.Errorf("%s at position %d, want %d", e.Command, e.Position, i+1)
+		}
+		if e.Statement != nil {
+			t.Errorf("a reader got statement text for %s", e.Command)
+		}
+		byID[e.ID] = e
+	}
+	r := byID[reshard]
+	if r.Command != "reshard 2 to 4 shards" || r.State != "running" || r.Progress == nil || *r.Progress != 0.28 ||
+		r.ProgressBar == nil || *r.ProgressBar != "[#####---------------]  28%" || r.Detail == nil || !strings.HasPrefix(*r.Detail, "copying 12/40 tables") {
+		t.Errorf("reshard entry %+v (progress %v, bar %v, detail %v)", r, deref(r.Progress), deref(r.ProgressBar), deref(r.Detail))
+	}
+	i := byID[index]
+	if i.Command != "CREATE INDEX orders_note_idx" || i.State != "waiting" || i.WaitingFor == nil || *i.WaitingFor != "reshard "+reshard+" (in progress)" ||
+		len(i.Blockers) != 1 || i.Blockers[0].ID != reshard || i.ProgressBar == nil || *i.ProgressBar != "[--------------------]   0%" {
+		t.Errorf("index entry %+v (waiting for %v)", i, deref(i.WaitingFor))
+	}
+	if c := byID[role].Command; c != "ALTER ROLE app" {
+		t.Errorf("role entry command %q", c)
+	}
+	// The role statement waits for the reshard, which started, and for the
+	// index, which arrived before it. The first of them is the one holding
+	// the queue and the one a reader is sent after -- and it is the reshard,
+	// which arrived first, not whichever of the two sorts first by kind and
+	// id. Sorting them put "ddl" ahead of "reshard" and named the newer
+	// blocker.
+	if b := byID[role].Blockers; len(b) != 2 || b[0].ID != reshard || b[1].ID != index {
+		t.Errorf("the role statement's blockers are not in arrival order: %+v", b)
+	}
+	if m := byID[move]; m.Command != "move app.public.items to sharded(id)" || m.State != "waiting" || m.Database == nil || *m.Database != "app" {
+		t.Errorf("placement entry %+v", m)
+	}
+	if _, err := rc.Exec(ctx, `SELECT * FROM pgshard.operation_queue_detail`); err == nil {
+		t.Error("a reader can read the queue with statements")
+	}
+	if got := queryOne[string](t, rc, `SELECT string_agg(row_to_json(q)::text, '') FROM pgshard.operation_queue q`); strings.Contains(got, "SCRAM") || strings.Contains(got, "secret") {
+		t.Errorf("the reader's queue carries a verifier: %s", got)
+	}
+
+	detail, _, err := ListOperationQueue(ctx, conn, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range detail {
+		switch e.ID {
+		case index:
+			if e.Statement == nil || *e.Statement != "CREATE INDEX orders_note_idx ON orders (note)" {
+				t.Errorf("index statement %v", deref(e.Statement))
+			}
+		case role:
+			if e.Statement == nil || strings.Contains(*e.Statement, "SCRAM") || !strings.Contains(*e.Statement, "not shown") {
+				t.Errorf("role statement %v", deref(e.Statement))
+			}
+		}
+	}
+
+	mustExec(t, conn, `DELETE FROM pgshard.migrations`)
+	// The status a controller actually writes once it has switched: when
+	// the switch happened, and the window the spec asked for. The deadline
+	// is derived from those. Seeding a cutover.retire_at here instead --
+	// which is what this test used to do -- proved only that the view can
+	// read a key the test invented.
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status, arrival) VALUES
+		($1, 'upgrade', 'running', '{"pg_major": 19, "source_pg_major": 18, "retire_after_seconds": 86400}',
+		 jsonb_build_object('stage', 'switched', 'cutover', jsonb_build_object('switched_at', now() - interval '1 hour')), 5)`, switched)
+	mustExec(t, conn, `UPDATE pgshard.workflows SET status = '{"stage": "copying", "progress": {"tables_ready": "twelve", "tables_total": [40]}, "started_at": "not a time"}' WHERE id = $1`, reshard)
+	entries, _, err = ListOperationQueue(ctx, conn, false)
+	if err != nil {
+		t.Fatalf("a status the view cannot read broke it: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.ID != switched {
+			continue
+		}
+		found = true
+		if e.Command != "upgrade PostgreSQL 18 to 19" || e.State != "retiring" {
+			t.Errorf("switched upgrade entry %+v", e)
+		}
+		if e.Detail == nil || !strings.HasPrefix(*e.Detail, "old groups retire in 22h5") {
+			t.Errorf("the countdown is not derived from the switch and the window: %v", deref(e.Detail))
+		}
+		if e.RetireAt == nil {
+			t.Error("retire_at is not answered for a switched workflow")
+		}
+		// An hour into a day-long window, not pinned at the top of the
+		// bar: the ramp reads the same two values the countdown does.
+		if e.Progress == nil || *e.Progress < 0.90 || *e.Progress > 0.92 {
+			t.Errorf("progress %v an hour into a 24h retirement window", deref(e.Progress))
+		}
+	}
+	if !found {
+		t.Fatal("the switched upgrade is not in the queue at all, so nothing above was asserted")
+	}
+}
+
+func deref[T any](p *T) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// TestTheAdminUILoginReadsWhatItShows (PGS-902): the admin UI reads the
+// catalog as its own login. It must see the queue and the migrations the
+// pages show, and nothing a reader is kept from: the verifiers.
+func TestTheAdminUILoginReadsWhatItShows(t *testing.T) {
+	conn, _, dsn := queueCatalog(t)
+	ctx := context.Background()
+	mustExec(t, conn, `INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, state, meta) VALUES
+		(gen_random_uuid(), 'app', 'CREATE INDEX i ON t (c)', 'CREATE INDEX', 'direct', 'all', 'queued', '{}'),
+		(gen_random_uuid(), 'app', 'ALTER ROLE app PASSWORD ''SCRAM-SHA-256$4096:hidden''', 'ALTER ROLE', 'direct', 'all', 'queued', '{"role": "app", "verifier": "SCRAM-SHA-256$4096:hidden"}')`)
+	mustExec(t, conn, `ALTER ROLE `+AdminUIRole+` LOGIN PASSWORD 'ui-secret'`)
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.User, cfg.Password = AdminUIRole, "ui-secret"
+	ui, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("the admin UI login cannot connect: %v", err)
+	}
+	defer func() { _ = ui.Close(ctx) }()
+
+	if _, _, err := ListOperationQueue(ctx, ui, true); err != nil {
+		t.Errorf("reading the queue with statements: %v", err)
+	}
+	ms, total, err := ListMigrationsFrom(ctx, ui, MigrationsDetailView, MigrationFilter{})
+	if err != nil || total != 2 {
+		t.Fatalf("listing migrations: %d (%v)", total, err)
+	}
+	for _, m := range ms {
+		if strings.Contains(m.Statement, "SCRAM") || m.Meta.Verifier != "" {
+			t.Errorf("the admin UI login can read a verifier: %q %q", m.Statement, m.Meta.Verifier)
+		}
+		if m.Kind == "ALTER ROLE" && !strings.Contains(m.Statement, "not shown") {
+			t.Errorf("a password-setting statement is shown as %q", m.Statement)
+		}
+	}
+	if _, err := CountMigrationsFrom(ctx, ui, MigrationsDetailView); err != nil {
+		t.Errorf("counting migrations: %v", err)
+	}
+	for _, sql := range []string{
+		`SELECT statement FROM pgshard.migrations`,
+		`SELECT verifier FROM pgshard.roles`,
+		`SELECT * FROM pgshard.operations`,
+		`INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, state) VALUES (gen_random_uuid(), 'app', 'x', 'CREATE TABLE', 'direct', 'all', 'queued')`,
+	} {
+		if _, err := ui.Exec(ctx, sql); err == nil {
+			t.Errorf("the admin UI login may run %q", sql)
+		}
+	}
+	if ro := queryOne[string](t, ui, `SHOW default_transaction_read_only`); ro != "on" {
+		t.Errorf("the admin UI login's transactions are %s", ro)
+	}
+}
