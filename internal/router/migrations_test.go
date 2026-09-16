@@ -19,8 +19,6 @@ import (
 
 // fakeQueue completes every migration with the outcome the test scripted,
 // after an optional delay.
-// fakeQueue completes every migration with the outcome the test scripted,
-// after an optional delay.
 type fakeQueue struct {
 	mu       sync.Mutex
 	queued   []catalog.DDLMigration
@@ -119,9 +117,9 @@ func (q *fakeQueue) last(t *testing.T) catalog.DDLMigration {
 	return q.queued[len(q.queued)-1]
 }
 
-func newDDLHarness(t *testing.T, q *fakeQueue) *shardedHarness {
+func newDDLHarness(t *testing.T, q *fakeQueue, opts ...func(*harness)) *shardedHarness {
 	t.Helper()
-	return newShardedHarnessWith(t, Config{Migrations: q})
+	return newShardedHarnessWith(t, Config{Migrations: q}, opts...)
 }
 
 func TestDDLIsQueuedAndAnsweredWhenComplete(t *testing.T) {
@@ -173,9 +171,6 @@ func TestDDLIsQueuedAndAnsweredWhenComplete(t *testing.T) {
 	}
 }
 
-// servingSetRenamed publishes the harness snapshot as a cutover leaves it:
-// the shards serve under a new set name and the database's home shard id
-// is the new set's.
 // servingSetRenamed publishes the harness snapshot as a cutover leaves it:
 // the shards serve under a new set name and the database's home shard id
 // is the new set's.
@@ -387,13 +382,6 @@ func TestPGMigrationQueueWaitResetsOnProgress(t *testing.T) {
 // answered only after the router has reloaded; a failed one, or one queued
 // asynchronously, is not held for it; and a reload that fails still answers
 // the applied DDL, with a warning.
-// TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt (PGS-871): the
-// watcher's own reload after a migration can wait out a notification budget
-// the migration's per-shard steps drained, and the client's next statement
-// was planned without the view it had just created. An applied migration is
-// answered only after the router has reloaded; a failed one, or one queued
-// asynchronously, is not held for it; and a reload that fails still answers
-// the applied DDL, with a warning.
 func TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt(t *testing.T) {
 	ctx := context.Background()
 	var (
@@ -477,11 +465,6 @@ func TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt(t *testing.T) {
 // two before one Sync queued the second twice and never the first. The
 // messages go on the wire by hand: pgx's pipeline reader also checks the
 // order of the replies, which is PGS-897.
-// TestEachDDLOfAPipelinedBatchRunsItsOwnStatement (PGS-896): the batch
-// handler ran the last DDL it saw for every Execute, so a client pipelining
-// two before one Sync queued the second twice and never the first. The
-// messages go on the wire by hand: pgx's pipeline reader also checks the
-// order of the replies, which is PGS-897.
 func TestEachDDLOfAPipelinedBatchRunsItsOwnStatement(t *testing.T) {
 	q := &fakeQueue{}
 	h := newDDLHarness(t, q)
@@ -536,8 +519,6 @@ func TestEachDDLOfAPipelinedBatchRunsItsOwnStatement(t *testing.T) {
 
 // A portal runs the statement it was bound to, even when the name was parsed
 // again before its Execute.
-// A portal runs the statement it was bound to, even when the name was parsed
-// again before its Execute.
 func TestADDLPortalRunsTheStatementItWasBoundTo(t *testing.T) {
 	q := &fakeQueue{}
 	h := newDDLHarness(t, q)
@@ -572,8 +553,6 @@ func TestADDLPortalRunsTheStatementItWasBoundTo(t *testing.T) {
 	}
 }
 
-// A DDL statement pipelined with anything else is refused whole: the
-// migration and the other statement cannot share a batch's transaction.
 // A DDL statement pipelined with anything else is refused whole: the
 // migration and the other statement cannot share a batch's transaction.
 func TestADDLBatchWithAnotherStatementIsRefused(t *testing.T) {
@@ -616,9 +595,6 @@ func TestADDLBatchWithAnotherStatementIsRefused(t *testing.T) {
 	}
 }
 
-// TestAnIdenticalDDLAttachesAndSaysSoAtOnce (PGS-900): a client whose DDL
-// timed out sends it again. The router hands it the migration already
-// queued, and says so while it waits rather than when it is done.
 // TestAnIdenticalDDLAttachesAndSaysSoAtOnce (PGS-900): a client whose DDL
 // timed out sends it again. The router hands it the migration already
 // queued, and says so while it waits rather than when it is done.
@@ -670,9 +646,6 @@ func TestAnIdenticalDDLAttachesAndSaysSoAtOnce(t *testing.T) {
 // TestADDLWaitEndsAtTheSessionStatementTimeout (PGS-900): the router did not
 // read statement_timeout, so a client's timeout never ended a DDL wait. It
 // now does, and says the migration continues and how to wait for it again.
-// TestADDLWaitEndsAtTheSessionStatementTimeout (PGS-900): the router did not
-// read statement_timeout, so a client's timeout never ended a DDL wait. It
-// now does, and says the migration continues and how to wait for it again.
 func TestADDLWaitEndsAtTheSessionStatementTimeout(t *testing.T) {
 	q := &fakeQueue{delay: time.Hour}
 	h := newDDLHarness(t, q)
@@ -721,8 +694,6 @@ func TestADDLWaitEndsAtTheSessionStatementTimeout(t *testing.T) {
 
 // TestAWaitingDDLSaysWhatItWaitsFor (PGS-900): DDL behind a reshard is
 // queued, not refused, and the client is told what holds it.
-// TestAWaitingDDLSaysWhatItWaitsFor (PGS-900): DDL behind a reshard is
-// queued, not refused, and the client is told what holds it.
 func TestAWaitingDDLSaysWhatItWaitsFor(t *testing.T) {
 	q := &fakeQueue{blockers: []catalog.Blocker{{Kind: catalog.OperationReshard, ID: "00000000-0000-0000-0000-00000000e5a1", Reason: catalog.BlockedByStarted}}}
 	h := newDDLHarness(t, q)
@@ -746,7 +717,6 @@ func TestAWaitingDDLSaysWhatItWaitsFor(t *testing.T) {
 	}
 }
 
-// TestPgshardDDLDedupOffQueuesWithoutAKey (PGS-900).
 // TestPgshardDDLDedupOffQueuesWithoutAKey (PGS-900).
 func TestPgshardDDLDedupOffQueuesWithoutAKey(t *testing.T) {
 	q := &fakeQueue{}
@@ -793,10 +763,6 @@ func TestParseTimeGUC(t *testing.T) {
 // behind a long reshard makes no progress for hours. The wait gave up after
 // ten minutes of that; it now gives up only when the controller's heartbeat
 // has stopped, and reads through a short catalog outage.
-// TestAWaitKeepsGoingWhileTheControllerIsAlive (PGS-900): a migration held
-// behind a long reshard makes no progress for hours. The wait gave up after
-// ten minutes of that; it now gives up only when the controller's heartbeat
-// has stopped, and reads through a short catalog outage.
 func TestAWaitKeepsGoingWhileTheControllerIsAlive(t *testing.T) {
 	queued := catalog.DDLMigration{State: catalog.MigrationQueued}
 	var mu sync.Mutex
@@ -838,10 +804,6 @@ func TestAWaitKeepsGoingWhileTheControllerIsAlive(t *testing.T) {
 	}
 }
 
-// TestALocalDatabasesDDLWaitsForNothingItWouldOverlap (PGS-900): DDL on a
-// local database runs on its home shard at once and cannot wait its turn, so
-// it is refused while something it would overlap is unfinished -- read from
-// the operation queue, or from the snapshot on a catalog without one.
 // TestALocalDatabasesDDLWaitsForNothingItWouldOverlap (PGS-900): DDL on a
 // local database runs on its home shard at once and cannot wait its turn, so
 // it is refused while something it would overlap is unfinished -- read from
@@ -1371,5 +1333,239 @@ func TestAMigrationNoControllerIsDrivingIsReportedAsSuch(t *testing.T) {
 	}
 	if !strings.Contains(pe.Message, "no pgshard controller") || !strings.Contains(pe.Hint, "controller is running") {
 		t.Fatalf("message %q hint %q", pe.Message, pe.Hint)
+	}
+}
+
+// TestAnIdenticalDDLThatHasAlreadyRunIsNotRunAgain (PGS-916): the retry of
+// a statement whose migration finished while the client was away is told
+// the work is done, not that it is waiting for it.
+func TestAnIdenticalDDLThatHasAlreadyRunIsNotRunAgain(t *testing.T) {
+	q := &fakeQueue{}
+	q.attach = func(m catalog.DDLMigration) (catalog.EnqueueResult, bool) {
+		q.queued = append(q.queued, catalog.DDLMigration{ID: "00000000-0000-0000-0000-00000000d0e1", Statement: m.Statement, DedupKey: m.DedupKey})
+		return catalog.EnqueueResult{ID: "00000000-0000-0000-0000-00000000d0e1", Attached: true, State: catalog.MigrationComplete}, true
+	}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) { notices = append(notices, n.Message) }
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "create index orders_note_idx on orders (note)"); err != nil {
+		t.Fatal(err)
+	}
+	if len(notices) != 1 || !strings.Contains(notices[0], "identical migration 00000000-0000-0000-0000-00000000d0e1 has just completed; not running the statement again") {
+		t.Fatalf("notices %q, want the client told the work is already done", notices)
+	}
+}
+
+// TestADDLWaitWithNoApplierSaysTheControllerIsMissing (PGS-916): a queue
+// nobody is applying is not a broken connection. The client is told the
+// migration is still there and what to look at.
+func TestADDLWaitWithNoApplierSaysTheControllerIsMissing(t *testing.T) {
+	q := &fakeQueue{waitErr: errNoApplier{id: "00000000-0000-0000-0000-000000000001", state: catalog.MigrationQueued, quiet: 10 * time.Minute}}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+	_, err := conn.Exec(ctx, "create index orders_note_idx on orders (note)")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "55000" {
+		t.Fatalf("%v, want 55000: a quiet queue is not a connection failure", err)
+	}
+	if !strings.Contains(pe.Message, "no pgshard controller has been seen applying migrations") ||
+		!strings.Contains(pe.Detail, q.last(t).ID+" continues in the background") ||
+		!strings.Contains(pe.Hint, "controller is running and leading") {
+		t.Fatalf("%+v, want the migration named and the controller pointed at", pe)
+	}
+}
+
+// TestDescribeBlockersNamesWhatItIsAndWhetherItStarted (PGS-916): a client
+// waiting behind an operation that has not started is told so. Saying "in
+// progress" for a queued one describes a reshard that may never have begun
+// as running.
+func TestDescribeBlockersNamesWhatItIsAndWhetherItStarted(t *testing.T) {
+	for _, c := range []struct {
+		blocker catalog.Blocker
+		want    string
+	}{
+		{catalog.Blocker{Kind: catalog.OperationDDL, ID: "a", Reason: catalog.BlockedByStarted}, "migration a (in progress)"},
+		{catalog.Blocker{Kind: catalog.OperationDDL, ID: "a", Reason: catalog.BlockedByEarlier}, "migration a (queued before it)"},
+		{catalog.Blocker{Kind: catalog.OperationReshard, ID: "b", Reason: catalog.BlockedByStarted}, "reshard b (in progress)"},
+		{catalog.Blocker{Kind: catalog.OperationReshard, ID: "b", Reason: catalog.BlockedByEarlier}, "reshard b (queued before it)"},
+		{catalog.Blocker{Kind: catalog.OperationUpgrade, ID: "c", Reason: catalog.BlockedByStarted}, "major upgrade c (in progress)"},
+		{catalog.Blocker{Kind: catalog.OperationUpgrade, ID: "c", Reason: catalog.BlockedByEarlier}, "major upgrade c (queued before it)"},
+		{catalog.Blocker{Kind: catalog.OperationPlacement, ID: "d", Reason: catalog.BlockedByStarted}, "table placement d (in progress)"},
+		{catalog.Blocker{Kind: catalog.OperationPlacement, ID: "d", Reason: catalog.BlockedByEarlier}, "table placement d (queued before it)"},
+		// A kind this router has not heard of is named, not dropped.
+		{catalog.Blocker{Kind: "rekey", ID: "e", Reason: catalog.BlockedByStarted}, "rekey e (in progress)"},
+	} {
+		if got := describeBlockers([]catalog.Blocker{c.blocker}); got != c.want {
+			t.Errorf("%+v = %q, want %q", c.blocker, got, c.want)
+		}
+	}
+	if got, want := describeBlockers([]catalog.Blocker{
+		{Kind: catalog.OperationReshard, ID: "b", Reason: catalog.BlockedByStarted},
+		{Kind: catalog.OperationDDL, ID: "a", Reason: catalog.BlockedByEarlier},
+	}), "reshard b (in progress), migration a (queued before it)"; got != want {
+		t.Errorf("two blockers = %q, want %q", got, want)
+	}
+}
+
+// TestTheBlockerNoticeIsSentOncePerChange (PGS-915): what a queued
+// migration waits for is read on a throttle and reported when it changes.
+// Reporting it on every poll is a notice every 200ms for as long as a
+// reshard runs, and reporting it for a running migration says it is waiting
+// when it is not.
+func TestTheBlockerNoticeIsSentOncePerChange(t *testing.T) {
+	var mu sync.Mutex
+	state := catalog.MigrationRunning
+	var set []catalog.Blocker
+	asked, polls := 0, 0
+	var got [][]catalog.Blocker
+	q := &PGMigrationQueue{Poll: time.Millisecond, MaxWait: time.Hour, CatalogOutage: time.Hour, BlockersEvery: 200 * time.Millisecond,
+		queue: func(context.Context) (bool, error) { return true, nil },
+		load: func(context.Context, string) (catalog.DDLMigration, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			polls++
+			return catalog.DDLMigration{ID: "m1", State: state}, nil
+		},
+		blockers: func(context.Context, string) ([]catalog.Blocker, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked++
+			return append([]catalog.Blocker(nil), set...), nil
+		},
+		beat: func(context.Context) (time.Duration, bool, error) { return 0, true, nil },
+	}
+	read := func() (int, int, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return polls, asked, len(got)
+	}
+	waitFor := func(what string, ok func(polls, asked, notices int) bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+			if ok(read()) {
+				return
+			}
+		}
+		p, a, n := read()
+		t.Fatalf("%s: after %d polls, %d blocker reads and %d notices", what, p, a, n)
+	}
+
+	mu.Lock()
+	set = []catalog.Blocker{{Kind: catalog.OperationReshard, ID: "e5a1", Reason: catalog.BlockedByStarted}}
+	mu.Unlock()
+	done := make(chan catalog.DDLMigration, 1)
+	go func() {
+		m, err := q.Wait(context.Background(), "m1", func(bs []catalog.Blocker) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, bs)
+		})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- m
+	}()
+
+	// A running migration is not waiting for anything, so the queue is not
+	// even asked.
+	waitFor("the wait never polled", func(p, _, _ int) bool { return p >= 50 })
+	if _, a, n := read(); a != 0 || n != 0 {
+		t.Fatalf("a running migration read the blockers %d times and sent %d notices", a, n)
+	}
+
+	mu.Lock()
+	state = catalog.MigrationQueued
+	mu.Unlock()
+	waitFor("the queued migration was never told what holds it", func(_, _, n int) bool { return n >= 1 })
+	mu.Lock()
+	if len(got[0]) != 1 || got[0][0].ID != "e5a1" {
+		mu.Unlock()
+		t.Fatalf("first notice %+v", got[0])
+	}
+	mu.Unlock()
+
+	// The same blockers, polled for another while: read on the throttle,
+	// reported once.
+	start, _, _ := read()
+	waitFor("the wait stopped polling", func(p, _, _ int) bool { return p >= start+200 })
+	p, a, n := read()
+	if n != 1 {
+		t.Fatalf("%d notices for one unchanged blocker set", n)
+	}
+	if a*2 >= p {
+		t.Fatalf("the blockers were read %d times in %d polls; the throttle did nothing", a, p)
+	}
+
+	mu.Lock()
+	set = []catalog.Blocker{{Kind: catalog.OperationUpgrade, ID: "u p 1", Reason: catalog.BlockedByEarlier}}
+	mu.Unlock()
+	waitFor("a new blocker set was not reported", func(_, _, n int) bool { return n >= 2 })
+	mu.Lock()
+	if len(got[1]) != 1 || got[1][0].ID != "u p 1" {
+		mu.Unlock()
+		t.Fatalf("second notice %+v", got[1])
+	}
+	mu.Unlock()
+
+	mu.Lock()
+	set = nil
+	mu.Unlock()
+	waitFor("an emptied blocker set was not reported", func(_, _, n int) bool { return n >= 3 })
+	mu.Lock()
+	if len(got[2]) != 0 {
+		mu.Unlock()
+		t.Fatalf("third notice %+v, want the empty set", got[2])
+	}
+	mu.Unlock()
+
+	mu.Lock()
+	state = catalog.MigrationComplete
+	mu.Unlock()
+	select {
+	case m := <-done:
+		if m.State != catalog.MigrationComplete {
+			t.Fatalf("the wait ended on %q", m.State)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wait did not end when the migration completed")
+	}
+	if _, _, n := read(); n != 3 {
+		t.Fatalf("%d notices in all, want one per change", n)
+	}
+}
+
+// TestARouterLimitOnAWaitingDDLKeepsTheMigrationsDetail (PGS-921): the
+// router's own --max-query-duration ends the wait, not the session's
+// statement_timeout. The client is still owed the migration id, because the
+// migration it queued carries on without it.
+func TestARouterLimitOnAWaitingDDLKeepsTheMigrationsDetail(t *testing.T) {
+	q := &fakeQueue{delay: time.Hour}
+	h := newDDLHarness(t, q, func(h *harness) { h.maxQueryDuration = 200 * time.Millisecond })
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+	start := time.Now()
+	_, err := conn.Exec(ctx, "create index orders_note_idx on orders (note)")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "57014" || pe.Message != "canceling statement due to statement timeout" {
+		t.Fatalf("%v, want 57014 from the router's own limit", err)
+	}
+	if !strings.Contains(pe.Detail, q.last(t).ID+" continues in the background") ||
+		!strings.Contains(pe.Detail, "The router stops a statement after 200ms.") ||
+		!strings.Contains(pe.Hint, "pgshard.migrations_public WHERE id = '"+q.last(t).ID+"'") {
+		t.Fatalf("detail %q hint %q, want both which clock ran out and the migration that continues", pe.Detail, pe.Hint)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the wait ended after %s", took)
 	}
 }

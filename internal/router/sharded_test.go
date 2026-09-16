@@ -35,14 +35,14 @@ func newShardedHarness(t testing.TB) *shardedHarness {
 
 // newShardedHarnessWith is newShardedHarness with cfg's Scatter and
 // Decisions settings.
-func newShardedHarnessWith(t testing.TB, cfg Config) *shardedHarness {
+func newShardedHarnessWith(t testing.TB, cfg Config, opts ...func(*harness)) *shardedHarness {
 	t.Helper()
-	return newShardedHarnessShards(t, cfg, 4)
+	return newShardedHarnessShards(t, cfg, 4, opts...)
 }
 
 // newShardedHarnessShards is newShardedHarnessWith over a chosen number of
 // shards.
-func newShardedHarnessShards(t testing.TB, cfg Config, shards int) *shardedHarness {
+func newShardedHarnessShards(t testing.TB, cfg Config, shards int, opts ...func(*harness)) *shardedHarness {
 	t.Helper()
 	ranges, err := placement.Split(shards)
 	if err != nil {
@@ -75,6 +75,9 @@ func newShardedHarnessShards(t testing.TB, cfg Config, shards int) *shardedHarne
 	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "eventlog"}] = snapshot.Placement{Placement: "sharded", ShardKey: "event_id", ShardKeyChecked: true, SequenceColumns: []string{"event_id"}}
 	snap.Sequences = map[string]bool{"invoice_numbers": true}
 	h := &harness{subs: map[chan snapshot.Change]struct{}{}}
+	for _, opt := range opts {
+		opt(h)
+	}
 	h.snapp.Store(snap)
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(pl.Close)

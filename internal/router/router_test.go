@@ -28,8 +28,11 @@ type harness struct {
 	r          *Router
 	srv        *pgwire.Server
 	snapp      atomic.Pointer[snapshot.Snapshot]
-	subsMu     sync.Mutex
-	subs       map[chan snapshot.Change]struct{}
+	// maxQueryDuration is the router-wide statement limit the server is
+	// built with, when a test sets one before startHarness runs.
+	maxQueryDuration time.Duration
+	subsMu           sync.Mutex
+	subs             map[chan snapshot.Change]struct{}
 }
 
 func (h *harness) snap() *snapshot.Snapshot { return h.snapp.Load() }
@@ -106,7 +109,7 @@ func startHarness(t testing.TB, h *harness, cfg Config) {
 		}
 		return "", ErrUnknownRole
 	}
-	pcfg := pgwire.Config{Authenticator: pgwire.SCRAMAuthenticator{Lookup: lookup}, NewExecutor: r.NewExecutor}
+	pcfg := pgwire.Config{Authenticator: pgwire.SCRAMAuthenticator{Lookup: lookup}, NewExecutor: r.NewExecutor, MaxQueryDuration: h.maxQueryDuration}
 	var srv *pgwire.Server
 	pcfg.CancelHandler = func(ctx context.Context, key pgwire.CancelKey) { r.CancelHandler(srv)(ctx, key) }
 	srv, err = pgwire.NewServer(pcfg)
