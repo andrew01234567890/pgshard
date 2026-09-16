@@ -59,6 +59,12 @@ func (q *fakeQueue) HomeDDLBlockers(context.Context, string) ([]catalog.Blocker,
 	return q.home, q.homeQueued, nil
 }
 
+func (q *fakeQueue) QueueSchema(context.Context) (bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.homeQueued, nil
+}
+
 func (q *fakeQueue) Wait(ctx context.Context, id string, waiting func([]catalog.Blocker)) (catalog.DDLMigration, error) {
 	q.mu.Lock()
 	q.waited++
@@ -1109,5 +1115,51 @@ func TestOneStatementIsAnsweredOnce(t *testing.T) {
 				t.Fatalf("%d command tags for one statement: %v", tags, got)
 			}
 		})
+	}
+}
+
+// TestFanOutDDLDuringAReshardOnAQueuelessCatalogIsRefusedAtOnce: a router
+// newer than its catalog is an ordinary moment in a rollout. Without the
+// operation queue there is nowhere for a migration to wait its turn, and
+// the applier holds it for the whole copy -- so the router that used to
+// refuse it in milliseconds waited ten minutes and then told the client no
+// controller had been seen applying migrations, while one was running and
+// leading.
+func TestFanOutDDLDuringAReshardOnAQueuelessCatalogIsRefusedAtOnce(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+
+	// The catalog has no queue: q.homeQueued is false, so QueueSchema is.
+	base := *h.snap
+	resharding := base
+	resharding.Serving = map[snapshot.ShardKey]snapshot.Serving{}
+	for k, v := range base.Serving {
+		resharding.Serving[k] = v
+	}
+	resharding.Serving[snapshot.ShardKey{ShardSet: "g2", ShardID: 0}] = snapshot.Serving{State: "provisioning"}
+	h.setSnap(&resharding)
+
+	start := time.Now()
+	_, err := conn.Exec(ctx, "alter table orders add column extra int")
+	if err == nil {
+		t.Fatal("fan-out DDL during a reshard on a catalog without the queue was accepted")
+	}
+	if !strings.Contains(err.Error(), "not available while a reshard is active") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the refusal took %s; it is meant to be immediate", time.Since(start))
+	}
+	if len(q.queued) != 0 {
+		t.Fatalf("the statement was queued into a catalog that has no queue: %d", len(q.queued))
+	}
+
+	// With the queue there, the same statement is queued rather than
+	// refused: that is the whole point, and this is the control.
+	q.homeQueued = true
+	if _, err := conn.Exec(ctx, "alter table orders add column extra2 int"); err != nil {
+		t.Fatalf("with the queue, the statement should be queued and applied: %v", err)
 	}
 }

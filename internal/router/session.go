@@ -658,8 +658,13 @@ func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, e
 	if err == nil && pl.Kind == plan.MigrationKind && e.catalogSession() {
 		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
 	}
-	if err == nil && pl.HomeDDL && !e.catalogSession() {
-		err = e.checkHomeDDL(ctx)
+	if err == nil && !e.catalogSession() {
+		switch {
+		case pl.HomeDDL:
+			err = e.checkHomeDDL(ctx)
+		case pl.Kind == plan.MigrationKind:
+			err = e.checkFanoutDDL(ctx)
+		}
 	}
 	if err != nil {
 		var perr *pgwire.Error

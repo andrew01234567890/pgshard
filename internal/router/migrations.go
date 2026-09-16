@@ -41,6 +41,10 @@ type MigrationQueue interface {
 	// would overlap; queued is false for a catalog without the operation
 	// queue, where the caller keeps its own check.
 	HomeDDLBlockers(ctx context.Context, database string) (blockers []catalog.Blocker, queued bool, err error)
+	// QueueSchema reports whether the catalog has the operation queue at
+	// all. A router newer than its catalog keeps the refusals it had
+	// before rather than queueing into something that is not there.
+	QueueSchema(ctx context.Context) (bool, error)
 }
 
 // PGMigrationQueue queues migrations in pgshard.migrations of the catalog
@@ -132,6 +136,9 @@ func (q *PGMigrationQueue) queued(ctx context.Context) (bool, error) {
 	q.queuePresent, q.queueChecked = present, time.Now()
 	return present, nil
 }
+
+// QueueSchema implements MigrationQueue.
+func (q *PGMigrationQueue) QueueSchema(ctx context.Context) (bool, error) { return q.queued(ctx) }
 
 // Enqueue implements MigrationQueue.
 func (q *PGMigrationQueue) Enqueue(ctx context.Context, m catalog.DDLMigration) (catalog.EnqueueResult, error) {
@@ -593,6 +600,36 @@ func parseTimeGUC(v string) time.Duration {
 		return 0
 	}
 	return time.Duration(n * float64(scale))
+}
+
+// checkFanoutDDL refuses a fanned-out migration while a reshard copies, on
+// a catalog that has no operation queue to wait in.
+//
+// With the queue, the migration is enqueued and waits its turn, which is
+// the point of all this. Without it, the applier holds the migration for
+// the whole copy while the router waits for progress that cannot come, and
+// after ten minutes tells the client no controller has been seen applying
+// migrations -- when one is running and leading, and a reshard is simply
+// holding the migration. A router newer than its catalog is an ordinary
+// moment in a rollout, and this is the refusal it used to give in
+// milliseconds.
+func (e *Executor) checkFanoutDDL(ctx context.Context) error {
+	if e.r.cfg.Migrations == nil {
+		return nil
+	}
+	queued, err := e.r.cfg.Migrations.QueueSchema(ctx)
+	if err != nil {
+		return pgwire.Errorf(codeConnectionFailure, "reading the operation queue: %v", err)
+	}
+	if queued {
+		return nil
+	}
+	if snap := e.r.cfg.Snapshot(); snap != nil && snap.Resharding() {
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
+		err.Hint = "retry once the reshard completes; a catalog migrated to the operation queue queues the statement instead of refusing it"
+		return err
+	}
+	return nil
 }
 
 // checkHomeDDL refuses DDL a local database runs directly on its home shard
