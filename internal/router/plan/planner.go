@@ -1107,6 +1107,14 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	// there being more than one place to run a statement, not about the
 	// statement. The same holds for a statement about a local schema.
 	if w.homeOnly() {
+		// CALL and DO reach this fallback too, and they are not schema
+		// changes: marking them would refuse every stored procedure a
+		// session calls for as long as any reshard in the cluster runs,
+		// which is hours, with a message about schema changes.
+		switch node.GetNode().(type) {
+		case *pgquerypb.Node_CallStmt, *pgquerypb.Node_DoStmt:
+			return w.homeStatement()
+		}
 		return w.homeDDL()
 	}
 	// Fail closed: a statement shape the planner does not recognise could

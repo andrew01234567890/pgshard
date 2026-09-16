@@ -426,7 +426,11 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 				return err
 			}
 		}
-		return w.CommandComplete(m.Kind)
+		// The caller sends the command tag, synchronously or not. Sending
+		// it here too put two CommandComplete frames on the wire for one
+		// statement, which PostgreSQL never does and which desynchronises
+		// a client that pairs one tag with one Execute.
+		return nil
 	}
 	waitCtx, stop := ctx, context.CancelFunc(func() {})
 	if d := e.statementTimeout(); d > 0 {

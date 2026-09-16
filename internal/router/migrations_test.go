@@ -1045,3 +1045,69 @@ func TestAnAtomicDatabaseStillRefusesDDLInATransaction(t *testing.T) {
 		t.Fatalf("queued %d migrations", len(q.queued))
 	}
 }
+
+// TestOneStatementIsAnsweredOnce counts the command tags on the wire.
+//
+// A statement gets exactly one CommandComplete, whatever it did and
+// whichever protocol carried it. The async branch used to send its own on
+// top of the one the caller sends, so every DDL under pgshard.ddl_async put
+// two on the wire -- which PostgreSQL never does, and which desynchronises
+// a client that pairs one tag with one Execute. Reading the command tag
+// cannot see it: a driver keeps the last one, and both are the same.
+func TestOneStatementIsAnsweredOnce(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		name := "sync"
+		if async {
+			name = "async"
+		}
+		t.Run(name, func(t *testing.T) {
+			q := &fakeQueue{}
+			if async {
+				q.delay = time.Hour
+			}
+			h := newDDLHarness(t, q)
+			ctx := context.Background()
+			conn := h.connect(t, h.dsn())
+			if async {
+				if _, err := conn.Exec(ctx, "set pgshard.ddl_async = on"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hj, err := conn.PgConn().Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = hj.Conn.Close() }()
+			fe := hj.Frontend
+
+			fe.Send(&pgproto3.Parse{Query: "create index concurrently orders_id on orders (id)"})
+			fe.Send(&pgproto3.Bind{})
+			fe.Send(&pgproto3.Execute{})
+			fe.Send(&pgproto3.Sync{})
+			if err := fe.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			_ = hj.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			var got []string
+			for {
+				m, err := fe.Receive()
+				if err != nil {
+					t.Fatalf("receive: %v (got %v)", err, got)
+				}
+				got = append(got, fmt.Sprintf("%T", m))
+				if _, done := m.(*pgproto3.ReadyForQuery); done {
+					break
+				}
+			}
+			tags := 0
+			for _, m := range got {
+				if m == "*pgproto3.CommandComplete" {
+					tags++
+				}
+			}
+			if tags != 1 {
+				t.Fatalf("%d command tags for one statement: %v", tags, got)
+			}
+		})
+	}
+}
