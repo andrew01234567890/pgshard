@@ -45,6 +45,26 @@ func (TrustAuthenticator) Authenticate(context.Context, map[string]string, AuthE
 // could never be verified, and the method is deprecated in PostgreSQL 18.
 type PasswordLookup func(ctx context.Context, user string) (string, error)
 
+// ErrLookupUnavailable marks a PasswordLookup failure that says nothing
+// about the role: the store the credentials live in could not be read.
+//
+// Every other error is an answer about the role, and stays
+// indistinguishable from a wrong password -- that is what the mock exchange
+// below is for. A failure to look at all is not: it told a client with the
+// right password that its password was wrong, and 28P01 is final to every
+// driver there is, so a connection that would have succeeded a second later
+// was never retried. A cluster moving to issued TLS lost writes that way.
+var ErrLookupUnavailable = errors.New("pgwire: the credential lookup could not be made")
+
+// lookupUnavailable is what a client is told instead. It names no role and
+// carries no detail of the failure -- the same answer for every user, and
+// nothing of the control plane on the wire.
+func lookupUnavailable() *Error {
+	e := Errorf(CodeCannotConnectNow, "the router cannot check credentials at the moment")
+	e.Hint = "the connection can be retried"
+	return e
+}
+
 func authFailed() error {
 	return Errorf(CodeInvalidPassword, "password authentication failed")
 }
@@ -65,6 +85,9 @@ func (a CleartextAuthenticator) Authenticate(ctx context.Context, startup map[st
 		return nil, Errorf(CodeProtocolViolation, "expected password response, got %T", reply)
 	}
 	secret, err := a.Lookup(ctx, user)
+	if errors.Is(err, ErrLookupUnavailable) {
+		return nil, lookupUnavailable()
+	}
 	if err != nil {
 		return nil, authFailed()
 	}
@@ -148,6 +171,9 @@ func (a SCRAMAuthenticator) Authenticate(ctx context.Context, startup map[string
 		return nil, Errorf(CodeInvalidAuthorization, "client selected an invalid SASL authentication mechanism %q", initial.AuthMechanism)
 	}
 	secret, err := a.Lookup(ctx, user)
+	if errors.Is(err, ErrLookupUnavailable) {
+		return nil, lookupUnavailable()
+	}
 	// A refusal that names the role -- NOLOGIN, an expired password -- is
 	// held until the client has proved it knows the password. Relaying it
 	// here answered "does this role exist?" for anyone who asked, since an

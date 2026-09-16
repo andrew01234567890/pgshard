@@ -144,10 +144,22 @@ func TestRoleCacheReloadsOnMissAndTTL(t *testing.T) {
 	if q.calls <= before {
 		t.Errorf("finding a new role took no catalog read: calls %d -> %d", before, q.calls)
 	}
+	// A catalog this router cannot read says nothing about anyone's
+	// password: the roles last read are served for a bounded while rather
+	// than every login being refused. Refusing them told clients with the
+	// right credentials that they were wrong, and 28P01 is final to every
+	// driver there is.
 	q.err = errors.New("catalog down")
 	now = now.Add(2 * time.Minute)
-	if _, err := c.Lookup(ctx, "alice"); err == nil || errors.Is(err, ErrUnknownRole) {
-		t.Fatalf("catalog failure must surface, got %v", err)
+	if v, err := c.Lookup(ctx, "alice"); err != nil || v != "v3" {
+		t.Fatalf("through a catalog outage the roles last read must still serve: %q %v", v, err)
+	}
+	// Past that, the client is told the router cannot check -- retryably,
+	// which is the whole difference from a wrong password.
+	now = now.Add(c.ttl + c.staleFor)
+	_, err := c.Lookup(ctx, "alice")
+	if err == nil || errors.Is(err, ErrUnknownRole) || !errors.Is(err, pgwire.ErrLookupUnavailable) {
+		t.Fatalf("past the window the failure must surface as unavailable, got %v", err)
 	}
 }
 

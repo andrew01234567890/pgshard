@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,7 +24,10 @@ var ErrUnknownRole = errors.New("router: unknown role")
 type RoleCache struct {
 	q   catalog.Querier
 	ttl time.Duration
-	now func() time.Time
+	// staleFor is how long past the ttl the last roles are still served
+	// when the catalog cannot be read.
+	staleFor time.Duration
+	now      func() time.Time
 	// load reads the roles; the catalog by default.
 	load func(context.Context) (*snapshot.Roles, error)
 
@@ -60,12 +64,21 @@ func MockAuthNonce(ctx context.Context, q catalog.Querier) ([]byte, error) {
 	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[[]byte])
 }
 
+// DefaultRolesStaleFor is how long past the ttl a router keeps serving the
+// roles it last read while it cannot read them again.
+//
+// A revocation is written to the catalog, so one cannot be issued through a
+// catalog this router cannot reach either; what the window really covers is
+// a partition that reaches the catalog but not this router, and there it
+// buys the same time the sessions already open have anyway.
+const DefaultRolesStaleFor = time.Minute
+
 // NewRoleCache builds a cache over q; ttl <= 0 means 5s.
 func NewRoleCache(q catalog.Querier, ttl time.Duration) *RoleCache {
 	if ttl <= 0 {
 		ttl = 5 * time.Second
 	}
-	c := &RoleCache{q: q, ttl: ttl, now: time.Now}
+	c := &RoleCache{q: q, ttl: ttl, staleFor: DefaultRolesStaleFor, now: time.Now}
 	c.load = func(ctx context.Context) (*snapshot.Roles, error) { return snapshot.LoadRoles(ctx, c.q) }
 	return c
 }
@@ -118,7 +131,20 @@ func (c *RoleCache) fresh(ctx context.Context) (*rolesAt, error) {
 	if cur := c.cur.Load(); cur != nil && c.now().Sub(cur.at) <= c.ttl {
 		return cur, nil
 	}
-	return c.loadLocked(ctx)
+	cur, err := c.loadLocked(ctx)
+	if err == nil {
+		return cur, nil
+	}
+	// A catalog this router cannot read says nothing about anyone's
+	// password. Refusing every login on it told clients with the right
+	// credentials that they were wrong -- 28P01, which every driver takes
+	// as final -- for as long as the read kept failing. The roles last read
+	// are served instead, for a bounded while, and only past that is the
+	// client told, retryably, that the router cannot check.
+	if prev := c.cur.Load(); prev != nil && c.now().Sub(prev.at) <= c.ttl+c.staleFor {
+		return prev, nil
+	}
+	return nil, fmt.Errorf("%w: %w", pgwire.ErrLookupUnavailable, err)
 }
 
 // reloadForMiss reads the catalog again because a role was not in the
