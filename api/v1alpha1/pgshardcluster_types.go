@@ -284,7 +284,11 @@ type BackupSpec struct {
 
 // ReshardingSpec controls resharding behaviour.
 type ReshardingSpec struct {
+	// RetireOldGroupsAfter is how long the old groups stay after the write
+	// switch, keeping a rollback possible. 0 deletes them as soon as the
+	// reshard completes.
 	// +kubebuilder:default="24h"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retireOldGroupsAfter must not be negative"
 	// +optional
 	RetireOldGroupsAfter *metav1.Duration `json:"retireOldGroupsAfter,omitempty"`
 	// +kubebuilder:validation:Enum=none;switchWrites;complete

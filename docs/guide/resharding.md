@@ -118,6 +118,15 @@ the volumes the operator provisions for the new members, and note that the
 window is a day by default: lowering `retireOldGroupsAfter` shortens it at
 the cost of the interval in which switching back is still cheap.
 
+`retireOldGroupsAfter: 0s` removes that interval altogether: the run
+completes on the controller's next pass after the write switch, and the
+operator deletes the old groups when it next looks -- within seconds once
+it has seen the run reach its last phase, and within its usual half minute
+otherwise. There is then no rollback
+(to keep a manual gate, set `pauseBefore: complete` as well), and a change
+stream consumer that is behind has no time left to read past the reshard
+before the old set's slots are dropped with its groups.
+
 Each source carries one replication slot per target it feeds
 (`pgshard_reshard_<target>_<table set>_<source>`), so a 1→2 split puts two
 on the source and a 2→1 merge puts one on each. A slot holds WAL on its

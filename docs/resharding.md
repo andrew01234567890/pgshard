@@ -401,6 +401,14 @@ At `0s` it does not hold at all: the run completes and the operator deletes
 the old groups on the pass that sees the switch, so there is no window to
 switch back in. `pauseBefore: complete` still holds a `0s` run, because an
 operator's pause is not a timer.
+
+The operator mirrors the window into the workflow spec as
+`retire_after_ms`; a spec written by an operator from before that key has
+only `retire_after_seconds`, where `0` still means the default, which is
+why both are read. `status.cutover.retire_at` records when the old groups
+retire, and the operation queue derives the same deadline from the switch
+and the spec when it is not there
+([operation-queue.md](operation-queue.md)).
 `completing` drops the forward and reverse subscriptions, slots and
 publications on both sides and ends the workflow at `completed`. The
 operator then deletes the retired groups' pods, PVCs and Services; their

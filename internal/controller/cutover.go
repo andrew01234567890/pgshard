@@ -89,6 +89,9 @@ type cutoverState struct {
 	PauseMS    int64      `json:"pause_ms,omitempty"`
 	FenceMS    int64      `json:"fence_ms,omitempty"`
 	SwitchedAt *time.Time `json:"switched_at,omitempty"`
+	// RetireAt is when the old groups retire: the switch plus the window
+	// the operator mirrored.
+	RetireAt *time.Time `json:"retire_at,omitempty"`
 	// DisablingAt records that THIS run is the one turning the forward
 	// subscriptions off, so a resume can tell its own half-finished swap
 	// from a subscription an operator disabled by hand. Saved before the
@@ -158,6 +161,10 @@ type cutoverSpec struct {
 	PauseBefore        string   `json:"pause_before"`
 	Proceed            []string `json:"proceed"`
 	RetireAfterSeconds int64    `json:"retire_after_seconds"`
+	// RetireAfterMS, when present, is the window the operator mirrored, and
+	// 0 means none; without it RetireAfterSeconds is read as before, 0
+	// meaning DefaultRetireAfter.
+	RetireAfterMS *int64 `json:"retire_after_ms,omitempty"`
 	// Rollback asks a switched run to return serving to the sources while
 	// the retirement window keeps them current over reverse replication.
 	Rollback bool `json:"rollback"`
@@ -168,6 +175,12 @@ func (s cutoverSpec) paused(point string) bool {
 }
 
 func (s cutoverSpec) retireAfter() time.Duration {
+	// A negative window is not a shorter one: nothing writes it (the CRD
+	// refuses it), and reading it as none would delete the old groups of a
+	// run an operator meant to keep.
+	if s.RetireAfterMS != nil && *s.RetireAfterMS >= 0 {
+		return time.Duration(*s.RetireAfterMS) * time.Millisecond
+	}
 	if s.RetireAfterSeconds > 0 {
 		return time.Duration(s.RetireAfterSeconds) * time.Second
 	}
@@ -932,7 +945,9 @@ func (c *Copier) abortSwitch(ctx context.Context, wf *copyWorkflow, ops cutoverO
 // the complete pause (if any) was released.
 func (c *Copier) retire(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	if wf.cutover.SwitchedAt != nil {
-		if remaining := wf.cutover.SwitchedAt.Add(wf.spec.retireAfter()).Sub(c.now()); remaining > 0 {
+		retireAt := wf.cutover.SwitchedAt.Add(wf.spec.retireAfter())
+		wf.cutover.RetireAt = &retireAt
+		if remaining := retireAt.Sub(c.now()); remaining > 0 {
 			return false, c.saveCutover(ctx, wf, fmt.Sprintf("switched: old groups retire in %s", remaining.Round(time.Second)))
 		}
 	}

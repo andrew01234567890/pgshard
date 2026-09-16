@@ -40,7 +40,7 @@ Print columns: Shards, Ready, Age.
 | `spec.backup.policyRef` | string | name of a PgShardBackupPolicy |
 | `spec.networkPolicy.enabled` | bool | default false; renders `<cluster>-members` (see [operator.md](operator.md#network-policy)) |
 | `spec.networkPolicy.clients` | []networkingv1.NetworkPolicyPeer | peers admitted to 5432/9090/9091 besides the cluster's own pods; CEL: non-empty while `enabled` ("networkPolicy.clients must name the control plane") |
-| `spec.resharding.retireOldGroupsAfter` | Duration | default `24h`; CEL: `>= 0s`. **`0s` retires the old groups as soon as the switch lands**, with no rollback window: the operator deletes them on the pass that sees the cutover complete, rather than waiting. Use it where the storage of a doubled cluster costs more than the ability to switch back |
+| `spec.resharding.retireOldGroupsAfter` | Duration | default `24h`; CEL: `>= 0s`, so a negative window is refused. **`0s` retires the old groups as soon as the switch lands**, with no rollback window: the operator deletes them on the pass that sees the cutover complete, rather than waiting. Use it where the storage of a doubled cluster costs more than the ability to switch back |
 | `spec.resharding.pauseBefore` | enum | `none` (default), `switchWrites`, `complete` |
 | `spec.upgrade.strategy` | enum | `online` (default), `offline` |
 | `spec.upgrade.maxParallelGroups` | int | default 1, min 1 |

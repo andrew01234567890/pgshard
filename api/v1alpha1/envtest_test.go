@@ -890,3 +890,28 @@ func TestADurabilityPromiseCanBeKept(t *testing.T) {
 		t.Fatalf("the unsafe single-replica mode must stay usable: %v", err)
 	}
 }
+
+// retireOldGroupsAfter may be zero -- no rollback window -- but not negative.
+func TestClusterRetireOldGroupsAfterMustNotBeNegative(t *testing.T) {
+	for _, c := range []struct {
+		window string
+		ok     bool
+	}{{"0s", true}, {"90m", true}, {"-1h", false}} {
+		obj := validCluster("retire-" + strings.TrimPrefix(strings.ReplaceAll(c.window, "-", "neg"), ""))
+		d, err := time.ParseDuration(c.window)
+		if err != nil {
+			t.Fatal(err)
+		}
+		obj.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: d}
+		// create, not k8sClient.Create: it is what skips when envtest is
+		// not available, and it cleans the object up. Going around it
+		// dereferenced a nil client and panicked the package.
+		err = create(t, obj)
+		if c.ok && err != nil {
+			t.Errorf("%s refused: %v", c.window, err)
+		}
+		if !c.ok && (err == nil || !strings.Contains(err.Error(), "must not be negative")) {
+			t.Errorf("%s accepted: %v", c.window, err)
+		}
+	}
+}
