@@ -78,7 +78,8 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    another beside. pgroll's `rename_column` and `drop_column` send nothing
    at start, so on a shard key they are refused only at complete, after
    pgroll has dropped the previous version schema; the table is untouched
-   and pgroll's rollback succeeds.
+   and pgroll's rollback succeeds. What an operator has to set up before
+   running pgroll at all is in [guide/pgroll.md](guide/pgroll.md).
 
    **Strategies.** Forms that would hold a strong lock for the length of a
    table scan or an index build are rewritten so no step takes a long

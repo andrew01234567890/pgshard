@@ -12,6 +12,7 @@
 | [Getting started](guide/getting-started.md) | Install the operator, create a `PgShardCluster`, connect with psql |
 | [Defining sharding](guide/sharding.md) | Databases, sharded/reference tables, shard ranges, global sequences — all as SQL on the catalog |
 | [Queries, DDL and DCL](guide/queries.md) | What routes where, scatter reads, reference tables, online DDL, the refusal list |
+| [Running pgroll](guide/pgroll.md) | The expand/contract migration tool against a sharded cluster: what to set up, what is supported, what is refused |
 | [Transactions](guide/transactions.md) | Single-shard commit, two-phase commit, in-doubt semantics, retry guidance |
 | [Backups and restore](guide/backup-restore.md) | Object stores, schedules, PITR, certified barriers |
 | [Resharding](guide/resharding.md) | Declaring range and key changes; current workflow status |
