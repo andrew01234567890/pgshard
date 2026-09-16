@@ -114,6 +114,20 @@ would collapse its last step into its first. A failed migration never stands
 in for a new one, so a statement run again after a failure runs again.
 `SET pgshard.ddl_dedup = off` turns attaching off for a session.
 
+A statement whose **second run is the work again** never attaches to a
+completed migration, however recent: `REINDEX`, `VACUUM` and `ALTER
+SEQUENCE`. Running one of those is asking for its effect now, against the
+state now — an `ALTER SEQUENCE … RESTART` sent again after the application
+has consumed a few thousand values is not the earlier one repeated.
+Attaching to a migration that is still **queued or running** is always
+right, for any kind: the work has not happened yet.
+
+The promise is only made where the catalog can keep it. A catalog without
+the operation queue has no `dedup_key` column, so the enqueue drops the key
+and the timeout's DETAIL says only that the migration continues — telling a
+client its retry will wait, where nothing can attach, is how the retry runs
+the statement twice.
+
 ## Reading the queue
 
 `pgshard.operation_queue` is the queue in arrival order, in one row per
@@ -135,6 +149,14 @@ SELECT position, kind, command, state, waiting_for, progress_bar, detail
 The view never shows a statement that sets a password or a verifier; those
 rows carry the command only. The admin UI serves the same rows at `/queue`
 and `/api/v1/queue` ([admin.md](admin.md), [guide/admin-ui.md](guide/admin-ui.md)).
+
+Every entry carries what it waits for, and a queue `N` deep behind one
+reshard holds `O(N²)` of those between them, so a reader takes the head of
+the queue rather than all of it: the admin reads the first 200 entries, with
+at most 20 blockers each, and `pgshard.operation_queue_depth()` for the
+total, so a long queue is reported as long rather than served in full to a
+page nobody can read. Reading the view directly is unbounded, which is fine
+for `psql` and is not what a page refreshing every two seconds should do.
 
 ## Where the gates are
 
