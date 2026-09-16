@@ -45,6 +45,17 @@ func internalTLSPhase(c *pgshardv1alpha1.PgShardCluster) string {
 	return c.Status.InternalTLS.Move.Phase
 }
 
+// internalTLSAcceptsPlaintext reports whether the step the move is in still
+// renders listeners that take a plaintext connection. The last step does
+// not: that is what makes the move's end mean what it says.
+func internalTLSAcceptsPlaintext(c *pgshardv1alpha1.PgShardCluster) bool {
+	switch internalTLSPhase(c) {
+	case pgshardv1alpha1.InternalTLSAccepting, pgshardv1alpha1.InternalTLSDialing:
+		return true
+	}
+	return false
+}
+
 func tlsMode(mode string) bool {
 	return mode == "issued" || strings.HasPrefix(mode, "secret:")
 }
@@ -97,10 +108,21 @@ func (r *ClusterReconciler) reconcileInternalTLSMove(ctx context.Context, c *pgs
 			return err
 		}
 		if len(left) == 0 {
+			move.Phase = pgshardv1alpha1.InternalTLSClosing
+			waiting = "every member, router and controller pod to stop accepting plaintext"
+		} else {
+			waiting = "router pods still dialling plaintext: " + strings.Join(left, ", ")
+		}
+	case move.Phase == pgshardv1alpha1.InternalTLSClosing:
+		left, err := r.podsBehindTheMove(ctx, c, base)
+		if err != nil {
+			return err
+		}
+		if len(left) == 0 {
 			st.Mode = internalTLSModeOf(c.Namespace, move.Target)
 			st.Move = nil
 		} else {
-			waiting = "router pods still dialling plaintext: " + strings.Join(left, ", ")
+			waiting = "pods still accepting plaintext: " + strings.Join(left, ", ")
 		}
 	}
 	if st.Move != nil {
@@ -157,8 +179,9 @@ func internalTLSModeOf(namespace string, spec pgshardv1alpha1.InternalTLSSpec) s
 // podsBehindTheMove names the pods not yet rendered in the step the move is
 // in (base, the status as the pass found it). Terminating pods count: a
 // router being drained keeps dialling, and a member being replaced keeps
-// serving, until it is gone. In Accepting that is every member, router and
-// controller pod; in Dialing only routers, since nothing else changes.
+// serving, until it is gone. In Accepting and in Closing that is every
+// member, router and controller pod; in Dialing only routers, since nothing
+// else changes.
 func (r *ClusterReconciler) podsBehindTheMove(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster) ([]string, error) {
 	phase := internalTLSPhase(base)
 	var pods corev1.PodList

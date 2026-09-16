@@ -154,9 +154,26 @@ func TestAMoveToTLSWaitsForEveryPodOfTheStepBefore(t *testing.T) {
 	for _, name := range []string{"moving-router-a", "moving-router-old"} {
 		annotate(name, pgshardv1alpha1.InternalTLSDialing)
 	}
+	// Every router dials TLS, so nothing dials plaintext any more and the
+	// listeners can stop taking it. That is a step of its own: while every
+	// pod still carries --tls-accept-plaintext the cluster does accept
+	// plaintext, so the move is not finished and must not say it is.
+	stored, rendered = pass(t, r, c)
+	if phaseOf(stored) != pgshardv1alpha1.InternalTLSClosing {
+		t.Fatalf("every router dials TLS, yet the move is %q; want Closing", phaseOf(stored))
+	}
+	if acceptsPlaintext(t, rendered) {
+		t.Error("the Closing step still renders --tls-accept-plaintext")
+	}
+	if stored, _ = pass(t, r, c); stored.Status.InternalTLS.Move == nil {
+		t.Fatal("the move finished while no pod had rolled out of accepting plaintext")
+	}
+	for _, name := range []string{"moving-shard-0-0", "moving-router-a", "moving-router-old", "moving-controller-x"} {
+		annotate(name, pgshardv1alpha1.InternalTLSClosing)
+	}
 	stored, rendered = pass(t, r, c)
 	if st := stored.Status.InternalTLS; st.Move != nil || st.Mode != "issued" || phaseOf(rendered) != "" {
-		t.Fatalf("every router dials TLS: recorded %+v, rendered phase %q; want the move complete in mode issued", st, phaseOf(rendered))
+		t.Fatalf("no pod accepts plaintext: recorded %+v, rendered phase %q; want the move complete in mode issued", st, phaseOf(rendered))
 	}
 	if cond := meta.FindStatusCondition(stored.Status.Conditions, pgshardv1alpha1.ConditionInternalTLSMoving); cond == nil || cond.Status != metav1.ConditionFalse {
 		t.Fatalf("the moving condition after the move: %+v", cond)
@@ -321,4 +338,25 @@ func TestAClusterFirstSeenMidwayRecordsWhatItRuns(t *testing.T) {
 	if internalTLSPhase(stored) != pgshardv1alpha1.InternalTLSAccepting {
 		t.Fatalf("a cluster whose routers still run --insecure-dev under a spec saying issue: true recorded %+v; want the move started", stored.Status.InternalTLS)
 	}
+}
+
+// acceptsPlaintext reports whether anything the cluster renders still takes
+// a plaintext connection.
+func acceptsPlaintext(t *testing.T, c *pgshardv1alpha1.PgShardCluster) bool {
+	t.Helper()
+	g := Groups(c)[1]
+	pod := Renderer{}.Pod(c, g, 0, "primary", "pvc", Template(c, g, nil, nil))
+	lists := [][]string{
+		Renderer{}.RouterDeployment(c).Spec.Template.Spec.Containers[0].Args,
+		Renderer{}.ControllerDeployment(c).Spec.Template.Spec.Containers[0].Args,
+	}
+	for _, ct := range pod.Spec.Containers {
+		lists = append(lists, ct.Args)
+	}
+	for _, args := range lists {
+		if slices.Contains(args, "--tls-accept-plaintext") {
+			return true
+		}
+	}
+	return false
 }

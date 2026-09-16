@@ -708,7 +708,7 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		if internalTLS(c).Issue {
 			args = append(args, "--tls-authorize-callers")
 		}
-		if internalTLSPhase(c) != "" {
+		if internalTLSAcceptsPlaintext(c) {
 			args = append(args, "--tls-accept-plaintext")
 		}
 		mounts = append(mounts, corev1.VolumeMount{Name: vol, MountPath: dir, ReadOnly: true})

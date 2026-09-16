@@ -103,7 +103,7 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 		if internalTLS(c).Issue {
 			args = append(args, "--tls-authorize-callers", "--agent-tls-server-name="+IssuedMemberServerName(c))
 		}
-		if internalTLSPhase(c) != "" {
+		if internalTLSAcceptsPlaintext(c) {
 			args = append(args, "--tls-accept-plaintext")
 		}
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
@@ -150,11 +150,16 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 			},
 		},
 	}
-	// The controller is rendered alike in both steps -- it serves TLS and
-	// plaintext and dials each agent by its pod -- so it records the first,
-	// and moving to the second does not roll it.
-	if internalTLSPhase(c) != "" {
-		dep.Spec.Template.Annotations[AnnotationInternalTLSPhase] = pgshardv1alpha1.InternalTLSAccepting
+	// The controller is rendered alike in the first two steps -- it serves
+	// TLS and plaintext and dials each agent by its pod -- so it records the
+	// first, and moving to the second does not roll it. The last step does
+	// change it, so that one is recorded as itself and rolls it.
+	if phase := internalTLSPhase(c); phase != "" {
+		stamp := pgshardv1alpha1.InternalTLSAccepting
+		if phase == pgshardv1alpha1.InternalTLSClosing {
+			stamp = phase
+		}
+		dep.Spec.Template.Annotations[AnnotationInternalTLSPhase] = stamp
 	}
 	return dep
 }

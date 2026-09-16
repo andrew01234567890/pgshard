@@ -1881,6 +1881,7 @@ spec:
                         enum:
                         - Accepting
                         - Dialing
+                        - Closing
                         type: string
                       startedAt:
                         format: date-time

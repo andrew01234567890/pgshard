@@ -76,7 +76,7 @@ move, so it is recorded as `insecure` and the move starts.
 
 Changing `spec.internalTLS` on a cluster recorded as `insecure` to `issue: true`
 or a `secretRef` does not switch every process at once, because members roll one
-at a time and routers roll as a Deployment. It moves in two steps:
+at a time and routers roll as a Deployment. It moves in three steps:
 
 1. **Accepting**: every member (pooler and agent), router and controller pod is
    rendered with its certificate and also serves plaintext on the same port
@@ -88,9 +88,16 @@ at a time and routers roll as a Deployment. It moves in two steps:
 2. **Dialing**: once no member, router or controller pod from before Accepting
    is left, terminating ones included, routers dial TLS. Members are rendered
    exactly as in Accepting and do not roll, and neither does the controller.
+3. **Closing**: once no router pod from Accepting is left, nothing dials
+   plaintext any more, so the listeners stop taking it. Members, routers and
+   the controller are rendered without `--tls-accept-plaintext` and roll once
+   more.
 
-Once no router pod from Accepting is left, the move completes. Listeners stop
-serving plaintext and members, routers and the controller roll once more.
+The move completes, and the mode becomes the target, only once no member,
+router or controller pod is left from before Closing. That is what makes the
+recorded mode mean what it says: while any pod still carries
+`--tls-accept-plaintext` the cluster does accept plaintext, and the move does
+not claim otherwise.
 
 - **Change of mind.** Setting the spec back to `insecure` during Accepting ends
   the move, because nothing depends on TLS yet. Any other change to
