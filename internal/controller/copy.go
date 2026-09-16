@@ -1462,6 +1462,7 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 	if err != nil {
 		return err
 	}
+	var failed error
 	for _, db := range dbs {
 		for _, t := range wf.ids {
 			conn, err := c.Shards.DialDatabase(ctx, wf.set, t, db.name)
@@ -1470,18 +1471,27 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 				continue
 			}
 			// Targets rolled back to carry this workflow's claimed pause
-			// refuse ALTER SUBSCRIPTION too. Waiting for the sweep to lift
-			// that pause first would make the target writable while its
-			// replication is still attached (PGS-840).
+			// refuse ALTER SUBSCRIPTION too, and the cleanup does not get
+			// past them. Lifting the pause first would make the target
+			// writable while its replication is still attached, so this
+			// session writes through it instead and the target stays paused
+			// (PGS-840).
 			err = writeThroughPause(ctx, conn)
 			if err == nil {
 				err = dropSubscriptions(ctx, conn, wf.gen, t)
 			}
 			_ = conn.Close(ctx)
 			if err != nil {
-				return err
+				// Every target is tried: returning here left the
+				// subscriptions attached on every target after this one,
+				// and the one that fails is the one most likely to be
+				// paused. dropReplication collects the same way.
+				failed = errors.Join(failed, err)
 			}
 		}
+	}
+	if failed != nil {
+		return failed
 	}
 	for _, s := range srcIDs {
 		conn, err := c.Shards.Dial(ctx, srcSet, s)
