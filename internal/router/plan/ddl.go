@@ -46,6 +46,9 @@ type Migration struct {
 	// Object is the created or dropped object the applier checks for when
 	// it resumes a shard step after a crash; empty when there is none.
 	Object ObjectRef
+	// Target is the object the statement names, for reading only: the
+	// operation queue shows it because it withholds the statement.
+	Target string
 	// Role and Verifier are set for CREATE/ALTER/DROP ROLE so the applier
 	// mirrors the desired row in pgshard.roles.
 	Role     string
@@ -157,8 +160,74 @@ func (w *walker) migration(m Migration) error {
 	if m.Statement == "" {
 		m.Statement = w.sql
 	}
+	if m.Target == "" {
+		m.Target = targetName(w.root)
+	}
 	w.plan.Kind, w.plan.Shards, w.plan.Migration = MigrationKind, nil, &m
 	return nil
+}
+
+// targetName is the object the statement names, for the operation queue to
+// show. The queue withholds the statement text, and Object is recorded only
+// where the applier needs it to resume -- so without this every ALTER TABLE
+// waiting in the queue reads as "ALTER TABLE" and no reader can tell them
+// apart. Empty when the statement names nothing a reader would recognise.
+func targetName(n *pgquerypb.Node) string {
+	switch s := n.GetNode().(type) {
+	case *pgquerypb.Node_AlterTableStmt:
+		return relName(s.AlterTableStmt.GetRelation())
+	case *pgquerypb.Node_AlterSeqStmt:
+		return relName(s.AlterSeqStmt.GetSequence())
+	case *pgquerypb.Node_RenameStmt:
+		if name := relName(s.RenameStmt.GetRelation()); name != "" {
+			return name
+		}
+		return objectPath(s.RenameStmt.GetObject())
+	case *pgquerypb.Node_CommentStmt:
+		return objectPath(s.CommentStmt.GetObject())
+	case *pgquerypb.Node_AlterOwnerStmt:
+		if name := objectPath(s.AlterOwnerStmt.GetObject()); name != "" {
+			return name
+		}
+	case *pgquerypb.Node_AlterObjectSchemaStmt:
+		if name := relName(s.AlterObjectSchemaStmt.GetRelation()); name != "" {
+			return name
+		}
+		return objectPath(s.AlterObjectSchemaStmt.GetObject())
+	case *pgquerypb.Node_IndexStmt:
+		return relName(s.IndexStmt.GetRelation())
+	case *pgquerypb.Node_CreateTrigStmt:
+		return relName(s.CreateTrigStmt.GetRelation())
+	case *pgquerypb.Node_CreateStmt:
+		return relName(s.CreateStmt.GetRelation())
+	case *pgquerypb.Node_ViewStmt:
+		return relName(s.ViewStmt.GetView())
+	case *pgquerypb.Node_ClusterStmt:
+		return relName(s.ClusterStmt.GetRelation())
+	}
+	return ""
+}
+
+// relName renders a RangeVar as a reader reads it, qualified when the
+// statement qualified it.
+func relName(rv *pgquerypb.RangeVar) string {
+	if rv.GetRelname() == "" {
+		return ""
+	}
+	if schema := rv.GetSchemaname(); schema != "" {
+		return schema + "." + rv.GetRelname()
+	}
+	return rv.GetRelname()
+}
+
+// objectPath renders the name list a statement carries for an object that
+// is not a relation -- a schema, a type, a column -- joined as it was
+// written.
+func objectPath(obj *pgquerypb.Node) string {
+	if s := obj.GetString_(); s != nil {
+		return s.GetSval()
+	}
+	return strings.Join(stringList(obj.GetList().GetItems()), ".")
 }
 
 // relScope maps the placement of the relations a statement names to a

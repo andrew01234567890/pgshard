@@ -349,12 +349,27 @@ func (p *Placer) list(ctx context.Context) ([]placementWorkflow, error) {
 	return out, rows.Err()
 }
 
+// savePlacementSQL records a placement's status, and stamps started_at the
+// first time the workflow is past preparing.
+//
+// The operation queue shows how long an operation has been running from
+// status.started_at, which until now only a copy wrote (copy.go), so every
+// table placement read as having started when it was created -- a move that
+// waited two days behind a reshard said it had been going for two days the
+// moment it began. Stamped in SQL, and only where the key is absent, so it
+// survives a restart and does not move on every later save.
+const savePlacementSQL = `UPDATE pgshard.workflows
+	 SET state = $2,
+	     status = status || $3::jsonb || CASE WHEN status ? 'started_at' OR $6::text IN ('', 'preparing')
+	                                          THEN '{}'::jsonb
+	                                          ELSE jsonb_build_object('started_at', to_jsonb(now())) END,
+	     updated_at = now()
+	 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`
+
 func (p *Placer) save(ctx context.Context, wf *placementWorkflow, message string) error {
 	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message, "start_error": wf.startError}
-	if err := ownedExec(ctx, p.Pool, wf.owner,
-		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
-		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
-		wf.id, wf.state, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence); err != nil {
+	if err := ownedExec(ctx, p.Pool, wf.owner, savePlacementSQL,
+		wf.id, wf.state, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence, wf.stage); err != nil {
 		return err
 	}
 	wf.fence = wf.state
@@ -365,10 +380,8 @@ func (p *Placer) save(ctx context.Context, wf *placementWorkflow, message string
 // with the work it describes or not at all.
 func (p *Placer) saveTx(ctx context.Context, tx pgx.Tx, wf *placementWorkflow, message string) error {
 	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message, "start_error": wf.startError}
-	tag, err := tx.Exec(ctx,
-		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
-		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
-		wf.id, wf.state, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
+	tag, err := tx.Exec(ctx, savePlacementSQL,
+		wf.id, wf.state, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence, wf.stage)
 	if err != nil {
 		return err
 	}

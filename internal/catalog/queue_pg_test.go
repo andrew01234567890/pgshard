@@ -916,3 +916,45 @@ func TestTheAdminUILoginReadsWhatItShows(t *testing.T) {
 		}
 	}
 }
+
+// TestTheQueueNamesTheObjectOfEveryMigration (PGS-923): meta.object is
+// recorded only for the kinds the applier has to check for when it resumes.
+// Every ALTER TABLE, COMMENT and rename carries none, and three of those
+// waiting together read as "ALTER TABLE", "ALTER TABLE", "COMMENT" -- in
+// the one view that withholds the statement they would have been told apart
+// by. The router records the name it planned as meta.target.
+func TestTheQueueNamesTheObjectOfEveryMigration(t *testing.T) {
+	conn, _, _ := queueCatalog(t)
+	ctx := context.Background()
+	mustExec(t, conn, `INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, state, meta, arrival) VALUES
+		('00000000-0000-0000-0000-000000000a01', 'app', 'ALTER TABLE orders ADD COLUMN extra int', 'ALTER TABLE', 'direct', 'all', 'queued', '{"target": "public.orders"}', 1),
+		('00000000-0000-0000-0000-000000000a02', 'app', 'ALTER TABLE items DROP COLUMN note', 'ALTER TABLE', 'direct', 'all', 'queued', '{"target": "items"}', 2),
+		('00000000-0000-0000-0000-000000000a03', 'app', 'COMMENT ON TABLE orders IS ''x''', 'COMMENT', 'direct', 'all', 'queued', '{"target": "public.orders"}', 3),
+		('00000000-0000-0000-0000-000000000a04', 'app', 'CREATE INDEX i ON orders (note)', 'CREATE INDEX', 'concurrent', 'all', 'queued', '{"object": {"kind": "relation", "schema": "public", "name": "i"}, "target": "orders"}', 4),
+		('00000000-0000-0000-0000-000000000a05', 'app', 'ALTER TABLE orders ADD COLUMN older int', 'ALTER TABLE', 'direct', 'all', 'queued', '{}', 5)`)
+
+	entries, _, err := ListOperationQueue(ctx, conn, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, e := range entries {
+		got[e.ID] = e.Command
+	}
+	for id, want := range map[string]string{
+		"00000000-0000-0000-0000-000000000a01": "ALTER TABLE public.orders",
+		"00000000-0000-0000-0000-000000000a02": "ALTER TABLE items",
+		"00000000-0000-0000-0000-000000000a03": "COMMENT public.orders",
+		// The applier's own record of the object wins: it is the name the
+		// statement creates, which is what a reader watching a CREATE INDEX
+		// is looking for.
+		"00000000-0000-0000-0000-000000000a04": "CREATE INDEX public.i",
+		// A migration queued before this upgrade has no target and reads as
+		// it did.
+		"00000000-0000-0000-0000-000000000a05": "ALTER TABLE",
+	} {
+		if got[id] != want {
+			t.Errorf("%s command = %q, want %q", id, got[id], want)
+		}
+	}
+}

@@ -106,7 +106,7 @@ func MigrationDedupKey(m DDLMigration, statement string) string {
 		return ""
 	}
 	meta := m.Meta
-	meta.ShardSet = ""
+	meta.ShardSet, meta.Target = "", ""
 	encoded, err := json.Marshal(meta)
 	if err != nil {
 		return ""

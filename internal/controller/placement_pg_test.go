@@ -392,6 +392,19 @@ func TestPlacementMovesOnPostgres(t *testing.T) {
 	f.reconcile()
 	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"drop_old_after_seconds": 0}'`)
 	f.driveUntil("items", 2*time.Minute, StageCompleted)
+	// The queue shows how long an operation has been running from
+	// status.started_at. Only a copy wrote it, so every table placement
+	// reported that it started when it was created: a move that waited two
+	// days behind a reshard said it had been going for two days the moment
+	// it began.
+	if started := queryOne[bool](t, f.catalog, `SELECT status ? 'started_at' AND (status->>'started_at')::timestamptz >= created_at
+		FROM pgshard.workflows WHERE kind = 'table_placement'`); !started {
+		t.Error("the placement recorded no started_at, so the queue reads its age from when it was created")
+	}
+	if late := queryOne[bool](t, f.catalog, `SELECT (status->>'started_at')::timestamptz > updated_at
+		FROM pgshard.workflows WHERE kind = 'table_placement'`); late {
+		t.Error("started_at moved with the last status write; it is stamped once, when the move leaves preparing")
+	}
 	if v := queryOne[int64](t, home, `INSERT INTO items (v, n) VALUES ('from-sequence', 2) RETURNING id`); v != 51 {
 		t.Fatalf("the sequence must survive the old table's drop: next id %d", v)
 	}
@@ -1719,4 +1732,36 @@ func (c copyWalkConn) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		c.d.once.Do(c.d.fire)
 	}
 	return c.ShardConn.Query(ctx, sql, args...)
+}
+
+// TestAPlacementStampsItsStartOnce (PGS-924): the stamp is written when the
+// move leaves preparing, and every status write after that leaves it alone.
+// A stamp that moved would make the queue's age column read as time since
+// the last status write.
+func TestAPlacementStampsItsStartOnce(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	const id = "00000000-0000-0000-0000-0000000009a1"
+	mustExec(t, f.catalog, `INSERT INTO pgshard.workflows (id, kind, state, spec, status, arrival)
+		VALUES ($1, 'table_placement', 'pending', '{"database": "app", "schema_name": "public", "table_name": "items"}', '{"stage": "preparing"}', 1)`, id)
+	save := func(state, stage string) {
+		t.Helper()
+		if _, err := f.catalog.Exec(ctx, savePlacementSQL, id, state, mustJSON(map[string]any{"stage": stage}), nil, nil, stage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save("pending", StagePlacementPreparing)
+	if stamped := queryOne[bool](t, f.catalog, `SELECT status ? 'started_at' FROM pgshard.workflows WHERE id = $1::uuid`, id); stamped {
+		t.Fatal("a placement still preparing was stamped as started")
+	}
+	save("running", StagePlacementShadow)
+	first := queryOne[string](t, f.catalog, `SELECT status->>'started_at' FROM pgshard.workflows WHERE id = $1::uuid`, id)
+	if first == "" {
+		t.Fatal("a placement past preparing recorded no started_at")
+	}
+	save("running", "copying")
+	if again := queryOne[string](t, f.catalog, `SELECT status->>'started_at' FROM pgshard.workflows WHERE id = $1::uuid`, id); again != first {
+		t.Errorf("started_at moved from %q to %q on a later write", first, again)
+	}
 }
