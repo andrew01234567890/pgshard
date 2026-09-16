@@ -1189,6 +1189,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 			err = rerr
 		} else {
 			e.r.cfg.Logger.Info("retrying statement after the cluster write pause", "session", e.sid, "shard", e.shard)
+			cw.retrying()
 			err = run(cw)
 		}
 	}
@@ -1208,6 +1209,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 			err = werr
 		case ok:
 			e.r.cfg.Logger.Info("retrying statement after shard failover", "session", e.sid, "shard", e.shard)
+			cw.retrying()
 			err = run(cw)
 		}
 	}
