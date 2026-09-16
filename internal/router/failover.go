@@ -243,6 +243,27 @@ func failoverInTxnError() error {
 type countingWriter struct {
 	w     pgwire.ResultWriter
 	wrote bool
+	// sent counts the describe answers that have reached the client, and
+	// seen those this attempt has produced. A retry re-sends the whole
+	// batch, so it produces the same describe answers again; the ones the
+	// client already has are dropped rather than written twice.
+	sent int
+	seen int
+}
+
+// retrying starts another attempt at the same batch. What the client has
+// already been told stands; this attempt's repeat of it is dropped.
+func (c *countingWriter) retrying() { c.seen = 0 }
+
+// describeAnswer writes one message of a Describe's answer unless the
+// client has it from an earlier attempt.
+func (c *countingWriter) describeAnswer(write func() error) error {
+	c.seen++
+	if c.seen <= c.sent {
+		return nil
+	}
+	c.sent++
+	return write()
 }
 
 func (c *countingWriter) RowDescription(f []pgproto3.FieldDescription) error {
@@ -269,10 +290,17 @@ func (c *countingWriter) EmptyQueryResponse() error { c.wrote = true; return c.w
 // the retry -- which exists so a client sees latency instead of a 25006 it
 // could not have avoided -- would have stopped working for most clients
 // without a single test noticing.
+//
+// Not counting them means the retry re-sends them, which is not a
+// protocol PostgreSQL ever produces: a client reading a described
+// statement takes the first answer and treats the second as a message it
+// cannot place. So they are written once, however many attempts it takes.
 func (c *countingWriter) ParameterDescription(o []uint32) error {
-	return c.w.ParameterDescription(o)
+	return c.describeAnswer(func() error { return c.w.ParameterDescription(o) })
 }
-func (c *countingWriter) NoData() error          { return c.w.NoData() }
+func (c *countingWriter) NoData() error {
+	return c.describeAnswer(c.w.NoData)
+}
 func (c *countingWriter) PortalSuspended() error { c.wrote = true; return c.w.PortalSuspended() }
 
 // ParseComplete, BindComplete and CloseComplete say that a statement was
