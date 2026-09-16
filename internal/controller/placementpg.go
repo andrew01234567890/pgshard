@@ -877,14 +877,31 @@ var triggerEnableWords = map[string]string{"O": "ENABLE", "D": "DISABLE", "R": "
 // resolved by name when it runs and follows the swap, so it records no
 // dependency to find.
 //
+// So is an expression naming the table as a regclass constant
+// ('orders'::regclass): the constant is the OID, LIKE copies it onto the
+// shadow, and after the swap it names the retired table. Another object's
+// (a default, constraint, index, trigger condition or domain default) is
+// recorded as a normal dependency on the whole table. The table's own is
+// not: PostgreSQL drops the whole-table dependency when the same expression
+// also references one of the table's columns, which a CHECK or a generated
+// column almost always does. So the table's own stored expressions are read
+// for a regclass constant (type 2205) holding its OID. A node tree prints a
+// by-value datum as its bytes, low byte first on the little-endian servers
+// we build, and as signed chars.
+//
+// So is anything bound to the table's row type, which the rename takes with
+// it: a function taking or returning the row, another table's or a
+// composite type's column of it, a view casting to it. They stay on the
+// retired table's type, and retiring it fails for as long as they exist.
+//
 // Reproduced rather than refused, each with its own function: row-level
 // security, user triggers, and the owner and table/column privileges.
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `WITH t AS (
-			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
+			SELECT c.oid, c.reltype, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
 			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = $1 AND c.relname = $2)
-		SELECT f FROM (
+		SELECT DISTINCT f FROM (
 			SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END AS f
 				FROM t WHERE t.relreplident <> 'd'
 			UNION ALL SELECT 'inbound foreign key ' || conname FROM pg_constraint, t
@@ -914,6 +931,40 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 				JOIN pg_class pc ON pc.oid = pol.polrelid
 				JOIN pg_namespace pn ON pn.oid = pc.relnamespace, t
 				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid AND pol.polrelid <> t.oid
+			UNION ALL SELECT DISTINCT 'reference to the table by OID in ' || pg_describe_object(d.classid, d.objid, d.objsubid)
+				FROM pg_depend d, t
+				WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid AND d.refobjsubid = 0 AND d.deptype = 'n'
+				  AND d.classid NOT IN ('pg_rewrite'::regclass, 'pg_proc'::regclass, 'pg_policy'::regclass)
+				  AND NOT (d.classid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = d.objid))
+			UNION ALL SELECT 'reference to the table by OID in ' || pg_describe_object(e.classid, e.objid, 0)
+				FROM t, LATERAL (
+					SELECT 'pg_constraint'::regclass AS classid, c.oid AS objid, c.conbin::text AS expr FROM pg_constraint c WHERE c.conrelid = t.oid
+					UNION ALL SELECT 'pg_attrdef'::regclass, a.oid, a.adbin::text FROM pg_attrdef a WHERE a.adrelid = t.oid
+					UNION ALL SELECT 'pg_class'::regclass, i.indexrelid, concat(i.indexprs::text, i.indpred::text) FROM pg_index i WHERE i.indrelid = t.oid
+					UNION ALL SELECT 'pg_trigger'::regclass, tg.oid, tg.tgqual::text FROM pg_trigger tg WHERE tg.tgrelid = t.oid
+					UNION ALL SELECT 'pg_statistic_ext'::regclass, x.oid, x.stxexprs::text FROM pg_statistic_ext x WHERE x.stxrelid = t.oid
+				) e, regexp_matches(e.expr, ':consttype 2205 [^{}]*:constisnull false [^{}]*:constvalue 4 \[ (-?\d+) (-?\d+) (-?\d+) (-?\d+) ', 'g') b
+				WHERE (b[1]::int + 256) % 256 + (b[2]::int + 256) % 256 * 256 + (b[3]::int + 256) % 256 * 65536
+					+ (b[4]::bigint + 256) % 256 * 16777216 = t.oid::bigint
+			UNION ALL SELECT DISTINCT CASE
+					WHEN d.classid = 'pg_rewrite'::regclass AND r.rulename = '_RETURN'
+					THEN 'row type used by ' || pg_describe_object('pg_class'::regclass, r.ev_class, 0)
+					ELSE 'row type used by ' || pg_describe_object(d.classid, d.objid, d.objsubid) END
+				FROM pg_depend d
+				LEFT JOIN pg_rewrite r ON d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid, t
+				WHERE d.refclassid = 'pg_type'::regclass AND d.deptype = 'n'
+				  AND d.refobjid IN (t.reltype, (SELECT typarray FROM pg_type WHERE oid = t.reltype))
+				  -- A view that has a column of the row type is named by that
+				  -- column, so its _RETURN rule would say the same thing twice.
+				  -- A view that only mentions the type -- jsonb_populate_record
+				  -- (NULL::t, ...) is the everyday shape -- records nothing
+				  -- else, so dropping every _RETURN row let it through the one
+				  -- check meant to catch it: after the swap its query is bound
+				  -- to the retired table's row type for ever, and the retired
+				  -- table can never be dropped.
+				  AND NOT (d.classid = 'pg_rewrite'::regclass AND r.rulename = '_RETURN' AND EXISTS (
+					SELECT 1 FROM pg_depend c WHERE c.classid = 'pg_class'::regclass AND c.objid = r.ev_class
+					  AND c.refclassid = 'pg_type'::regclass AND c.refobjid = d.refobjid))
 		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err
