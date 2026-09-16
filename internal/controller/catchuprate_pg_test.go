@@ -171,8 +171,20 @@ func TestCatchUpAppliesMoreDeletesASecondWhenItBatchesThem(t *testing.T) {
 	t.Logf("one IN list:              %8.0f operations/s", batched)
 	t.Logf("batching deletes is %.1fx", batched/perRow)
 
-	if batched < 1.5*perRow {
-		t.Errorf("batching deletes is only %.1fx one at a time; it was over 10x when written", batched/perRow)
+	// The same treatment as its sibling above, for the same reason, which
+	// this half never got: measured here the two arms are 15.4x apart
+	// (63081 and 970303 operations a second), and on a loaded hosted runner
+	// they were 1.3x apart (68819 and 92633). Note which number moved. The
+	// per-row arm is bound by round trips and barely changed; the batched
+	// arm is bound by CPU in one big statement and fell by a factor of ten.
+	// So the ratio between them measures how much CPU the runner had to
+	// spare, not whether batching still batches.
+	switch ratio := batched / perRow; {
+	case ratio >= 1.5:
+	case sharedRunner():
+		t.Logf("batching deletes is only %.1fx here; not asserted on a shared runner, where the arms are not equally affected", ratio)
+	default:
+		t.Errorf("batching deletes is only %.1fx one at a time; it was over 10x when written", ratio)
 	}
 	for _, table := range []string{"del_per_row", "del_batched"} {
 		assertRowsLanded(t, raw, table, 0)
