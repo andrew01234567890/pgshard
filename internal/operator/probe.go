@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -486,31 +487,79 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 // of the restored catalog afterwards: certified is WAL-logged after the
 // catalog group's own restore point, so a catalog recovered to that name
 // always reads back uncertified, even for a good barrier.
-func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, []string, error) {
+func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name string) (BarrierRecord, error) {
 	// The operator has no PGPASSWORD for an arbitrary cluster's superuser,
 	// so the password comes from that cluster's secret and is set on the
 	// parsed config rather than written into the DSN, which reaches logs
 	// and error messages.
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return false, nil, err
+		return BarrierRecord{}, err
 	}
 	cfg.Password = password
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		return false, nil, err
+		return BarrierRecord{}, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	var (
-		certified bool
-		groups    []string
+		rec                    BarrierRecord
+		recordedSystem, system string
+		perGroup               []byte
 	)
-	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1)
-		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&certified, &groups)
+	err = conn.QueryRow(ctx, `SELECT certified, ARRAY(SELECT jsonb_object_keys(per_group) ORDER BY 1), created_at, per_group,
+			coalesce(per_group->'catalog'->>'system_identifier', ''), (SELECT system_identifier::text FROM pg_control_system())
+		FROM pgshard.restore_points WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&rec.Certified, &rec.Groups, &rec.CreatedAt, &perGroup, &recordedSystem, &system)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil, nil
+		return BarrierRecord{}, nil
 	}
-	return certified, groups, err
+	if err == nil {
+		var points map[string]struct {
+			LSN uint64 `json:"lsn"`
+		}
+		if err := json.Unmarshal(perGroup, &points); err != nil {
+			return BarrierRecord{}, fmt.Errorf("barrier %q manifest: %w", name, err)
+		}
+		rec.LSNs = map[string]uint64{}
+		for g, p := range points {
+			if p.LSN != 0 {
+				rec.LSNs[g] = p.LSN
+			}
+		}
+	}
+	// The manifest names the catalog "catalog" whatever its generation, and
+	// its rows travel with the catalog through a major upgrade. So a
+	// barrier from before one reads back here as covering the catalog,
+	// while the catalog group a restore recovers was initdb'd since and has
+	// none of its restore points. The system identifier tells them apart.
+	// A manifest written before it was recorded carries none, and whether
+	// that one can be trusted depends on something only the caller knows --
+	// whether this cluster's catalog has been rebuilt since -- so it is
+	// reported rather than decided here.
+	rec.CatalogIdentified = recordedSystem != ""
+	if recordedSystem != "" && recordedSystem != system {
+		rec.Groups = slices.DeleteFunc(rec.Groups, func(g string) bool { return g == "catalog" })
+		// Its LSN is in the old catalog system's WAL, not comparable with
+		// a backup of the current one.
+		delete(rec.LSNs, "catalog")
+	}
+	return rec, err
+}
+
+// BarrierRecord is what the source's catalog says about a barrier.
+type BarrierRecord struct {
+	Certified bool
+	// Groups are the groups its manifest holds a restore point on.
+	Groups []string
+	// CreatedAt is when the catalog recorded it.
+	CreatedAt time.Time
+	// LSNs is each group's restore point, by the manifest's group key.
+	LSNs map[string]uint64
+	// CatalogIdentified reports that the manifest recorded which catalog
+	// system its restore point belongs to. A manifest written before that
+	// was recorded says nothing about it, so a caller that knows the
+	// catalog has been rebuilt since cannot take it at its word.
+	CatalogIdentified bool
 }
 
 // ClearWriteFenceAfterRestore lifts the fence on a restored catalog,

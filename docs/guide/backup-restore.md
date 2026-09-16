@@ -91,6 +91,17 @@ spec:
 - Each group's primary restores with `pgbackrest restore` plus archive
   recovery to the target, then the standbys clone from it. The new cluster
   archives to its own stanzas.
+- A barrier restore is refused up front, before anything is created, when
+  the barrier has no restore point on a group the restore would recover:
+  one created by a reshard since the barrier, or a catalog rebuilt by a
+  major upgrade since (told apart by its database system identifier, which
+  barriers record). So is a barrier a restored cluster inherited from the
+  cluster it was restored from: its restore point is in that cluster's
+  repository. Take a new barrier. So is a `backupId` whose backup of any
+  group ended after the barrier's restore point there: recovery replays
+  forward from where the backup ended and could never stop at the barrier.
+  A barrier restore waits while the source's catalog is switching
+  generations.
 - A barrier restore ends with a reconciliation phase: prepared
   `pgshard-*` transactions are finished against the restored decision log,
   and the write fence the barrier raised is released only when there is no

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -57,6 +58,31 @@ func TestBarrierOnPostgres(t *testing.T) {
 	var fenced bool
 	if err := f.pool.QueryRow(ctx, `SELECT write_fence FROM pgshard.shard_map_generation`).Scan(&fenced); err != nil || fenced {
 		t.Fatalf("fence after the barrier: %v %v", fenced, err)
+	}
+	// Each group's point names the database system it was written in: a
+	// catalog rebuilt by a major upgrade since keeps the manifest's rows
+	// but none of its restore points, and a restore has to tell (PGS-825).
+	var manifest []byte
+	if err := f.pool.QueryRow(ctx, `SELECT per_group FROM pgshard.restore_points WHERE name = 'b1'`).Scan(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	var perGroup map[string]GroupRestorePoint
+	if err := json.Unmarshal(manifest, &perGroup); err != nil {
+		t.Fatal(err)
+	}
+	systemOf := func(q interface {
+		QueryRow(context.Context, string, ...any) pgx.Row
+	}) string {
+		var id string
+		if err := q.QueryRow(ctx, `SELECT system_identifier::text FROM pg_control_system()`).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	for group, want := range map[string]string{CatalogGroup: systemOf(f.pool), "g0": systemOf(connect(t, f.shardDSN(0))), "g1": systemOf(connect(t, f.shardDSN(1)))} {
+		if got := perGroup[group].SystemIdentifier; got != want {
+			t.Errorf("the manifest records %s's system as %q, want %q", group, got, want)
+		}
 	}
 	var restorePoint string
 	if err := connect(t, f.shardDSN(1)).QueryRow(ctx, `SELECT pg_walfile_name(pg_current_wal_lsn())`).Scan(&restorePoint); err != nil {

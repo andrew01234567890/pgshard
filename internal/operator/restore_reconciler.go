@@ -44,11 +44,15 @@ type RestoreReconciler struct {
 	Now      func() time.Time
 }
 
-// BarrierCertifier reports whether a barrier of that name was certified and
-// which groups it holds a restore point on, and lifts the fence a restored
-// catalog came back holding.
+// catalogUpgradeRestoreWait is how often a barrier restore asks again whether
+// the source's catalog upgrade has finished.
+const catalogUpgradeRestoreWait = 30 * time.Second
+
+// BarrierCertifier reports whether a barrier of that name was certified,
+// which groups it holds a restore point on and when it was recorded, and
+// lifts the fence a restored catalog came back holding.
 type BarrierCertifier interface {
-	CertifiedBarrier(ctx context.Context, dsn, password, name string) (certified bool, groups []string, err error)
+	CertifiedBarrier(ctx context.Context, dsn, password, name string) (BarrierRecord, error)
 	ClearWriteFenceAfterRestore(ctx context.Context, dsn, password string) error
 }
 
@@ -204,6 +208,26 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 	// point on every group, so restoring to it succeeds and silently lands
 	// the cluster on a point that is not two-phase-consistent. Ask the live
 	// source, which is the only place the answer is knowable.
+	//
+	// Not while the source's catalog is switching generations: the groups
+	// this restore recovers are read from the cluster's status and the
+	// barrier from its catalog Service, and during the cutover and a
+	// rollback the two can name different generations for a pass. The
+	// retiring stage that follows one does not wait: it lasts the whole
+	// retirement window, and the barrier is read at the group's own address
+	// rather than the stable endpoint, so it does not depend on the
+	// endpoint having caught up.
+	if up := source.Status.CatalogUpgrade; rs.Spec.Target.Barrier != nil && r.Barriers != nil && up != nil &&
+		(up.Stage == CatalogUpgradeCutover || up.RollbackRequested || up.RollbackStarted) {
+		base := rs.DeepCopy()
+		meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: metav1.ConditionFalse, Reason: "WaitingForCatalogUpgrade",
+			Message:            fmt.Sprintf("waiting for %s's catalog to finish switching generations before judging barrier %q", source.Name, *rs.Spec.Target.Barrier),
+			ObservedGeneration: rs.Generation})
+		if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: catalogUpgradeRestoreWait}, nil
+	}
 	if rs.Spec.Target.Barrier != nil && r.Barriers != nil {
 		name := *rs.Spec.Target.Barrier
 		password, perr := r.superuserPassword(ctx, &source)
@@ -213,11 +237,15 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// pgshard.restore_points is keyed by the barrier's own name; the
 		// pgshard- prefix belongs to the WAL restore point the recovery
 		// target names, not to the catalog row.
-		ok, recorded, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), password, name)
+		// The group's own address, not the stable endpoint: the endpoint
+		// moves after the status that names the new generation, so for a
+		// window after a cutover the stable one answers as the catalog the
+		// restore is NOT going to recover (PGS-932).
+		rec, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogGroupDSN(&source), password, name)
 		if cerr != nil {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
 		}
-		if !ok {
+		if !rec.Certified {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q is not certified on %s; restoring to it would land on a point that is not two-phase consistent", name, source.Name))
 		}
 		// Certified says the barrier held on the groups it was taken on,
@@ -227,7 +255,64 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// configured recovery target was reached", and the restore only
 		// finds out after it has created the cluster and watched that
 		// member crash-loop.
-		if missing := groupsWithoutBarrier(Groups(&source), recorded); len(missing) > 0 {
+		// A cluster built by a restore carries its source's
+		// pgshard.restore_points rows, but archives to stanzas of its own
+		// that begin with that restore. A barrier recorded before the restore
+		// that built this cluster completed was taken on the cluster it was
+		// restored from -- a restore to the end of the archive keeps
+		// replaying that cluster's WAL after this one's object exists -- and
+		// its restore point is in that cluster's repository, not this one's.
+		if from := source.Labels[LabelRestoredFrom]; from != "" {
+			// The cluster's own stamp first: the PgShardRestore is a
+			// one-shot object operators delete, and without it the cut-off
+			// falls back to the cluster's creation time -- which is BEFORE
+			// recovery ended, so every barrier inherited in that window is
+			// accepted again. That is the window this check exists for.
+			built := source.CreationTimestamp.Time
+			if at, err := time.Parse(time.RFC3339, source.Annotations[AnnotationRestoreCompletedAt]); err == nil {
+				built = at
+			} else {
+				var buildingRestore pgshardv1alpha1.PgShardRestore
+				gerr := r.Get(ctx, types.NamespacedName{Namespace: source.Namespace, Name: from}, &buildingRestore)
+				switch {
+				case gerr == nil:
+					if buildingRestore.Spec.NewClusterName == source.Name && buildingRestore.Status.CompletedAt != nil {
+						built = buildingRestore.Status.CompletedAt.Time
+					}
+				case !apierrors.IsNotFound(gerr):
+					// Deleted is an answer; unreachable is not. Falling
+					// through on an API failure would loosen the cut-off
+					// for as long as the failure lasted.
+					return ctrl.Result{}, gerr
+				}
+			}
+			if rec.CreatedAt.Before(built) {
+				return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q was recorded at %s, before PgShardRestore %s finished building %s: it belongs to the cluster %s was restored from, whose repository holds its restore point; take a new barrier on %s",
+					name, rec.CreatedAt.UTC().Format(time.RFC3339), from, source.Name, source.Name, source.Name))
+			}
+		}
+		refusal, berr := backupAfterBarrier(ctx, r.Client, rs, name, rec)
+		if berr != nil {
+			return ctrl.Result{}, berr
+		}
+		if refusal != "" {
+			return ctrl.Result{}, r.fail(ctx, rs, refusal)
+		}
+		// A manifest from before the catalog identifier was recorded names
+		// "catalog" and says nothing about which catalog system that was. On
+		// a cluster whose catalog has been rebuilt by a major upgrade it is
+		// the barrier most likely to be wrong: the rows travelled with the
+		// catalog, while the group a restore recovers was initdb'd since and
+		// holds none of its restore points. Treated as covering the catalog
+		// it recovers the new group to a name only the old stanza has, which
+		// ends in "recovery ended before configured recovery target was
+		// reached" and a crash-looping member -- the late failure this whole
+		// gate exists to turn into an up-front refusal.
+		if !rec.CatalogIdentified && CatalogGeneration(&source) > 1 {
+			rec.Groups = slices.DeleteFunc(rec.Groups, func(g string) bool { return g == "catalog" })
+			delete(rec.LSNs, "catalog")
+		}
+		if missing := groupsWithoutBarrier(Groups(&source), rec.Groups); len(missing) > 0 {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q on %s has no restore point on group(s) %s, which this restore would recover to it; take a new barrier that covers every serving group",
 				name, source.Name, strings.Join(missing, ", ")))
 		}
@@ -415,6 +500,21 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	inProgress := rs.Status.Phase == pgshardv1alpha1.RestorePhaseRestoring || rs.Status.Phase == pgshardv1alpha1.RestorePhaseReconciling
 	if !inProgress {
 		rs.Status.CompletedAt = ptrTime(r.now())
+		// On the cluster too, because that is what outlives this object:
+		// a barrier recorded before recovery ended belongs to the cluster
+		// this one was restored from, and the check that refuses it needs
+		// the time long after anyone has deleted the PgShardRestore.
+		if c.Annotations == nil || c.Annotations[AnnotationRestoreCompletedAt] == "" {
+			stamped := c.DeepCopy()
+			if stamped.Annotations == nil {
+				stamped.Annotations = map[string]string{}
+			}
+			stamped.Annotations[AnnotationRestoreCompletedAt] = rs.Status.CompletedAt.UTC().Format(time.RFC3339)
+			if err := r.Patch(ctx, stamped, client.MergeFrom(c)); err != nil {
+				return ctrl.Result{}, err
+			}
+			c = stamped
+		}
 	}
 	msg := fmt.Sprintf("cluster %s: %d/%d groups recovered, ready=%v", c.Name, countReached(groups), len(groups), ready)
 	switch {
@@ -683,6 +783,46 @@ func (r *RestoreReconciler) fail(ctx context.Context, rs *pgshardv1alpha1.PgShar
 // has no restore point for. The manifest keys a shard group by the name
 // shard_status carries, which is Group.Name(), and the catalog as "catalog"
 // whatever its generation.
+// backupAfterBarrier explains why the restore's base backup cannot reach the
+// barrier, or returns "". Recovery replays forward from where a backup
+// ended, so a backup of a group that ended after the barrier's restore point
+// on that group has already passed it: recovery never stops at the barrier,
+// and the member fails late. Only a backup the restore names as a
+// PgShardBackup is known group by group.
+func backupAfterBarrier(ctx context.Context, c client.Client, rs *pgshardv1alpha1.PgShardRestore, barrier string, rec BarrierRecord) (string, error) {
+	if rs.Spec.BackupID == "" {
+		return "", nil
+	}
+	var b pgshardv1alpha1.PgShardBackup
+	if err := c.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Spec.BackupID}, &b); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var late []string
+	for _, g := range b.Status.Groups {
+		key := g.Group
+		if strings.HasPrefix(key, "catalog") {
+			key = "catalog"
+		}
+		point, ok := rec.LSNs[key]
+		if !ok || g.StopLSN == "" {
+			continue
+		}
+		stop, err := backup.ParseLSN(g.StopLSN)
+		if err != nil || stop <= point {
+			continue
+		}
+		late = append(late, fmt.Sprintf("%s (backup ends at %s, the restore point is at %s)", g.Group, g.StopLSN, formatLSN(point)))
+	}
+	if len(late) == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("backup %s ended after barrier %q on group(s) %s, so recovery from it cannot stop at the barrier; use a backup taken before the barrier",
+		b.Name, barrier, strings.Join(late, ", ")), nil
+}
+
 func groupsWithoutBarrier(want []Group, recorded []string) []string {
 	var missing []string
 	for _, g := range want {

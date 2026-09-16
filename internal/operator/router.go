@@ -75,6 +75,21 @@ func CatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
 	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", CatalogServiceRW(c.Name), c.Namespace, postgresPort, superuserName)
 }
 
+// CatalogGroupDSN reaches the catalog group this cluster's status names,
+// rather than the stable endpoint whose selector follows whichever
+// generation is active.
+//
+// The two are the same address almost always, and differ exactly where it
+// matters: a catalog upgrade's cutover writes the new generation into the
+// status and moves the Service afterwards, so between the two -- and for as
+// long as the endpoint takes to propagate -- the stable address still
+// answers as the old catalog while the status already names the new one.
+// Anything judging a barrier has to ask the group the restore will actually
+// recover, which is this one.
+func CatalogGroupDSN(c *pgshardv1alpha1.PgShardCluster) string {
+	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", Groups(c)[0].ServiceRW(), c.Namespace, postgresPort, superuserName)
+}
+
 // ControllerCatalogDSN is the same catalog, reached as the controller's own
 // login role. The controller drives every workflow, so it writes the whole
 // pgshard schema -- but it does not need the superuser to do that, and

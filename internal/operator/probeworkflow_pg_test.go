@@ -256,25 +256,57 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 	mustProbeExec(t, conn, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, per_group, certified)
 		VALUES (gen_random_uuid(), 'nightly', 7, '{"catalog": {"group": "catalog"}, "shard-0": {"group": "shard-0"}}'::jsonb, true),
 		       (gen_random_uuid(), 'aborted', 7, '{}'::jsonb, false)`)
+	// PGS-825: a manifest records the system each point was written in. The
+	// catalog's rows are copied through a major upgrade into a group
+	// initdb'd for it, so a barrier from before one names a system this
+	// catalog is not, and its catalog restore point is not here.
+	var system string
+	if err := conn.QueryRow(ctx, `SELECT system_identifier::text FROM pg_control_system()`).Scan(&system); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, per_group, certified)
+		VALUES (gen_random_uuid(), 'before-an-upgrade', 7, jsonb_build_object('catalog', jsonb_build_object('group', 'catalog', 'system_identifier', '1', 'lsn', 50331648), 'shard-0', jsonb_build_object('group', 'shard-0')), true),
+		       (gen_random_uuid(), 'after-an-upgrade', 7, jsonb_build_object('catalog', jsonb_build_object('group', 'catalog', 'system_identifier', $1::text, 'lsn', 50331648), 'shard-0', jsonb_build_object('group', 'shard-0')), true)`, system); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, c := range []struct {
 		name   string
 		want   bool
 		groups []string
+		// identified is whether the manifest says which catalog system its
+		// restore point belongs to. A manifest written before that was
+		// recorded does not, and the caller -- which knows whether this
+		// cluster's catalog has been rebuilt -- decides what to do about it.
+		identified bool
 	}{
-		{"nightly", true, []string{"catalog", "shard-0"}},
-		{"aborted", false, []string{}},
-		{"never-taken", false, nil},
+		{"nightly", true, []string{"catalog", "shard-0"}, false},
+		{"before-an-upgrade", true, []string{"shard-0"}, true},
+		{"after-an-upgrade", true, []string{"catalog", "shard-0"}, true},
+		{"aborted", false, []string{}, false},
+		{"never-taken", false, nil, false},
 		// The name the recovery target uses, which is not what the row is
 		// keyed by. This is the case the fake could never fail on.
-		{BarrierRestorePoint("nightly"), false, nil},
+		{BarrierRestorePoint("nightly"), false, nil, false},
 	} {
-		got, groups, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
+		rec, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		if got != c.want || !slices.Equal(groups, c.groups) {
-			t.Errorf("CertifiedBarrier(%q) = %v %v, want %v %v", c.name, got, groups, c.want, c.groups)
+		if rec.Certified != c.want || !slices.Equal(rec.Groups, c.groups) {
+			t.Errorf("CertifiedBarrier(%q) = %v %v, want %v %v", c.name, rec.Certified, rec.Groups, c.want, c.groups)
+		}
+		if rec.CatalogIdentified != c.identified {
+			t.Errorf("CertifiedBarrier(%q) reports the catalog identified = %v, want %v", c.name, rec.CatalogIdentified, c.identified)
+		}
+		if c.name == "before-an-upgrade" && len(rec.LSNs) != 0 {
+			t.Errorf("CertifiedBarrier(%q) kept restore point LSNs %v from a catalog system that is gone", c.name, rec.LSNs)
+		}
+		if c.name == "after-an-upgrade" && (rec.LSNs["catalog"] != 50331648 || len(rec.LSNs) != 1) {
+			t.Errorf("CertifiedBarrier(%q) restore point LSNs %v, want the catalog's 50331648 only", c.name, rec.LSNs)
+		}
+		if c.groups != nil && time.Since(rec.CreatedAt) > time.Hour {
+			t.Errorf("CertifiedBarrier(%q) recorded at %v, want the row's created_at", c.name, rec.CreatedAt)
 		}
 	}
 }
