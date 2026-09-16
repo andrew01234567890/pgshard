@@ -53,6 +53,38 @@ CREATE FUNCTION pgshard.status_time(v text) RETURNS timestamptz
     LANGUAGE sql STABLE PARALLEL SAFE
     AS $$ SELECT CASE WHEN v IS NOT NULL AND pg_input_is_valid(v, 'timestamptz') THEN v::timestamptz END $$;
 
+-- When a switched reshard or upgrade retires its old groups.
+--
+-- The controller records it once it has switched, but a controller older
+-- than this view does not, and the window is knowable either way: the
+-- switch plus what the spec asked for, or the 24 hours the cluster
+-- defaults to. Reading the recorded value alone left the countdown blank
+-- and the progress bar pinned for the whole retirement window.
+CREATE FUNCTION pgshard.retire_at(status jsonb, spec jsonb) RETURNS timestamptz
+    LANGUAGE sql STABLE PARALLEL SAFE
+    AS $$ SELECT coalesce(
+        pgshard.status_time(status->'cutover'->>'retire_at'),
+        pgshard.status_time(status->'cutover'->>'switched_at')
+            + make_interval(secs => coalesce(
+                pgshard.status_number(status->'cutover'->'retire_after_ms') / 1000.0,
+                pgshard.status_number(status->'cutover'->'retire_after_seconds'),
+                pgshard.status_number(spec->'retire_after_ms') / 1000.0,
+                pgshard.status_number(spec->'retire_after_seconds'),
+                86400))) $$;
+
+-- How many operations are in the queue. The queue view carries what every
+-- entry waits for, which is quadratic in the depth of the queue, so a
+-- reader shows the head of a long queue and needs the count separately to
+-- say that is what it is doing. SECURITY DEFINER because a count of
+-- unfinished operations is not a reason to grant a reader the base view.
+CREATE FUNCTION pgshard.operation_queue_depth() RETURNS bigint
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$ SELECT count(*) FROM pgshard.operations $$;
+
+REVOKE ALL ON FUNCTION pgshard.operation_queue_depth() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pgshard.operation_queue_depth() TO pgshard_reader, pgshard_admin, pgshard_router;
+
 CREATE VIEW pgshard.operation_queue_detail WITH (security_barrier = true) AS
 WITH entries AS (
     SELECT 'ddl'::text AS kind, m.id, m.arrival, m.database,
@@ -95,16 +127,16 @@ WITH entries AS (
                WHEN 'switching' THEN 0.85
                WHEN 'switched' THEN 0.90 + 0.09 * coalesce(pgshard.fraction(
                    extract(epoch FROM now() - pgshard.status_time(w.status->'cutover'->>'switched_at'))::numeric,
-                   extract(epoch FROM pgshard.status_time(w.status->'cutover'->>'retire_at') - pgshard.status_time(w.status->'cutover'->>'switched_at'))::numeric), 1)
+                   extract(epoch FROM pgshard.retire_at(w.status, w.spec) - pgshard.status_time(w.status->'cutover'->>'switched_at'))::numeric), 1)
                WHEN 'completing' THEN 0.99
            END,
            concat_ws(' · ',
                CASE WHEN w.status->>'stage' = 'copying' AND w.status->'progress' ? 'tables_total'
                     THEN 'copying ' || coalesce(w.status->'progress'->>'tables_ready', '0') || '/' || (w.status->'progress'->>'tables_total') || ' tables' END,
-               CASE WHEN w.status->>'stage' = 'switched' AND pgshard.status_time(w.status->'cutover'->>'retire_at') > now()
-                    THEN 'old groups retire in ' || pgshard.short_interval(pgshard.status_time(w.status->'cutover'->>'retire_at') - now()) END,
+               CASE WHEN w.status->>'stage' = 'switched' AND pgshard.retire_at(w.status, w.spec) > now()
+                    THEN 'old groups retire in ' || pgshard.short_interval(pgshard.retire_at(w.status, w.spec) - now()) END,
                nullif(w.status->>'message', '')),
-           w.created_at, pgshard.status_time(w.status->>'started_at'), w.updated_at, pgshard.status_time(w.status->'cutover'->>'retire_at')
+           w.created_at, pgshard.status_time(w.status->>'started_at'), w.updated_at, pgshard.retire_at(w.status, w.spec)
     FROM pgshard.workflows w
     WHERE w.kind IN ('reshard', 'upgrade')
       AND (w.state IN ('pending', 'provisioning', 'running', 'paused') OR w.status->>'stage' = 'cancelling')
@@ -132,10 +164,17 @@ WITH entries AS (
       AND (w.state IN ('pending', 'provisioning', 'running', 'paused') OR w.status->>'stage' = 'cancelling')
 ), waits AS (
     SELECT e.kind, e.id,
-           coalesce(jsonb_agg(jsonb_build_object('kind', b.blocker_kind, 'id', b.blocker_id, 'reason', b.reason) ORDER BY b.blocker_kind, b.blocker_id)
-                    FILTER (WHERE b.blocker_id IS NOT NULL), '[]') AS blockers
+           -- No ORDER BY: operation_blockers already returns them oldest
+           -- arrival first, and that head is the operation actually holding
+           -- the queue -- the one a reader is sent after. Re-sorting them by
+           -- (kind, id) named whichever blocker sorted first instead.
+           --
+           -- WITH ORDINALITY, because a LATERAL set function's row order is
+           -- not something an aggregate is entitled to assume.
+           coalesce(jsonb_agg(jsonb_build_object('kind', b.blocker_kind, 'id', b.blocker_id, 'reason', b.reason) ORDER BY b.n)
+                    FILTER (WHERE b.blocker_id IS NOT NULL AND b.n <= 20), '[]') AS blockers
     FROM entries e
-    LEFT JOIN LATERAL pgshard.operation_blockers(e.kind, e.id) b ON true
+    LEFT JOIN LATERAL pgshard.operation_blockers(e.kind, e.id) WITH ORDINALITY AS b(blocker_kind, blocker_id, reason, n) ON true
     GROUP BY e.kind, e.id
 )
 SELECT row_number() OVER (ORDER BY e.arrival, e.kind, e.id) AS position,

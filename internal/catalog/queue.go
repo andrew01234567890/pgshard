@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -232,21 +233,33 @@ type QueueEntry struct {
 	RetireAt    *time.Time `json:"retire_at"`
 }
 
-// ListOperationQueue reads the operation queue in arrival order, with each
-// migration's statement when detail is set (pgshard.operation_queue_detail,
-// for administrators) and without it otherwise.
-func ListOperationQueue(ctx context.Context, q Querier, detail bool) ([]QueueEntry, error) {
+// QueueLimit caps how many entries one read of the queue returns. Every
+// entry carries what it waits for, and a queue N deep behind one reshard
+// has O(N^2) of those between them, so an unbounded read of a deep queue
+// costs the catalog primary seconds of CPU and megabytes of JSON for a page
+// nobody can read anyway. The head of the queue is what an operator needs.
+const QueueLimit = 200
+
+// ListOperationQueue reads the head of the operation queue in arrival
+// order, with each migration's statement when detail is set
+// (pgshard.operation_queue_detail, for administrators) and without it
+// otherwise. total is how many entries there are, which is more than the
+// rows returned when the queue is deeper than QueueLimit.
+func ListOperationQueue(ctx context.Context, q RowQuerier, detail bool) (entries []QueueEntry, total int, err error) {
 	statement, view := "NULL::text", "pgshard.operation_queue"
 	if detail {
 		statement, view = "statement", "pgshard.operation_queue_detail"
 	}
+	if err := q.QueryRow(ctx, `SELECT pgshard.operation_queue_depth()`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 	rows, err := q.Query(ctx, `SELECT position, kind, id::text, database, command, `+statement+`, state, stage, waiting_for, blockers,
 		progress::float8, progress_bar, detail, created_at, started_at, updated_at, retire_at
-		FROM `+view+` ORDER BY position`)
+		FROM `+view+` ORDER BY position LIMIT `+strconv.Itoa(QueueLimit))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (QueueEntry, error) {
+	entries, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (QueueEntry, error) {
 		var e QueueEntry
 		var blockers []struct {
 			Kind   string `json:"kind"`
@@ -261,4 +274,5 @@ func ListOperationQueue(ctx context.Context, q Querier, detail bool) ([]QueueEnt
 		}
 		return e, err
 	})
+	return entries, total, err
 }

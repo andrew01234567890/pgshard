@@ -15,11 +15,16 @@ import (
 
 type fakeQueueSource struct {
 	entries []catalog.QueueEntry
+	total   int
 	err     error
 }
 
-func (f fakeQueueSource) OperationQueue(context.Context) ([]catalog.QueueEntry, error) {
-	return f.entries, f.err
+func (f fakeQueueSource) OperationQueue(context.Context) ([]catalog.QueueEntry, int, error) {
+	total := f.total
+	if total == 0 {
+		total = len(f.entries)
+	}
+	return f.entries, total, f.err
 }
 
 // fakeQueueCatalog is a catalog source that also answers the queue.
@@ -28,7 +33,7 @@ type fakeQueueCatalog struct {
 	queue fakeQueueSource
 }
 
-func (f fakeQueueCatalog) OperationQueue(ctx context.Context) ([]catalog.QueueEntry, error) {
+func (f fakeQueueCatalog) OperationQueue(ctx context.Context) ([]catalog.QueueEntry, int, error) {
 	return f.queue.OperationQueue(ctx)
 }
 
@@ -125,5 +130,22 @@ func TestQueueSummaryAccountsForEveryEntry(t *testing.T) {
 	s, _ := newTestServer(t, fakeQueueCatalog{queue: fakeQueueSource{entries: append(entries, paused)}})
 	if body := get(t, s, "/queue").Body.String(); !strings.Contains(body, "3 in the queue · 1 running · 1 waiting · 1 paused") {
 		t.Errorf("the summary drops the paused operation: %s", body)
+	}
+}
+
+func TestQueuePageSaysWhenItShowsOnlyTheHead(t *testing.T) {
+	now := time.Now()
+	s, _ := newTestServer(t, fakeQueueCatalog{queue: fakeQueueSource{entries: queueEntries(now), total: 940}})
+	body := get(t, s, "/queue").Body.String()
+	if !strings.Contains(body, "940 in the queue") {
+		t.Errorf("the page counts what it shows, not what is queued: %s", body)
+	}
+	if !strings.Contains(body, "showing the first 2") {
+		t.Errorf("the page shows a partial queue as if it were the whole one: %s", body)
+	}
+	// A queue that fits says nothing about a limit.
+	s, _ = newTestServer(t, fakeQueueCatalog{queue: fakeQueueSource{entries: queueEntries(now)}})
+	if body := get(t, s, "/queue").Body.String(); strings.Contains(body, "showing the first") {
+		t.Errorf("a queue that fits reports a limit: %s", body)
 	}
 }

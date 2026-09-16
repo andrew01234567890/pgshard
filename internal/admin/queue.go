@@ -14,16 +14,23 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
-// QueueSource reads the operation queue.
+// QueueSource reads the head of the operation queue, and how many entries
+// there are in all.
 type QueueSource interface {
-	OperationQueue(ctx context.Context) ([]catalog.QueueEntry, error)
+	OperationQueue(ctx context.Context) ([]catalog.QueueEntry, int, error)
 }
 
 // OperationQueue implements QueueSource.
-func (p PgxCatalog) OperationQueue(ctx context.Context) ([]catalog.QueueEntry, error) {
-	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) ([]catalog.QueueEntry, error) {
-		return catalog.ListOperationQueue(ctx, conn, true)
+func (p PgxCatalog) OperationQueue(ctx context.Context) ([]catalog.QueueEntry, int, error) {
+	type page struct {
+		entries []catalog.QueueEntry
+		total   int
+	}
+	out, err := withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) (page, error) {
+		entries, total, err := catalog.ListOperationQueue(ctx, conn, true)
+		return page{entries, total}, err
 	})
+	return out.entries, out.total, err
 }
 
 // QueueView is the /queue page.
@@ -36,7 +43,12 @@ type QueueView struct {
 	// that the summary accounts for all of the entries and not only the two
 	// states with their own counter.
 	States []QueueStateCount `json:"states"`
-	Error   string `json:"error,omitempty"`
+	// Total is how many operations are in the queue, which is more than
+	// Entries holds once the queue is deeper than the page reads. Showing
+	// the head of a long queue is the point; showing it as if it were the
+	// whole queue is not.
+	Total int    `json:"total"`
+	Error string `json:"error,omitempty"`
 	// Unavailable says why there is no queue to show: no catalog, or a
 	// catalog not yet migrated to have one.
 	Unavailable string    `json:"unavailable,omitempty"`
@@ -82,7 +94,7 @@ func BuildQueueView(ctx context.Context, src QueueSource, now time.Time) QueueVi
 		v.Unavailable = "no catalog connection is configured for the admin"
 		return v
 	}
-	entries, err := src.OperationQueue(ctx)
+	entries, total, err := src.OperationQueue(ctx)
 	var pgErr *pgconn.PgError
 	switch {
 	case errors.As(err, &pgErr) && pgErr.Code == "42P01":
@@ -92,6 +104,7 @@ func BuildQueueView(ctx context.Context, src QueueSource, now time.Time) QueueVi
 		v.Error = err.Error()
 		return v
 	}
+	v.Total = total
 	for _, e := range entries {
 		row := QueueRow{QueueEntry: e, KindLabel: queueKindLabels[e.Kind]}
 		if row.KindLabel == "" {

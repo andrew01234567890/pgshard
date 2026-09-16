@@ -709,12 +709,15 @@ func TestTheOperationQueueReadsAsPeopleNeedIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = rc.Close(ctx) }()
-	entries, err := ListOperationQueue(ctx, rc, false)
+	entries, total, err := ListOperationQueue(ctx, rc, false)
 	if err != nil {
 		t.Fatalf("a reader reading the queue: %v", err)
 	}
 	if len(entries) != 4 {
 		t.Fatalf("%d entries, want 4: %+v", len(entries), entries)
+	}
+	if total != 4 {
+		t.Errorf("total %d, want 4", total)
 	}
 	byID := map[string]QueueEntry{}
 	for i, e := range entries {
@@ -739,6 +742,15 @@ func TestTheOperationQueueReadsAsPeopleNeedIt(t *testing.T) {
 	if c := byID[role].Command; c != "ALTER ROLE app" {
 		t.Errorf("role entry command %q", c)
 	}
+	// The role statement waits for the reshard, which started, and for the
+	// index, which arrived before it. The first of them is the one holding
+	// the queue and the one a reader is sent after -- and it is the reshard,
+	// which arrived first, not whichever of the two sorts first by kind and
+	// id. Sorting them put "ddl" ahead of "reshard" and named the newer
+	// blocker.
+	if b := byID[role].Blockers; len(b) != 2 || b[0].ID != reshard || b[1].ID != index {
+		t.Errorf("the role statement's blockers are not in arrival order: %+v", b)
+	}
 	if m := byID[move]; m.Command != "move app.public.items to sharded(id)" || m.State != "waiting" || m.Database == nil || *m.Database != "app" {
 		t.Errorf("placement entry %+v", m)
 	}
@@ -749,7 +761,7 @@ func TestTheOperationQueueReadsAsPeopleNeedIt(t *testing.T) {
 		t.Errorf("the reader's queue carries a verifier: %s", got)
 	}
 
-	detail, err := ListOperationQueue(ctx, conn, true)
+	detail, _, err := ListOperationQueue(ctx, conn, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,18 +779,42 @@ func TestTheOperationQueueReadsAsPeopleNeedIt(t *testing.T) {
 	}
 
 	mustExec(t, conn, `DELETE FROM pgshard.migrations`)
+	// The status a controller actually writes once it has switched: when
+	// the switch happened, and the window the spec asked for. The deadline
+	// is derived from those. Seeding a cutover.retire_at here instead --
+	// which is what this test used to do -- proved only that the view can
+	// read a key the test invented.
 	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status, arrival) VALUES
-		($1, 'upgrade', 'running', '{"pg_major": 19, "source_pg_major": 18}',
-		 jsonb_build_object('stage', 'switched', 'cutover', jsonb_build_object('switched_at', now() - interval '1 hour', 'retire_at', now() + interval '23 hours')), 5)`, switched)
+		($1, 'upgrade', 'running', '{"pg_major": 19, "source_pg_major": 18, "retire_after_seconds": 86400}',
+		 jsonb_build_object('stage', 'switched', 'cutover', jsonb_build_object('switched_at', now() - interval '1 hour')), 5)`, switched)
 	mustExec(t, conn, `UPDATE pgshard.workflows SET status = '{"stage": "copying", "progress": {"tables_ready": "twelve", "tables_total": [40]}, "started_at": "not a time"}' WHERE id = $1`, reshard)
-	entries, err = ListOperationQueue(ctx, conn, false)
+	entries, _, err = ListOperationQueue(ctx, conn, false)
 	if err != nil {
 		t.Fatalf("a status the view cannot read broke it: %v", err)
 	}
+	found := false
 	for _, e := range entries {
-		if e.ID == switched && (e.Command != "upgrade PostgreSQL 18 to 19" || e.State != "retiring" || e.Detail == nil || !strings.HasPrefix(*e.Detail, "old groups retire in 22h5") || e.RetireAt == nil) {
-			t.Errorf("switched upgrade entry %+v (detail %v)", e, deref(e.Detail))
+		if e.ID != switched {
+			continue
 		}
+		found = true
+		if e.Command != "upgrade PostgreSQL 18 to 19" || e.State != "retiring" {
+			t.Errorf("switched upgrade entry %+v", e)
+		}
+		if e.Detail == nil || !strings.HasPrefix(*e.Detail, "old groups retire in 22h5") {
+			t.Errorf("the countdown is not derived from the switch and the window: %v", deref(e.Detail))
+		}
+		if e.RetireAt == nil {
+			t.Error("retire_at is not answered for a switched workflow")
+		}
+		// An hour into a day-long window, not pinned at the top of the
+		// bar: the ramp reads the same two values the countdown does.
+		if e.Progress == nil || *e.Progress < 0.90 || *e.Progress > 0.92 {
+			t.Errorf("progress %v an hour into a 24h retirement window", deref(e.Progress))
+		}
+	}
+	if !found {
+		t.Fatal("the switched upgrade is not in the queue at all, so nothing above was asserted")
 	}
 }
 
@@ -810,7 +846,7 @@ func TestTheAdminUILoginReadsWhatItShows(t *testing.T) {
 	}
 	defer func() { _ = ui.Close(ctx) }()
 
-	if _, err := ListOperationQueue(ctx, ui, true); err != nil {
+	if _, _, err := ListOperationQueue(ctx, ui, true); err != nil {
 		t.Errorf("reading the queue with statements: %v", err)
 	}
 	ms, total, err := ListMigrationsFrom(ctx, ui, MigrationsDetailView, MigrationFilter{})

@@ -1,7 +1,7 @@
 {{define "wait"}}<div>{{if .Href}}<a href="{{.Href}}">{{.Label}}</a>{{else}}{{.Label}}{{end}} <span class="meta">({{.Reason}})</span></div>{{end}}
 {{if .Error}}<p class="bad">catalog: {{.Error}}</p>{{end}}
 {{if .Unavailable}}<p class="notice">{{.Unavailable}}</p>{{else if not .Error}}
-<p class="meta">{{len .Entries}} in the queue{{range .States}} · {{.Count}} {{.State}}{{end}}</p>
+<p class="meta">{{.Total}} in the queue{{range .States}} · {{.Count}} {{.State}}{{end}}{{if gt .Total (len .Entries)}} · showing the first {{len .Entries}}{{end}}</p>
 {{if .Entries}}
 <table class="queue">
 <thead><tr><th>#</th><th>Kind</th><th>Operation</th><th>State</th><th>Waits for</th><th>Progress</th><th>Since</th></tr></thead>
