@@ -49,6 +49,16 @@ type ResultWriter interface {
 	NoData() error
 	// PortalSuspended reports that Execute stopped at its row limit.
 	PortalSuspended() error
+	// ParseComplete, BindComplete and CloseComplete answer Parse, Bind and
+	// Close. They belong to the executor rather than to the session
+	// because an executor that stages a batch answers them where the
+	// backend does -- in among the batch's other responses -- and a
+	// session that answered them as the messages arrived would send the
+	// second statement's ParseComplete before the first statement's
+	// results.
+	ParseComplete() error
+	BindComplete() error
+	CloseComplete() error
 	Notice(*pgproto3.NoticeResponse) error
 	Notification(*pgproto3.NotificationResponse) error
 	// ParameterStatus reports a GUC_REPORT setting whose value changed on
@@ -72,11 +82,16 @@ type CopyInStream interface {
 // the session goroutine; the context is cancelled on client cancel or drain.
 type Executor interface {
 	SimpleQuery(ctx context.Context, sql string, w ResultWriter) error
-	Parse(ctx context.Context, name, sql string, paramOIDs []uint32) error
-	Bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error
+	// Parse, Bind and Close take a writer because they own their own
+	// completion message: an executor that answers the statement itself
+	// writes it at once, and one that stages the statement leaves it to
+	// whatever answers the batch, so that the client reads one statement's
+	// messages before the next one's.
+	Parse(ctx context.Context, name, sql string, paramOIDs []uint32, w ResultWriter) error
+	Bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16, w ResultWriter) error
 	Describe(ctx context.Context, kind DescribeKind, name string, w ResultWriter) error
 	Execute(ctx context.Context, portal string, maxRows int32, w ResultWriter) error
-	Close(ctx context.Context, kind DescribeKind, name string) error
+	Close(ctx context.Context, kind DescribeKind, name string, w ResultWriter) error
 	// Sync is called for every Sync message so the executor can end an
 	// implicit transaction block.
 	Sync(ctx context.Context) error

@@ -234,6 +234,11 @@ type Executor struct {
 	batch       []*pgshardv1.ExecuteRequest
 	batchStmts  []string
 	batchFailed bool
+	// clientReqs marks the staged requests the client sent, and
+	// completions queues, in send order, the Parse, Bind and Close
+	// completions the backend owes and whether each is the client's.
+	clientReqs  map[*pgshardv1.ExecuteRequest]bool
+	completions []owedCompletion
 	// backendOpen marks a batch this session flushed to the backend but
 	// has not synced. The backend is mid-batch and holding an implicit
 	// transaction open, so the client's Sync still has to reach it even
@@ -1363,8 +1368,9 @@ func (e *Executor) awaitReleaseOf(ctx context.Context, sh Shard) error {
 }
 
 // Parse implements pgwire.Executor: the message is buffered until Sync.
-func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint32) error {
+func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint32, w pgwire.ResultWriter) error {
 	e.enterStatement(ctx)
+	e.batchWriter = w
 	return e.guard("Parse", func() error { return e.parse(ctx, name, sql, paramOIDs) })
 }
 
@@ -1401,7 +1407,7 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 	st := prepared{sql: sql, oids: paramOIDs, class: pl.Class, plan: pl, snap: e.currentSnapshot()}
 	e.stmts[name] = st
 	e.batchStmts = append(e.batchStmts, name)
-	e.batch = append(e.batch, parseReq(e.physical(name), st.shardSQL(), st.shardOIDs()))
+	e.batch = append(e.batch, e.clientRequest(parseReq(e.physical(name), st.shardSQL(), st.shardOIDs())))
 	e.batchDDL = append(e.batchDDL, migrationPlan(e.stmts, name))
 	return nil
 }
@@ -1484,8 +1490,9 @@ func (e *Executor) currentSnapshot() *snapshot.Snapshot {
 // Bind implements pgwire.Executor: a deferred plan is resolved here, once
 // the shard key parameters are known. A statement prepared against an
 // older snapshot is planned again first.
-func (e *Executor) Bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error {
+func (e *Executor) Bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16, w pgwire.ResultWriter) error {
 	e.enterStatement(ctx)
+	e.batchWriter = w
 	return e.guard("Bind", func() error { return e.bind(ctx, portal, statement, paramFormats, params, resultFormats) })
 }
 
@@ -1521,7 +1528,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 	}
 	e.portals[portal] = statement
 	e.portalDDL[portal] = migrationPlan(e.stmts, statement)
-	e.batch = append(e.batch, bindReq(portal, e.physical(statement), paramFormats, params, resultFormats))
+	e.batch = append(e.batch, e.clientRequest(bindReq(portal, e.physical(statement), paramFormats, params, resultFormats)))
 	e.batchDDL = append(e.batchDDL, e.portalDDL[portal])
 	return nil
 }
@@ -1682,10 +1689,11 @@ func (e *Executor) injectSearchPath(g gucEntry) {
 }
 
 // Close implements pgwire.Executor.
-func (e *Executor) Close(_ context.Context, kind pgwire.DescribeKind, name string) error {
+func (e *Executor) Close(_ context.Context, kind pgwire.DescribeKind, name string, w pgwire.ResultWriter) error {
 	if e.batchFailed {
 		return nil
 	}
+	e.batchWriter = w
 	if kind == pgwire.DescribeStatement {
 		delete(e.stmts, name)
 		name = e.physical(name)
@@ -1693,7 +1701,7 @@ func (e *Executor) Close(_ context.Context, kind pgwire.DescribeKind, name strin
 		delete(e.portals, name)
 		delete(e.portalDDL, name)
 	}
-	e.batch = append(e.batch, closeReq(kind, name))
+	e.batch = append(e.batch, e.clientRequest(closeReq(kind, name)))
 	return nil
 }
 
@@ -1704,6 +1712,7 @@ func (e *Executor) failBatch() {
 	e.staged = e.staged[:e.stagedMark]
 	e.batch, e.batchStmts, e.batchFailed, e.batchWriter, e.batchDDL = nil, nil, true, nil, nil
 	e.batchTarget, e.batchExec, e.describes, e.batchBinds = nil, nil, nil, nil
+	e.completions, e.clientReqs = nil, nil
 	e.batchInject = nil
 	e.batchScatter, e.batchScatterStmt = nil, ""
 }
@@ -1895,7 +1904,13 @@ func (e *Executor) sync(ctx context.Context) error {
 			// table under an online rewrite carries a column list the
 			// client did not write, and RETURNING * is expanded to the
 			// visible columns.
+			if err := e.answerStagedCompletions(w, batch); err != nil {
+				return e.afterBatch(ctx, err)
+			}
 			return e.afterBatch(ctx, e.referenceWrite(ctx, *scatterPlan, unnamedBatch(st.shardSQL(), st.shardOIDs(), batch), w))
+		}
+		if err := e.answerStagedCompletions(w, batch); err != nil {
+			return e.afterBatch(ctx, err)
 		}
 		return e.afterBatch(ctx, e.scatterBatch(ctx, *scatterPlan, scatterStmt, batch, w))
 	}
@@ -1951,9 +1966,10 @@ func (e *Executor) sync(ctx context.Context) error {
 		// message, while pinning would cost every such session its
 		// transaction pooling, including the single-batch
 		// Parse-Bind-Execute that works correctly today. The extra
-		// ParseComplete needs no suppression -- the router drops the
-		// pooler's ParseComplete for every statement and pgwire answers
-		// the client itself.
+		// ParseComplete is suppressed like any other request the router
+		// sends on its own account: it is not in clientReqs, so the
+		// completion queue records it as the router's and the pump does
+		// not relay it.
 		if st, ok := e.stmts[""]; ok && !fresh[""] && bindsUnnamed(batch) {
 			if err := e.send(parseReq("", st.shardSQL(), st.shardOIDs())); err != nil {
 				return err
@@ -2023,6 +2039,11 @@ func (e *Executor) reapplyStartupSearchPath(ctx context.Context, g gucEntry) err
 // afterBatch settles staged GUCs and releases the pinned backend when a
 // transaction just ended.
 func (e *Executor) afterBatch(ctx context.Context, err error) error {
+	// A batch that ended holds no more completions, whether every one of
+	// them arrived or the batch failed with some still owed. Carrying them
+	// into the next batch would relay its first completion against this
+	// batch's answer.
+	e.completions, e.clientReqs = nil, nil
 	if e.tx == pgwire.TxIdle {
 		e.txnPrelude, e.txnTouched = nil, false
 		e.txnOnBackend, e.txnPreFence = false, false
@@ -2268,6 +2289,7 @@ func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
 	if err := e.conn.send(req, e.sid, e.generation(), e.ident, e.backendDatabase(), e.statement.Load()); err != nil {
 		return e.poolerLost(err)
 	}
+	e.noteCompletion(req)
 	return nil
 }
 
@@ -2438,10 +2460,30 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			if prev != pgwire.TxIdle && e.tx == pgwire.TxIdle {
 				e.txnEnded = true
 			}
+			// A pooler older than this router does not forward
+			// CloseComplete, so a client that closed a statement would
+			// wait for an answer that never comes. Answering the
+			// stragglers at the end of the batch is later than PostgreSQL
+			// would, and it is the difference between a mixed-version
+			// rollout being slightly out of order and being hung.
+			if werr := e.answerOwedCompletions(w); werr != nil {
+				return werr
+			}
 			return firstErr
 		case *pgshardv1.ExecuteResponse_ParameterStatus:
 			werr = e.reportParameter(w, m.ParameterStatus.GetName(), m.ParameterStatus.GetValue())
-		case *pgshardv1.ExecuteResponse_ParseComplete, *pgshardv1.ExecuteResponse_BindComplete:
+		case *pgshardv1.ExecuteResponse_ParseComplete:
+			if e.popCompletion() {
+				werr = w.ParseComplete()
+			}
+		case *pgshardv1.ExecuteResponse_BindComplete:
+			if e.popCompletion() {
+				werr = w.BindComplete()
+			}
+		case *pgshardv1.ExecuteResponse_CloseComplete:
+			if e.popCompletion() {
+				werr = w.CloseComplete()
+			}
 		default:
 			e.r.cfg.Logger.Warn("unexpected pooler response", "session", e.sid, "type", fmt.Sprintf("%T", resp.Message))
 		}
@@ -2449,6 +2491,105 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			return werr
 		}
 	}
+}
+
+// clientRequest marks a request as one the client sent, so that the
+// completion the backend answers it with is relayed rather than swallowed.
+// Every other Parse, Bind and Close in a batch is the router's own -- a
+// re-Parse of the unnamed statement, a search_path reapplication, a
+// scatter's per-shard copy -- and PostgreSQL's answer to it is not the
+// client's to see.
+func (e *Executor) clientRequest(req *pgshardv1.ExecuteRequest) *pgshardv1.ExecuteRequest {
+	if e.clientReqs == nil {
+		e.clientReqs = map[*pgshardv1.ExecuteRequest]bool{}
+	}
+	e.clientReqs[req] = true
+	return req
+}
+
+// noteCompletion records, in send order, whether the completion req will be
+// answered with belongs to the client. The queue is read by the pump as the
+// completions arrive, which is what keeps them in the backend's order
+// instead of the order the messages were received in.
+func (e *Executor) noteCompletion(req *pgshardv1.ExecuteRequest) {
+	owed := owedCompletion{client: e.clientReqs[req]}
+	switch req.GetMessage().(type) {
+	case *pgshardv1.ExecuteRequest_Parse:
+		owed.write = pgwire.ResultWriter.ParseComplete
+	case *pgshardv1.ExecuteRequest_Bind:
+		owed.write = pgwire.ResultWriter.BindComplete
+	case *pgshardv1.ExecuteRequest_Close:
+		owed.write = pgwire.ResultWriter.CloseComplete
+	default:
+		return
+	}
+	e.completions = append(e.completions, owed)
+}
+
+// owedCompletion is one completion the backend owes: which message answers
+// it, and whether the request was the client's, since the router's own
+// Parses, Binds and Closes are answered too and those answers are not the
+// client's to see.
+type owedCompletion struct {
+	write  func(pgwire.ResultWriter) error
+	client bool
+}
+
+// popCompletion reports whether the completion that just arrived is the
+// client's. An unexpected one -- a completion with nothing owed -- is not
+// relayed: the router would otherwise pass on a message the client cannot
+// place.
+func (e *Executor) popCompletion() bool {
+	if len(e.completions) == 0 {
+		return false
+	}
+	c := e.completions[0]
+	e.completions = e.completions[1:]
+	return c.client
+}
+
+// answerStagedCompletions writes the Parse, Bind and Close completions the
+// client is owed for a batch the router answers itself rather than sending
+// to a pooler -- a scatter, a reference write, a migration, a multi-shard
+// transaction control statement. Such a batch carries one statement (a
+// multi-shard statement may not share a batch), so writing them in staged
+// order, before the statement's own output, is the order PostgreSQL would
+// have answered in.
+func (e *Executor) answerStagedCompletions(w pgwire.ResultWriter, batch []*pgshardv1.ExecuteRequest) error {
+	for _, req := range batch {
+		if !e.clientReqs[req] {
+			continue
+		}
+		var err error
+		switch req.GetMessage().(type) {
+		case *pgshardv1.ExecuteRequest_Parse:
+			err = w.ParseComplete()
+		case *pgshardv1.ExecuteRequest_Bind:
+			err = w.BindComplete()
+		case *pgshardv1.ExecuteRequest_Close:
+			err = w.CloseComplete()
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// answerOwedCompletions writes what the batch still owes the client when
+// the batch has ended without the backend's answer for it.
+func (e *Executor) answerOwedCompletions(w pgwire.ResultWriter) error {
+	owed := e.completions
+	e.completions = nil
+	for _, c := range owed {
+		if !c.client {
+			continue
+		}
+		if err := c.write(w); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // hiddenNow reports whether the responses arriving belong to a request the
@@ -2743,6 +2884,9 @@ func (discardWriter) EmptyQueryResponse() error                         { return
 func (discardWriter) ParameterDescription([]uint32) error               { return nil }
 func (discardWriter) NoData() error                                     { return nil }
 func (discardWriter) PortalSuspended() error                            { return nil }
+func (discardWriter) ParseComplete() error                              { return nil }
+func (discardWriter) BindComplete() error                               { return nil }
+func (discardWriter) CloseComplete() error                              { return nil }
 func (discardWriter) Notice(*pgproto3.NoticeResponse) error             { return nil }
 func (discardWriter) Notification(*pgproto3.NotificationResponse) error { return nil }
 func (discardWriter) ParameterStatus(string, string) error              { return nil }

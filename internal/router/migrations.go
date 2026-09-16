@@ -363,6 +363,9 @@ func (e *Executor) migrationBatch(ctx context.Context, batch []*pgshardv1.Execut
 		switch r := req.Message.(type) {
 		case *pgshardv1.ExecuteRequest_Parse, *pgshardv1.ExecuteRequest_Bind:
 			next++
+			if err := e.answerStagedCompletions(w, []*pgshardv1.ExecuteRequest{req}); err != nil {
+				return true, err
+			}
 		case *pgshardv1.ExecuteRequest_Describe:
 			if r.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
 				if err := w.ParameterDescription(nil); err != nil {

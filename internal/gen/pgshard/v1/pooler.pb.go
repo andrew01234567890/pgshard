@@ -226,7 +226,7 @@ func (x HealthStatus_Role) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use HealthStatus_Role.Descriptor instead.
 func (HealthStatus_Role) EnumDescriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{41, 0}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{42, 0}
 }
 
 // Row change kind.
@@ -282,7 +282,7 @@ func (x ChangeEvent_Row_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ChangeEvent_Row_Kind.Descriptor instead.
 func (ChangeEvent_Row_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 1, 0}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 1, 0}
 }
 
 // UserIdentity carries the SCRAM verifier material for the client user.
@@ -1866,6 +1866,47 @@ func (*BindComplete) Descriptor() ([]byte, []int) {
 	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{24}
 }
 
+// CloseComplete mirrors pgwire CloseComplete. The pooler answers some of a
+// backend's CloseCompletes itself, for the closes it makes on its own
+// account; the ones belonging to a client's Close are forwarded, so that
+// the router can relay them in the order the backend answered rather than
+// answering them as the messages arrive.
+type CloseComplete struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CloseComplete) Reset() {
+	*x = CloseComplete{}
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CloseComplete) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CloseComplete) ProtoMessage() {}
+
+func (x *CloseComplete) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CloseComplete.ProtoReflect.Descriptor instead.
+func (*CloseComplete) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{25}
+}
+
 // NoData mirrors pgwire NoData.
 type NoData struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1875,7 +1916,7 @@ type NoData struct {
 
 func (x *NoData) Reset() {
 	*x = NoData{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[25]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1887,7 +1928,7 @@ func (x *NoData) String() string {
 func (*NoData) ProtoMessage() {}
 
 func (x *NoData) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[25]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1900,7 +1941,7 @@ func (x *NoData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NoData.ProtoReflect.Descriptor instead.
 func (*NoData) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{25}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{26}
 }
 
 // ParameterDescription mirrors pgwire ParameterDescription.
@@ -1913,7 +1954,7 @@ type ParameterDescription struct {
 
 func (x *ParameterDescription) Reset() {
 	*x = ParameterDescription{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[26]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1925,7 +1966,7 @@ func (x *ParameterDescription) String() string {
 func (*ParameterDescription) ProtoMessage() {}
 
 func (x *ParameterDescription) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[26]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1938,7 +1979,7 @@ func (x *ParameterDescription) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ParameterDescription.ProtoReflect.Descriptor instead.
 func (*ParameterDescription) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{26}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ParameterDescription) GetParamOids() []uint32 {
@@ -1961,7 +2002,7 @@ type CopyInResponse struct {
 
 func (x *CopyInResponse) Reset() {
 	*x = CopyInResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[27]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1973,7 +2014,7 @@ func (x *CopyInResponse) String() string {
 func (*CopyInResponse) ProtoMessage() {}
 
 func (x *CopyInResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[27]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1986,7 +2027,7 @@ func (x *CopyInResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyInResponse.ProtoReflect.Descriptor instead.
 func (*CopyInResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{27}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *CopyInResponse) GetFormat() int32 {
@@ -2016,7 +2057,7 @@ type CopyOutResponse struct {
 
 func (x *CopyOutResponse) Reset() {
 	*x = CopyOutResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[28]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2028,7 +2069,7 @@ func (x *CopyOutResponse) String() string {
 func (*CopyOutResponse) ProtoMessage() {}
 
 func (x *CopyOutResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[28]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2041,7 +2082,7 @@ func (x *CopyOutResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyOutResponse.ProtoReflect.Descriptor instead.
 func (*CopyOutResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{28}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *CopyOutResponse) GetFormat() int32 {
@@ -2069,7 +2110,7 @@ type ParameterStatus struct {
 
 func (x *ParameterStatus) Reset() {
 	*x = ParameterStatus{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[29]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2081,7 +2122,7 @@ func (x *ParameterStatus) String() string {
 func (*ParameterStatus) ProtoMessage() {}
 
 func (x *ParameterStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[29]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2094,7 +2135,7 @@ func (x *ParameterStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ParameterStatus.ProtoReflect.Descriptor instead.
 func (*ParameterStatus) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{29}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ParameterStatus) GetName() string {
@@ -2123,7 +2164,7 @@ type NotificationResponse struct {
 
 func (x *NotificationResponse) Reset() {
 	*x = NotificationResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[30]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2135,7 +2176,7 @@ func (x *NotificationResponse) String() string {
 func (*NotificationResponse) ProtoMessage() {}
 
 func (x *NotificationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[30]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2148,7 +2189,7 @@ func (x *NotificationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotificationResponse.ProtoReflect.Descriptor instead.
 func (*NotificationResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{30}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *NotificationResponse) GetPid() uint32 {
@@ -2181,7 +2222,7 @@ type EmptyQuery struct {
 
 func (x *EmptyQuery) Reset() {
 	*x = EmptyQuery{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[31]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2193,7 +2234,7 @@ func (x *EmptyQuery) String() string {
 func (*EmptyQuery) ProtoMessage() {}
 
 func (x *EmptyQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[31]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2206,7 +2247,7 @@ func (x *EmptyQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EmptyQuery.ProtoReflect.Descriptor instead.
 func (*EmptyQuery) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{31}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{32}
 }
 
 // PortalSuspended reports that Execute stopped at its row limit with the
@@ -2219,7 +2260,7 @@ type PortalSuspended struct {
 
 func (x *PortalSuspended) Reset() {
 	*x = PortalSuspended{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[32]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2231,7 +2272,7 @@ func (x *PortalSuspended) String() string {
 func (*PortalSuspended) ProtoMessage() {}
 
 func (x *PortalSuspended) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[32]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2244,7 +2285,7 @@ func (x *PortalSuspended) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PortalSuspended.ProtoReflect.Descriptor instead.
 func (*PortalSuspended) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{32}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{33}
 }
 
 // Flush asks the backend to answer everything sent since the last flush
@@ -2260,7 +2301,7 @@ type Flush struct {
 
 func (x *Flush) Reset() {
 	*x = Flush{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[33]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2272,7 +2313,7 @@ func (x *Flush) String() string {
 func (*Flush) ProtoMessage() {}
 
 func (x *Flush) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[33]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2285,7 +2326,7 @@ func (x *Flush) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Flush.ProtoReflect.Descriptor instead.
 func (*Flush) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{33}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{34}
 }
 
 // FlushComplete marks the end of the responses to one Flush. It is the
@@ -2299,7 +2340,7 @@ type FlushComplete struct {
 
 func (x *FlushComplete) Reset() {
 	*x = FlushComplete{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[34]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2311,7 +2352,7 @@ func (x *FlushComplete) String() string {
 func (*FlushComplete) ProtoMessage() {}
 
 func (x *FlushComplete) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[34]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2324,7 +2365,7 @@ func (x *FlushComplete) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushComplete.ProtoReflect.Descriptor instead.
 func (*FlushComplete) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{34}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{35}
 }
 
 // ExecuteResponse is one pooler-originated pgwire message.
@@ -2356,6 +2397,7 @@ type ExecuteResponse struct {
 	//	*ExecuteResponse_PortalSuspended
 	//	*ExecuteResponse_FlushComplete
 	//	*ExecuteResponse_DataRows
+	//	*ExecuteResponse_CloseComplete
 	Message       isExecuteResponse_Message `protobuf_oneof:"message"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2363,7 +2405,7 @@ type ExecuteResponse struct {
 
 func (x *ExecuteResponse) Reset() {
 	*x = ExecuteResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[35]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2375,7 +2417,7 @@ func (x *ExecuteResponse) String() string {
 func (*ExecuteResponse) ProtoMessage() {}
 
 func (x *ExecuteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[35]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2388,7 +2430,7 @@ func (x *ExecuteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteResponse.ProtoReflect.Descriptor instead.
 func (*ExecuteResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{35}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *ExecuteResponse) GetSessionId() string {
@@ -2585,6 +2627,15 @@ func (x *ExecuteResponse) GetDataRows() *DataRows {
 	return nil
 }
 
+func (x *ExecuteResponse) GetCloseComplete() *CloseComplete {
+	if x != nil {
+		if x, ok := x.Message.(*ExecuteResponse_CloseComplete); ok {
+			return x.CloseComplete
+		}
+	}
+	return nil
+}
+
 type isExecuteResponse_Message interface {
 	isExecuteResponse_Message()
 }
@@ -2669,6 +2720,10 @@ type ExecuteResponse_DataRows struct {
 	DataRows *DataRows `protobuf:"bytes,29,opt,name=data_rows,json=dataRows,proto3,oneof"`
 }
 
+type ExecuteResponse_CloseComplete struct {
+	CloseComplete *CloseComplete `protobuf:"bytes,30,opt,name=close_complete,json=closeComplete,proto3,oneof"`
+}
+
 func (*ExecuteResponse_RowDescription) isExecuteResponse_Message() {}
 
 func (*ExecuteResponse_DataRow) isExecuteResponse_Message() {}
@@ -2709,6 +2764,8 @@ func (*ExecuteResponse_FlushComplete) isExecuteResponse_Message() {}
 
 func (*ExecuteResponse_DataRows) isExecuteResponse_Message() {}
 
+func (*ExecuteResponse_CloseComplete) isExecuteResponse_Message() {}
+
 // ReserveRequest pins a backend to a session.
 type ReserveRequest struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
@@ -2722,7 +2779,7 @@ type ReserveRequest struct {
 
 func (x *ReserveRequest) Reset() {
 	*x = ReserveRequest{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[36]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2734,7 +2791,7 @@ func (x *ReserveRequest) String() string {
 func (*ReserveRequest) ProtoMessage() {}
 
 func (x *ReserveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[36]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2747,7 +2804,7 @@ func (x *ReserveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveRequest.ProtoReflect.Descriptor instead.
 func (*ReserveRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{36}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ReserveRequest) GetSessionId() string {
@@ -2784,7 +2841,7 @@ type ReserveResponse struct {
 
 func (x *ReserveResponse) Reset() {
 	*x = ReserveResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[37]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2796,7 +2853,7 @@ func (x *ReserveResponse) String() string {
 func (*ReserveResponse) ProtoMessage() {}
 
 func (x *ReserveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[37]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2809,7 +2866,7 @@ func (x *ReserveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveResponse.ProtoReflect.Descriptor instead.
 func (*ReserveResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{37}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *ReserveResponse) GetBackendPid() int32 {
@@ -2841,7 +2898,7 @@ type ReleaseRequest struct {
 
 func (x *ReleaseRequest) Reset() {
 	*x = ReleaseRequest{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[38]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2853,7 +2910,7 @@ func (x *ReleaseRequest) String() string {
 func (*ReleaseRequest) ProtoMessage() {}
 
 func (x *ReleaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[38]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2866,7 +2923,7 @@ func (x *ReleaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{38}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *ReleaseRequest) GetSessionId() string {
@@ -2892,7 +2949,7 @@ type ReleaseResponse struct {
 
 func (x *ReleaseResponse) Reset() {
 	*x = ReleaseResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[39]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2904,7 +2961,7 @@ func (x *ReleaseResponse) String() string {
 func (*ReleaseResponse) ProtoMessage() {}
 
 func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[39]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2917,7 +2974,7 @@ func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseResponse.ProtoReflect.Descriptor instead.
 func (*ReleaseResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{39}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{40}
 }
 
 // HealthRequest opens a health stream.
@@ -2929,7 +2986,7 @@ type HealthRequest struct {
 
 func (x *HealthRequest) Reset() {
 	*x = HealthRequest{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[40]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2941,7 +2998,7 @@ func (x *HealthRequest) String() string {
 func (*HealthRequest) ProtoMessage() {}
 
 func (x *HealthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[40]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2954,7 +3011,7 @@ func (x *HealthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthRequest.ProtoReflect.Descriptor instead.
 func (*HealthRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{40}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{41}
 }
 
 // HealthStatus is a snapshot of the shard behind the pooler.
@@ -2981,7 +3038,7 @@ type HealthStatus struct {
 
 func (x *HealthStatus) Reset() {
 	*x = HealthStatus{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[41]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2993,7 +3050,7 @@ func (x *HealthStatus) String() string {
 func (*HealthStatus) ProtoMessage() {}
 
 func (x *HealthStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[41]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3006,7 +3063,7 @@ func (x *HealthStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthStatus.ProtoReflect.Descriptor instead.
 func (*HealthStatus) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{41}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *HealthStatus) GetRole() HealthStatus_Role {
@@ -3075,7 +3132,7 @@ type StreamRequest struct {
 
 func (x *StreamRequest) Reset() {
 	*x = StreamRequest{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[42]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3087,7 +3144,7 @@ func (x *StreamRequest) String() string {
 func (*StreamRequest) ProtoMessage() {}
 
 func (x *StreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[42]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3100,7 +3157,7 @@ func (x *StreamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamRequest.ProtoReflect.Descriptor instead.
 func (*StreamRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{42}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *StreamRequest) GetSlot() string {
@@ -3177,7 +3234,7 @@ type AckRequest struct {
 
 func (x *AckRequest) Reset() {
 	*x = AckRequest{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[43]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3189,7 +3246,7 @@ func (x *AckRequest) String() string {
 func (*AckRequest) ProtoMessage() {}
 
 func (x *AckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[43]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3202,7 +3259,7 @@ func (x *AckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AckRequest.ProtoReflect.Descriptor instead.
 func (*AckRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{43}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *AckRequest) GetSlot() string {
@@ -3264,7 +3321,7 @@ type AckResponse struct {
 
 func (x *AckResponse) Reset() {
 	*x = AckResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[44]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3276,7 +3333,7 @@ func (x *AckResponse) String() string {
 func (*AckResponse) ProtoMessage() {}
 
 func (x *AckResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[44]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3289,7 +3346,7 @@ func (x *AckResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AckResponse.ProtoReflect.Descriptor instead.
 func (*AckResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{44}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *AckResponse) GetError() *Error {
@@ -3338,7 +3395,7 @@ type CopyTablesRequest struct {
 
 func (x *CopyTablesRequest) Reset() {
 	*x = CopyTablesRequest{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[45]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3350,7 +3407,7 @@ func (x *CopyTablesRequest) String() string {
 func (*CopyTablesRequest) ProtoMessage() {}
 
 func (x *CopyTablesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[45]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3363,7 +3420,7 @@ func (x *CopyTablesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesRequest.ProtoReflect.Descriptor instead.
 func (*CopyTablesRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{45}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *CopyTablesRequest) GetStream() string {
@@ -3453,7 +3510,7 @@ type CopyTablesResponse struct {
 
 func (x *CopyTablesResponse) Reset() {
 	*x = CopyTablesResponse{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[46]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3465,7 +3522,7 @@ func (x *CopyTablesResponse) String() string {
 func (*CopyTablesResponse) ProtoMessage() {}
 
 func (x *CopyTablesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[46]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3478,7 +3535,7 @@ func (x *CopyTablesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesResponse.ProtoReflect.Descriptor instead.
 func (*CopyTablesResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *CopyTablesResponse) GetResponse() isCopyTablesResponse_Response {
@@ -3580,7 +3637,7 @@ type ChangeBatch struct {
 
 func (x *ChangeBatch) Reset() {
 	*x = ChangeBatch{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[47]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3592,7 +3649,7 @@ func (x *ChangeBatch) String() string {
 func (*ChangeBatch) ProtoMessage() {}
 
 func (x *ChangeBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[47]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3605,7 +3662,7 @@ func (x *ChangeBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeBatch.ProtoReflect.Descriptor instead.
 func (*ChangeBatch) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *ChangeBatch) GetEvents() []*ChangeEvent {
@@ -3656,7 +3713,7 @@ type ChangeEvent struct {
 
 func (x *ChangeEvent) Reset() {
 	*x = ChangeEvent{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[48]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3668,7 +3725,7 @@ func (x *ChangeEvent) String() string {
 func (*ChangeEvent) ProtoMessage() {}
 
 func (x *ChangeEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[48]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3681,7 +3738,7 @@ func (x *ChangeEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent.ProtoReflect.Descriptor instead.
 func (*ChangeEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *ChangeEvent) GetLsn() uint64 {
@@ -3980,7 +4037,7 @@ type CopyTablesResponse_Snapshot struct {
 
 func (x *CopyTablesResponse_Snapshot) Reset() {
 	*x = CopyTablesResponse_Snapshot{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[50]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3992,7 +4049,7 @@ func (x *CopyTablesResponse_Snapshot) String() string {
 func (*CopyTablesResponse_Snapshot) ProtoMessage() {}
 
 func (x *CopyTablesResponse_Snapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[50]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4005,7 +4062,7 @@ func (x *CopyTablesResponse_Snapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesResponse_Snapshot.ProtoReflect.Descriptor instead.
 func (*CopyTablesResponse_Snapshot) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46, 0}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47, 0}
 }
 
 func (x *CopyTablesResponse_Snapshot) GetSlot() string {
@@ -4049,7 +4106,7 @@ type CopyTablesResponse_TableBegin struct {
 
 func (x *CopyTablesResponse_TableBegin) Reset() {
 	*x = CopyTablesResponse_TableBegin{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[51]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4061,7 +4118,7 @@ func (x *CopyTablesResponse_TableBegin) String() string {
 func (*CopyTablesResponse_TableBegin) ProtoMessage() {}
 
 func (x *CopyTablesResponse_TableBegin) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[51]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4074,7 +4131,7 @@ func (x *CopyTablesResponse_TableBegin) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesResponse_TableBegin.ProtoReflect.Descriptor instead.
 func (*CopyTablesResponse_TableBegin) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46, 1}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47, 1}
 }
 
 func (x *CopyTablesResponse_TableBegin) GetRelation() *ChangeEvent_Relation {
@@ -4101,7 +4158,7 @@ type CopyTablesResponse_Row struct {
 
 func (x *CopyTablesResponse_Row) Reset() {
 	*x = CopyTablesResponse_Row{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[52]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4113,7 +4170,7 @@ func (x *CopyTablesResponse_Row) String() string {
 func (*CopyTablesResponse_Row) ProtoMessage() {}
 
 func (x *CopyTablesResponse_Row) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[52]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4126,7 +4183,7 @@ func (x *CopyTablesResponse_Row) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesResponse_Row.ProtoReflect.Descriptor instead.
 func (*CopyTablesResponse_Row) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46, 2}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47, 2}
 }
 
 func (x *CopyTablesResponse_Row) GetValues() []*Value {
@@ -4147,7 +4204,7 @@ type CopyTablesResponse_Rows struct {
 
 func (x *CopyTablesResponse_Rows) Reset() {
 	*x = CopyTablesResponse_Rows{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[53]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4159,7 +4216,7 @@ func (x *CopyTablesResponse_Rows) String() string {
 func (*CopyTablesResponse_Rows) ProtoMessage() {}
 
 func (x *CopyTablesResponse_Rows) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[53]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4172,7 +4229,7 @@ func (x *CopyTablesResponse_Rows) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesResponse_Rows.ProtoReflect.Descriptor instead.
 func (*CopyTablesResponse_Rows) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46, 3}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47, 3}
 }
 
 func (x *CopyTablesResponse_Rows) GetRows() []*CopyTablesResponse_Row {
@@ -4200,7 +4257,7 @@ type CopyTablesResponse_TableDone struct {
 
 func (x *CopyTablesResponse_TableDone) Reset() {
 	*x = CopyTablesResponse_TableDone{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[54]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4212,7 +4269,7 @@ func (x *CopyTablesResponse_TableDone) String() string {
 func (*CopyTablesResponse_TableDone) ProtoMessage() {}
 
 func (x *CopyTablesResponse_TableDone) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[54]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4225,7 +4282,7 @@ func (x *CopyTablesResponse_TableDone) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesResponse_TableDone.ProtoReflect.Descriptor instead.
 func (*CopyTablesResponse_TableDone) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46, 4}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47, 4}
 }
 
 func (x *CopyTablesResponse_TableDone) GetSchema() string {
@@ -4251,7 +4308,7 @@ type CopyTablesResponse_Done struct {
 
 func (x *CopyTablesResponse_Done) Reset() {
 	*x = CopyTablesResponse_Done{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[55]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4263,7 +4320,7 @@ func (x *CopyTablesResponse_Done) String() string {
 func (*CopyTablesResponse_Done) ProtoMessage() {}
 
 func (x *CopyTablesResponse_Done) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[55]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4276,7 +4333,7 @@ func (x *CopyTablesResponse_Done) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyTablesResponse_Done.ProtoReflect.Descriptor instead.
 func (*CopyTablesResponse_Done) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{46, 5}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{47, 5}
 }
 
 // Transaction begins.
@@ -4292,7 +4349,7 @@ type ChangeEvent_Begin struct {
 
 func (x *ChangeEvent_Begin) Reset() {
 	*x = ChangeEvent_Begin{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[56]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4304,7 +4361,7 @@ func (x *ChangeEvent_Begin) String() string {
 func (*ChangeEvent_Begin) ProtoMessage() {}
 
 func (x *ChangeEvent_Begin) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[56]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4317,7 +4374,7 @@ func (x *ChangeEvent_Begin) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Begin.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Begin) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 0}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 0}
 }
 
 func (x *ChangeEvent_Begin) GetXid() uint32 {
@@ -4364,7 +4421,7 @@ type ChangeEvent_Row struct {
 
 func (x *ChangeEvent_Row) Reset() {
 	*x = ChangeEvent_Row{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[57]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4376,7 +4433,7 @@ func (x *ChangeEvent_Row) String() string {
 func (*ChangeEvent_Row) ProtoMessage() {}
 
 func (x *ChangeEvent_Row) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[57]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4389,7 +4446,7 @@ func (x *ChangeEvent_Row) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Row.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Row) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 1}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 1}
 }
 
 func (x *ChangeEvent_Row) GetSchema() string {
@@ -4459,7 +4516,7 @@ type ChangeEvent_Commit struct {
 
 func (x *ChangeEvent_Commit) Reset() {
 	*x = ChangeEvent_Commit{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[58]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4471,7 +4528,7 @@ func (x *ChangeEvent_Commit) String() string {
 func (*ChangeEvent_Commit) ProtoMessage() {}
 
 func (x *ChangeEvent_Commit) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[58]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4484,7 +4541,7 @@ func (x *ChangeEvent_Commit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Commit.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Commit) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 2}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 2}
 }
 
 func (x *ChangeEvent_Commit) GetCommitLsn() uint64 {
@@ -4513,7 +4570,7 @@ type ChangeEvent_Keepalive struct {
 
 func (x *ChangeEvent_Keepalive) Reset() {
 	*x = ChangeEvent_Keepalive{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[59]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4525,7 +4582,7 @@ func (x *ChangeEvent_Keepalive) String() string {
 func (*ChangeEvent_Keepalive) ProtoMessage() {}
 
 func (x *ChangeEvent_Keepalive) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[59]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4538,7 +4595,7 @@ func (x *ChangeEvent_Keepalive) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Keepalive.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Keepalive) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 3}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 3}
 }
 
 func (x *ChangeEvent_Keepalive) GetWalEnd() uint64 {
@@ -4567,7 +4624,7 @@ type ChangeEvent_Prepare struct {
 
 func (x *ChangeEvent_Prepare) Reset() {
 	*x = ChangeEvent_Prepare{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[60]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4579,7 +4636,7 @@ func (x *ChangeEvent_Prepare) String() string {
 func (*ChangeEvent_Prepare) ProtoMessage() {}
 
 func (x *ChangeEvent_Prepare) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[60]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4592,7 +4649,7 @@ func (x *ChangeEvent_Prepare) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Prepare.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Prepare) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 4}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 4}
 }
 
 func (x *ChangeEvent_Prepare) GetGid() string {
@@ -4628,7 +4685,7 @@ type ChangeEvent_CommitPrepared struct {
 
 func (x *ChangeEvent_CommitPrepared) Reset() {
 	*x = ChangeEvent_CommitPrepared{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[61]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4640,7 +4697,7 @@ func (x *ChangeEvent_CommitPrepared) String() string {
 func (*ChangeEvent_CommitPrepared) ProtoMessage() {}
 
 func (x *ChangeEvent_CommitPrepared) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[61]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4653,7 +4710,7 @@ func (x *ChangeEvent_CommitPrepared) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_CommitPrepared.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_CommitPrepared) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 5}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 5}
 }
 
 func (x *ChangeEvent_CommitPrepared) GetGid() string {
@@ -4689,7 +4746,7 @@ type ChangeEvent_RollbackPrepared struct {
 
 func (x *ChangeEvent_RollbackPrepared) Reset() {
 	*x = ChangeEvent_RollbackPrepared{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[62]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4701,7 +4758,7 @@ func (x *ChangeEvent_RollbackPrepared) String() string {
 func (*ChangeEvent_RollbackPrepared) ProtoMessage() {}
 
 func (x *ChangeEvent_RollbackPrepared) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[62]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4714,7 +4771,7 @@ func (x *ChangeEvent_RollbackPrepared) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_RollbackPrepared.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_RollbackPrepared) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 6}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 6}
 }
 
 func (x *ChangeEvent_RollbackPrepared) GetGid() string {
@@ -4750,7 +4807,7 @@ type ChangeEvent_Message struct {
 
 func (x *ChangeEvent_Message) Reset() {
 	*x = ChangeEvent_Message{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[63]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4762,7 +4819,7 @@ func (x *ChangeEvent_Message) String() string {
 func (*ChangeEvent_Message) ProtoMessage() {}
 
 func (x *ChangeEvent_Message) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[63]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4775,7 +4832,7 @@ func (x *ChangeEvent_Message) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Message.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Message) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 7}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 7}
 }
 
 func (x *ChangeEvent_Message) GetPrefix() string {
@@ -4815,7 +4872,7 @@ type ChangeEvent_Relation struct {
 
 func (x *ChangeEvent_Relation) Reset() {
 	*x = ChangeEvent_Relation{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[64]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4827,7 +4884,7 @@ func (x *ChangeEvent_Relation) String() string {
 func (*ChangeEvent_Relation) ProtoMessage() {}
 
 func (x *ChangeEvent_Relation) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[64]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4840,7 +4897,7 @@ func (x *ChangeEvent_Relation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Relation.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Relation) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 8}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 8}
 }
 
 func (x *ChangeEvent_Relation) GetRelationId() uint32 {
@@ -4890,7 +4947,7 @@ type ChangeEvent_Truncate struct {
 
 func (x *ChangeEvent_Truncate) Reset() {
 	*x = ChangeEvent_Truncate{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[65]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4902,7 +4959,7 @@ func (x *ChangeEvent_Truncate) String() string {
 func (*ChangeEvent_Truncate) ProtoMessage() {}
 
 func (x *ChangeEvent_Truncate) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[65]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4915,7 +4972,7 @@ func (x *ChangeEvent_Truncate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Truncate.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Truncate) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 9}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 9}
 }
 
 func (x *ChangeEvent_Truncate) GetRelationIds() []uint32 {
@@ -4950,7 +5007,7 @@ type ChangeEvent_StreamStart struct {
 
 func (x *ChangeEvent_StreamStart) Reset() {
 	*x = ChangeEvent_StreamStart{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[66]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4962,7 +5019,7 @@ func (x *ChangeEvent_StreamStart) String() string {
 func (*ChangeEvent_StreamStart) ProtoMessage() {}
 
 func (x *ChangeEvent_StreamStart) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[66]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4975,7 +5032,7 @@ func (x *ChangeEvent_StreamStart) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_StreamStart.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_StreamStart) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 10}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 10}
 }
 
 func (x *ChangeEvent_StreamStart) GetXid() uint32 {
@@ -5001,7 +5058,7 @@ type ChangeEvent_StreamStop struct {
 
 func (x *ChangeEvent_StreamStop) Reset() {
 	*x = ChangeEvent_StreamStop{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[67]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5013,7 +5070,7 @@ func (x *ChangeEvent_StreamStop) String() string {
 func (*ChangeEvent_StreamStop) ProtoMessage() {}
 
 func (x *ChangeEvent_StreamStop) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[67]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5026,7 +5083,7 @@ func (x *ChangeEvent_StreamStop) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_StreamStop.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_StreamStop) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 11}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 11}
 }
 
 // StreamCommit commits a streamed transaction.
@@ -5043,7 +5100,7 @@ type ChangeEvent_StreamCommit struct {
 
 func (x *ChangeEvent_StreamCommit) Reset() {
 	*x = ChangeEvent_StreamCommit{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[68]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5055,7 +5112,7 @@ func (x *ChangeEvent_StreamCommit) String() string {
 func (*ChangeEvent_StreamCommit) ProtoMessage() {}
 
 func (x *ChangeEvent_StreamCommit) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[68]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5068,7 +5125,7 @@ func (x *ChangeEvent_StreamCommit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_StreamCommit.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_StreamCommit) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 12}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 12}
 }
 
 func (x *ChangeEvent_StreamCommit) GetXid() uint32 {
@@ -5111,7 +5168,7 @@ type ChangeEvent_StreamAbort struct {
 
 func (x *ChangeEvent_StreamAbort) Reset() {
 	*x = ChangeEvent_StreamAbort{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[69]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5123,7 +5180,7 @@ func (x *ChangeEvent_StreamAbort) String() string {
 func (*ChangeEvent_StreamAbort) ProtoMessage() {}
 
 func (x *ChangeEvent_StreamAbort) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[69]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5136,7 +5193,7 @@ func (x *ChangeEvent_StreamAbort) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_StreamAbort.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_StreamAbort) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 13}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 13}
 }
 
 func (x *ChangeEvent_StreamAbort) GetXid() uint32 {
@@ -5174,7 +5231,7 @@ type ChangeEvent_BeginPrepare struct {
 
 func (x *ChangeEvent_BeginPrepare) Reset() {
 	*x = ChangeEvent_BeginPrepare{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[70]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5186,7 +5243,7 @@ func (x *ChangeEvent_BeginPrepare) String() string {
 func (*ChangeEvent_BeginPrepare) ProtoMessage() {}
 
 func (x *ChangeEvent_BeginPrepare) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[70]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5199,7 +5256,7 @@ func (x *ChangeEvent_BeginPrepare) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_BeginPrepare.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_BeginPrepare) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 14}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 14}
 }
 
 func (x *ChangeEvent_BeginPrepare) GetGid() string {
@@ -5245,7 +5302,7 @@ type ChangeEvent_StreamPrepare struct {
 
 func (x *ChangeEvent_StreamPrepare) Reset() {
 	*x = ChangeEvent_StreamPrepare{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[71]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5257,7 +5314,7 @@ func (x *ChangeEvent_StreamPrepare) String() string {
 func (*ChangeEvent_StreamPrepare) ProtoMessage() {}
 
 func (x *ChangeEvent_StreamPrepare) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[71]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5270,7 +5327,7 @@ func (x *ChangeEvent_StreamPrepare) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_StreamPrepare.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_StreamPrepare) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 15}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 15}
 }
 
 func (x *ChangeEvent_StreamPrepare) GetGid() string {
@@ -5319,7 +5376,7 @@ type ChangeEvent_Origin struct {
 
 func (x *ChangeEvent_Origin) Reset() {
 	*x = ChangeEvent_Origin{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[72]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5331,7 +5388,7 @@ func (x *ChangeEvent_Origin) String() string {
 func (*ChangeEvent_Origin) ProtoMessage() {}
 
 func (x *ChangeEvent_Origin) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[72]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5344,7 +5401,7 @@ func (x *ChangeEvent_Origin) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Origin.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Origin) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 16}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 16}
 }
 
 func (x *ChangeEvent_Origin) GetName() string {
@@ -5375,7 +5432,7 @@ type ChangeEvent_Relation_Column struct {
 
 func (x *ChangeEvent_Relation_Column) Reset() {
 	*x = ChangeEvent_Relation_Column{}
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[73]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5387,7 +5444,7 @@ func (x *ChangeEvent_Relation_Column) String() string {
 func (*ChangeEvent_Relation_Column) ProtoMessage() {}
 
 func (x *ChangeEvent_Relation_Column) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_pooler_proto_msgTypes[73]
+	mi := &file_pgshard_v1_pooler_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5400,7 +5457,7 @@ func (x *ChangeEvent_Relation_Column) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEvent_Relation_Column.ProtoReflect.Descriptor instead.
 func (*ChangeEvent_Relation_Column) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{48, 8, 0}
+	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{49, 8, 0}
 }
 
 func (x *ChangeEvent_Relation_Column) GetName() string {
@@ -5544,7 +5601,8 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\x19TXN_STATUS_IN_TRANSACTION\x10\x02\x12\x15\n" +
 	"\x11TXN_STATUS_FAILED\x10\x03\"\x0f\n" +
 	"\rParseComplete\"\x0e\n" +
-	"\fBindComplete\"\b\n" +
+	"\fBindComplete\"\x0f\n" +
+	"\rCloseComplete\"\b\n" +
 	"\x06NoData\"5\n" +
 	"\x14ParameterDescription\x12\x1d\n" +
 	"\n" +
@@ -5566,8 +5624,7 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"EmptyQuery\"\x11\n" +
 	"\x0fPortalSuspended\"\a\n" +
 	"\x05Flush\"\x0f\n" +
-	"\rFlushComplete\"\xc6\n" +
-	"\n" +
+	"\rFlushComplete\"\x8a\v\n" +
 	"\x0fExecuteResponse\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12E\n" +
@@ -5592,7 +5649,8 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\fnotification\x18\x1a \x01(\v2 .pgshard.v1.NotificationResponseH\x00R\fnotification\x12H\n" +
 	"\x10portal_suspended\x18\x1b \x01(\v2\x1b.pgshard.v1.PortalSuspendedH\x00R\x0fportalSuspended\x12B\n" +
 	"\x0eflush_complete\x18\x1c \x01(\v2\x19.pgshard.v1.FlushCompleteH\x00R\rflushComplete\x123\n" +
-	"\tdata_rows\x18\x1d \x01(\v2\x14.pgshard.v1.DataRowsH\x00R\bdataRowsB\t\n" +
+	"\tdata_rows\x18\x1d \x01(\v2\x14.pgshard.v1.DataRowsH\x00R\bdataRows\x12B\n" +
+	"\x0eclose_complete\x18\x1e \x01(\v2\x19.pgshard.v1.CloseCompleteH\x00R\rcloseCompleteB\t\n" +
 	"\amessage\"\x85\x01\n" +
 	"\x0eReserveRequest\x12\x1d\n" +
 	"\n" +
@@ -5845,7 +5903,7 @@ func file_pgshard_v1_pooler_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_pooler_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_pgshard_v1_pooler_proto_msgTypes = make([]protoimpl.MessageInfo, 74)
+var file_pgshard_v1_pooler_proto_msgTypes = make([]protoimpl.MessageInfo, 75)
 var file_pgshard_v1_pooler_proto_goTypes = []any{
 	(Describe_Kind)(0),                    // 0: pgshard.v1.Describe.Kind
 	(Close_Kind)(0),                       // 1: pgshard.v1.Close.Kind
@@ -5877,64 +5935,65 @@ var file_pgshard_v1_pooler_proto_goTypes = []any{
 	(*ReadyForQuery)(nil),                 // 27: pgshard.v1.ReadyForQuery
 	(*ParseComplete)(nil),                 // 28: pgshard.v1.ParseComplete
 	(*BindComplete)(nil),                  // 29: pgshard.v1.BindComplete
-	(*NoData)(nil),                        // 30: pgshard.v1.NoData
-	(*ParameterDescription)(nil),          // 31: pgshard.v1.ParameterDescription
-	(*CopyInResponse)(nil),                // 32: pgshard.v1.CopyInResponse
-	(*CopyOutResponse)(nil),               // 33: pgshard.v1.CopyOutResponse
-	(*ParameterStatus)(nil),               // 34: pgshard.v1.ParameterStatus
-	(*NotificationResponse)(nil),          // 35: pgshard.v1.NotificationResponse
-	(*EmptyQuery)(nil),                    // 36: pgshard.v1.EmptyQuery
-	(*PortalSuspended)(nil),               // 37: pgshard.v1.PortalSuspended
-	(*Flush)(nil),                         // 38: pgshard.v1.Flush
-	(*FlushComplete)(nil),                 // 39: pgshard.v1.FlushComplete
-	(*ExecuteResponse)(nil),               // 40: pgshard.v1.ExecuteResponse
-	(*ReserveRequest)(nil),                // 41: pgshard.v1.ReserveRequest
-	(*ReserveResponse)(nil),               // 42: pgshard.v1.ReserveResponse
-	(*ReleaseRequest)(nil),                // 43: pgshard.v1.ReleaseRequest
-	(*ReleaseResponse)(nil),               // 44: pgshard.v1.ReleaseResponse
-	(*HealthRequest)(nil),                 // 45: pgshard.v1.HealthRequest
-	(*HealthStatus)(nil),                  // 46: pgshard.v1.HealthStatus
-	(*StreamRequest)(nil),                 // 47: pgshard.v1.StreamRequest
-	(*AckRequest)(nil),                    // 48: pgshard.v1.AckRequest
-	(*AckResponse)(nil),                   // 49: pgshard.v1.AckResponse
-	(*CopyTablesRequest)(nil),             // 50: pgshard.v1.CopyTablesRequest
-	(*CopyTablesResponse)(nil),            // 51: pgshard.v1.CopyTablesResponse
-	(*ChangeBatch)(nil),                   // 52: pgshard.v1.ChangeBatch
-	(*ChangeEvent)(nil),                   // 53: pgshard.v1.ChangeEvent
-	nil,                                   // 54: pgshard.v1.StreamRequest.OptionsEntry
-	(*CopyTablesResponse_Snapshot)(nil),   // 55: pgshard.v1.CopyTablesResponse.Snapshot
-	(*CopyTablesResponse_TableBegin)(nil), // 56: pgshard.v1.CopyTablesResponse.TableBegin
-	(*CopyTablesResponse_Row)(nil),        // 57: pgshard.v1.CopyTablesResponse.Row
-	(*CopyTablesResponse_Rows)(nil),       // 58: pgshard.v1.CopyTablesResponse.Rows
-	(*CopyTablesResponse_TableDone)(nil),  // 59: pgshard.v1.CopyTablesResponse.TableDone
-	(*CopyTablesResponse_Done)(nil),       // 60: pgshard.v1.CopyTablesResponse.Done
-	(*ChangeEvent_Begin)(nil),             // 61: pgshard.v1.ChangeEvent.Begin
-	(*ChangeEvent_Row)(nil),               // 62: pgshard.v1.ChangeEvent.Row
-	(*ChangeEvent_Commit)(nil),            // 63: pgshard.v1.ChangeEvent.Commit
-	(*ChangeEvent_Keepalive)(nil),         // 64: pgshard.v1.ChangeEvent.Keepalive
-	(*ChangeEvent_Prepare)(nil),           // 65: pgshard.v1.ChangeEvent.Prepare
-	(*ChangeEvent_CommitPrepared)(nil),    // 66: pgshard.v1.ChangeEvent.CommitPrepared
-	(*ChangeEvent_RollbackPrepared)(nil),  // 67: pgshard.v1.ChangeEvent.RollbackPrepared
-	(*ChangeEvent_Message)(nil),           // 68: pgshard.v1.ChangeEvent.Message
-	(*ChangeEvent_Relation)(nil),          // 69: pgshard.v1.ChangeEvent.Relation
-	(*ChangeEvent_Truncate)(nil),          // 70: pgshard.v1.ChangeEvent.Truncate
-	(*ChangeEvent_StreamStart)(nil),       // 71: pgshard.v1.ChangeEvent.StreamStart
-	(*ChangeEvent_StreamStop)(nil),        // 72: pgshard.v1.ChangeEvent.StreamStop
-	(*ChangeEvent_StreamCommit)(nil),      // 73: pgshard.v1.ChangeEvent.StreamCommit
-	(*ChangeEvent_StreamAbort)(nil),       // 74: pgshard.v1.ChangeEvent.StreamAbort
-	(*ChangeEvent_BeginPrepare)(nil),      // 75: pgshard.v1.ChangeEvent.BeginPrepare
-	(*ChangeEvent_StreamPrepare)(nil),     // 76: pgshard.v1.ChangeEvent.StreamPrepare
-	(*ChangeEvent_Origin)(nil),            // 77: pgshard.v1.ChangeEvent.Origin
-	(*ChangeEvent_Relation_Column)(nil),   // 78: pgshard.v1.ChangeEvent.Relation.Column
-	(*Generation)(nil),                    // 79: pgshard.v1.Generation
-	(*Error)(nil),                         // 80: pgshard.v1.Error
+	(*CloseComplete)(nil),                 // 30: pgshard.v1.CloseComplete
+	(*NoData)(nil),                        // 31: pgshard.v1.NoData
+	(*ParameterDescription)(nil),          // 32: pgshard.v1.ParameterDescription
+	(*CopyInResponse)(nil),                // 33: pgshard.v1.CopyInResponse
+	(*CopyOutResponse)(nil),               // 34: pgshard.v1.CopyOutResponse
+	(*ParameterStatus)(nil),               // 35: pgshard.v1.ParameterStatus
+	(*NotificationResponse)(nil),          // 36: pgshard.v1.NotificationResponse
+	(*EmptyQuery)(nil),                    // 37: pgshard.v1.EmptyQuery
+	(*PortalSuspended)(nil),               // 38: pgshard.v1.PortalSuspended
+	(*Flush)(nil),                         // 39: pgshard.v1.Flush
+	(*FlushComplete)(nil),                 // 40: pgshard.v1.FlushComplete
+	(*ExecuteResponse)(nil),               // 41: pgshard.v1.ExecuteResponse
+	(*ReserveRequest)(nil),                // 42: pgshard.v1.ReserveRequest
+	(*ReserveResponse)(nil),               // 43: pgshard.v1.ReserveResponse
+	(*ReleaseRequest)(nil),                // 44: pgshard.v1.ReleaseRequest
+	(*ReleaseResponse)(nil),               // 45: pgshard.v1.ReleaseResponse
+	(*HealthRequest)(nil),                 // 46: pgshard.v1.HealthRequest
+	(*HealthStatus)(nil),                  // 47: pgshard.v1.HealthStatus
+	(*StreamRequest)(nil),                 // 48: pgshard.v1.StreamRequest
+	(*AckRequest)(nil),                    // 49: pgshard.v1.AckRequest
+	(*AckResponse)(nil),                   // 50: pgshard.v1.AckResponse
+	(*CopyTablesRequest)(nil),             // 51: pgshard.v1.CopyTablesRequest
+	(*CopyTablesResponse)(nil),            // 52: pgshard.v1.CopyTablesResponse
+	(*ChangeBatch)(nil),                   // 53: pgshard.v1.ChangeBatch
+	(*ChangeEvent)(nil),                   // 54: pgshard.v1.ChangeEvent
+	nil,                                   // 55: pgshard.v1.StreamRequest.OptionsEntry
+	(*CopyTablesResponse_Snapshot)(nil),   // 56: pgshard.v1.CopyTablesResponse.Snapshot
+	(*CopyTablesResponse_TableBegin)(nil), // 57: pgshard.v1.CopyTablesResponse.TableBegin
+	(*CopyTablesResponse_Row)(nil),        // 58: pgshard.v1.CopyTablesResponse.Row
+	(*CopyTablesResponse_Rows)(nil),       // 59: pgshard.v1.CopyTablesResponse.Rows
+	(*CopyTablesResponse_TableDone)(nil),  // 60: pgshard.v1.CopyTablesResponse.TableDone
+	(*CopyTablesResponse_Done)(nil),       // 61: pgshard.v1.CopyTablesResponse.Done
+	(*ChangeEvent_Begin)(nil),             // 62: pgshard.v1.ChangeEvent.Begin
+	(*ChangeEvent_Row)(nil),               // 63: pgshard.v1.ChangeEvent.Row
+	(*ChangeEvent_Commit)(nil),            // 64: pgshard.v1.ChangeEvent.Commit
+	(*ChangeEvent_Keepalive)(nil),         // 65: pgshard.v1.ChangeEvent.Keepalive
+	(*ChangeEvent_Prepare)(nil),           // 66: pgshard.v1.ChangeEvent.Prepare
+	(*ChangeEvent_CommitPrepared)(nil),    // 67: pgshard.v1.ChangeEvent.CommitPrepared
+	(*ChangeEvent_RollbackPrepared)(nil),  // 68: pgshard.v1.ChangeEvent.RollbackPrepared
+	(*ChangeEvent_Message)(nil),           // 69: pgshard.v1.ChangeEvent.Message
+	(*ChangeEvent_Relation)(nil),          // 70: pgshard.v1.ChangeEvent.Relation
+	(*ChangeEvent_Truncate)(nil),          // 71: pgshard.v1.ChangeEvent.Truncate
+	(*ChangeEvent_StreamStart)(nil),       // 72: pgshard.v1.ChangeEvent.StreamStart
+	(*ChangeEvent_StreamStop)(nil),        // 73: pgshard.v1.ChangeEvent.StreamStop
+	(*ChangeEvent_StreamCommit)(nil),      // 74: pgshard.v1.ChangeEvent.StreamCommit
+	(*ChangeEvent_StreamAbort)(nil),       // 75: pgshard.v1.ChangeEvent.StreamAbort
+	(*ChangeEvent_BeginPrepare)(nil),      // 76: pgshard.v1.ChangeEvent.BeginPrepare
+	(*ChangeEvent_StreamPrepare)(nil),     // 77: pgshard.v1.ChangeEvent.StreamPrepare
+	(*ChangeEvent_Origin)(nil),            // 78: pgshard.v1.ChangeEvent.Origin
+	(*ChangeEvent_Relation_Column)(nil),   // 79: pgshard.v1.ChangeEvent.Relation.Column
+	(*Generation)(nil),                    // 80: pgshard.v1.Generation
+	(*Error)(nil),                         // 81: pgshard.v1.Error
 }
 var file_pgshard_v1_pooler_proto_depIdxs = []int32{
 	9,  // 0: pgshard.v1.Bind.params:type_name -> pgshard.v1.Value
 	0,  // 1: pgshard.v1.Describe.kind:type_name -> pgshard.v1.Describe.Kind
 	1,  // 2: pgshard.v1.Close.kind:type_name -> pgshard.v1.Close.Kind
 	23, // 3: pgshard.v1.DataRows.rows:type_name -> pgshard.v1.DataRow
-	79, // 4: pgshard.v1.ExecuteRequest.generation:type_name -> pgshard.v1.Generation
+	80, // 4: pgshard.v1.ExecuteRequest.generation:type_name -> pgshard.v1.Generation
 	5,  // 5: pgshard.v1.ExecuteRequest.user:type_name -> pgshard.v1.UserIdentity
 	6,  // 6: pgshard.v1.ExecuteRequest.simple_query:type_name -> pgshard.v1.SimpleQuery
 	7,  // 7: pgshard.v1.ExecuteRequest.parse:type_name -> pgshard.v1.Parse
@@ -5943,15 +6002,15 @@ var file_pgshard_v1_pooler_proto_depIdxs = []int32{
 	11, // 10: pgshard.v1.ExecuteRequest.describe:type_name -> pgshard.v1.Describe
 	12, // 11: pgshard.v1.ExecuteRequest.close:type_name -> pgshard.v1.Close
 	13, // 12: pgshard.v1.ExecuteRequest.sync:type_name -> pgshard.v1.Sync
-	38, // 13: pgshard.v1.ExecuteRequest.flush:type_name -> pgshard.v1.Flush
+	39, // 13: pgshard.v1.ExecuteRequest.flush:type_name -> pgshard.v1.Flush
 	15, // 14: pgshard.v1.ExecuteRequest.copy_data:type_name -> pgshard.v1.CopyData
 	16, // 15: pgshard.v1.ExecuteRequest.copy_done:type_name -> pgshard.v1.CopyDone
 	17, // 16: pgshard.v1.ExecuteRequest.copy_fail:type_name -> pgshard.v1.CopyFail
 	18, // 17: pgshard.v1.ExecuteRequest.cancel:type_name -> pgshard.v1.CancelRequest
 	21, // 18: pgshard.v1.RowDescription.fields:type_name -> pgshard.v1.FieldDescription
 	9,  // 19: pgshard.v1.DataRow.columns:type_name -> pgshard.v1.Value
-	80, // 20: pgshard.v1.ErrorResponse.error:type_name -> pgshard.v1.Error
-	80, // 21: pgshard.v1.NoticeResponse.notice:type_name -> pgshard.v1.Error
+	81, // 20: pgshard.v1.ErrorResponse.error:type_name -> pgshard.v1.Error
+	81, // 21: pgshard.v1.NoticeResponse.notice:type_name -> pgshard.v1.Error
 	2,  // 22: pgshard.v1.ReadyForQuery.txn_status:type_name -> pgshard.v1.ReadyForQuery.TxnStatus
 	22, // 23: pgshard.v1.ExecuteResponse.row_description:type_name -> pgshard.v1.RowDescription
 	23, // 24: pgshard.v1.ExecuteResponse.data_row:type_name -> pgshard.v1.DataRow
@@ -5960,80 +6019,81 @@ var file_pgshard_v1_pooler_proto_depIdxs = []int32{
 	27, // 27: pgshard.v1.ExecuteResponse.ready_for_query:type_name -> pgshard.v1.ReadyForQuery
 	28, // 28: pgshard.v1.ExecuteResponse.parse_complete:type_name -> pgshard.v1.ParseComplete
 	29, // 29: pgshard.v1.ExecuteResponse.bind_complete:type_name -> pgshard.v1.BindComplete
-	30, // 30: pgshard.v1.ExecuteResponse.no_data:type_name -> pgshard.v1.NoData
-	31, // 31: pgshard.v1.ExecuteResponse.parameter_description:type_name -> pgshard.v1.ParameterDescription
-	32, // 32: pgshard.v1.ExecuteResponse.copy_in_response:type_name -> pgshard.v1.CopyInResponse
-	33, // 33: pgshard.v1.ExecuteResponse.copy_out_response:type_name -> pgshard.v1.CopyOutResponse
+	31, // 30: pgshard.v1.ExecuteResponse.no_data:type_name -> pgshard.v1.NoData
+	32, // 31: pgshard.v1.ExecuteResponse.parameter_description:type_name -> pgshard.v1.ParameterDescription
+	33, // 32: pgshard.v1.ExecuteResponse.copy_in_response:type_name -> pgshard.v1.CopyInResponse
+	34, // 33: pgshard.v1.ExecuteResponse.copy_out_response:type_name -> pgshard.v1.CopyOutResponse
 	15, // 34: pgshard.v1.ExecuteResponse.copy_data:type_name -> pgshard.v1.CopyData
 	16, // 35: pgshard.v1.ExecuteResponse.copy_done:type_name -> pgshard.v1.CopyDone
 	26, // 36: pgshard.v1.ExecuteResponse.notice:type_name -> pgshard.v1.NoticeResponse
-	34, // 37: pgshard.v1.ExecuteResponse.parameter_status:type_name -> pgshard.v1.ParameterStatus
-	36, // 38: pgshard.v1.ExecuteResponse.empty_query:type_name -> pgshard.v1.EmptyQuery
-	35, // 39: pgshard.v1.ExecuteResponse.notification:type_name -> pgshard.v1.NotificationResponse
-	37, // 40: pgshard.v1.ExecuteResponse.portal_suspended:type_name -> pgshard.v1.PortalSuspended
-	39, // 41: pgshard.v1.ExecuteResponse.flush_complete:type_name -> pgshard.v1.FlushComplete
+	35, // 37: pgshard.v1.ExecuteResponse.parameter_status:type_name -> pgshard.v1.ParameterStatus
+	37, // 38: pgshard.v1.ExecuteResponse.empty_query:type_name -> pgshard.v1.EmptyQuery
+	36, // 39: pgshard.v1.ExecuteResponse.notification:type_name -> pgshard.v1.NotificationResponse
+	38, // 40: pgshard.v1.ExecuteResponse.portal_suspended:type_name -> pgshard.v1.PortalSuspended
+	40, // 41: pgshard.v1.ExecuteResponse.flush_complete:type_name -> pgshard.v1.FlushComplete
 	14, // 42: pgshard.v1.ExecuteResponse.data_rows:type_name -> pgshard.v1.DataRows
-	79, // 43: pgshard.v1.ReserveRequest.generation:type_name -> pgshard.v1.Generation
-	80, // 44: pgshard.v1.ReserveResponse.error:type_name -> pgshard.v1.Error
-	3,  // 45: pgshard.v1.HealthStatus.role:type_name -> pgshard.v1.HealthStatus.Role
-	54, // 46: pgshard.v1.StreamRequest.options:type_name -> pgshard.v1.StreamRequest.OptionsEntry
-	79, // 47: pgshard.v1.StreamRequest.generation:type_name -> pgshard.v1.Generation
-	79, // 48: pgshard.v1.AckRequest.generation:type_name -> pgshard.v1.Generation
-	80, // 49: pgshard.v1.AckResponse.error:type_name -> pgshard.v1.Error
-	79, // 50: pgshard.v1.CopyTablesRequest.generation:type_name -> pgshard.v1.Generation
-	55, // 51: pgshard.v1.CopyTablesResponse.snapshot:type_name -> pgshard.v1.CopyTablesResponse.Snapshot
-	56, // 52: pgshard.v1.CopyTablesResponse.table_begin:type_name -> pgshard.v1.CopyTablesResponse.TableBegin
-	58, // 53: pgshard.v1.CopyTablesResponse.rows:type_name -> pgshard.v1.CopyTablesResponse.Rows
-	59, // 54: pgshard.v1.CopyTablesResponse.table_done:type_name -> pgshard.v1.CopyTablesResponse.TableDone
-	60, // 55: pgshard.v1.CopyTablesResponse.done:type_name -> pgshard.v1.CopyTablesResponse.Done
-	53, // 56: pgshard.v1.ChangeBatch.events:type_name -> pgshard.v1.ChangeEvent
-	61, // 57: pgshard.v1.ChangeEvent.begin:type_name -> pgshard.v1.ChangeEvent.Begin
-	62, // 58: pgshard.v1.ChangeEvent.row:type_name -> pgshard.v1.ChangeEvent.Row
-	63, // 59: pgshard.v1.ChangeEvent.commit:type_name -> pgshard.v1.ChangeEvent.Commit
-	64, // 60: pgshard.v1.ChangeEvent.keepalive:type_name -> pgshard.v1.ChangeEvent.Keepalive
-	65, // 61: pgshard.v1.ChangeEvent.prepare:type_name -> pgshard.v1.ChangeEvent.Prepare
-	66, // 62: pgshard.v1.ChangeEvent.commit_prepared:type_name -> pgshard.v1.ChangeEvent.CommitPrepared
-	67, // 63: pgshard.v1.ChangeEvent.rollback_prepared:type_name -> pgshard.v1.ChangeEvent.RollbackPrepared
-	68, // 64: pgshard.v1.ChangeEvent.message:type_name -> pgshard.v1.ChangeEvent.Message
-	69, // 65: pgshard.v1.ChangeEvent.relation:type_name -> pgshard.v1.ChangeEvent.Relation
-	70, // 66: pgshard.v1.ChangeEvent.truncate:type_name -> pgshard.v1.ChangeEvent.Truncate
-	71, // 67: pgshard.v1.ChangeEvent.stream_start:type_name -> pgshard.v1.ChangeEvent.StreamStart
-	72, // 68: pgshard.v1.ChangeEvent.stream_stop:type_name -> pgshard.v1.ChangeEvent.StreamStop
-	73, // 69: pgshard.v1.ChangeEvent.stream_commit:type_name -> pgshard.v1.ChangeEvent.StreamCommit
-	74, // 70: pgshard.v1.ChangeEvent.stream_abort:type_name -> pgshard.v1.ChangeEvent.StreamAbort
-	75, // 71: pgshard.v1.ChangeEvent.begin_prepare:type_name -> pgshard.v1.ChangeEvent.BeginPrepare
-	76, // 72: pgshard.v1.ChangeEvent.stream_prepare:type_name -> pgshard.v1.ChangeEvent.StreamPrepare
-	77, // 73: pgshard.v1.ChangeEvent.origin:type_name -> pgshard.v1.ChangeEvent.Origin
-	69, // 74: pgshard.v1.CopyTablesResponse.TableBegin.relation:type_name -> pgshard.v1.ChangeEvent.Relation
-	9,  // 75: pgshard.v1.CopyTablesResponse.Row.values:type_name -> pgshard.v1.Value
-	57, // 76: pgshard.v1.CopyTablesResponse.Rows.rows:type_name -> pgshard.v1.CopyTablesResponse.Row
-	4,  // 77: pgshard.v1.ChangeEvent.Row.kind:type_name -> pgshard.v1.ChangeEvent.Row.Kind
-	9,  // 78: pgshard.v1.ChangeEvent.Row.old:type_name -> pgshard.v1.Value
-	9,  // 79: pgshard.v1.ChangeEvent.Row.new:type_name -> pgshard.v1.Value
-	78, // 80: pgshard.v1.ChangeEvent.Relation.columns:type_name -> pgshard.v1.ChangeEvent.Relation.Column
-	20, // 81: pgshard.v1.Pooler.Execute:input_type -> pgshard.v1.ExecuteRequest
-	41, // 82: pgshard.v1.Pooler.Reserve:input_type -> pgshard.v1.ReserveRequest
-	43, // 83: pgshard.v1.Pooler.Release:input_type -> pgshard.v1.ReleaseRequest
-	18, // 84: pgshard.v1.Pooler.Cancel:input_type -> pgshard.v1.CancelRequest
-	45, // 85: pgshard.v1.Pooler.Health:input_type -> pgshard.v1.HealthRequest
-	47, // 86: pgshard.v1.Pooler.StreamChanges:input_type -> pgshard.v1.StreamRequest
-	47, // 87: pgshard.v1.Pooler.Stream:input_type -> pgshard.v1.StreamRequest
-	48, // 88: pgshard.v1.Pooler.Ack:input_type -> pgshard.v1.AckRequest
-	50, // 89: pgshard.v1.Pooler.CopyTables:input_type -> pgshard.v1.CopyTablesRequest
-	40, // 90: pgshard.v1.Pooler.Execute:output_type -> pgshard.v1.ExecuteResponse
-	42, // 91: pgshard.v1.Pooler.Reserve:output_type -> pgshard.v1.ReserveResponse
-	44, // 92: pgshard.v1.Pooler.Release:output_type -> pgshard.v1.ReleaseResponse
-	19, // 93: pgshard.v1.Pooler.Cancel:output_type -> pgshard.v1.CancelResponse
-	46, // 94: pgshard.v1.Pooler.Health:output_type -> pgshard.v1.HealthStatus
-	53, // 95: pgshard.v1.Pooler.StreamChanges:output_type -> pgshard.v1.ChangeEvent
-	52, // 96: pgshard.v1.Pooler.Stream:output_type -> pgshard.v1.ChangeBatch
-	49, // 97: pgshard.v1.Pooler.Ack:output_type -> pgshard.v1.AckResponse
-	51, // 98: pgshard.v1.Pooler.CopyTables:output_type -> pgshard.v1.CopyTablesResponse
-	90, // [90:99] is the sub-list for method output_type
-	81, // [81:90] is the sub-list for method input_type
-	81, // [81:81] is the sub-list for extension type_name
-	81, // [81:81] is the sub-list for extension extendee
-	0,  // [0:81] is the sub-list for field type_name
+	30, // 43: pgshard.v1.ExecuteResponse.close_complete:type_name -> pgshard.v1.CloseComplete
+	80, // 44: pgshard.v1.ReserveRequest.generation:type_name -> pgshard.v1.Generation
+	81, // 45: pgshard.v1.ReserveResponse.error:type_name -> pgshard.v1.Error
+	3,  // 46: pgshard.v1.HealthStatus.role:type_name -> pgshard.v1.HealthStatus.Role
+	55, // 47: pgshard.v1.StreamRequest.options:type_name -> pgshard.v1.StreamRequest.OptionsEntry
+	80, // 48: pgshard.v1.StreamRequest.generation:type_name -> pgshard.v1.Generation
+	80, // 49: pgshard.v1.AckRequest.generation:type_name -> pgshard.v1.Generation
+	81, // 50: pgshard.v1.AckResponse.error:type_name -> pgshard.v1.Error
+	80, // 51: pgshard.v1.CopyTablesRequest.generation:type_name -> pgshard.v1.Generation
+	56, // 52: pgshard.v1.CopyTablesResponse.snapshot:type_name -> pgshard.v1.CopyTablesResponse.Snapshot
+	57, // 53: pgshard.v1.CopyTablesResponse.table_begin:type_name -> pgshard.v1.CopyTablesResponse.TableBegin
+	59, // 54: pgshard.v1.CopyTablesResponse.rows:type_name -> pgshard.v1.CopyTablesResponse.Rows
+	60, // 55: pgshard.v1.CopyTablesResponse.table_done:type_name -> pgshard.v1.CopyTablesResponse.TableDone
+	61, // 56: pgshard.v1.CopyTablesResponse.done:type_name -> pgshard.v1.CopyTablesResponse.Done
+	54, // 57: pgshard.v1.ChangeBatch.events:type_name -> pgshard.v1.ChangeEvent
+	62, // 58: pgshard.v1.ChangeEvent.begin:type_name -> pgshard.v1.ChangeEvent.Begin
+	63, // 59: pgshard.v1.ChangeEvent.row:type_name -> pgshard.v1.ChangeEvent.Row
+	64, // 60: pgshard.v1.ChangeEvent.commit:type_name -> pgshard.v1.ChangeEvent.Commit
+	65, // 61: pgshard.v1.ChangeEvent.keepalive:type_name -> pgshard.v1.ChangeEvent.Keepalive
+	66, // 62: pgshard.v1.ChangeEvent.prepare:type_name -> pgshard.v1.ChangeEvent.Prepare
+	67, // 63: pgshard.v1.ChangeEvent.commit_prepared:type_name -> pgshard.v1.ChangeEvent.CommitPrepared
+	68, // 64: pgshard.v1.ChangeEvent.rollback_prepared:type_name -> pgshard.v1.ChangeEvent.RollbackPrepared
+	69, // 65: pgshard.v1.ChangeEvent.message:type_name -> pgshard.v1.ChangeEvent.Message
+	70, // 66: pgshard.v1.ChangeEvent.relation:type_name -> pgshard.v1.ChangeEvent.Relation
+	71, // 67: pgshard.v1.ChangeEvent.truncate:type_name -> pgshard.v1.ChangeEvent.Truncate
+	72, // 68: pgshard.v1.ChangeEvent.stream_start:type_name -> pgshard.v1.ChangeEvent.StreamStart
+	73, // 69: pgshard.v1.ChangeEvent.stream_stop:type_name -> pgshard.v1.ChangeEvent.StreamStop
+	74, // 70: pgshard.v1.ChangeEvent.stream_commit:type_name -> pgshard.v1.ChangeEvent.StreamCommit
+	75, // 71: pgshard.v1.ChangeEvent.stream_abort:type_name -> pgshard.v1.ChangeEvent.StreamAbort
+	76, // 72: pgshard.v1.ChangeEvent.begin_prepare:type_name -> pgshard.v1.ChangeEvent.BeginPrepare
+	77, // 73: pgshard.v1.ChangeEvent.stream_prepare:type_name -> pgshard.v1.ChangeEvent.StreamPrepare
+	78, // 74: pgshard.v1.ChangeEvent.origin:type_name -> pgshard.v1.ChangeEvent.Origin
+	70, // 75: pgshard.v1.CopyTablesResponse.TableBegin.relation:type_name -> pgshard.v1.ChangeEvent.Relation
+	9,  // 76: pgshard.v1.CopyTablesResponse.Row.values:type_name -> pgshard.v1.Value
+	58, // 77: pgshard.v1.CopyTablesResponse.Rows.rows:type_name -> pgshard.v1.CopyTablesResponse.Row
+	4,  // 78: pgshard.v1.ChangeEvent.Row.kind:type_name -> pgshard.v1.ChangeEvent.Row.Kind
+	9,  // 79: pgshard.v1.ChangeEvent.Row.old:type_name -> pgshard.v1.Value
+	9,  // 80: pgshard.v1.ChangeEvent.Row.new:type_name -> pgshard.v1.Value
+	79, // 81: pgshard.v1.ChangeEvent.Relation.columns:type_name -> pgshard.v1.ChangeEvent.Relation.Column
+	20, // 82: pgshard.v1.Pooler.Execute:input_type -> pgshard.v1.ExecuteRequest
+	42, // 83: pgshard.v1.Pooler.Reserve:input_type -> pgshard.v1.ReserveRequest
+	44, // 84: pgshard.v1.Pooler.Release:input_type -> pgshard.v1.ReleaseRequest
+	18, // 85: pgshard.v1.Pooler.Cancel:input_type -> pgshard.v1.CancelRequest
+	46, // 86: pgshard.v1.Pooler.Health:input_type -> pgshard.v1.HealthRequest
+	48, // 87: pgshard.v1.Pooler.StreamChanges:input_type -> pgshard.v1.StreamRequest
+	48, // 88: pgshard.v1.Pooler.Stream:input_type -> pgshard.v1.StreamRequest
+	49, // 89: pgshard.v1.Pooler.Ack:input_type -> pgshard.v1.AckRequest
+	51, // 90: pgshard.v1.Pooler.CopyTables:input_type -> pgshard.v1.CopyTablesRequest
+	41, // 91: pgshard.v1.Pooler.Execute:output_type -> pgshard.v1.ExecuteResponse
+	43, // 92: pgshard.v1.Pooler.Reserve:output_type -> pgshard.v1.ReserveResponse
+	45, // 93: pgshard.v1.Pooler.Release:output_type -> pgshard.v1.ReleaseResponse
+	19, // 94: pgshard.v1.Pooler.Cancel:output_type -> pgshard.v1.CancelResponse
+	47, // 95: pgshard.v1.Pooler.Health:output_type -> pgshard.v1.HealthStatus
+	54, // 96: pgshard.v1.Pooler.StreamChanges:output_type -> pgshard.v1.ChangeEvent
+	53, // 97: pgshard.v1.Pooler.Stream:output_type -> pgshard.v1.ChangeBatch
+	50, // 98: pgshard.v1.Pooler.Ack:output_type -> pgshard.v1.AckResponse
+	52, // 99: pgshard.v1.Pooler.CopyTables:output_type -> pgshard.v1.CopyTablesResponse
+	91, // [91:100] is the sub-list for method output_type
+	82, // [82:91] is the sub-list for method input_type
+	82, // [82:82] is the sub-list for extension type_name
+	82, // [82:82] is the sub-list for extension extendee
+	0,  // [0:82] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_pooler_proto_init() }
@@ -6056,7 +6116,7 @@ func file_pgshard_v1_pooler_proto_init() {
 		(*ExecuteRequest_CopyFail)(nil),
 		(*ExecuteRequest_Cancel)(nil),
 	}
-	file_pgshard_v1_pooler_proto_msgTypes[35].OneofWrappers = []any{
+	file_pgshard_v1_pooler_proto_msgTypes[36].OneofWrappers = []any{
 		(*ExecuteResponse_RowDescription)(nil),
 		(*ExecuteResponse_DataRow)(nil),
 		(*ExecuteResponse_CommandComplete)(nil),
@@ -6077,16 +6137,17 @@ func file_pgshard_v1_pooler_proto_init() {
 		(*ExecuteResponse_PortalSuspended)(nil),
 		(*ExecuteResponse_FlushComplete)(nil),
 		(*ExecuteResponse_DataRows)(nil),
+		(*ExecuteResponse_CloseComplete)(nil),
 	}
-	file_pgshard_v1_pooler_proto_msgTypes[41].OneofWrappers = []any{}
-	file_pgshard_v1_pooler_proto_msgTypes[46].OneofWrappers = []any{
+	file_pgshard_v1_pooler_proto_msgTypes[42].OneofWrappers = []any{}
+	file_pgshard_v1_pooler_proto_msgTypes[47].OneofWrappers = []any{
 		(*CopyTablesResponse_Snapshot_)(nil),
 		(*CopyTablesResponse_TableBegin_)(nil),
 		(*CopyTablesResponse_Rows_)(nil),
 		(*CopyTablesResponse_TableDone_)(nil),
 		(*CopyTablesResponse_Done_)(nil),
 	}
-	file_pgshard_v1_pooler_proto_msgTypes[48].OneofWrappers = []any{
+	file_pgshard_v1_pooler_proto_msgTypes[49].OneofWrappers = []any{
 		(*ChangeEvent_Begin_)(nil),
 		(*ChangeEvent_Row_)(nil),
 		(*ChangeEvent_Commit_)(nil),
@@ -6111,7 +6172,7 @@ func file_pgshard_v1_pooler_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_pooler_proto_rawDesc), len(file_pgshard_v1_pooler_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   74,
+			NumMessages:   75,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

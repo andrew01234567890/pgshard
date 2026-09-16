@@ -134,18 +134,18 @@ func (f *FakeExecutor) SimpleQuery(ctx context.Context, sql string, w ResultWrit
 }
 
 // Parse implements Executor.
-func (f *FakeExecutor) Parse(_ context.Context, name, sql string, _ []uint32) error {
+func (f *FakeExecutor) Parse(_ context.Context, name, sql string, _ []uint32, w ResultWriter) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if q := normalize(sql); q != "" && q != "select 1" && q != "copy fake from stdin" && q != "begin" && q != "commit" && q != "rollback" {
 		return f.fail(Errorf(CodeSyntaxError, "fake executor: unsupported statement"))
 	}
 	f.statements[name] = sql
-	return nil
+	return w.ParseComplete()
 }
 
 // Bind implements Executor.
-func (f *FakeExecutor) Bind(_ context.Context, name, statement string, _ []int16, _ [][]byte, resultFormats []int16) error {
+func (f *FakeExecutor) Bind(_ context.Context, name, statement string, _ []int16, _ [][]byte, resultFormats []int16, w ResultWriter) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	sql, ok := f.statements[statement]
@@ -153,7 +153,7 @@ func (f *FakeExecutor) Bind(_ context.Context, name, statement string, _ []int16
 		return f.fail(Errorf("26000", "prepared statement %q does not exist", statement))
 	}
 	f.portals[name] = portal{sql: sql, binary: len(resultFormats) > 0 && resultFormats[0] == 1}
-	return nil
+	return w.BindComplete()
 }
 
 // Describe implements Executor.
@@ -198,7 +198,7 @@ func (f *FakeExecutor) Execute(_ context.Context, portal string, maxRows int32, 
 }
 
 // Close implements Executor.
-func (f *FakeExecutor) Close(_ context.Context, kind DescribeKind, name string) error {
+func (f *FakeExecutor) Close(_ context.Context, kind DescribeKind, name string, w ResultWriter) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if kind == DescribeStatement {
@@ -206,7 +206,7 @@ func (f *FakeExecutor) Close(_ context.Context, kind DescribeKind, name string) 
 	} else {
 		delete(f.portals, name)
 	}
-	return nil
+	return w.CloseComplete()
 }
 
 // Sync implements Executor.

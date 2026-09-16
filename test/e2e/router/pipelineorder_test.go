@@ -161,3 +161,46 @@ func lastIndexOf(all []string, want string) int {
 	}
 	return -1
 }
+
+// TestTheRoutersOwnParseIsNotAnsweredToTheClient drives the sequence that
+// makes the router re-Parse a statement the client parsed in an earlier
+// batch: the backend answers that Parse too, and its ParseComplete is the
+// router's, not the client's. A client counting messages against what it
+// sent is desynchronised by one for the rest of the session if it arrives.
+func TestTheRoutersOwnParseIsNotAnsweredToTheClient(t *testing.T) {
+	s := startStack(t)
+	conn := s.connect(t)
+	hj, err := conn.PgConn().Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hj.Conn.Close() })
+	fe := hj.Frontend
+
+	// The unnamed statement, parsed and synced on its own, so the Bind
+	// below is in a batch that never parsed it. The router carries the
+	// statement to whatever backend the next batch lands on by parsing it
+	// again there.
+	fe.Send(&pgproto3.Parse{Query: "select 1"})
+	fe.Send(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainMessages(t, hj.Conn, fe); indexOf(got, "*pgproto3.ParseComplete") < 0 {
+		t.Fatalf("the client's own Parse was not answered: %v", got)
+	}
+
+	fe.Send(&pgproto3.Bind{})
+	fe.Send(&pgproto3.Execute{})
+	fe.Send(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	got := drainMessages(t, hj.Conn, fe)
+	if n := indexOf(got, "*pgproto3.ParseComplete"); n >= 0 {
+		t.Fatalf("the router's own Parse was answered to the client:\n%s", strings.Join(got, "\n"))
+	}
+	if indexOf(got, "*pgproto3.BindComplete") < 0 || indexOf(got, "*pgproto3.CommandComplete") < 0 {
+		t.Fatalf("the batch was not answered: %v", got)
+	}
+}

@@ -163,6 +163,8 @@ func toResponse(msg pgproto3.BackendMessage, packed bool) *pgshardv1.ExecuteResp
 		r.Message = &pgshardv1.ExecuteResponse_ParseComplete{ParseComplete: &pgshardv1.ParseComplete{}}
 	case *pgproto3.BindComplete:
 		r.Message = &pgshardv1.ExecuteResponse_BindComplete{BindComplete: &pgshardv1.BindComplete{}}
+	case *pgproto3.CloseComplete:
+		r.Message = &pgshardv1.ExecuteResponse_CloseComplete{CloseComplete: &pgshardv1.CloseComplete{}}
 	case *pgproto3.NoData:
 		r.Message = &pgshardv1.ExecuteResponse_NoData{NoData: &pgshardv1.NoData{}}
 	case *pgproto3.ParameterDescription:
