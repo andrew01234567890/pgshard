@@ -2975,12 +2975,24 @@ func execWithLockWait(ctx context.Context, conn ShardConn, wait time.Duration, s
 // dropOld drops the previous tables and gives the new table's indexes and
 // constraints their final names.
 func (p *Placer) dropOld(ctx context.Context, wf *placementWorkflow) error {
+	var failed error
 	for _, t := range wf.rt.ids {
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
-			return err
+			failed = errors.Join(failed, err)
+			continue
 		}
 		err = func() error {
+			// The retiring stage lasts an hour by default, and a barrier
+			// pauses every serving group for its own run: DROP TABLE and the
+			// RENAMEs below are refused with 25006 exactly as the shadow and
+			// replication cleanups were. A retirement that cannot finish
+			// keeps the workflow active, and an active placement makes a
+			// reshard wait and an upgrade fail its preconditions -- while a
+			// whole second copy of the table stays on every shard.
+			if err := writeThroughPause(ctx, conn); err != nil {
+				return err
+			}
 			dropped, err := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.old(), wf.placementMarker())
 			if err != nil {
 				return err
@@ -3009,10 +3021,13 @@ func (p *Placer) dropOld(ctx context.Context, wf *placementWorkflow) error {
 		}()
 		_ = conn.Close(ctx)
 		if err != nil {
-			return fmt.Errorf("retire on %s/%d: %w", wf.st.SourceSet, t, err)
+			// Every shard is tried: stopping at the first left the old table
+			// on every shard after it, and the one that failed is usually
+			// the only one that is paused.
+			failed = errors.Join(failed, fmt.Errorf("retire on %s/%d: %w", wf.st.SourceSet, t, err))
 		}
 	}
-	return nil
+	return failed
 }
 
 func renameShadowIndexes(ctx context.Context, conn ShardConn, wf *placementWorkflow) error {

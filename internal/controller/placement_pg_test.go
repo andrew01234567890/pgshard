@@ -2218,3 +2218,52 @@ func TestARecheckRefusesAnIdentityTheMoveDidNotRaise(t *testing.T) {
 		t.Fatalf("the workflow's own widened identity was refused: %v", err)
 	}
 }
+
+// TestRetirementDropsTheOldTableThroughAWritePause (PGS-859, from the
+// pre-merge audit): dropOld was the one cleanup of the family that was not
+// given the write-through.
+//
+// Retirement lasts an hour by default, and a barrier pauses every serving
+// group for its own run, so the DROP TABLE and the constraint and index
+// renames are refused with 25006 just as the shadow and replication
+// cleanups were. A retirement that cannot finish keeps the placement
+// active, and an active placement makes a reshard wait and an upgrade fail
+// its preconditions -- with a whole second copy of the table still on disk
+// on every shard.
+func TestRetirementDropsTheOldTableThroughAWritePause(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+	wf := &placementWorkflow{id: "55555555-5555-5555-5555-555555555555", stage: StagePlacementRetiring,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default"},
+		from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+		rt:    &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0, ids: []int32{0}},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	// The table as the swap leaves it: the live one carrying the shadow's
+	// index names, and the retired one alongside it.
+	mustExec(t, admin, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, admin, `CREATE INDEX `+QuoteIdent("ledger_v_idx"+ShadowSuffix)+` ON ledger (v)`)
+	mustExec(t, admin, `CREATE TABLE `+QuoteIdent(wf.old())+` (id int PRIMARY KEY, v text)`)
+	if err := markPlacementArtifact(ctx, pgxShardConn{admin}, "public", wf.old(), wf.placementMarker()); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, admin, `SELECT pg_reload_conf()`)
+	waitReadOnly(t, dsn, true)
+
+	p := &Placer{Shards: realShards{dsn}}
+	if err := p.dropOld(ctx, wf); err != nil {
+		t.Fatalf("retiring on a paused shard: %v", err)
+	}
+	check := connect(t, dsn)
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_class WHERE relname = $1`, wf.old()); n != 0 {
+		t.Errorf("the retired table survived its own retirement")
+	}
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_class WHERE relname LIKE '%' || $1 || '%'`, ShadowSuffix); n != 0 {
+		t.Errorf("%d relation(s) kept a shadow-suffixed name after retirement", n)
+	}
+	// The shard is still paused: only this session wrote through it.
+	waitReadOnly(t, dsn, true)
+}
