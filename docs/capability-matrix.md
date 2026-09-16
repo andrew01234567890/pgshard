@@ -65,6 +65,8 @@ tests are authoritative.
 | Capability | Status | Where |
 |---|---|---|
 | Online DDL/DCL fan-out as migrations; idempotent per-shard resume; sync + async wait | Implemented | `internal/controller/applier.go`, [ddl.md](ddl.md) |
+| One operation queue: DDL, reshards, major upgrades and table placements take one arrival order and wait their turn instead of being refused | Implemented | `internal/catalog/schema/0058_operation_queue.sql`, `internal/controller/queuegate.go`, `internal/router/migrations.go`, [operation-queue.md](operation-queue.md) |
+| A statement sent again while an identical migration is queued, running or just completed attaches to it instead of enqueueing a second | Implemented | `catalog.EnqueueMigrationOnce`; a client timeout keeps the queue slot, so a retry loop builds an index once ([operation-queue.md](operation-queue.md)). Suppressed for statements carrying a password or verifier, and off per session with `SET pgshard.ddl_dedup = off` |
 | Weaker-lock strategies (NOT VALID+VALIDATE, concurrent index PK/UNIQUE, DETACH CONCURRENTLY) | Implemented | [ddl.md](ddl.md) |
 | Rewrite-class DDL (`ALTER COLUMN ... TYPE`, volatile-default ADD COLUMN, ...) — online schema change | Implemented | OID-preserving column duplication with trigger backfill; router hides the working column. **No rollback window once cutover starts**: cutting a shard over drops the old column, so a failure part-way leaves shards on both sides and the old values recoverable only from a backup ([online-ddl.md](online-ddl.md#failure-revert-and-gc)); `internal/controller/rewrite.go`, `internal/router/plan/hide.go` |
 | Cluster-wide roles/grants with one SCRAM verifier, drift detection and repair | Implemented | `internal/controller/roles.go`, [roles.md](roles.md) |
