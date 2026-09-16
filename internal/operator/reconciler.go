@@ -1546,7 +1546,14 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 			return err
 		}
 		if !AdminEnabled(c) {
-			return nil
+			// Disabling the admin deletes its Deployment, Service and
+			// Secret, which looks like revocation and is not: the role
+			// keeps the password it was last given and the agent's pg_hba
+			// line still admits it, so anyone who read the Secret while it
+			// existed keeps read access to the catalog indefinitely. An
+			// admin shut down for that reason is never re-enabled, which
+			// is the one thing that would have rotated it.
+			return r.Prober.RevokeLogin(ctx, dsn, adminUILoginRole)
 		}
 		// The admin UI reads the catalog as its own read-only login. Without
 		// it every catalog-backed page of an operator-deployed admin is

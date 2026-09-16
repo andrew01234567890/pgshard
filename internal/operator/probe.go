@@ -60,6 +60,7 @@ type Prober interface {
 	WriteFenced(ctx context.Context, dsn string) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
 	SetLoginPassword(ctx context.Context, dsn, role, password string) error
+	RevokeLogin(ctx context.Context, dsn, role string) error
 	// EnsureGroupLogins creates or updates the login roles every group
 	// carries, given a superuser DSN for its primary.
 	EnsureGroupLogins(ctx context.Context, dsn string, logins []GroupLogin) error
@@ -778,6 +779,21 @@ func (PgxProber) SetLoginPassword(ctx context.Context, dsn, role, password strin
 	return err
 }
 
+// RevokeLogin takes the password off one of the cluster's own login roles
+// and stops it logging in at all. Deleting the Kubernetes Secret that
+// carried the password is not revocation: the role keeps whatever password
+// it was last given, the pg_hba line still admits it, and anyone who read
+// the Secret while it existed can still connect.
+func (PgxProber) RevokeLogin(ctx context.Context, dsn, role string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	_, err = conn.Exec(ctx, `ALTER ROLE `+pgx.Identifier{role}.Sanitize()+` WITH NOLOGIN PASSWORD NULL`)
+	return err
+}
+
 // GroupLogin is one login role every group carries, with the attributes it
 // is created with and the grants it needs. Neither is derivable from the
 // role name, and both are what the operator has to reapply on a group
@@ -1050,6 +1066,12 @@ func (b boundedProber) SetLoginPassword(ctx context.Context, dsn, role, password
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.SetLoginPassword(ctx, dsn, role, password)
+}
+
+func (b boundedProber) RevokeLogin(ctx context.Context, dsn, role string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.RevokeLogin(ctx, dsn, role)
 }
 
 func (b boundedProber) EnsureGroupLogins(ctx context.Context, dsn string, logins []GroupLogin) error {
