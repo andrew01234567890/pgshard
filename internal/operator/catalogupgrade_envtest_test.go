@@ -611,6 +611,15 @@ func TestCatalogUpgradeGivesTheNewCatalogTheRouterPassword(t *testing.T) {
 	if !slices.Contains(applied, wantCtl) {
 		t.Errorf("the new catalog was never given the controller password: %v", applied)
 	}
+	// And the admin's read-only login. Without it every catalog-backed
+	// admin page answers "password authentication failed" from the moment
+	// the endpoint moves until the next reconcile pass sets it.
+	var asec corev1.Secret
+	get(t, AdminCatalogSecretName(c.Name), &asec)
+	wantAdmin := "cp-catalog-g2-rw.default.svc/" + catalog.AdminUIRole + "=" + string(asec.Data["password"])
+	if !slices.Contains(applied, wantAdmin) {
+		t.Errorf("the new catalog was never given the admin UI password: %v", applied)
+	}
 }
 
 // TestNoCatalogMigrationWhileAnUpgradeIsInFlight: both catalog
