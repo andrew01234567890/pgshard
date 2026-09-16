@@ -695,6 +695,16 @@ const (
 	// InternalTLSDialing: every listener still serves both, and every
 	// caller dials TLS. Only the routers roll into it.
 	InternalTLSDialing = "Dialing"
+	// InternalTLSClosing: nothing dials plaintext any more, so the
+	// listeners stop taking it. Members, routers and the controller roll
+	// into it, and only once every one of them has is the mode mutual.
+	//
+	// Without this step the move reported itself finished while every pod
+	// still carried --tls-accept-plaintext: the flag is rendered for the
+	// whole move and only dropped once the move is cleared, so the roll
+	// that removes it happened after the cluster had already said nothing
+	// accepts plaintext.
+	InternalTLSClosing = "Closing"
 )
 
 // InternalTLSStatus records the internal transport a cluster runs.
@@ -716,7 +726,7 @@ type InternalTLSStatus struct {
 
 // InternalTLSMove is one move from plaintext to mutual TLS.
 type InternalTLSMove struct {
-	// +kubebuilder:validation:Enum=Accepting;Dialing
+	// +kubebuilder:validation:Enum=Accepting;Dialing;Closing
 	Phase string `json:"phase"`
 	// Target is the spec.internalTLS the move is heading to. Once callers
 	// dial TLS the operator renders it, whatever the spec has since been

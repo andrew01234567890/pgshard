@@ -127,9 +127,14 @@ func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings
 		RestartToken: c.Annotations[AnnotationRestart],
 		InternalTLS:  internalTLSMode(c),
 	}
-	// Both steps of a move render members alike -- listening for TLS and
-	// plaintext -- so moving from the first to the second rolls none.
-	if internalTLSPhase(c) != "" {
+	// The first two steps of a move render members alike -- listening for
+	// TLS and plaintext -- so moving from the first to the second rolls
+	// none. The last one does NOT: it takes the plaintext listener away,
+	// and the hash has to say so or nothing rolls into it. This is what
+	// decides whether a member is stale (classifyPod), so a step the hash
+	// cannot see is a step that never happens: the move then waits for
+	// pods to carry an annotation they are never re-rendered with.
+	if internalTLSAcceptsPlaintext(c) {
 		tpl.InternalTLS += "+accepting-plaintext"
 	}
 	if pol != nil {
@@ -708,7 +713,7 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		if internalTLS(c).Issue {
 			args = append(args, "--tls-authorize-callers")
 		}
-		if internalTLSPhase(c) != "" {
+		if internalTLSAcceptsPlaintext(c) {
 			args = append(args, "--tls-accept-plaintext")
 		}
 		mounts = append(mounts, corev1.VolumeMount{Name: vol, MountPath: dir, ReadOnly: true})
@@ -801,8 +806,13 @@ func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
 		// no identity to authorise.
 		AuthorizeCallers: internalTLS(c).Issue,
 		// A caller that has not switched to TLS yet is still served while
-		// the cluster moves to it.
-		AcceptPlaintext: internalTLSPhase(c) != "",
+		// the cluster moves to it -- until the last step, where nothing
+		// dials plaintext any more and the listeners stop taking it. The
+		// operator and the controller dial every agent with mTLS from the
+		// first step onwards (AgentTLS.Set keys off the agent-mTLS
+		// annotation, not the phase), so by then there is no plaintext
+		// caller left to serve.
+		AcceptPlaintext: internalTLSAcceptsPlaintext(c),
 		CertFile:        internalTLSMountPath + "/tls.crt",
 		KeyFile:         internalTLSMountPath + "/tls.key",
 		CAFile:          internalTLSMountPath + "/ca.crt",

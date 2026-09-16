@@ -154,9 +154,26 @@ func TestAMoveToTLSWaitsForEveryPodOfTheStepBefore(t *testing.T) {
 	for _, name := range []string{"moving-router-a", "moving-router-old"} {
 		annotate(name, pgshardv1alpha1.InternalTLSDialing)
 	}
+	// Every router dials TLS, so nothing dials plaintext any more and the
+	// listeners can stop taking it. That is a step of its own: while every
+	// pod still carries --tls-accept-plaintext the cluster does accept
+	// plaintext, so the move is not finished and must not say it is.
+	stored, rendered = pass(t, r, c)
+	if phaseOf(stored) != pgshardv1alpha1.InternalTLSClosing {
+		t.Fatalf("every router dials TLS, yet the move is %q; want Closing", phaseOf(stored))
+	}
+	if acceptsPlaintext(t, rendered) {
+		t.Error("the Closing step still renders --tls-accept-plaintext")
+	}
+	if stored, _ = pass(t, r, c); stored.Status.InternalTLS.Move == nil {
+		t.Fatal("the move finished while no pod had rolled out of accepting plaintext")
+	}
+	for _, name := range []string{"moving-shard-0-0", "moving-router-a", "moving-router-old", "moving-controller-x"} {
+		annotate(name, pgshardv1alpha1.InternalTLSClosing)
+	}
 	stored, rendered = pass(t, r, c)
 	if st := stored.Status.InternalTLS; st.Move != nil || st.Mode != "issued" || phaseOf(rendered) != "" {
-		t.Fatalf("every router dials TLS: recorded %+v, rendered phase %q; want the move complete in mode issued", st, phaseOf(rendered))
+		t.Fatalf("no pod accepts plaintext: recorded %+v, rendered phase %q; want the move complete in mode issued", st, phaseOf(rendered))
 	}
 	if cond := meta.FindStatusCondition(stored.Status.Conditions, pgshardv1alpha1.ConditionInternalTLSMoving); cond == nil || cond.Status != metav1.ConditionFalse {
 		t.Fatalf("the moving condition after the move: %+v", cond)
@@ -227,16 +244,23 @@ func TestEachStepOfAMoveRendersWhatItsCallersNeed(t *testing.T) {
 			t.Errorf("%q: router pods record phase %q", phase, got)
 		}
 		controller := Renderer{}.ControllerDeployment(c)
+		// The controller is rendered alike in the first two steps, so it
+		// records the first and does not roll between them; the last step
+		// takes its plaintext listener away, so it records that one.
 		want := phase
-		if phase != "" {
+		if phase == pgshardv1alpha1.InternalTLSDialing {
 			want = pgshardv1alpha1.InternalTLSAccepting
 		}
 		if got := controller.Spec.Template.Annotations[AnnotationInternalTLSPhase]; got != want {
 			t.Errorf("%q: controller pods record phase %q, want %q", phase, got, want)
 		}
 		controllers = append(controllers, controller.Spec.Template)
-		if got := agentGRPCTLS(c).AcceptPlaintext; got != (phase != "") {
-			t.Errorf("%q: agent accepts plaintext = %v", phase, got)
+		// The agent's listener follows the same rule as every other: it
+		// serves callers that have not switched yet, and stops in the step
+		// where nothing dials plaintext any more.
+		wantPlaintext := phase == pgshardv1alpha1.InternalTLSAccepting || phase == pgshardv1alpha1.InternalTLSDialing
+		if got := agentGRPCTLS(c).AcceptPlaintext; got != wantPlaintext {
+			t.Errorf("%q: agent accepts plaintext = %v, want %v", phase, got, wantPlaintext)
 		}
 		return tpl, pooler, router.Spec.Template.Spec.Containers[0].Args, controller.Spec.Template.Spec.Containers[0].Args
 	}
@@ -259,6 +283,13 @@ func TestEachStepOfAMoveRendersWhatItsCallersNeed(t *testing.T) {
 		t.Error("Dialing renders members or the controller differently from Accepting, so it rolls them again")
 	}
 
+	closeTpl, closePooler, closeRouter, closeController := render(pgshardv1alpha1.InternalTLSClosing)
+	if has(closePooler, "--tls-accept-plaintext") || has(closeRouter, "--tls-accept-plaintext") || has(closeController, "--tls-accept-plaintext") {
+		t.Errorf("Closing still renders --tls-accept-plaintext: pooler %v router %v controller %v", closePooler, closeRouter, closeController)
+	}
+	if closeTpl.Hash() == dialTpl.Hash() {
+		t.Error("Closing hashes like Dialing, so no member rolls out of accepting plaintext")
+	}
 	doneTpl, donePooler, doneRouter, doneController := render("")
 	for what, args := range map[string][]string{"pooler": donePooler, "router": doneRouter, "controller": doneController} {
 		if has(args, "--tls-accept-plaintext") || has(args, "--tls-dial-plaintext") {
@@ -320,5 +351,62 @@ func TestAClusterFirstSeenMidwayRecordsWhatItRuns(t *testing.T) {
 	stored, _ := pass(t, r, c)
 	if internalTLSPhase(stored) != pgshardv1alpha1.InternalTLSAccepting {
 		t.Fatalf("a cluster whose routers still run --insecure-dev under a spec saying issue: true recorded %+v; want the move started", stored.Status.InternalTLS)
+	}
+}
+
+// acceptsPlaintext reports whether anything the cluster renders still takes
+// a plaintext connection.
+func acceptsPlaintext(t *testing.T, c *pgshardv1alpha1.PgShardCluster) bool {
+	t.Helper()
+	g := Groups(c)[1]
+	pod := Renderer{}.Pod(c, g, 0, "primary", "pvc", Template(c, g, nil, nil))
+	lists := [][]string{
+		Renderer{}.RouterDeployment(c).Spec.Template.Spec.Containers[0].Args,
+		Renderer{}.ControllerDeployment(c).Spec.Template.Spec.Containers[0].Args,
+	}
+	for _, ct := range pod.Spec.Containers {
+		lists = append(lists, ct.Args)
+	}
+	for _, args := range lists {
+		if slices.Contains(args, "--tls-accept-plaintext") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTheTemplateHashSeesTheStepThatStopsAcceptingPlaintext (PGS-930): the
+// member template's hash is what classifyPod compares to decide a member is
+// stale, so a step the hash cannot see is a step no member ever rolls into
+// -- and the move then waits for pods to carry an annotation they are never
+// re-rendered with. It waited for ever, and the e2e cell sat in the suite
+// for thirty-five minutes rather than the usual five.
+//
+// The first two steps do render members alike and must NOT roll them. The
+// last one takes the plaintext listener away and must.
+func TestTheTemplateHashSeesTheStepThatStopsAcceptingPlaintext(t *testing.T) {
+	hashAt := func(phase string) string {
+		c := insecureCluster("hashing")
+		c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{Issue: true}
+		c.Status.InternalTLS = &pgshardv1alpha1.InternalTLSStatus{Mode: "insecure"}
+		if phase != "" {
+			c.Status.InternalTLS.Move = &pgshardv1alpha1.InternalTLSMove{Phase: phase, Target: c.Spec.InternalTLS}
+		} else {
+			c.Status.InternalTLS.Mode = "issued"
+		}
+		return Template(c, Groups(c)[1], nil, nil).Hash()
+	}
+	accepting := hashAt(pgshardv1alpha1.InternalTLSAccepting)
+	dialing := hashAt(pgshardv1alpha1.InternalTLSDialing)
+	closing := hashAt(pgshardv1alpha1.InternalTLSClosing)
+	done := hashAt("")
+	if accepting != dialing {
+		t.Errorf("Accepting and Dialing hash differently (%s, %s); members would roll for a step that renders them alike", accepting, dialing)
+	}
+	if closing == dialing {
+		t.Errorf("Dialing and Closing hash the same (%s); no member ever rolls out of accepting plaintext, and the move never finishes", closing)
+	}
+	if closing != done {
+		t.Errorf("Closing hashes %s and the finished move %s; the last step already renders what the finished cluster runs, so it must not roll twice", closing, done)
 	}
 }
