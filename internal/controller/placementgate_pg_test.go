@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -243,4 +244,69 @@ func TestACopyAndAPlacementDecidingTogetherDoNotBothStart(t *testing.T) {
 			t.Fatalf("the placement is %s (%q) although a copy started while it decided", state, msg)
 		}
 	})
+}
+
+// TestARangeEditNothingDrivesIsNotAnActiveCopy (PGS-866): an in-place edit
+// of pgshard.shard_ranges records a reshard that nothing drives, and
+// activeCopies counted it, so a placement waited at prepare until somebody
+// cancelled the row.
+//
+// activeCopies is the gate only on a catalog that has not yet applied the
+// operation queue migration, so this calls it directly: on a catalog that
+// has, prepareAndStart asks the queue instead and never reaches it. What
+// the queue answers for the same row is in the queue rule's own test.
+//
+// The row is made the way the controller makes it -- an actual range edit,
+// an actual reconcile -- because what the count turns on is which keys that
+// row's spec carries.
+func TestARangeEditNothingDrivesIsNotAnActiveCopy(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+
+	mustExec(t, f.catalog, `BEGIN`)
+	mustExec(t, f.catalog, `UPDATE pgshard.shard_ranges SET range = int8range(lower(range), 1000) WHERE shard_set = 'default' AND shard_id = 0`)
+	mustExec(t, f.catalog, `UPDATE pgshard.shard_ranges SET range = int8range(1000, upper(range)) WHERE shard_set = 'default' AND shard_id = 1`)
+	mustExec(t, f.catalog, `COMMIT`)
+	f.reconcile()
+	if msg := queryOne[string](t, f.catalog, `SELECT coalesce(status->>'message', '') FROM pgshard.workflows WHERE kind = $1 AND state = $2`, KindReshard, StatePending); !strings.Contains(msg, "not driven yet") {
+		t.Fatalf("the premise is the pending row an in-place range edit records: %q", msg)
+	}
+	if n, err := activeCopies(ctx, f.pool); err != nil || n != 0 {
+		t.Fatalf("the pending range edit counts as %d active copies (%v)", n, err)
+	}
+
+	// Paused it is no less inert, and the row still carries no stage.
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET state = $2 WHERE kind = $1 AND state = $3`, KindReshard, StatePaused, StatePending)
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.workflows WHERE kind = $1 AND state = $2`, KindReshard, StatePaused); n != 1 {
+		t.Fatalf("%d reshards are paused; the pause did not land, so the assertion below would pass without exercising it", n)
+	}
+	if n, err := activeCopies(ctx, f.pool); err != nil || n != 0 {
+		t.Fatalf("the paused range edit counts as %d active copies (%v)", n, err)
+	}
+
+	// The shape that must NOT be let past, and the reason the count reads the
+	// stage rather than the state: a reshard whose spec names no source set
+	// but which HAS started. Legacy rows resolved their source only at
+	// cutover, so "no source set" does not mean "not running" for them, and a
+	// copy past its first stage keeps applying through its subscriptions
+	// whatever state the row is in -- paused included.
+	const started = "00000000-0000-0000-0000-0000000000a2"
+	mustExec(t, f.catalog, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, '{}', $4)`,
+		started, KindReshard, StatePaused, mustJSON(map[string]any{"stage": "copying"}))
+	if n, err := activeCopies(ctx, f.pool); err != nil || n != 1 {
+		t.Fatalf("a sourceless reshard already copying counts as %d active copies, want 1 (%v)", n, err)
+	}
+	mustExec(t, f.catalog, `DELETE FROM pgshard.workflows WHERE id = $1::uuid`, started)
+
+	// And the ordinary driven reshard, in the state the controller actually
+	// creates it in: reshard.go inserts provisioning, never pending.
+	const driven = "00000000-0000-0000-0000-0000000000a1"
+	mustExec(t, f.catalog, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, $4, $5)`,
+		driven, KindReshard, StateProvisioning,
+		mustJSON(map[string]any{"shard_set": "g2", "generation": 2, "desired_generation": 2, "source_set": "default", "ranges": []any{}}),
+		mustJSON(map[string]any{"stage": StageProvisioning}))
+	if n, err := activeCopies(ctx, f.pool); err != nil || n != 1 {
+		t.Fatalf("a driven reshard counts as %d active copies, want 1 (%v)", n, err)
+	}
 }
