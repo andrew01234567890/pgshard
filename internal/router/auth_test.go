@@ -527,3 +527,59 @@ func TestTheDefaultPerRoleCapAppliesOnlyWhereTheRoleHasNone(t *testing.T) {
 		}
 	})
 }
+
+// TestAnEmptyRoleReadDoesNotRevokeEveryone: a read that succeeds and finds
+// no roles must not replace a set that had some.
+//
+// Every cluster has at least the bootstrap credential it was first used
+// with, so an empty answer is a read of something that is not the catalog
+// far more often than it is every role being revoked at once. Publishing it
+// answers "password authentication failed" for every user -- which is what
+// a revoked role is deliberately indistinguishable from -- and the refresh
+// loop then terminates every open session, because after an empty load
+// every role is one that may no longer log in.
+func TestAnEmptyRoleReadDoesNotRevokeEveryone(t *testing.T) {
+	rows := map[string]snapshot.RoleCred{
+		"app":      {Verifier: "v", CanLogin: true},
+		"postgres": {Verifier: "v", CanLogin: true},
+	}
+	c := &RoleCache{ttl: time.Hour, now: time.Now}
+	c.load = func(context.Context) (*snapshot.Roles, error) { return snapshot.NewRoles(rows), nil }
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !c.MayLogIn("app") || !c.MayLogIn("postgres") {
+		t.Fatal("the roles were not admitted before the empty read")
+	}
+
+	c.load = func(context.Context) (*snapshot.Roles, error) { return snapshot.NewRoles(nil), nil }
+	if err := c.Refresh(context.Background()); err == nil {
+		t.Fatal("an empty read was accepted silently; the caller has no way to know it kept the old roles")
+	}
+	if !c.MayLogIn("app") || !c.MayLogIn("postgres") {
+		t.Fatal("an empty read revoked every role in the cluster")
+	}
+
+	// A cluster that genuinely has no roles yet still loads: the guard is
+	// about replacing a set that had some, not about refusing to start.
+	fresh := &RoleCache{ttl: time.Hour, now: time.Now}
+	fresh.load = func(context.Context) (*snapshot.Roles, error) { return snapshot.NewRoles(nil), nil }
+	if err := fresh.Refresh(context.Background()); err != nil {
+		t.Fatalf("an empty catalog must still load: %v", err)
+	}
+
+	// And a role really being dropped still takes effect, as long as
+	// something is left.
+	c.load = func(context.Context) (*snapshot.Roles, error) {
+		return snapshot.NewRoles(map[string]snapshot.RoleCred{"postgres": {Verifier: "v", CanLogin: true}}), nil
+	}
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c.MayLogIn("app") {
+		t.Fatal("a dropped role is still admitted")
+	}
+	if !c.MayLogIn("postgres") {
+		t.Fatal("the role that remains was revoked with it")
+	}
+}
