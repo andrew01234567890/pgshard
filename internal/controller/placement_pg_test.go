@@ -2158,3 +2158,63 @@ func (c alterReplicaIdentityDies) Exec(ctx context.Context, sql string, args ...
 	}
 	return c.ShardConn.Exec(ctx, sql, args...)
 }
+
+// TestARecheckRefusesAnIdentityTheMoveDidNotRaise (PGS-859, from the
+// pre-merge audit): the recheck before the swap exempted "replica identity
+// FULL" wherever it found it, rather than only where this workflow had
+// raised it.
+//
+// The preflight refuses any non-default replica identity, so a table that
+// reaches the copy is at DEFAULT and the shadow is built from that. Set FULL
+// between the preflight and the copy and the workflow never records it --
+// ensureReplication only records what it raises, and the table is already
+// FULL -- so the exemption swallowed a dependent the move cannot carry, and
+// the swap put back a table at DEFAULT, silently breaking the downstream
+// logical replication of its UPDATEs and DELETEs.
+func TestARecheckRefusesAnIdentityTheMoveDidNotRaise(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	const id = "77777777-7777-7777-7777-777777777777"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, '{}', '{}')`, id, KindTablePlacement, StateRunning)
+	p := &Placer{Pool: pool, Shards: realShards{dsn}}
+	newWF := func() *placementWorkflow {
+		return &placementWorkflow{id: id, state: StateRunning, stage: StagePlacementCopying,
+			spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+			st:    placementState{SourceSet: "default"},
+			from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+			shape: rowShape{Schema: "public", Name: "ledger"}}
+	}
+
+	// At DEFAULT, with nothing else on the table, the recheck passes.
+	if err := p.recheckDependents(ctx, newWF()); err != nil {
+		t.Fatalf("a table with no dependents was refused: %v", err)
+	}
+
+	// FULL that the workflow did not raise is a dependent like any other.
+	mustExec(t, cat, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	err = p.recheckDependents(ctx, newWF())
+	if err == nil {
+		t.Fatal("a replica identity the move never raised was taken for its own; the swap would have dropped it")
+	}
+	if !strings.Contains(err.Error(), "replica identity FULL") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+
+	// The same identity, recorded as this workflow's, is its own to ignore.
+	wf := newWF()
+	wf.st.ReplicaIdentityFull = []int32{0}
+	if err := p.recheckDependents(ctx, wf); err != nil {
+		t.Fatalf("the workflow's own widened identity was refused: %v", err)
+	}
+}

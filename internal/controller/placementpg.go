@@ -988,8 +988,20 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 //
 // What remains is the moment between this check and each shard's rename.
 func (p *Placer) recheckDependents(ctx context.Context, wf *placementWorkflow) error {
-	own := map[string]bool{"replica identity FULL": true, "publication " + wf.publicationName(): true}
 	for _, src := range wf.from.Sources() {
+		// Per source, not once for the move: the identity this workflow
+		// raised is its own to ignore, and a FULL it did not raise is a
+		// dependent like any other. Exempting the string wherever it
+		// appeared let a REPLICA IDENTITY FULL set between the preflight
+		// and the swap through the one check meant to catch it -- and the
+		// shadow was built from what the preflight saw, so the swap put
+		// back a table at DEFAULT and broke the downstream logical
+		// replication of its UPDATEs and DELETEs, which is exactly what
+		// unsupportedTableFeatures refuses a move for.
+		own := map[string]bool{"publication " + wf.publicationName(): true}
+		if slices.Contains(wf.st.ReplicaIdentityFull, src) {
+			own["replica identity FULL"] = true
+		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, src, wf.spec.Database)
 		if err != nil {
 			return err
