@@ -230,16 +230,22 @@ func TestAnIssuedTLSClusterReachedFromPlaintextUnderLoad(t *testing.T) {
 		t.Logf("move took %s through %v; writer: %d acknowledged, %d failed, longest failing stretch %s, last error %q",
 			time.Since(started).Round(time.Second), phases, len(acked), failures, longestStreak.Round(time.Second), lastErr)
 
-		if !slices.Equal(phases, []string{"Accepting", "Dialing"}) {
-			t.Errorf("the move went through %v, want Accepting then Dialing", phases)
+		// Three steps, in this order. The last one is what makes the
+		// finished mode mean what it says: until every listener has been
+		// rolled without --tls-accept-plaintext the cluster does still
+		// accept plaintext, and the move used to report itself complete
+		// before that roll (PGS-930).
+		if !slices.Equal(phases, []string{"Accepting", "Dialing", "Closing"}) {
+			t.Errorf("the move went through %v, want Accepting then Dialing then Closing", phases)
 		}
 		if len(notAcceptingAtDialing) > 0 {
 			t.Errorf("routers were switched to TLS while member pods rendered before the move still served plaintext only: %v", notAcceptingAtDialing)
 		}
-		// Every member restarts twice: into Accepting, and out of it once
-		// the move completes.
+		// Every member restarts twice: into Accepting, and out of it in
+		// Closing. Dialing renders members exactly as Accepting does and
+		// must roll none.
 		if want := 3 * len(before); len(uids) < want {
-			t.Errorf("member pods had %d incarnations over the move, want at least %d (%d members, each rolled into and out of Accepting)", len(uids), want, len(before))
+			t.Errorf("member pods had %d incarnations over the move, want at least %d (%d members, each rolled into Accepting and out of it in Closing)", len(uids), want, len(before))
 		}
 		if len(acked) == 0 {
 			t.Fatal("the writer acknowledged nothing through the router")
