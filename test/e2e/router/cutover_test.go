@@ -365,7 +365,16 @@ func TestReshardCutoverUnderLoad(t *testing.T) {
 	s := startCutoverStack(t)
 	ctx := context.Background()
 	ranges, _ := placement.Split(2)
-	spec := map[string]any{"shard_set": "g2", "generation": 2, "source_set": "default", "retire_after_seconds": 1,
+	// Long enough to outlast this test's own load, short enough that the
+	// run still reaches completed. This measures the cutover, not the
+	// retirement: at one second the old groups are now retired while the
+	// workload is still running against them, and every session pinned to
+	// one is closed under it -- 152 failed transfers. That was invisible
+	// while the retirement waited for a full reconcile pass rather than the
+	// window, and it is what retireOldGroupsAfter is for. Whether a
+	// retiring set should drain its sessions rather than close them is
+	// PGS-927.
+	spec := map[string]any{"shard_set": "g2", "generation": 2, "source_set": "default", "retire_after_seconds": 10,
 		"ranges": []map[string]any{{"shard_id": 0, "lower": ranges[0].Start, "upper": ranges[0].End}, {"shard_id": 1, "lower": ranges[1].Start, "upper": ranges[1].End}}}
 	var id string
 	if err := s.catalog.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES (gen_random_uuid(), 'reshard', 'running', $1, '{"stage": "ready_for_copy"}') RETURNING id::text`, spec).Scan(&id); err != nil {
