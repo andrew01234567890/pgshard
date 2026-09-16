@@ -37,6 +37,18 @@ const EnqueueLockKey int64 = 0x7067736861726451
 // statement run again attaches to it instead of running again.
 const DefaultRetryWindow = 10 * time.Minute
 
+// RepeatableMigrationKinds are the kinds whose second run is the work
+// again rather than a repeat of a statement already applied: running one
+// of them is asking for its effect now, against the state now.
+//
+// A statement of any other kind that completed a moment ago stands for one
+// sent again, which is what makes a client's retry after a timeout build
+// an index once. One of these does not: ALTER SEQUENCE ... RESTART sent
+// again after the application has consumed a few thousand values is asking
+// for a restart from where the sequence is now, and answering it with the
+// earlier one reports success for work that did not happen.
+var RepeatableMigrationKinds = []string{"REINDEX", "VACUUM", "ALTER SEQUENCE"}
+
 // ClusterScopedMigrationKinds are the migration kinds about the whole
 // cluster rather than one database; pgshard.cluster_scoped_migration lists
 // the same.
@@ -116,6 +128,13 @@ type EnqueueResult struct {
 	Attached bool
 	// State is the state of the migration ID named when it was chosen.
 	State string
+	// Deduplicated reports that the stored row carries a dedup key, so the
+	// same statement sent again attaches to it rather than running twice.
+	// It is the enqueue's answer rather than the caller's intent: a
+	// catalog without the operation queue has nowhere to record a key, and
+	// telling a client its retry will wait is how the retry builds the
+	// index twice.
+	Deduplicated bool
 }
 
 // EnqueueMigrationOnce enqueues m unless an identical migration (the same
@@ -139,8 +158,8 @@ func EnqueueMigrationOnce(ctx context.Context, db Beginner, m DDLMigration, wind
 		err := tx.QueryRow(ctx, `SELECT id::text, state, arrival FROM pgshard.migrations
 			WHERE dedup_key = $1
 			  AND (state IN ('queued', 'running')
-			       OR (state = 'complete' AND finished_at >= now() - make_interval(secs => $2) AND kind NOT IN ('REINDEX', 'VACUUM')))
-			ORDER BY arrival DESC LIMIT 1`, m.DedupKey, window.Seconds()).Scan(&id, &state, &arrival)
+			       OR (state = 'complete' AND finished_at >= now() - make_interval(secs => $2) AND kind <> ALL ($3)))
+			ORDER BY arrival DESC LIMIT 1`, m.DedupKey, window.Seconds(), RepeatableMigrationKinds).Scan(&id, &state, &arrival)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 		case err != nil:
@@ -155,7 +174,7 @@ func EnqueueMigrationOnce(ctx context.Context, db Beginner, m DDLMigration, wind
 				return EnqueueResult{}, fmt.Errorf("catalog: enqueue migration: %w", err)
 			}
 			if !overtaken {
-				return EnqueueResult{ID: id, Attached: true, State: state}, tx.Commit(ctx)
+				return EnqueueResult{ID: id, Attached: true, State: state, Deduplicated: true}, tx.Commit(ctx)
 			}
 		}
 	}
@@ -163,7 +182,7 @@ func EnqueueMigrationOnce(ctx context.Context, db Beginner, m DDLMigration, wind
 	if err != nil {
 		return EnqueueResult{}, err
 	}
-	return EnqueueResult{ID: id, State: MigrationQueued}, tx.Commit(ctx)
+	return EnqueueResult{ID: id, State: MigrationQueued, Deduplicated: m.DedupKey != ""}, tx.Commit(ctx)
 }
 
 // HeartbeatApplier is the controller_heartbeat component the applier beats.

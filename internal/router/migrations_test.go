@@ -19,6 +19,8 @@ import (
 
 // fakeQueue completes every migration with the outcome the test scripted,
 // after an optional delay.
+// fakeQueue completes every migration with the outcome the test scripted,
+// after an optional delay.
 type fakeQueue struct {
 	mu       sync.Mutex
 	queued   []catalog.DDLMigration
@@ -26,20 +28,60 @@ type fakeQueue struct {
 	delay    time.Duration
 	waited   int
 	enqueueE error
+	// attach, when set, answers an enqueue with an existing migration.
+	attach func(m catalog.DDLMigration) (catalog.EnqueueResult, bool)
+	// blockers is what every waiting migration is told it waits for.
+	blockers []catalog.Blocker
+	// home and homeQueued answer HomeDDLBlockers.
+	home       []catalog.Blocker
+	homeQueued bool
+	// noQueue makes the catalog one without the operation queue at all,
+	// which is a router newer than its catalog mid-rollout.
+	noQueue bool
+	// waitErr, when set, is what Wait fails with.
+	waitErr error
 }
 
-func (q *fakeQueue) Enqueue(_ context.Context, m catalog.DDLMigration) (string, error) {
+func (q *fakeQueue) Enqueue(_ context.Context, m catalog.DDLMigration) (catalog.EnqueueResult, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.enqueueE != nil {
-		return "", q.enqueueE
+		return catalog.EnqueueResult{}, q.enqueueE
+	}
+	if q.attach != nil {
+		if r, ok := q.attach(m); ok {
+			return r, nil
+		}
 	}
 	m.ID = fmt.Sprintf("00000000-0000-0000-0000-%012d", len(q.queued)+1)
 	q.queued = append(q.queued, m)
-	return m.ID, nil
+	// As the real one does: a catalog with no queue has nowhere to store a
+	// key, whatever the caller asked for.
+	return catalog.EnqueueResult{ID: m.ID, State: catalog.MigrationQueued, Deduplicated: !q.noQueue && m.DedupKey != ""}, nil
 }
 
-func (q *fakeQueue) Wait(ctx context.Context, id string) (catalog.DDLMigration, error) {
+func (q *fakeQueue) HomeDDLBlockers(context.Context, string) ([]catalog.Blocker, bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.home, q.homeQueued, nil
+}
+
+// QueueSchema answers for a catalog that has the operation queue unless a
+// test says otherwise: that is the state the feature is about, and the
+// queue-less catalog is the rollout case two tests set explicitly.
+func (q *fakeQueue) QueueSchema(context.Context) (bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return !q.noQueue, nil
+}
+
+func (q *fakeQueue) Wait(ctx context.Context, id string, waiting func([]catalog.Blocker)) (catalog.DDLMigration, error) {
+	q.mu.Lock()
+	failWith := q.waitErr
+	q.mu.Unlock()
+	if failWith != nil {
+		return catalog.DDLMigration{ID: id, State: catalog.MigrationQueued}, failWith
+	}
 	q.mu.Lock()
 	q.waited++
 	var m catalog.DDLMigration
@@ -48,8 +90,11 @@ func (q *fakeQueue) Wait(ctx context.Context, id string) (catalog.DDLMigration, 
 			m = x
 		}
 	}
-	delay, outcome := q.delay, q.outcome
+	delay, outcome, blockers := q.delay, q.outcome, q.blockers
 	q.mu.Unlock()
+	if waiting != nil && len(blockers) > 0 {
+		waiting(blockers)
+	}
 	if delay > 0 {
 		select {
 		case <-ctx.Done():
@@ -128,6 +173,9 @@ func TestDDLIsQueuedAndAnsweredWhenComplete(t *testing.T) {
 	}
 }
 
+// servingSetRenamed publishes the harness snapshot as a cutover leaves it:
+// the shards serve under a new set name and the database's home shard id
+// is the new set's.
 // servingSetRenamed publishes the harness snapshot as a cutover leaves it:
 // the shards serve under a new set name and the database's home shard id
 // is the new set's.
@@ -290,7 +338,7 @@ func TestPGMigrationQueueWaitIsBounded(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		_, err := q.Wait(context.Background(), "m1")
+		_, err := q.Wait(context.Background(), "m1", nil)
 		done <- result{err}
 	}()
 	select {
@@ -316,7 +364,7 @@ func TestPGMigrationQueueWaitResetsOnProgress(t *testing.T) {
 		}}
 	done := make(chan error, 1)
 	go func() {
-		m, err := q.Wait(context.Background(), "m1")
+		m, err := q.Wait(context.Background(), "m1", nil)
 		if err == nil && m.State != catalog.MigrationComplete {
 			err = fmt.Errorf("state %s", m.State)
 		}
@@ -332,6 +380,13 @@ func TestPGMigrationQueueWaitResetsOnProgress(t *testing.T) {
 	}
 }
 
+// TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt (PGS-871): the
+// watcher's own reload after a migration can wait out a notification budget
+// the migration's per-shard steps drained, and the client's next statement
+// was planned without the view it had just created. An applied migration is
+// answered only after the router has reloaded; a failed one, or one queued
+// asynchronously, is not held for it; and a reload that fails still answers
+// the applied DDL, with a warning.
 // TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt (PGS-871): the
 // watcher's own reload after a migration can wait out a notification budget
 // the migration's per-shard steps drained, and the client's next statement
@@ -422,6 +477,11 @@ func TestAMigrationIsAnsweredOnceTheRoutersSnapshotHasIt(t *testing.T) {
 // two before one Sync queued the second twice and never the first. The
 // messages go on the wire by hand: pgx's pipeline reader also checks the
 // order of the replies, which is PGS-897.
+// TestEachDDLOfAPipelinedBatchRunsItsOwnStatement (PGS-896): the batch
+// handler ran the last DDL it saw for every Execute, so a client pipelining
+// two before one Sync queued the second twice and never the first. The
+// messages go on the wire by hand: pgx's pipeline reader also checks the
+// order of the replies, which is PGS-897.
 func TestEachDDLOfAPipelinedBatchRunsItsOwnStatement(t *testing.T) {
 	q := &fakeQueue{}
 	h := newDDLHarness(t, q)
@@ -476,6 +536,8 @@ func TestEachDDLOfAPipelinedBatchRunsItsOwnStatement(t *testing.T) {
 
 // A portal runs the statement it was bound to, even when the name was parsed
 // again before its Execute.
+// A portal runs the statement it was bound to, even when the name was parsed
+// again before its Execute.
 func TestADDLPortalRunsTheStatementItWasBoundTo(t *testing.T) {
 	q := &fakeQueue{}
 	h := newDDLHarness(t, q)
@@ -510,6 +572,8 @@ func TestADDLPortalRunsTheStatementItWasBoundTo(t *testing.T) {
 	}
 }
 
+// A DDL statement pipelined with anything else is refused whole: the
+// migration and the other statement cannot share a batch's transaction.
 // A DDL statement pipelined with anything else is refused whole: the
 // migration and the other statement cannot share a batch's transaction.
 func TestADDLBatchWithAnotherStatementIsRefused(t *testing.T) {
@@ -549,6 +613,271 @@ func TestADDLBatchWithAnotherStatementIsRefused(t *testing.T) {
 		if n != 0 {
 			t.Fatalf("%q: %d migrations queued from a refused batch", order, n)
 		}
+	}
+}
+
+// TestAnIdenticalDDLAttachesAndSaysSoAtOnce (PGS-900): a client whose DDL
+// timed out sends it again. The router hands it the migration already
+// queued, and says so while it waits rather than when it is done.
+// TestAnIdenticalDDLAttachesAndSaysSoAtOnce (PGS-900): a client whose DDL
+// timed out sends it again. The router hands it the migration already
+// queued, and says so while it waits rather than when it is done.
+func TestAnIdenticalDDLAttachesAndSaysSoAtOnce(t *testing.T) {
+	q := &fakeQueue{delay: 400 * time.Millisecond}
+	q.attach = func(m catalog.DDLMigration) (catalog.EnqueueResult, bool) {
+		q.queued = append(q.queued, catalog.DDLMigration{ID: "00000000-0000-0000-0000-00000000a77a", Statement: m.Statement, DedupKey: m.DedupKey})
+		return catalog.EnqueueResult{ID: "00000000-0000-0000-0000-00000000a77a", Attached: true, State: catalog.MigrationRunning}, true
+	}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var noticeAt time.Time
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		mu.Lock()
+		defer mu.Unlock()
+		notices = append(notices, n.Message)
+		if noticeAt.IsZero() {
+			noticeAt = time.Now()
+		}
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "create index orders_note_idx on orders (note)"); err != nil {
+		t.Fatal(err)
+	}
+	answered := time.Now()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(notices) != 1 || !strings.Contains(notices[0], "identical migration 00000000-0000-0000-0000-00000000a77a is already running") {
+		t.Fatalf("notices %q", notices)
+	}
+	if answered.Sub(noticeAt) < 200*time.Millisecond {
+		t.Fatalf("the notice arrived %s before the answer; it must reach the client while the statement waits", answered.Sub(noticeAt))
+	}
+	if key := q.queued[0].DedupKey; key == "" {
+		t.Fatal("the statement was queued with no dedup key")
+	}
+}
+
+// TestADDLWaitEndsAtTheSessionStatementTimeout (PGS-900): the router did not
+// read statement_timeout, so a client's timeout never ended a DDL wait. It
+// now does, and says the migration continues and how to wait for it again.
+// TestADDLWaitEndsAtTheSessionStatementTimeout (PGS-900): the router did not
+// read statement_timeout, so a client's timeout never ended a DDL wait. It
+// now does, and says the migration continues and how to wait for it again.
+func TestADDLWaitEndsAtTheSessionStatementTimeout(t *testing.T) {
+	q := &fakeQueue{delay: time.Hour}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	for _, c := range []struct{ dsn, set string }{
+		{h.dsn(), "set statement_timeout = '150ms'"},
+		{h.dsn() + "&options=-c%20statement_timeout%3D150", ""},
+	} {
+		conn := h.connect(t, c.dsn)
+		if c.set != "" {
+			if _, err := conn.Exec(ctx, c.set); err != nil {
+				t.Fatal(err)
+			}
+		}
+		start := time.Now()
+		_, err := conn.Exec(ctx, "create index orders_note_idx on orders (note)")
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != "57014" || pe.Message != "canceling statement due to statement timeout" ||
+			!strings.Contains(pe.Detail, q.last(t).ID+" continues in the background") || !strings.Contains(pe.Detail, "Running the same statement again waits for it") {
+			t.Fatalf("%q: %v, want 57014 naming the migration that continues", c.dsn, err)
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Fatalf("the wait ended after %s", took)
+		}
+	}
+	// RESET puts the session back to the startup value, so a wait longer
+	// than the timeout that was set is no longer cut short.
+	slow := &fakeQueue{delay: 400 * time.Millisecond}
+	sh := newDDLHarness(t, slow)
+	conn := sh.connect(t, sh.dsn())
+	for _, sql := range []string{"set statement_timeout = '150ms'", "reset statement_timeout"} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := conn.Exec(ctx, "create index orders_note_idx on orders (note)"); err != nil {
+		t.Fatalf("after RESET statement_timeout: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "set statement_timeout = '150ms'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "create index orders_note_idx on orders (note)"); err == nil {
+		t.Fatal("a wait longer than the session's statement_timeout was not cut short")
+	}
+}
+
+// TestAWaitingDDLSaysWhatItWaitsFor (PGS-900): DDL behind a reshard is
+// queued, not refused, and the client is told what holds it.
+// TestAWaitingDDLSaysWhatItWaitsFor (PGS-900): DDL behind a reshard is
+// queued, not refused, and the client is told what holds it.
+func TestAWaitingDDLSaysWhatItWaitsFor(t *testing.T) {
+	q := &fakeQueue{blockers: []catalog.Blocker{{Kind: catalog.OperationReshard, ID: "00000000-0000-0000-0000-00000000e5a1", Reason: catalog.BlockedByStarted}}}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) { notices = append(notices, n.Message) }
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "alter table orders add column extra int"); err != nil {
+		t.Fatal(err)
+	}
+	if len(notices) != 1 || !strings.Contains(notices[0], "waits for reshard 00000000-0000-0000-0000-00000000e5a1 (in progress)") {
+		t.Fatalf("notices %q", notices)
+	}
+}
+
+// TestPgshardDDLDedupOffQueuesWithoutAKey (PGS-900).
+// TestPgshardDDLDedupOffQueuesWithoutAKey (PGS-900).
+func TestPgshardDDLDedupOffQueuesWithoutAKey(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+	if _, err := conn.Exec(ctx, "create index a on orders (note)"); err != nil {
+		t.Fatal(err)
+	}
+	if q.last(t).DedupKey == "" {
+		t.Fatal("DDL was queued with no dedup key by default")
+	}
+	if _, err := conn.Exec(ctx, "set pgshard.ddl_dedup = off"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "create index a on orders (note)"); err != nil {
+		t.Fatal(err)
+	}
+	if q.last(t).DedupKey != "" {
+		t.Fatal("pgshard.ddl_dedup = off still queued a key")
+	}
+}
+
+func TestNormalizedStatementIgnoresSpelling(t *testing.T) {
+	a := normalizedStatement("create   index i ON orders (note) -- retry\n")
+	if b := normalizedStatement("CREATE INDEX i ON orders(note);"); a != b {
+		t.Fatalf("%q != %q", a, b)
+	}
+	if c := normalizedStatement("CREATE INDEX j ON orders(note)"); c == a {
+		t.Fatal("a different index name normalises to the same statement")
+	}
+}
+
+func TestParseTimeGUC(t *testing.T) {
+	for v, want := range map[string]time.Duration{"": 0, "0": 0, "150": 150 * time.Millisecond, "5s": 5 * time.Second, "5 s": 5 * time.Second,
+		"2min": 2 * time.Minute, "1h": time.Hour, "1d": 24 * time.Hour, "500us": 500 * time.Microsecond, "1.5s": 1500 * time.Millisecond, "x": 0, "5 years": 0} {
+		if got := parseTimeGUC(v); got != want {
+			t.Errorf("%q = %s, want %s", v, got, want)
+		}
+	}
+}
+
+// TestAWaitKeepsGoingWhileTheControllerIsAlive (PGS-900): a migration held
+// behind a long reshard makes no progress for hours. The wait gave up after
+// ten minutes of that; it now gives up only when the controller's heartbeat
+// has stopped, and reads through a short catalog outage.
+// TestAWaitKeepsGoingWhileTheControllerIsAlive (PGS-900): a migration held
+// behind a long reshard makes no progress for hours. The wait gave up after
+// ten minutes of that; it now gives up only when the controller's heartbeat
+// has stopped, and reads through a short catalog outage.
+func TestAWaitKeepsGoingWhileTheControllerIsAlive(t *testing.T) {
+	queued := catalog.DDLMigration{State: catalog.MigrationQueued}
+	var mu sync.Mutex
+	beatAge, polls, failFor := time.Duration(0), 0, 0
+	q := &PGMigrationQueue{Poll: time.Millisecond, MaxWait: 30 * time.Millisecond, CatalogOutage: time.Hour,
+		queue: func(context.Context) (bool, error) { return true, nil },
+		load: func(context.Context, string) (catalog.DDLMigration, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			polls++
+			if failFor > 0 {
+				failFor--
+				return queued, errors.New("catalog restarting")
+			}
+			return queued, nil
+		},
+		blockers: func(context.Context, string) ([]catalog.Blocker, error) { return nil, nil },
+		beat: func(context.Context) (time.Duration, bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return beatAge, true, nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	mu.Lock()
+	failFor = 20
+	mu.Unlock()
+	if _, err := q.Wait(ctx, "m1", nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("with a fresh heartbeat the wait ended with %v, want it to last until the caller gave up", err)
+	}
+	mu.Lock()
+	beatAge = time.Hour
+	mu.Unlock()
+	_, err := q.Wait(context.Background(), "m1", nil)
+	var quiet errNoApplier
+	if !errors.As(err, &quiet) {
+		t.Fatalf("with a stale heartbeat the wait ended with %v, want errNoApplier", err)
+	}
+}
+
+// TestALocalDatabasesDDLWaitsForNothingItWouldOverlap (PGS-900): DDL on a
+// local database runs on its home shard at once and cannot wait its turn, so
+// it is refused while something it would overlap is unfinished -- read from
+// the operation queue, or from the snapshot on a catalog without one.
+// TestALocalDatabasesDDLWaitsForNothingItWouldOverlap (PGS-900): DDL on a
+// local database runs on its home shard at once and cannot wait its turn, so
+// it is refused while something it would overlap is unfinished -- read from
+// the operation queue, or from the snapshot on a catalog without one.
+func TestALocalDatabasesDDLWaitsForNothingItWouldOverlap(t *testing.T) {
+	q := &fakeQueue{}
+	h := newDDLHarness(t, q)
+	local := *h.snap
+	local.Databases = map[string]catalog.Database{"app": {Name: "app", HomeShard: 0, DefaultPlacement: "unsharded", LocalOnly: true}}
+	h.setSnap(&local)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+
+	q.homeQueued = true
+	q.home = []catalog.Blocker{{Kind: catalog.OperationReshard, ID: "00000000-0000-0000-0000-00000000e5a2", Reason: catalog.BlockedByStarted}}
+	_, err := conn.Exec(ctx, "alter table items add column extra int")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "55000" || !strings.Contains(pe.Message, "reshard 00000000-0000-0000-0000-00000000e5a2") {
+		t.Fatalf("local DDL behind a reshard: %v, want 55000 naming it", err)
+	}
+
+	q.home = nil
+	if _, err := conn.Exec(ctx, "alter table items add column extra int"); err != nil && strings.Contains(err.Error(), "not available") {
+		t.Fatalf("local DDL with nothing in the queue: %v", err)
+	}
+
+	q.homeQueued = false
+	resharding := local
+	resharding.Serving = map[snapshot.ShardKey]snapshot.Serving{}
+	for k, v := range local.Serving {
+		resharding.Serving[k] = v
+	}
+	resharding.Serving[snapshot.ShardKey{ShardSet: "g2", ShardID: 0}] = snapshot.Serving{State: "provisioning"}
+	h.setSnap(&resharding)
+	if _, err := conn.Exec(ctx, "alter table items add column extra2 int"); err == nil || !strings.Contains(err.Error(), "not available while a reshard is active") {
+		t.Fatalf("local DDL during a reshard on a catalog without the queue: %v", err)
 	}
 }
 
@@ -720,6 +1049,9 @@ func TestASequentialDatabaseRunsATransactionsDDLStatementByStatement(t *testing.
 
 // TestAnAtomicDatabaseStillRefusesDDLInATransaction: the default is
 // unchanged, including for pgroll's version-view query.
+
+// TestAnAtomicDatabaseStillRefusesDDLInATransaction: the default is
+// unchanged, including for pgroll's version-view query.
 func TestAnAtomicDatabaseStillRefusesDDLInATransaction(t *testing.T) {
 	q := &fakeQueue{}
 	h := newDDLHarness(t, q)
@@ -733,5 +1065,311 @@ func TestAnAtomicDatabaseStillRefusesDDLInATransaction(t *testing.T) {
 	_ = expectRefusal(t, err, "ALTER TABLE is not available inside a multi-statement simple query")
 	if len(q.queued) != 0 {
 		t.Fatalf("queued %d migrations", len(q.queued))
+	}
+}
+
+// TestOneStatementIsAnsweredOnce counts the command tags on the wire.
+//
+// A statement gets exactly one CommandComplete, whatever it did and
+// whichever protocol carried it. The async branch used to send its own on
+// top of the one the caller sends, so every DDL under pgshard.ddl_async put
+// two on the wire -- which PostgreSQL never does, and which desynchronises
+// a client that pairs one tag with one Execute. Reading the command tag
+// cannot see it: a driver keeps the last one, and both are the same.
+func TestOneStatementIsAnsweredOnce(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		name := "sync"
+		if async {
+			name = "async"
+		}
+		t.Run(name, func(t *testing.T) {
+			q := &fakeQueue{}
+			if async {
+				q.delay = time.Hour
+			}
+			h := newDDLHarness(t, q)
+			ctx := context.Background()
+			conn := h.connect(t, h.dsn())
+			if async {
+				if _, err := conn.Exec(ctx, "set pgshard.ddl_async = on"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hj, err := conn.PgConn().Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = hj.Conn.Close() }()
+			fe := hj.Frontend
+
+			fe.Send(&pgproto3.Parse{Query: "create index concurrently orders_id on orders (id)"})
+			fe.Send(&pgproto3.Bind{})
+			fe.Send(&pgproto3.Execute{})
+			fe.Send(&pgproto3.Sync{})
+			if err := fe.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			_ = hj.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			var got []string
+			for {
+				m, err := fe.Receive()
+				if err != nil {
+					t.Fatalf("receive: %v (got %v)", err, got)
+				}
+				got = append(got, fmt.Sprintf("%T", m))
+				if _, done := m.(*pgproto3.ReadyForQuery); done {
+					break
+				}
+			}
+			tags := 0
+			for _, m := range got {
+				if m == "*pgproto3.CommandComplete" {
+					tags++
+				}
+			}
+			if tags != 1 {
+				t.Fatalf("%d command tags for one statement: %v", tags, got)
+			}
+		})
+	}
+}
+
+// TestFanOutDDLDuringAReshardOnAQueuelessCatalogIsRefusedAtOnce: a router
+// newer than its catalog is an ordinary moment in a rollout. Without the
+// operation queue there is nowhere for a migration to wait its turn, and
+// the applier holds it for the whole copy -- so the router that used to
+// refuse it in milliseconds waited ten minutes and then told the client no
+// controller had been seen applying migrations, while one was running and
+// leading.
+func TestFanOutDDLDuringAReshardOnAQueuelessCatalogIsRefusedAtOnce(t *testing.T) {
+	q := &fakeQueue{noQueue: true}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+
+	base := *h.snap
+	resharding := base
+	resharding.Serving = map[snapshot.ShardKey]snapshot.Serving{}
+	for k, v := range base.Serving {
+		resharding.Serving[k] = v
+	}
+	resharding.Serving[snapshot.ShardKey{ShardSet: "g2", ShardID: 0}] = snapshot.Serving{State: "provisioning"}
+	h.setSnap(&resharding)
+
+	start := time.Now()
+	_, err := conn.Exec(ctx, "alter table orders add column extra int")
+	if err == nil {
+		t.Fatal("fan-out DDL during a reshard on a catalog without the queue was accepted")
+	}
+	if !strings.Contains(err.Error(), "not available while a reshard is active") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the refusal took %s; it is meant to be immediate", time.Since(start))
+	}
+	if len(q.queued) != 0 {
+		t.Fatalf("the statement was queued into a catalog that has no queue: %d", len(q.queued))
+	}
+
+	// With the queue there, the same statement is queued rather than
+	// refused: that is the whole point, and this is the control.
+	q.noQueue = false
+	if _, err := conn.Exec(ctx, "alter table orders add column extra2 int"); err != nil {
+		t.Fatalf("with the queue, the statement should be queued and applied: %v", err)
+	}
+}
+
+// TestATimeoutPromisesDedupOnlyWhereTheCatalogCanDoIt: the DETAIL on a
+// timed-out DDL tells the client the migration continues, and -- when the
+// statement carries a dedup key the catalog stored -- that sending it again
+// waits for that migration rather than queueing another.
+//
+// The sentence used to be chosen from the router's own request, which says
+// only what the router intended. A catalog without the operation queue has
+// no dedup_key column, so the enqueue drops the key, and the advised retry
+// queued a second migration: the index was built twice, on the advice of
+// the error that suggested it.
+func TestATimeoutPromisesDedupOnlyWhereTheCatalogCanDoIt(t *testing.T) {
+	const promise = "Running the same statement again waits for it"
+	for _, c := range []struct{ queue, promised bool }{{true, true}, {false, false}} {
+		name := "without the queue"
+		if c.queue {
+			name = "with the queue"
+		}
+		t.Run(name, func(t *testing.T) {
+			q := &fakeQueue{delay: time.Hour, noQueue: !c.queue}
+			h := newDDLHarness(t, q)
+			ctx := context.Background()
+			conn := h.connect(t, h.dsn())
+			if _, err := conn.Exec(ctx, "set statement_timeout = '300ms'"); err != nil {
+				t.Fatal(err)
+			}
+			_, err := conn.Exec(ctx, "create index concurrently orders_note_idx on orders (note)")
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "57014" {
+				t.Fatalf("want a statement timeout, got %v", err)
+			}
+			if !strings.Contains(pgErr.Detail, "continues in the background") {
+				t.Fatalf("detail %q", pgErr.Detail)
+			}
+			if got := strings.Contains(pgErr.Detail, promise); got != c.promised {
+				t.Fatalf("the detail promises dedup = %v, want %v: %q", got, c.promised, pgErr.Detail)
+			}
+		})
+	}
+}
+
+// TestWaitAsksWhatAMigrationWaitsForAndSaysSoOnlyWhenItChanges covers the
+// half of the waiting notice the fake queue used to stand in for: the
+// router's callback was tested against a fake that invoked it itself, so
+// the query, the throttle, the queued-only guard and the change detection
+// in PGMigrationQueue.Wait had no coverage at all.
+func TestWaitAsksWhatAMigrationWaitsForAndSaysSoOnlyWhenItChanges(t *testing.T) {
+	reshard := catalog.Blocker{Kind: catalog.OperationReshard, ID: "r1", Reason: catalog.BlockedByStarted}
+	earlier := catalog.Blocker{Kind: catalog.OperationDDL, ID: "d1", Reason: catalog.BlockedByEarlier}
+
+	var mu sync.Mutex
+	state := catalog.MigrationQueued
+	blockers := []catalog.Blocker{reshard, earlier}
+	asked, loads := 0, 0
+	q := &PGMigrationQueue{
+		Poll: time.Millisecond, MaxWait: 10 * time.Second, BlockersEvery: 2 * time.Millisecond,
+		load: func(context.Context, string) (catalog.DDLMigration, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			loads++
+			return catalog.DDLMigration{State: state}, nil
+		},
+		blockers: func(context.Context, string) ([]catalog.Blocker, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked++
+			return blockers, nil
+		},
+		queue: func(context.Context) (bool, error) { return true, nil },
+		beat:  func(context.Context) (time.Duration, bool, error) { return 0, true, nil },
+	}
+	var told [][]catalog.Blocker
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.Wait(context.Background(), "m1", func(bs []catalog.Blocker) {
+			mu.Lock()
+			defer mu.Unlock()
+			told = append(told, bs)
+		})
+		done <- err
+	}()
+
+	// The same set, polled many times over, is said once.
+	waitFor(t, 10*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return len(told) == 1 && asked > 3 }, "the first blocker set to be reported once")
+	// A set that changes is said again.
+	mu.Lock()
+	blockers = []catalog.Blocker{reshard}
+	mu.Unlock()
+	waitFor(t, 10*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return len(told) == 2 }, "a changed blocker set to be reported")
+	// Once the migration is running it is no longer waiting for anything,
+	// so the session is not told about blockers it no longer has.
+	mu.Lock()
+	state, blockers, asked = catalog.MigrationRunning, []catalog.Blocker{earlier}, 0
+	from := loads
+	mu.Unlock()
+	// Long enough that a query that was still going to happen has: many
+	// polls and several blocker intervals. Asserting "asked == 0" the
+	// moment after zeroing it would hold whatever the code did.
+	waitFor(t, 10*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return loads-from > 30 }, "the wait to poll on while the migration runs")
+	mu.Lock()
+	if asked != 0 {
+		t.Errorf("a running migration was asked what it waits for %d times", asked)
+	}
+	if len(told) != 2 {
+		t.Errorf("a running migration was reported as waiting: %v", told)
+	}
+	state = catalog.MigrationComplete
+	mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(told) != 2 || len(told[0]) != 2 || told[0][0] != reshard || len(told[1]) != 1 {
+		t.Fatalf("what the session was told: %v", told)
+	}
+}
+
+// TestDescribeBlockersNamesEveryKindAndBothReasons: what a waiting session
+// is told about what holds it. Every blocker in the suite was a started
+// reshard, so collapsing "queued before it" into "in progress" passed --
+// and a client waiting behind a migration that has not started would have
+// been told it was running.
+func TestDescribeBlockersNamesEveryKindAndBothReasons(t *testing.T) {
+	got := describeBlockers([]catalog.Blocker{
+		{Kind: catalog.OperationReshard, ID: "r1", Reason: catalog.BlockedByStarted},
+		{Kind: catalog.OperationUpgrade, ID: "u1", Reason: catalog.BlockedByStarted},
+		{Kind: catalog.OperationPlacement, ID: "p1", Reason: catalog.BlockedByStarted},
+		{Kind: catalog.OperationDDL, ID: "d1", Reason: catalog.BlockedByEarlier},
+		{Kind: "something new", ID: "x1", Reason: catalog.BlockedByEarlier},
+	})
+	want := "reshard r1 (in progress), major upgrade u1 (in progress), table placement p1 (in progress), " +
+		"migration d1 (queued before it), something new x1 (queued before it)"
+	if got != want {
+		t.Fatalf("describeBlockers:\n got %s\nwant %s", got, want)
+	}
+	if describeBlockers(nil) != "" {
+		t.Errorf("nothing to wait for reads %q", describeBlockers(nil))
+	}
+}
+
+// TestAStatementAttachedToAFinishedMigrationIsNotRunAgain: the retry window
+// answers a statement whose identical migration completed a moment ago
+// without running it, and says which. fakeQueue.attach always answered
+// "running", so this branch shipped untested.
+func TestAStatementAttachedToAFinishedMigrationIsNotRunAgain(t *testing.T) {
+	q := &fakeQueue{}
+	q.attach = func(catalog.DDLMigration) (catalog.EnqueueResult, bool) {
+		return catalog.EnqueueResult{ID: "00000000-0000-0000-0000-00000000c0de", Attached: true,
+			State: catalog.MigrationComplete, Deduplicated: true}, true
+	}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	var notices []string
+	cfg, err := pgx.ParseConfig(h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) { notices = append(notices, n.Message) }
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "create index concurrently orders_note_idx on orders (note)"); err != nil {
+		t.Fatal(err)
+	}
+	if len(notices) != 1 || !strings.Contains(notices[0], "has just completed; not running the statement again") {
+		t.Fatalf("notices %q", notices)
+	}
+	if len(q.queued) != 0 {
+		t.Fatalf("the statement was queued although an identical one had just completed: %d", len(q.queued))
+	}
+}
+
+// TestAMigrationNoControllerIsDrivingIsReportedAsSuch: 55000, not a
+// connection error, and it says the migration is still queued rather than
+// that something went wrong with the connection.
+func TestAMigrationNoControllerIsDrivingIsReportedAsSuch(t *testing.T) {
+	q := &fakeQueue{waitErr: errNoApplier{id: "00000000-0000-0000-0000-00000000dead", state: catalog.MigrationQueued, quiet: 10 * time.Minute}}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+	_, err := conn.Exec(ctx, "create index concurrently orders_note_idx on orders (note)")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		t.Fatalf("want a PostgreSQL error, got %v", err)
+	}
+	if pe.Code != "55000" {
+		t.Fatalf("SQLSTATE %s, want 55000: %s", pe.Code, pe.Message)
+	}
+	if !strings.Contains(pe.Message, "no pgshard controller") || !strings.Contains(pe.Hint, "controller is running") {
+		t.Fatalf("message %q hint %q", pe.Message, pe.Hint)
 	}
 }

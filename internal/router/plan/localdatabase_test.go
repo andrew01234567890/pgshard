@@ -87,3 +87,57 @@ func TestALocalDatabaseRunsItsOwnDDL(t *testing.T) {
 		t.Fatalf("refused for the wrong reason: %v", err)
 	}
 }
+
+// DDL a local database runs on its home shard is marked, so the executor can
+// refuse it while the operation queue holds something it would overlap; the
+// same statement in a shared database is a migration, which waits instead.
+func TestALocalDatabasesDDLIsMarkedAsHomeDDL(t *testing.T) {
+	p := New()
+	for _, c := range []struct {
+		snap    *snapshot.Snapshot
+		homeDDL bool
+	}{{localFixture(t), true}, {fixture(t), false}} {
+		pl, err := p.Plan(context.Background(), session(c.snap), `ALTER TABLE items ADD COLUMN extra int`)
+		if err != nil || pl.HomeDDL != c.homeDDL {
+			t.Fatalf("HomeDDL = %v (%v), want %v", pl.HomeDDL, err, c.homeDDL)
+		}
+	}
+	if pl, err := p.Plan(context.Background(), session(localFixture(t)), `SELECT 1`); err != nil || pl.HomeDDL {
+		t.Fatalf("a query in a local database is marked as DDL: %v", err)
+	}
+
+	// Every path that sends a local database's statement to its home shard,
+	// so that none of them can lose the marking unnoticed: the migration
+	// fallthrough, ALTER TABLE, the unfannable objects, and the
+	// unrecognised-statement fallback.
+	for _, sql := range []string{
+		`CREATE TABLE more (id int)`,
+		`ALTER TABLE items ADD COLUMN extra2 int`,
+		`ALTER FUNCTION f() RENAME TO g`,
+		`CREATE EVENT TRIGGER e ON ddl_command_end EXECUTE FUNCTION f()`,
+	} {
+		pl, err := p.Plan(context.Background(), session(localFixture(t)), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if !pl.HomeDDL {
+			t.Errorf("%s: schema change not marked, so the executor cannot refuse it while a reshard runs", sql)
+		}
+	}
+
+	// CALL and DO reach the same fallback and are not schema changes.
+	// Marking them refused every stored procedure a session calls for as
+	// long as any reshard in the cluster ran.
+	for _, sql := range []string{
+		`CALL recompute_totals(1)`,
+		`DO $$ BEGIN PERFORM 1; END $$`,
+	} {
+		pl, err := p.Plan(context.Background(), session(localFixture(t)), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if pl.HomeDDL {
+			t.Errorf("%s: marked as a schema change, so a reshard would refuse it for hours", sql)
+		}
+	}
+}

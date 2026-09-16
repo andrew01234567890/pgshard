@@ -617,11 +617,34 @@ func TestEnqueueEdges(t *testing.T) {
 		t.Fatalf("a statement with no key attached: %+v %+v", a, b)
 	}
 
-	reindex := enqueue(keyed("REINDEX", "REINDEX INDEX CONCURRENTLY i"))
-	mustExec(t, conn, `UPDATE pgshard.migrations SET state = 'complete', finished_at = now() WHERE id = $1`, reindex.ID)
-	if r := enqueue(keyed("REINDEX", "REINDEX INDEX CONCURRENTLY i")); r.ID == reindex.ID {
-		t.Fatal("a REINDEX run again just after one completed attached to it; running it again is the point")
+	// Every kind whose second run is the work again rather than a repeat
+	// of a statement already applied. Attaching one of these to a
+	// completed migration answers the client with a success for work that
+	// did not happen: an ALTER SEQUENCE ... RESTART sent again after the
+	// application has consumed values is asking to restart from where the
+	// sequence is now.
+	for _, c := range []struct{ kind, sql string }{
+		{"REINDEX", "REINDEX INDEX CONCURRENTLY i"},
+		{"VACUUM", "VACUUM FULL t"},
+		{"ALTER SEQUENCE", "ALTER SEQUENCE order_no RESTART"},
+	} {
+		first := enqueue(keyed(c.kind, c.sql))
+		mustExec(t, conn, `UPDATE pgshard.migrations SET state = 'complete', finished_at = now() WHERE id = $1`, first.ID)
+		if again := enqueue(keyed(c.kind, c.sql)); again.ID == first.ID || again.Attached {
+			t.Errorf("%s run again just after one completed attached to it; running it again is the point", c.kind)
+		}
+		mustExec(t, conn, `DELETE FROM pgshard.migrations`)
 	}
+
+	// The kind this does not apply to: a timed-out CREATE INDEX sent again
+	// inside the window is the same work, and attaching is what keeps the
+	// client's retry loop from building it twice.
+	idx := enqueue(keyed("CREATE INDEX", "CREATE INDEX CONCURRENTLY orders_note_idx ON orders (note)"))
+	mustExec(t, conn, `UPDATE pgshard.migrations SET state = 'complete', finished_at = now() WHERE id = $1`, idx.ID)
+	if again := enqueue(keyed("CREATE INDEX", "CREATE INDEX CONCURRENTLY orders_note_idx ON orders (note)")); again.ID != idx.ID || !again.Attached {
+		t.Errorf("a completed CREATE INDEX no longer stands for the same statement sent again: %+v", again)
+	}
+	mustExec(t, conn, `DELETE FROM pgshard.migrations`)
 
 	mustExec(t, conn, `DELETE FROM pgshard.migrations`)
 	grant := enqueue(keyed("GRANT", "GRANT SELECT ON t TO r"))
