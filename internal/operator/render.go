@@ -683,6 +683,14 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		"--catalog-password-file", poolerCatalogPasswordDir + "/" + secretKey,
 		"--shard-set", shardSet,
 		"--shard-id", fmt.Sprint(g.ShardID),
+		// A client CAN log in as the cluster superuser, and PostgreSQL
+		// exempts a superuser from superuser_reserved_connections and from
+		// its role's CONNECTION LIMIT alike -- so without this its pooled
+		// backends could take the headroom the control plane depends on
+		// (PGS-830). Named here because the pooler has no way to know which
+		// role that is: the catalog does not record superuser-ness, since
+		// pgshard refuses to grant it.
+		"--superuser-role", superuserName,
 		// Without a DSN the pooler refuses every Stream and CopyTables
 		// call, so a change stream fails on the first request. The
 		// database is taken from the request, so this one only has to

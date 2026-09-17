@@ -141,7 +141,8 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 	// the DSN only has to reach the local server.
 	for _, want := range []string{"pgshard-pooler run", "--listen :9091", "--pg-socket-dir /tmp", "--catalog-dsn ", "--shard-set catalog", "--shard-id 0",
 		"--stream-dsn host=/tmp user=" + catalog.PoolerRole + " dbname=postgres",
-		"--stream-password-file /etc/pgshard/pooler/password", "--insecure-dev"} {
+		"--stream-password-file /etc/pgshard/pooler/password", "--insecure-dev",
+		"--superuser-role " + superuserName} {
 		if !strings.Contains(got, want) {
 			t.Errorf("command %q lacks %q", got, want)
 		}

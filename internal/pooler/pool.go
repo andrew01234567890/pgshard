@@ -16,6 +16,23 @@ type PoolConfig struct {
 	// MaxPerRole caps backends any one role may hold, so a hot role cannot
 	// starve the others. Must be <= MaxBackends.
 	MaxPerRole int
+	// SuperuserRoles name the roles whose backends are superuser
+	// connections, and MaxPerSuperuser caps the backends any ONE of them may
+	// hold. Zero means DefaultMaxPerSuperuser.
+	//
+	// They need their own cap because PostgreSQL gives a superuser none of
+	// the limits that hold everyone else back: superuser_reserved_connections
+	// does not apply to it, and neither does the role's CONNECTION LIMIT. So
+	// a client logged in as the cluster superuser could pool up to the whole
+	// per-role budget of backends and take the headroom the control plane
+	// depends on -- the agent's probes, the operator, the 2PC resolver and
+	// backups -- and the resolver is what reaches a shard when something has
+	// already gone wrong (PGS-830, the PGS-819 exhaustion).
+	//
+	// This does not make superuser sessions unsupported: they keep working,
+	// they simply cannot take the reserve.
+	SuperuserRoles  []string
+	MaxPerSuperuser int
 	// MaxLifetime retires a backend after this age; zero means never.
 	MaxLifetime time.Duration
 	// MaxIdleTime closes an idle backend after this long unused; zero means never.
@@ -39,8 +56,23 @@ func (c PoolConfig) withDefaults() PoolConfig {
 	if c.AcquireTimeout <= 0 {
 		c.AcquireTimeout = 5 * time.Second
 	}
+	if c.MaxPerSuperuser <= 0 {
+		c.MaxPerSuperuser = DefaultMaxPerSuperuser
+	}
+	// A cap above the per-role budget would not be a cap; one above the
+	// reserve would not protect it.
+	if c.MaxPerSuperuser > c.MaxPerRole {
+		c.MaxPerSuperuser = c.MaxPerRole
+	}
 	return c
 }
+
+// DefaultMaxPerSuperuser bounds one superuser role's backends. It must stay
+// BELOW pgtune.ReservedConnections, which sizes the headroom
+// superuser_reserved_connections holds for the control plane: a superuser is
+// exempt from that reservation, so this is the only thing keeping it. The
+// relationship is asserted by a test rather than left to this comment.
+const DefaultMaxPerSuperuser = 7
 
 // ErrPoolClosed is returned by Acquire after Close.
 var ErrPoolClosed = errors.New("pooler: pool closed")
@@ -60,6 +92,10 @@ type Pool struct {
 	// stop ends the idle reaper; wg waits for it.
 	stop chan struct{}
 	wg   sync.WaitGroup
+
+	// superuser indexes SuperuserRoles, read without the lock because it
+	// is built once and never written again.
+	superuser map[string]bool
 
 	mu     sync.Mutex
 	roles  map[poolKey]*rolePool
@@ -169,7 +205,14 @@ func NewPool(cfg PoolConfig, d Dialer) *Pool {
 
 func newPool(cfg PoolConfig, dial dialFunc) *Pool {
 	cfg = cfg.withDefaults()
-	p := &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, sems: map[string]chan struct{}{}, stop: make(chan struct{})}
+	su := make(map[string]bool, len(cfg.SuperuserRoles))
+	for _, r := range cfg.SuperuserRoles {
+		if r != "" {
+			su[r] = true
+		}
+	}
+	p := &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{},
+		sems: map[string]chan struct{}{}, superuser: su, stop: make(chan struct{})}
 	if cfg.MaxIdleTime > 0 {
 		p.wg.Add(1)
 		go p.reap()
@@ -239,7 +282,13 @@ func (p *Pool) role(database, role string) *rolePool {
 	if !ok {
 		sem, ok := p.sems[role]
 		if !ok {
-			sem = make(chan struct{}, p.cfg.MaxPerRole)
+			// One semaphore per role, shared across that role's databases,
+			// so the cap is on the role rather than on each pool of it.
+			limit := p.cfg.MaxPerRole
+			if p.superuser[role] {
+				limit = p.cfg.MaxPerSuperuser
+			}
+			sem = make(chan struct{}, limit)
 			p.sems[role] = sem
 		}
 		rp = &rolePool{sem: sem}
