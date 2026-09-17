@@ -564,6 +564,14 @@ func (s *session) run() {
 	for {
 		msg, err := s.be.Receive()
 		if err != nil {
+			// PGS-940 PROBE: temporary. This is the one exit that closes
+			// WITHOUT saying anything, and it is the exit the failing runs
+			// take (zero terminate probes). The error distinguishes the
+			// client going away (EOF) from the socket being closed under
+			// us (net.ErrClosed) from a read that failed some other way.
+			s.server.logger.Info("PGS940 receive ended session", "session", s.id, "serving", s.serving,
+				"err", fmt.Sprint(err), "eof", errors.Is(err, io.EOF),
+				"unexpectedEOF", errors.Is(err, io.ErrUnexpectedEOF), "netClosed", errors.Is(err, net.ErrClosed))
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
 				s.terminate(Errorf(CodeProtocolViolation, "invalid frontend message: %v", err))
 			}
