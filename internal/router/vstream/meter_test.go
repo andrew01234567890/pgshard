@@ -18,6 +18,7 @@ type countingMeter struct {
 	open     int
 	maxBytes int
 	exceeded map[string]int
+	retries  map[string]int
 }
 
 func (m *countingMeter) BufferedBytes(delta int) {
@@ -42,6 +43,26 @@ func (m *countingMeter) TooLarge(bound string) {
 		m.exceeded = map[string]int{}
 	}
 	m.exceeded[bound]++
+}
+
+func (m *countingMeter) Reconnect(shard string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retries == nil {
+		m.retries = map[string]int{}
+	}
+	m.retries[shard]++
+}
+
+// reconnects reports how many attempts each shard's stream has made.
+func (m *countingMeter) reconnects() map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]int{}
+	for k, v := range m.retries {
+		out[k] = v
+	}
+	return out
 }
 
 func (m *countingMeter) read() (bytes, open int, exceeded map[string]int) {

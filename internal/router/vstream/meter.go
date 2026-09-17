@@ -8,9 +8,10 @@ import "github.com/prometheus/client_golang/prometheus"
 // call site. A collector left nil is skipped rather than panicking, which
 // is what lets a test wire up only the one it asserts on.
 type PrometheusMeter struct {
-	Buffered prometheus.Gauge
-	Open     prometheus.Gauge
-	Exceeded *prometheus.CounterVec
+	Buffered   prometheus.Gauge
+	Open       prometheus.Gauge
+	Exceeded   *prometheus.CounterVec
+	Reconnects *prometheus.CounterVec
 }
 
 // BufferedBytes implements Meter.
@@ -31,5 +32,12 @@ func (m PrometheusMeter) OpenTransactions(delta int) {
 func (m PrometheusMeter) TooLarge(bound string) {
 	if m.Exceeded != nil {
 		m.Exceeded.WithLabelValues(bound).Inc()
+	}
+}
+
+// Reconnect implements Meter.
+func (m PrometheusMeter) Reconnect(shard string) {
+	if m.Reconnects != nil {
+		m.Reconnects.WithLabelValues(shard).Inc()
 	}
 }

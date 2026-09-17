@@ -28,8 +28,14 @@ type Router struct {
 	VStreamBufferedBytes prometheus.Gauge
 	VStreamOpenTxns      prometheus.Gauge
 	VStreamTooLarge      *prometheus.CounterVec
-	activeSessions       prometheus.GaugeFunc
-	snapshotAge          prometheus.GaugeFunc
+	// VStreamReconnects counts attempts to reopen a shard's change stream.
+	// The reader retries for its whole reconnect window before the consumer
+	// hears anything, so a rising count is the only early sign that a
+	// stream is failing to reattach -- most often a slot another walsender
+	// still holds.
+	VStreamReconnects *prometheus.CounterVec
+	activeSessions    prometheus.GaugeFunc
+	snapshotAge       prometheus.GaugeFunc
 }
 
 // NewRouter registers the router metric set on reg. sessions reports the
@@ -84,6 +90,8 @@ func NewRouter(reg *prometheus.Registry, sessions, snapshotAge func() float64) *
 			Name: "pgshard_router_vstream_open_transactions", Help: "Interleaved in-progress change-stream transactions being assembled."}),
 		VStreamTooLarge: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgshard_router_vstream_too_large_total", Help: "Change streams ended because a buffer bound was exceeded, by which bound."}, []string{"bound"}),
+		VStreamReconnects: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgshard_router_vstream_reconnects_total", Help: "Attempts to reopen a shard's change stream, by shard."}, []string{"shard"}),
 	}
 	m.activeSessions = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "pgshard_router_active_sessions", Help: "Live client sessions."}, sessions)
@@ -96,7 +104,7 @@ func NewRouter(reg *prometheus.Registry, sessions, snapshotAge func() float64) *
 	reg.MustRegister(m.Connections, m.Queries, m.PlanCacheHits, m.PlanCacheMiss, m.PlanCacheEvicted, m.PlanCacheBytes, m.Refusals,
 		m.TwoPCCommits, m.TwoPCAborts, m.TwoPCInDoubt, m.BufferEvents, m.BufferSeconds,
 		m.ScatterFanout, m.ShardLatency, m.ShardStatements, m.ShardRows, m.ShardErrors,
-		m.VStreamBufferedBytes, m.VStreamOpenTxns, m.VStreamTooLarge,
+		m.VStreamBufferedBytes, m.VStreamOpenTxns, m.VStreamTooLarge, m.VStreamReconnects,
 		m.activeSessions, m.snapshotAge)
 	return m
 }

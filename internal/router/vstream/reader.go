@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +79,7 @@ type reader struct {
 	maxBytes   int
 	maxOpen    int
 	meter      Meter
+	logger     *slog.Logger
 	// copy is the pending initial copy; nil once streaming.
 	copy *copyPhase
 
@@ -84,6 +87,16 @@ type reader struct {
 }
 
 var errEpochChanged = errors.New("primary epoch changed")
+
+func (r *reader) log() *slog.Logger {
+	if r.logger != nil {
+		return r.logger
+	}
+	return slog.New(slog.DiscardHandler)
+}
+
+// shardLabel names a shard for a metric label.
+func shardLabel(sh router.Shard) string { return sh.Set + "/" + strconv.FormatInt(int64(sh.ID), 10) }
 
 // epochPoll is how often a reader parked in Recv checks whether the shard
 // has been promoted underneath it. The topology is a snapshot read, so
@@ -132,6 +145,18 @@ func (r *reader) run(ctx context.Context) {
 		}
 		if firstFailure.IsZero() {
 			firstFailure = time.Now()
+			// Once per cycle, not once per attempt: a shard that cannot be
+			// reopened makes up to a dozen attempts before the window runs
+			// out, and a line each would bury the one that says why. The
+			// error carries the pooler's message, which for a slot another
+			// walsender still holds names that walsender's PID -- the thing
+			// an operator needs and had no way to see, because this loop
+			// said nothing at all until it gave up (PGS-834).
+			r.log().Warn("vstream: shard stream broken, reconnecting",
+				"stream", r.stream, "set", r.shard.Set, "shard", r.shard.ID, "window", r.window, "err", err)
+		}
+		if r.meter != nil {
+			r.meter.Reconnect(shardLabel(r.shard))
 		}
 		if time.Since(firstFailure) > r.window {
 			r.push(ctx, &unit{shard: r.shard, err: &pgshardv1.VEvent_Error{Code: pgshardv1.VEvent_Error_CODE_SHARD_UNAVAILABLE,
@@ -409,6 +434,11 @@ type Meter interface {
 	OpenTransactions(delta int)
 	// TooLarge names the bound that tripped: "bytes" or "transactions".
 	TooLarge(bound string)
+	// Reconnect counts one attempt to reopen a shard's stream. A stream
+	// that cannot be reopened retries silently until its window runs out,
+	// so this is what says a stream is struggling before its consumer is
+	// told the shard is unavailable.
+	Reconnect(shard string)
 }
 
 // errTooLarge ends a stream whose buffer a transaction did not fit in. The
