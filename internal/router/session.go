@@ -1214,8 +1214,16 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 			e.r.cfg.Logger.Info("retrying statement after shard failover", "session", e.sid, "shard", e.shard)
 			cw.retrying()
 			err = run(cw)
+			// PGS-940 PROBE: what the retry actually returned, and whether
+			// anything had already reached the client. Temporary.
+			e.r.cfg.Logger.Info("PGS940 retry returned", "session", e.sid, "shard", e.shard,
+				"err", fmt.Sprint(err), "wrote", cw.wrote)
 		}
 	}
+	// PGS-940 PROBE: the decision itself, so the BEGIN hypothesis is
+	// observed rather than inferred from the decision table. Temporary.
+	e.r.cfg.Logger.Info("PGS940 failover decided", "session", e.sid, "shard", e.shard,
+		"inTxn", inTxn, "wrote", cw.wrote, "isFailover", isFailover(err), "err", fmt.Sprint(err))
 	// A fence refusal must never reach the client as the pooler wrote it.
 	// The wait can run out with the map still moving, and the one retry it
 	// allows can meet the same flip, and both of those returned 55000 --
