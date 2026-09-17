@@ -525,3 +525,21 @@ func TestAMigrationNamesTheObjectItTouches(t *testing.T) {
 		t.Errorf("GRANT target %q, want none", pl.Migration.Target)
 	}
 }
+
+// TestACreateIndexRecordsItsTable (PGS-887): a resumed CREATE INDEX looks for
+// the index on the table the statement named, so the table travels with the
+// migration.
+func TestACreateIndexRecordsItsTable(t *testing.T) {
+	for _, c := range []struct{ sql, schema, table string }{
+		{"create index orders_note on orders (note)", "", "orders"},
+		{"create index concurrently audit_kind on audit.events (kind)", "audit", "events"},
+	} {
+		pl, err := New().Plan(context.Background(), session(fixture(t)), c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		if o := pl.Migration.Object; o.Table != c.table || o.Schema != c.schema {
+			t.Errorf("%s: object %+v, want table %q in schema %q", c.sql, o, c.table, c.schema)
+		}
+	}
+}

@@ -189,6 +189,31 @@ func TestRepackStepPicksRepackOn19(t *testing.T) {
 	}
 }
 
+// TestAResumedRepackRunsAgain (PGS-887): a repack records its table only to
+// name it, and the table is always there, so the resume check reported
+// every resumed repack done whether or not it had run.
+func TestAResumedRepackRunsAgain(t *testing.T) {
+	m := catalog.DDLMigration{ID: "00000000-0000-0000-0000-00000000ab06", Database: "app",
+		Statement: "vacuum (full) orders", Kind: "VACUUM", Strategy: catalog.StrategyRepack, Scope: "all",
+		State: catalog.MigrationRunning, PerShard: map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning}},
+		Meta: catalog.MigrationMeta{Repack: true,
+			Object: catalog.MigrationObject{Kind: "relation", Schema: "public", Name: "orders", Expect: "present"}}}
+	store := &memStore{migrations: []catalog.DDLMigration{m}, shards: []int32{0}}
+	shards := newFakeShards()
+	shards.version = 190001
+	shards.exists = func(int32, string, string) bool { return true }
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.get(t, m.ID); got.State != catalog.MigrationComplete {
+		t.Fatalf("state = %s error %q", got.State, got.Error)
+	}
+	if !has(shards.statements(0), `REPACK (CONCURRENTLY) "public"."orders"`) {
+		t.Fatalf("the resumed repack did not run:\n%s", strings.Join(shards.statements(0), "\n"))
+	}
+}
+
 func TestSweepDropsRewriteArtifacts(t *testing.T) {
 	store := &memStore{shards: []int32{0}, dbs: []string{"app"}}
 	shards := newFakeShards()

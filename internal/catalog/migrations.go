@@ -36,6 +36,8 @@ type MigrationObject struct {
 	Kind   string `json:"kind,omitempty"`
 	Schema string `json:"schema,omitempty"`
 	Name   string `json:"name,omitempty"`
+	// Table is the table an index object is built on.
+	Table string `json:"table,omitempty"`
 	// Expect is "present" or "absent".
 	Expect string `json:"expect,omitempty"`
 }

@@ -940,8 +940,19 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 			return "", err
 		}
 	}
-	if resumed && obj.Kind != "" {
+	// A repack records its table only to name it: the table is always there,
+	// so the check would call every resumed repack done. Repacking again is
+	// harmless.
+	if resumed && obj.Kind != "" && !m.Meta.Repack {
 		switch {
+		case m.Kind == "CREATE INDEX" && obj.Name != "" && obj.Table != "":
+			applied, err := resumeIndexOnTable(ctx, conn, obj)
+			if err != nil {
+				return "", err
+			}
+			if applied {
+				return catalog.ShardApplied, nil
+			}
 		case m.Kind == "CREATE INDEX" && obj.Name != "":
 			dropped, err := dropInvalidIndex(ctx, conn, m.Meta.Object)
 			if err != nil {
@@ -1300,6 +1311,38 @@ func (a *Applier) concurrently(ctx context.Context, conn ShardConn, m *catalog.D
 
 // dropInvalidIndex removes idx when it exists but is invalid and reports
 // whether it did.
+// resumeIndexOnTable reports whether the index a resumed CREATE INDEX makes
+// is already on its table and valid. It is looked for through pg_index on the
+// table the statement named, which is where PostgreSQL builds it: a relation
+// of the same name elsewhere in the path is not it. An index left invalid by
+// an interrupted CREATE INDEX CONCURRENTLY is dropped, in the schema it is in,
+// so the statement builds it again.
+func resumeIndexOnTable(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (bool, error) {
+	table := pgx.Identifier{o.Table}.Sanitize()
+	if o.Schema != "" {
+		table = pgx.Identifier{o.Schema, o.Table}.Sanitize()
+	}
+	rows, err := conn.Query(ctx, `SELECT n.nspname, i.indisvalid FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE i.indrelid = to_regclass($1) AND c.relname = $2`, table, o.Name)
+	if err != nil {
+		return false, err
+	}
+	type found struct {
+		Schema string
+		Valid  bool
+	}
+	indexes, err := pgx.CollectRows(rows, pgx.RowToStructByPos[found])
+	if err != nil || len(indexes) == 0 {
+		return false, err
+	}
+	if indexes[0].Valid {
+		return true, nil
+	}
+	_, err = conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+qualified(indexes[0].Schema, o.Name))
+	return false, err
+}
+
 func dropInvalidIndex(ctx context.Context, conn ShardConn, idx catalog.MigrationObject) (bool, error) {
 	schema, invalid, err := invalidIndex(ctx, conn, idx)
 	if err != nil || !invalid {
