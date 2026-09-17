@@ -186,8 +186,18 @@ func EnqueueMigrationOnce(ctx context.Context, db Beginner, m DDLMigration, wind
 	return EnqueueResult{ID: id, State: MigrationQueued, Deduplicated: m.DedupKey != ""}, tx.Commit(ctx)
 }
 
-// HeartbeatApplier is the controller_heartbeat component the applier beats.
+// HeartbeatApplier is the controller_heartbeat component the applier's
+// liveness goroutine beats. It says a leader exists; it does NOT say that
+// leader is getting anywhere -- the goroutine beats on its own timer,
+// independently of the applier pass.
 const HeartbeatApplier = "applier"
+
+// HeartbeatApplierPass is beaten when an applier pass FINISHES. A pass that
+// never returns -- a shard connection that does not come back, a lock wait
+// with no bound -- leaves this one to go stale while HeartbeatApplier keeps
+// ticking, which is the difference a router waiting on a migration needs
+// (PGS-907).
+const HeartbeatApplierPass = "applier_pass"
 
 // BeatController records that component is alive under leadership term. A
 // beat from a term that is no longer current writes nothing.
@@ -196,6 +206,22 @@ func BeatController(ctx context.Context, db Execer, component string, term int64
 		SELECT $1, $2, now() WHERE $2 = (SELECT term FROM pgshard.leader_term)
 		ON CONFLICT (component) DO UPDATE SET term = EXCLUDED.term, beat_at = EXCLUDED.beat_at`, component, term)
 	return err
+}
+
+// ApplierProgressAge is how long ago the applier last finished a pass,
+// falling back to its liveness beat when no pass has been recorded yet.
+//
+// The fallback is for a controller that has not completed a pass since it
+// became leader -- including one too old to record them at all -- and it is
+// the residual of this signal: such a controller still reads as alive. Once
+// one pass has finished, a wedged pass stops refreshing this and a router
+// gives up on the bound instead of waiting for ever.
+func ApplierProgressAge(ctx context.Context, q RowQuerier) (age time.Duration, found bool, err error) {
+	age, found, err = ControllerHeartbeatAge(ctx, q, HeartbeatApplierPass)
+	if err != nil || found {
+		return age, found, err
+	}
+	return ControllerHeartbeatAge(ctx, q, HeartbeatApplier)
 }
 
 // ControllerHeartbeatAge is how long ago component last beat; found is
