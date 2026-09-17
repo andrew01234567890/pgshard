@@ -807,3 +807,65 @@ func TestAReshardCarriesLocalSchemasOnlyToItsHome(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+// TestCancelDropsItsSubscriptionsOnPausedTargets: targets that carry this
+// workflow's claimed pause -- a switch rolled back whose Complete then
+// failed -- refused ALTER SUBSCRIPTION with 25006, so the cancel stalled
+// until the write-pause sweep lifted the pause, making the targets writable
+// while their replication was still attached (PGS-840).
+func TestCancelDropsItsSubscriptionsOnPausedTargets(t *testing.T) {
+	parallelPG(t)
+	f := newCopyFixture(t)
+	ctx := context.Background()
+	id := f.startWorkflow()
+
+	subs := func() int64 {
+		var n int64
+		for s := range int32(2) {
+			n += queryOne[int64](t, connect(t, f.dsns[ShardRef{Set: "g2", ID: s}]), `SELECT count(*) FROM pg_subscription WHERE subname LIKE 'pgshard_reshard_%'`)
+		}
+		return n
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for subs() == 0 {
+		f.pass()
+		if time.Now().After(deadline) {
+			_, stage, msg := f.workflow(id)
+			t.Fatalf("the workflow never subscribed on its targets: %s %q", stage, msg)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	readOnly := func(s int32) bool {
+		return queryOne[string](t, connect(t, f.dsns[ShardRef{Set: "g2", ID: s}]), `SHOW default_transaction_read_only`) == "on"
+	}
+	for s := range int32(2) {
+		admin := connect(t, f.dsns[ShardRef{Set: "g2", ID: s}])
+		mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
+		mustExec(t, admin, `SELECT pg_reload_conf()`)
+	}
+	waitFor(t, 20*time.Second, func() bool { return readOnly(0) && readOnly(1) }, "the targets never became read-only")
+
+	if err := f.reconcileDrop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(time.Minute)
+	for {
+		out := f.pass()
+		if out.Cancelled == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			_, stage, msg := f.workflow(id)
+			t.Fatalf("the cancel never finished on paused targets: %s %q", stage, msg)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if n := subs(); n != 0 {
+		t.Fatalf("%d subscriptions left on the targets after the cancel", n)
+	}
+	for s := range int32(2) {
+		if !readOnly(s) {
+			t.Fatalf("target %d was made writable by the cancel; only its own session may write through the pause", s)
+		}
+	}
+}

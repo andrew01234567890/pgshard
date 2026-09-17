@@ -615,3 +615,57 @@ func TestTwoCutoversFencingOneSourceAtOnceOnPostgres(t *testing.T) {
 		t.Fatalf("%d shards still fenced after the owner released", n)
 	}
 }
+
+// TestUnwindDropsReverseReplicationOnAPausedSource: Unwind writes through a
+// write pause to drop the reverse subscriptions on a source another workflow
+// retired since, and nothing reached that path -- the test above runs it
+// with no databases (PGS-840).
+func TestUnwindDropsReverseReplicationOnAPausedSource(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := placement.Split(1)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, rs, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
+		VALUES ('default', 0, 'shard0', 'serving', 1)`)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	sourceDSN := startPostgres(t)
+	source := connect(t, sourceDSN)
+	mustExec(t, source, `CREATE SUBSCRIPTION pgshard_reshard_g2_rev_s0_t0 CONNECTION 'host=127.0.0.1 port=1 dbname=postgres' PUBLICATION p
+		WITH (connect = false, slot_name = NONE)`)
+	mustExec(t, source, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, source, `SELECT pg_reload_conf()`)
+	waitReadOnly(t, sourceDSN, true)
+
+	id := newWorkflowID(t, conn)
+	o := &pgCutover{c: &Copier{Pool: pool, Shards: realShards{sourceDSN}}, wf: &copyWorkflow{id: id, set: "g2", gen: 2},
+		srcSet: "default", srcIDs: []int32{0}, dbs: []dbPlan{{name: "postgres"}}}
+	if err := o.Fence(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Unwind(ctx); err != nil {
+		t.Fatalf("unwind on a paused source: %v", err)
+	}
+	if n := queryOne[int64](t, connect(t, sourceDSN), `SELECT count(*) FROM pg_subscription WHERE subname LIKE 'pgshard_reshard_g2_rev_%'`); n != 0 {
+		t.Fatalf("%d reverse subscription(s) left on the paused source", n)
+	}
+	waitReadOnly(t, sourceDSN, true)
+}
