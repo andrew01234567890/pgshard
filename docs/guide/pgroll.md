@@ -93,21 +93,36 @@ read its output, not its exit code.
 
 ## What is supported
 
-`add_column` (without `up`/`default`) and `create_index` are **proved**
-against a sharded table by the acceptance test: the column and the index
-reach every shard, and reads through the version schema answer for all of
-them.
+These are **proved** against a sharded table by the acceptance test, each
+run to its `complete` and checked on every shard:
 
-`drop_index`, `rename_column`, `rename_constraint`, `create_constraint` and
-`drop_column`/`drop_constraint` are the rest of what the design expects to
-work — they are metadata changes of the same shape — but they are not yet
-exercised end to end, and PGS-929 tracks that. Treat them as untested rather
-than as guaranteed.
+| operation | |
+|---|---|
+| `add_column` (without `up`/`default`) | the column reaches every shard, and reads through the version schema answer for all of them |
+| `create_index` | the index reaches every shard |
+| `drop_index` | gone from every shard |
+| `rename_column` | renamed on every shard, old name gone |
+| `rename_constraint` | renamed on every shard, old name gone |
+| `drop_column` | gone from every shard, and takes its dependent constraint with it |
 
-Anything that needs pgroll's **dual-write triggers and batched backfill** —
-an `alter_column` with `up` and `down` — is not supported yet on a
-non-local database: pgroll's backfill is a single scalar cursor, which
-cannot be split across shards. A **local** database (`local_only = true`)
+`create_constraint` is **refused**, and it is the one whose reason is not
+obvious from its shape. It looks like a metadata change, but pgroll
+backfills the column to validate the new constraint, and that backfill is a
+**data-modifying CTE**, which the router does not support:
+
+```
+unable to backfill table "orders": pq: data-modifying statements in WITH are not available yet
+```
+
+Add the constraint with plain DDL through the router instead — that fans
+out to every shard — and use `NOT VALID` plus a later `VALIDATE` if you need
+to avoid the scan.
+
+Anything else that needs pgroll's **dual-write triggers and batched
+backfill** — an `alter_column` with `up` and `down` — is not supported on a
+non-local database either, for the same underlying reason plus one more:
+pgroll's backfill is a single scalar cursor, which cannot be split across
+shards. A **local** database (`local_only = true`)
 has one shard and runs all of it, including the backfill; that is what
 [`TestPgrollAgainstALocalDatabase`](../../test/e2e/router/pgroll_test.go)
 covers.
