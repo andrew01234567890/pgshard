@@ -236,10 +236,16 @@ reach, then every `pgshard_reshard_g<gen>_*` slot (terminating its
 walsender) and publication on the sources, and ends at
 `stage=cancelled`. Targets the operator already deleted are skipped.
 Runs past `Copying` cannot be cancelled: once the journal row exists the
-switch is the point of no return (see Cutover).
+switch is the point of no return (see Cutover). A `Failed` run can: a
+reshard fails only before its journal or when its switch is abandoned
+because another run retired its sources, so its target set never served, and
+reverting `spec.shards` (or deleting a catalog-sourced set's rows) drops the
+set and deletes its groups the same way. Until then the set remains, and
+routers keep refusing what they refuse while a reshard is active.
 
 The `Cancelled` record stays for the audit trail; the next reshard gets the
-next generation and a new record.
+next generation and a new record, counting the generations of every record
+of the cluster as well as the shard sets still in the catalog.
 
 ## Cutover
 

@@ -11,15 +11,18 @@ import (
 // the target set's pgshard.shard_status rows, and those rows are how the
 // resolver finds shards to search for prepared transactions. Before the
 // write switch a target set has taken no client writes and holds none, so
-// dropping it hides nothing. Adding a phase at or past the switch to that
-// list would delete the rows of a set that can hold a prepared transaction,
-// and a decided commit could then be lost with them.
+// dropping it hides nothing. Failed belongs with them: a run fails before
+// its journal or when its switch is abandoned before the flip, so its set
+// never served either. Adding a phase at or past the switch to that list
+// would delete the rows of a set that can hold a prepared transaction, and
+// a decided commit could then be lost with them.
 func TestOnlyPreSwitchReshardsAreDroppedOnRevert(t *testing.T) {
 	preSwitch := map[string]bool{
 		pgshardv1alpha1.ReshardPhasePending:      true,
 		pgshardv1alpha1.ReshardPhaseProvisioning: true,
 		pgshardv1alpha1.ReshardPhaseCopying:      true,
 		pgshardv1alpha1.ReshardPhaseVerifying:    true,
+		pgshardv1alpha1.ReshardPhaseFailed:       true,
 	}
 	for _, phase := range []string{
 		pgshardv1alpha1.ReshardPhasePending, pgshardv1alpha1.ReshardPhaseProvisioning,

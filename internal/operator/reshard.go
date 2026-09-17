@@ -63,16 +63,26 @@ type reshardPlan struct {
 // paused before switchWrites could not be cancelled by reverting
 // spec.shards, which is the one thing that pause exists to allow.
 //
-// Being before the switch is also what makes the DropShardSet that follows
-// safe: it deletes the set's pgshard.shard_status rows, and those rows are
-// how the resolver finds shards to search for prepared transactions. A set
+// Failed is in the list too. A reshard fails only before its journal -- in
+// its copy, or in a switch step that gives up before the point of no return
+// -- or when its switch is abandoned because another run already retired
+// its sources (abandonSwitch); either way its target set never served. Left
+// in place, that set kept every router refusing DDL -- they refuse it while
+// a reshard's set exists -- with no way to remove it but editing the
+// catalog by hand.
+//
+// Being before the switch, or never having switched, is also what makes the
+// DropShardSet that follows safe: it deletes the set's pgshard.shard_status
+// rows, and those rows are how the resolver finds shards to search for
+// prepared transactions. A set
 // that never took client writes holds none, so removing them hides
 // nothing. Past the switch the old set is retired rather than dropped --
 // its rows stay, and stay visible to the resolver.
 func cancellableOnRevert(phase string) bool {
 	switch phase {
 	case pgshardv1alpha1.ReshardPhasePending, pgshardv1alpha1.ReshardPhaseProvisioning,
-		pgshardv1alpha1.ReshardPhaseCopying, pgshardv1alpha1.ReshardPhaseVerifying:
+		pgshardv1alpha1.ReshardPhaseCopying, pgshardv1alpha1.ReshardPhaseVerifying,
+		pgshardv1alpha1.ReshardPhaseFailed:
 		return true
 	}
 	return false
@@ -182,6 +192,15 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		log.Info("spec.shards differs from the catalog but has not changed; not resharding", "spec", *want, "effective", effective)
 		want = nil
 	}
+	if pending == nil && ((want != nil && *want != effective) || UpgradeRequested(c, serving)) {
+		// A dropped set leaves no shard_sets row, but its record and its
+		// workflow keep its generation; reusing it collides with both.
+		recorded, err := r.recordedGeneration(ctx, c)
+		if err != nil {
+			return plan, err
+		}
+		maxGen = max(maxGen, recorded)
+	}
 	if pending == nil && want != nil && *want != effective {
 		gen := maxGen + 1
 		ranges, err := placement.Split(*want)
@@ -284,6 +303,12 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		if err := r.patchReshardStatus(ctx, record, func(st *pgshardv1alpha1.PgShardReshardStatus) {
 			st.Phase = pgshardv1alpha1.ReshardPhaseCancelled
 			st.Message = "spec.shards reverted to the serving shard count; target groups deleted"
+			if phase == pgshardv1alpha1.ReshardPhaseFailed {
+				st.Message = "spec.shards reverted after the reshard failed; target groups deleted"
+				if wf.Message != "" {
+					st.Message = "spec.shards reverted after the reshard failed (" + wf.Message + "); target groups deleted"
+				}
+			}
 			st.Targets = nil
 		}); err != nil {
 			return plan, err
@@ -481,6 +506,20 @@ func reshardPhase(wf WorkflowInfo) string {
 		return pgshardv1alpha1.ReshardPhaseCompleting
 	}
 	return pgshardv1alpha1.ReshardPhaseProvisioning
+}
+
+// recordedGeneration is the highest target generation of any PgShardReshard
+// record of the cluster, cancelled and failed ones included.
+func (r *ClusterReconciler) recordedGeneration(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (int64, error) {
+	var records pgshardv1alpha1.PgShardReshardList
+	if err := r.List(ctx, &records, client.InNamespace(c.Namespace), client.MatchingLabels{LabelCluster: c.Name}); err != nil {
+		return 0, err
+	}
+	var gen int64
+	for _, rec := range records.Items {
+		gen = max(gen, rec.Spec.TargetGeneration)
+	}
+	return gen, nil
 }
 
 func (r *ClusterReconciler) ensureReshardRecord(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, serving, pending *ShardSetInfo, source string) error {
