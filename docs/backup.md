@@ -391,7 +391,7 @@ before the postmaster and is then not cleared — the safe direction, and where
 this was before. `docs/runbooks/stuck-workflows.md` has the manual command.
 
 `Controller.ListBarriers` (`certified_only`) lists them newest first; the
-restore point name every group shares is `pgshard-<name>`.
+restore point name every group shares is `pgshard-<name>`. A barrier whose manifest names a different catalog system than the live catalog — one taken before a catalog major upgrade — is listed with `catalog_superseded`; a restore to it is refused.
 
 **What a certified barrier covers, and what it does not.** The pause is
 `default_transaction_read_only` on every primary. The router refuses the

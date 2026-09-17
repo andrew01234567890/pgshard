@@ -916,13 +916,16 @@ func (x *CreateBarrierRequest) GetName() string {
 
 // GroupRestorePoint is where one group's restore point landed.
 type GroupRestorePoint struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Group         string                 `protobuf:"bytes,1,opt,name=group,proto3" json:"group,omitempty"`
-	Lsn           uint64                 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
-	Timeline      int64                  `protobuf:"varint,3,opt,name=timeline,proto3" json:"timeline,omitempty"`
-	WalSegment    string                 `protobuf:"bytes,4,opt,name=wal_segment,json=walSegment,proto3" json:"wal_segment,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Group      string                 `protobuf:"bytes,1,opt,name=group,proto3" json:"group,omitempty"`
+	Lsn        uint64                 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	Timeline   int64                  `protobuf:"varint,3,opt,name=timeline,proto3" json:"timeline,omitempty"`
+	WalSegment string                 `protobuf:"bytes,4,opt,name=wal_segment,json=walSegment,proto3" json:"wal_segment,omitempty"`
+	// The database system the point was written in; empty for points recorded
+	// before it was.
+	SystemIdentifier string `protobuf:"bytes,5,opt,name=system_identifier,json=systemIdentifier,proto3" json:"system_identifier,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *GroupRestorePoint) Reset() {
@@ -983,6 +986,13 @@ func (x *GroupRestorePoint) GetWalSegment() string {
 	return ""
 }
 
+func (x *GroupRestorePoint) GetSystemIdentifier() string {
+	if x != nil {
+		return x.SystemIdentifier
+	}
+	return ""
+}
+
 // Barrier is one recorded restore point.
 type Barrier struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -997,9 +1007,13 @@ type Barrier struct {
 	Certified bool                 `protobuf:"varint,5,opt,name=certified,proto3" json:"certified,omitempty"`
 	Groups    []*GroupRestorePoint `protobuf:"bytes,6,rep,name=groups,proto3" json:"groups,omitempty"`
 	// Unix seconds.
-	CreatedAt     int64 `protobuf:"varint,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	CreatedAt int64 `protobuf:"varint,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	// The catalog was rebuilt since this barrier -- a major upgrade initdb's
+	// a new one -- so its catalog restore point is not in the catalog's
+	// repository and a restore to it is refused.
+	CatalogSuperseded bool `protobuf:"varint,8,opt,name=catalog_superseded,json=catalogSuperseded,proto3" json:"catalog_superseded,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Barrier) Reset() {
@@ -1079,6 +1093,13 @@ func (x *Barrier) GetCreatedAt() int64 {
 		return x.CreatedAt
 	}
 	return 0
+}
+
+func (x *Barrier) GetCatalogSuperseded() bool {
+	if x != nil {
+		return x.CatalogSuperseded
+	}
+	return false
 }
 
 // CreateBarrierResponse returns the recorded barrier.
@@ -1727,13 +1748,14 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"unresolved\x12'\n" +
 	"\x05error\x18\x04 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"*\n" +
 	"\x14CreateBarrierRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"x\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"\xa5\x01\n" +
 	"\x11GroupRestorePoint\x12\x14\n" +
 	"\x05group\x18\x01 \x01(\tR\x05group\x12\x10\n" +
 	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x12\x1a\n" +
 	"\btimeline\x18\x03 \x01(\x03R\btimeline\x12\x1f\n" +
 	"\vwal_segment\x18\x04 \x01(\tR\n" +
-	"walSegment\"\xf8\x01\n" +
+	"walSegment\x12+\n" +
+	"\x11system_identifier\x18\x05 \x01(\tR\x10systemIdentifier\"\xa7\x02\n" +
 	"\aBarrier\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12#\n" +
@@ -1742,7 +1764,8 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"\tcertified\x18\x05 \x01(\bR\tcertified\x125\n" +
 	"\x06groups\x18\x06 \x03(\v2\x1d.pgshard.v1.GroupRestorePointR\x06groups\x12\x1d\n" +
 	"\n" +
-	"created_at\x18\a \x01(\x03R\tcreatedAt\"o\n" +
+	"created_at\x18\a \x01(\x03R\tcreatedAt\x12-\n" +
+	"\x12catalog_superseded\x18\b \x01(\bR\x11catalogSuperseded\"o\n" +
 	"\x15CreateBarrierResponse\x12-\n" +
 	"\abarrier\x18\x01 \x01(\v2\x13.pgshard.v1.BarrierR\abarrier\x12'\n" +
 	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"<\n" +
