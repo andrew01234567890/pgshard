@@ -36,6 +36,12 @@ type Server struct {
 	BufferUnits int
 	// ReconnectWindow bounds how long a shard stream may stay broken before
 	// the stream ends with SHARD_UNAVAILABLE; zero means 30s.
+	//
+	// It must exceed wal_sender_timeout. A walsender orphaned by a dead TCP
+	// peer keeps its slot until that timeout, so a shorter window gives up
+	// on a slot the reader would have won. The agent OWNS wal_sender_timeout
+	// and sets it to 5s, so the default clears it; a deployment that raises
+	// it has to raise this too (PGS-834).
 	ReconnectWindow time.Duration
 	// MaxTransactionBytes bounds the encoded events one shard may hold for
 	// transactions that have not committed; zero means 64 MiB. BufferUnits
@@ -437,7 +443,7 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		inputs[sh] = ch
 		r := &reader{shard: sh, stream: def.Name, database: def.Database, twoPhase: opts.twoPhase, topo: s.Topology,
 			out: ch, ready: ready, window: window, delivered: startPos[sh],
-			maxBytes: maxBytes, maxOpen: maxOpen, meter: s.Meter}
+			maxBytes: maxBytes, maxOpen: maxOpen, meter: s.Meter, logger: s.logger()}
 		if st, ok := copying[sh]; ok {
 			r.copy = copyPhaseFrom(st, opts.copyBatch)
 		} else if opts.copy && startPos[sh] == 0 {

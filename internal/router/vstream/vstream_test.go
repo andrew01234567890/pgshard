@@ -900,3 +900,63 @@ func (emptyCatalog) Journal(context.Context, string) (Journal, bool, error) {
 func (emptyCatalog) List(context.Context) ([]catalog.Stream, []catalog.StreamStatus, error) {
 	return nil, nil, nil
 }
+
+// syncBuffer collects log output written from the reader's goroutine.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestAStreamThatCannotReattachIsLoggedOnceAndCounted (PGS-834): a shard
+// stream that keeps failing retryably reconnects until its window runs out
+// and only THEN tells the consumer. That whole window used to pass in
+// silence -- no log line, no counter -- so a slot another walsender still
+// held produced a dozen invisible attempts and an operator had nothing
+// naming the holder.
+//
+// One line per cycle, not per attempt: a line each would bury the one that
+// says why. The counter is what shows the retrying, and it is the pair that
+// makes this watchable, so both are asserted.
+func TestAStreamThatCannotReattachIsLoggedOnceAndCounted(t *testing.T) {
+	h := newHarness(t, 1)
+	m := &countingMeter{}
+	logs := &syncBuffer{}
+	h.server.Meter = m
+	h.server.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	h.server.ReconnectWindow = 700 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain"})
+	held := status.Error(codes.FailedPrecondition, `slot pgshard_plain_shard0 already has an active reader (PID 4242)`)
+	for i := 0; i < 8; i++ {
+		h.pool[0].fail(held)
+	}
+	got := recvN(t, st, 1, 5*time.Second)
+	if describe(got[0]) != "error SHARD_UNAVAILABLE shard=0" {
+		t.Fatalf("got %s, want the shard reported unavailable once the window ran out", describe(got[0]))
+	}
+
+	out := logs.String()
+	if n := strings.Count(out, "shard stream broken, reconnecting"); n != 1 {
+		t.Errorf("want exactly one warning for the cycle, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "PID 4242") {
+		t.Errorf("the warning must carry the pooler's message, which names the holder:\n%s", out)
+	}
+	if n := m.reconnects()["default/0"]; n < 2 {
+		t.Errorf("reconnect attempts counted = %d; the counter is what shows a stream retrying before its consumer hears", n)
+	}
+}

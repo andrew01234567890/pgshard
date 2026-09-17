@@ -251,7 +251,15 @@ generated from.
     pooler at the last delivered LSN with backoff; the failover slot exists
     there because it was synchronized (see above). A shard that stays broken
     for longer than the reconnect window (30s) ends the stream with
-    `Error{SHARD_UNAVAILABLE}`;
+    `Error{SHARD_UNAVAILABLE}`. The window has to exceed `wal_sender_timeout`,
+    or a walsender orphaned by a dead TCP peer still holds the slot when the
+    reconnect gives up, and the reader loses a race it would have won: the
+    agent sets `wal_sender_timeout` to 5s and owns the setting, so the 30s
+    default clears it by a wide margin. Each cycle logs one warning naming
+    the failure -- for a slot another walsender holds, that message carries
+    its PID -- and `pgshard_router_vstream_reconnects_total` counts the
+    attempts per shard, so a stream struggling to reattach is visible before
+    its consumer is told anything;
   - an invalidated slot, a slot that is gone, or WAL no longer retained ends
     the stream with `Error{POSITION_TOO_OLD}`, which tells a consumer its
     checkpoints are worthless and it must copy again. Nothing else earns it:

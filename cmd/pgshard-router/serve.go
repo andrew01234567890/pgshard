@@ -347,9 +347,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		vs := &vstream.Server{Topology: vstream.SnapshotTopology{Snapshot: w.Current, Poolers: poolerClients},
 			Catalog: vstream.PGCatalog{Pool: pool}, Logger: logger,
 			Meter: vstream.PrometheusMeter{
-				Buffered: rt.Metrics().VStreamBufferedBytes,
-				Open:     rt.Metrics().VStreamOpenTxns,
-				Exceeded: rt.Metrics().VStreamTooLarge,
+				Buffered:   rt.Metrics().VStreamBufferedBytes,
+				Open:       rt.Metrics().VStreamOpenTxns,
+				Exceeded:   rt.Metrics().VStreamTooLarge,
+				Reconnects: rt.Metrics().VStreamReconnects,
 			}}
 		if *controllerAddr != "" {
 			cc, err := grpc.NewClient(*controllerAddr, grpc.WithTransportCredentials(controllerCreds))
