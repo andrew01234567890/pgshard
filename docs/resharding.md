@@ -470,7 +470,13 @@ Reverting the `pgshard.tables` row before `swapping` cancels the run: the
 placer drops the shadows, slots and publications, restores the replica
 identity, releases fence and lock (`cancelled`). After the swap the run
 cannot be cancelled; edit the row again for a new run. A failed change is
-not retried until the row is edited again.
+not retried until the row is edited again; its cleanup runs once, on every
+source it can reach, and what it could not drop is listed in the workflow's
+`status.leaked`. Cleanup writes through a barrier's or a retired set's
+write pause. Setting or restoring the replica identity waits at most 5s
+for its lock per try, so it never holds the table's readers behind a long
+transaction: `copying` retries on the next pass, and cleanup tries three
+times.
 
 The swapped table keeps its name but gets a new relation OID. Publications
 `FOR ALL TABLES` keep publishing it; logical consumers that follow the

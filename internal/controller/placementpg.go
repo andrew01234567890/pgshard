@@ -10,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -986,8 +988,20 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 //
 // What remains is the moment between this check and each shard's rename.
 func (p *Placer) recheckDependents(ctx context.Context, wf *placementWorkflow) error {
-	own := map[string]bool{"replica identity FULL": true, "publication " + wf.publicationName(): true}
 	for _, src := range wf.from.Sources() {
+		// Per source, not once for the move: the identity this workflow
+		// raised is its own to ignore, and a FULL it did not raise is a
+		// dependent like any other. Exempting the string wherever it
+		// appeared let a REPLICA IDENTITY FULL set between the preflight
+		// and the swap through the one check meant to catch it -- and the
+		// shadow was built from what the preflight saw, so the swap put
+		// back a table at DEFAULT and broke the downstream logical
+		// replication of its UPDATEs and DELETEs, which is exactly what
+		// unsupportedTableFeatures refuses a move for.
+		own := map[string]bool{"publication " + wf.publicationName(): true}
+		if slices.Contains(wf.st.ReplicaIdentityFull, src) {
+			own["replica identity FULL"] = true
+		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, src, wf.spec.Database)
 		if err != nil {
 			return err
@@ -1829,11 +1843,32 @@ func (p *Placer) ensureReplication(ctx context.Context, wf *placementWorkflow, c
 		return err
 	}
 	if ident != "f" {
-		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", wf.shape.qualified(wf.spec.TableName))); err != nil {
-			return err
-		}
+		// Recorded before the ALTER, not after: an ALTER that committed while
+		// the controller died before saving left FULL on the user's table
+		// with nothing saying it was this workflow's to put back.
+		recorded := false
 		if !slices.Contains(wf.st.ReplicaIdentityFull, s) {
 			wf.st.ReplicaIdentityFull = append(wf.st.ReplicaIdentityFull, s)
+			if err := p.save(ctx, wf, fmt.Sprintf("widening the replica identity of %s on %s/%d", wf.spec.table(), wf.st.SourceSet, s)); err != nil {
+				return err
+			}
+			recorded = true
+		}
+		if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "FULL", 1); err != nil {
+			// The ALTER is bounded and gets one try, so failing it is an
+			// ordinary outcome, not the crash the record above is for. A
+			// record that outlives a failed ALTER is a claim this workflow
+			// raised a FULL it did not: the swap's recheck would then exempt
+			// somebody else's FULL as its own, and the teardown would put the
+			// identity "back" to DEFAULT over a setting the move never made.
+			// The ALTER changed nothing, so neither does the record.
+			if recorded {
+				wf.st.ReplicaIdentityFull = slices.DeleteFunc(wf.st.ReplicaIdentityFull, func(x int32) bool { return x == s })
+				if serr := p.save(ctx, wf, fmt.Sprintf("the replica identity of %s on %s/%d was not widened", wf.spec.table(), wf.st.SourceSet, s)); serr != nil {
+					return errors.Join(err, serr)
+				}
+			}
+			return err
 		}
 	}
 	rows, err = conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`, wf.publicationName())
@@ -2247,7 +2282,12 @@ func (p *Placer) releaseShardFence(ctx context.Context, wf *placementWorkflow) e
 			failed = errors.Join(failed, err)
 			continue
 		}
-		err = unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
+		// A barrier's or a switch's pause refuses DROP TRIGGER too, and the
+		// cleanup that follows a release is never reached while it does.
+		err = writeThroughPause(ctx, conn)
+		if err == nil {
+			err = unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
+		}
 		_ = conn.Close(ctx)
 		if err != nil {
 			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err))
@@ -2861,49 +2901,131 @@ func (p *Placer) publish(ctx context.Context, wf *placementWorkflow) error {
 }
 
 // dropReplication drops the slots and publications of the run on every
-// source; a cancelled run also restores the replica identity it changed
-// (a completed one dropped that table).
+// source; a cancelled or failed run also restores the replica identity it
+// changed (a completed one dropped that table). Every source is tried: one
+// that cannot be reached must not leave the slots on the others pinning WAL.
 func (p *Placer) dropReplication(ctx context.Context, wf *placementWorkflow) error {
+	var failed error
 	for _, s := range wf.from.Sources() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
+		if err := p.dropSourceReplication(ctx, wf, s); err != nil {
+			failed = errors.Join(failed, fmt.Errorf("replication objects on %s/%d: %w", wf.st.SourceSet, s, err))
+		}
+	}
+	return failed
+}
+
+func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflow, s int32) error {
+	conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	// A source under a barrier's pause, or a switch's, refuses DROP
+	// PUBLICATION and ALTER TABLE with 25006, and the fail path does not
+	// come back: the replica identity would stay widened for good. This
+	// session writes through; the shard stays paused.
+	if err := writeThroughPause(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, wf.slotName(s)); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, "DROP PUBLICATION IF EXISTS "+QuoteIdent(wf.publicationName())); err != nil {
+		return err
+	}
+	// On the failure path too, not only when cancelling: a failed workflow
+	// is never revisited, so REPLICA IDENTITY FULL left behind makes every
+	// UPDATE on the source log the whole old row for good. A few tries, as
+	// the fail path gets only this one pass.
+	if (wf.stage == StageCancelling || wf.stage == StageFailed) && slices.Contains(wf.st.ReplicaIdentityFull, s) {
+		// Only while it is still the FULL this workflow raised. The record
+		// says what the move did, not what the table is now: somebody may
+		// have set USING INDEX or DEFAULT meanwhile, and putting "back" a
+		// DEFAULT over that would change the table's replication semantics
+		// on the way out of a workflow that is already failing. The swap's
+		// recheck refuses such a table, which makes this path the likely
+		// one to reach it, and writing through the pause has removed the
+		// refusal that used to stop it by accident.
+		rows, err := conn.Query(ctx, `SELECT relreplident::text FROM pg_class WHERE oid = $1::regclass`, wf.shape.qualified(wf.spec.TableName))
 		if err != nil {
 			return err
 		}
-		err = func() error {
-			if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, wf.slotName(s)); err != nil {
-				return err
-			}
-			if _, err := conn.Exec(ctx, "DROP PUBLICATION IF EXISTS "+QuoteIdent(wf.publicationName())); err != nil {
-				return err
-			}
-			// On the failure path too, not only when cancelling: a failed
-			// workflow is never revisited, so REPLICA IDENTITY FULL left
-			// behind makes every UPDATE on the source log the whole old row
-			// for good.
-			if (wf.stage == StageCancelling || wf.stage == StageFailed) && slices.Contains(wf.st.ReplicaIdentityFull, s) {
-				if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY DEFAULT", wf.shape.qualified(wf.spec.TableName))); err != nil {
-					return err
-				}
-			}
-			return nil
-		}()
-		_ = conn.Close(ctx)
+		now, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[string])
 		if err != nil {
-			return fmt.Errorf("replication objects on %s/%d: %w", wf.st.SourceSet, s, err)
+			return err
+		}
+		if now == "f" {
+			if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "DEFAULT", 3); err != nil {
+				return fmt.Errorf("putting back the default replica identity of %s: %w", wf.spec.table(), err)
+			}
 		}
 	}
 	return nil
 }
 
+// replicaIdentityLockWait bounds how long changing a table's replica
+// identity waits for its AccessExclusiveLock. The waiting request queues
+// every new reader of the table behind it, so one waiting on a long
+// transaction would stall the user's reads for as long as that runs.
+const replicaIdentityLockWait = 5 * time.Second
+
+// setReplicaIdentity sets a table's replica identity with a bounded lock
+// wait, trying again after a lock timeout up to attempts times in all.
+func setReplicaIdentity(ctx context.Context, conn ShardConn, table, identity string, attempts int) error {
+	for attempt := 1; ; attempt++ {
+		err := execWithLockWait(ctx, conn, replicaIdentityLockWait, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY %s", table, identity))
+		var pgErr *pgconn.PgError
+		if err == nil || attempt >= attempts || !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// execWithLockWait runs one statement in a transaction of its own whose
+// lock_timeout is wait, leaving the session's setting alone.
+func execWithLockWait(ctx context.Context, conn ShardConn, wait time.Duration, sql string) error {
+	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
+		return err
+	}
+	_, err := conn.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", wait.Milliseconds()))
+	if err == nil {
+		_, err = conn.Exec(ctx, sql)
+	}
+	if err == nil {
+		_, err = conn.Exec(ctx, "COMMIT")
+	}
+	if err != nil {
+		_, _ = conn.Exec(ctx, "ROLLBACK")
+	}
+	return err
+}
+
 // dropOld drops the previous tables and gives the new table's indexes and
 // constraints their final names.
 func (p *Placer) dropOld(ctx context.Context, wf *placementWorkflow) error {
+	var failed error
 	for _, t := range wf.rt.ids {
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
-			return err
+			failed = errors.Join(failed, err)
+			continue
 		}
 		err = func() error {
+			// The retiring stage lasts an hour by default, and a barrier
+			// pauses every serving group for its own run: DROP TABLE and the
+			// RENAMEs below are refused with 25006 exactly as the shadow and
+			// replication cleanups were. A retirement that cannot finish
+			// keeps the workflow active, and an active placement makes a
+			// reshard wait and an upgrade fail its preconditions -- while a
+			// whole second copy of the table stays on every shard.
+			if err := writeThroughPause(ctx, conn); err != nil {
+				return err
+			}
 			dropped, err := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.old(), wf.placementMarker())
 			if err != nil {
 				return err
@@ -2932,10 +3054,13 @@ func (p *Placer) dropOld(ctx context.Context, wf *placementWorkflow) error {
 		}()
 		_ = conn.Close(ctx)
 		if err != nil {
-			return fmt.Errorf("retire on %s/%d: %w", wf.st.SourceSet, t, err)
+			// Every shard is tried: stopping at the first left the old table
+			// on every shard after it, and the one that failed is usually
+			// the only one that is paused.
+			failed = errors.Join(failed, fmt.Errorf("retire on %s/%d: %w", wf.st.SourceSet, t, err))
 		}
 	}
-	return nil
+	return failed
 }
 
 func renameShadowIndexes(ctx context.Context, conn ShardConn, wf *placementWorkflow) error {

@@ -1908,3 +1908,423 @@ func TestAMoveStopsBeforeItsSwapWhenTheTableGainedADependent(t *testing.T) {
 	// stop that left the fence up would leave the table refusing writes.
 	mustExec(t, home, `INSERT INTO ledger VALUES (21, 'after-the-stopped-move')`)
 }
+
+// TestAFailedPlacementCleansUpItsSourceThroughAWritePause (PGS-858,
+// PGS-859): a placement's release of its fence and cleanup on its source --
+// dropping the fence triggers and its publication, putting back the replica
+// identity it widened, dropping its shadow -- ran without writing through a
+// write pause. A barrier's pause, or a switch's on the same shards, refused
+// them with 25006; the fail path records the residue and ends anyway, so
+// REPLICA IDENTITY FULL stayed on the user's table for good and the shadow
+// refused the next move of the table.
+func TestAFailedPlacementCleansUpItsSourceThroughAWritePause(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+	mustExec(t, admin, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, admin, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	wf := &placementWorkflow{id: "66666666-6666-6666-6666-666666666666", stage: StageFailed,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default", ReplicaIdentityFull: []int32{0}},
+		from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+		rt:    &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0, ids: []int32{0}},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	mustExec(t, admin, `CREATE PUBLICATION `+wf.publicationName()+` FOR TABLE ledger`)
+	if err := fenceTables(ctx, pgxShardConn{admin}, "public", wf.shape.qualified("ledger")); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, `CREATE TABLE `+QuoteIdent(wf.shadow())+` (id int PRIMARY KEY, v text)`)
+	if err := markPlacementArtifact(ctx, pgxShardConn{admin}, "public", wf.shadow(), wf.placementMarker()); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, admin, `SELECT pg_reload_conf()`)
+	waitReadOnly(t, dsn, true)
+
+	// In the order the fail path runs them.
+	p := &Placer{Shards: realShards{dsn}}
+	if err := p.releaseShardFence(ctx, wf); err != nil {
+		t.Fatalf("releasing the fence on a paused source: %v", err)
+	}
+	if err := p.dropReplication(ctx, wf); err != nil {
+		t.Fatalf("cleanup on a paused source: %v", err)
+	}
+	if err := p.dropShadows(ctx, wf); err != nil {
+		t.Fatalf("dropping the shadow on a paused shard: %v", err)
+	}
+	check := connect(t, dsn)
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_class WHERE relname = $1`, wf.shadow()); n != 0 {
+		t.Fatalf("the failed placement's shadow survived its cleanup")
+	}
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.ledger'::regclass AND NOT tgisinternal`); n != 0 {
+		t.Fatalf("%d fence trigger(s) left on the table", n)
+	}
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_publication WHERE pubname = $1`, wf.publicationName()); n != 0 {
+		t.Fatalf("the placement's publication survived its cleanup")
+	}
+	if ident := queryOne[string](t, check, `SELECT relreplident::text FROM pg_class WHERE oid = 'public.ledger'::regclass`); ident != "d" {
+		t.Fatalf("replica identity is %q after the cleanup, want the default back", ident)
+	}
+	waitReadOnly(t, dsn, true)
+}
+
+// TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock (PGS-859): the
+// restore takes an AccessExclusiveLock with no lock_timeout. Written through
+// a pause it no longer failed fast, so behind a long reader it queued every
+// new reader of the user's table behind it, and the Placer with it. It now
+// waits a bounded time per try, tries a few times, and lets readers through
+// between tries.
+func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+	mustExec(t, admin, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, admin, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	wf := &placementWorkflow{id: "77777777-7777-7777-7777-777777777777", stage: StageFailed,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default", ReplicaIdentityFull: []int32{0}},
+		from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	p := &Placer{Shards: realShards{dsn}}
+	identity := func() string {
+		return queryOne[string](t, connect(t, dsn), `SELECT relreplident::text FROM pg_class WHERE oid = 'public.ledger'::regclass`)
+	}
+
+	holdLedger := func() pgx.Tx {
+		tx, err := connect(t, dsn).Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT count(*) FROM ledger`); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+
+	t.Run("a reader that ends while it retries", func(t *testing.T) {
+		tx := holdLedger()
+		committed := make(chan error, 1)
+		go func() {
+			time.Sleep(replicaIdentityLockWait + replicaIdentityLockWait/2)
+			committed <- tx.Commit(ctx)
+		}()
+		if err := p.dropReplication(ctx, wf); err != nil {
+			t.Fatalf("the restore gave up although the reader ended before its last try: %v", err)
+		}
+		if err := <-committed; err != nil {
+			t.Fatal(err)
+		}
+		if got := identity(); got != "d" {
+			t.Fatalf("replica identity is %q, want the default back", got)
+		}
+	})
+
+	mustExec(t, admin, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	t.Run("a reader that outlasts every try", func(t *testing.T) {
+		tx := holdLedger()
+		defer func() { _ = tx.Rollback(ctx) }()
+		runCtx, cancel := context.WithTimeout(ctx, 6*replicaIdentityLockWait)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- p.dropReplication(runCtx, wf) }()
+
+		// Only a reader arriving while the ALTER waits queues behind it.
+		watch := connect(t, dsn)
+		for queued := false; !queued; {
+			if runCtx.Err() != nil {
+				t.Fatal("the restore never waited for its lock")
+			}
+			queued = queryOne[bool](t, watch, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'public.ledger'::regclass AND NOT granted)`)
+			time.Sleep(20 * time.Millisecond)
+		}
+		readCtx, cancelRead := context.WithTimeout(ctx, 2*replicaIdentityLockWait)
+		defer cancelRead()
+		var n int64
+		if err := connect(t, dsn).QueryRow(readCtx, `SELECT count(*) FROM ledger`).Scan(&n); err != nil {
+			t.Fatalf("a new reader of the table queued behind the restore past its lock wait: %v", err)
+		}
+
+		err := <-done
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Fatalf("the restore behind a reader that never ends: %v, want its lock wait to run out (55P03)", err)
+		}
+		if got := identity(); got != "f" {
+			t.Fatalf("replica identity is %q after a restore that could not get its lock", got)
+		}
+	})
+}
+
+// TestAFailedPlacementCleansUpTheSourcesItCanReach (PGS-859): the cleanup
+// stopped at the first source it could not reach, so the fail path, which
+// runs it once, left the publication, slots and widened replica identity on
+// every source after that one.
+func TestAFailedPlacementCleansUpTheSourcesItCanReach(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+	mustExec(t, admin, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, admin, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	wf := &placementWorkflow{id: "99999999-9999-9999-9999-999999999999", stage: StageFailed,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default", ReplicaIdentityFull: []int32{0, 1}},
+		from:  &placementRouter{placement: TablePlacement{Placement: "sharded"}, ids: []int32{0, 1}},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	mustExec(t, admin, `CREATE PUBLICATION `+wf.publicationName()+` FOR TABLE ledger`)
+
+	p := &Placer{Shards: unreachableShard{realShards{dsn}, 0}}
+	err := p.dropReplication(ctx, wf)
+	if err == nil || !strings.Contains(err.Error(), "default/0") {
+		t.Fatalf("the unreachable source was not reported: %v", err)
+	}
+	if n := queryOne[int64](t, admin, `SELECT count(*) FROM pg_publication WHERE pubname = $1`, wf.publicationName()); n != 0 {
+		t.Fatalf("the reachable source kept the publication because an earlier one could not be reached")
+	}
+	if ident := queryOne[string](t, admin, `SELECT relreplident::text FROM pg_class WHERE oid = 'public.ledger'::regclass`); ident != "d" {
+		t.Fatalf("replica identity is %q on the reachable source, want the default back", ident)
+	}
+}
+
+type unreachableShard struct {
+	realShards
+	down int32
+}
+
+func (u unreachableShard) DialDatabase(ctx context.Context, set string, id int32, db string) (ShardConn, error) {
+	if id == u.down {
+		return nil, errors.New("connection refused")
+	}
+	return u.realShards.DialDatabase(ctx, set, id, db)
+}
+
+// TestTheReplicaIdentityIsRecordedBeforeItIsWidened (PGS-859): the source
+// was recorded in ReplicaIdentityFull only after its ALTER committed, and
+// saved later still. A controller that died in between left FULL on the
+// user's table with nothing saying it was the workflow's to put back.
+func TestTheReplicaIdentityIsRecordedBeforeItIsWidened(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	const id = "88888888-8888-8888-8888-888888888888"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, '{}', '{}')`, id, KindTablePlacement, StateRunning)
+	wf := &placementWorkflow{id: id, state: StateRunning, stage: StagePlacementCopying,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default"},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	p := &Placer{Pool: pool, Shards: realShards{dsn}}
+
+	recorded := func() []int32 {
+		var ids []int32
+		if err := cat.QueryRow(ctx, `SELECT coalesce(array_agg(v::int), '{}') FROM pgshard.workflows,
+			jsonb_array_elements_text(coalesce(status->'placement'->'replica_identity_full', '[]')) v WHERE id = $1`, id).Scan(&ids); err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	var atAlter []int32
+	conn := alterReplicaIdentityDies{ShardConn: pgxShardConn{connect(t, dsn)}, before: func() { atAlter = recorded() }}
+	if err := p.ensureReplication(ctx, wf, conn, 0); err == nil {
+		t.Fatal("the ALTER was never reached")
+	}
+	if !slices.Contains(atAlter, 0) {
+		t.Fatalf("when the replica identity was widened the workflow had recorded %v: a controller dying there leaves FULL behind unrecorded", atAlter)
+	}
+	// And the other half: the ALTER failed, so the record must not outlive
+	// it. The ALTER is bounded and gets one try, so a lock timeout is an
+	// ordinary outcome rather than the crash the record above is for -- and
+	// a record standing over a table this workflow never widened is a claim
+	// on somebody else's FULL. The swap's recheck would exempt it as its
+	// own, and the teardown would put the identity "back" to DEFAULT over a
+	// setting the move never made.
+	if after := recorded(); slices.Contains(after, 0) {
+		t.Errorf("the workflow still records %v after an ALTER that failed: it claims a FULL it never raised", after)
+	}
+}
+
+// TestTheRestoreLeavesAnIdentityTheMoveNoLongerOwns: the record says what
+// the move DID, not what the table IS. If the identity is no longer the
+// FULL this workflow raised -- somebody set USING INDEX, or put it back
+// themselves -- then putting "back" a DEFAULT over that changes the
+// table's replication semantics on the way out of a workflow that is
+// already failing.
+//
+// The swap's recheck refuses a table whose identity the move did not raise,
+// which makes the fail path the likely way to reach this; and now that the
+// teardown writes through a retired set's pause, the refusal that used to
+// stop it by accident is gone.
+func TestTheRestoreLeavesAnIdentityTheMoveNoLongerOwns(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, cat, `CREATE UNIQUE INDEX ledger_v_key ON ledger (v)`)
+	mustExec(t, cat, `ALTER TABLE ledger ALTER COLUMN v SET NOT NULL`)
+	// What the move raised, and then what somebody else set over it.
+	mustExec(t, cat, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	mustExec(t, cat, `ALTER TABLE ledger REPLICA IDENTITY USING INDEX ledger_v_key`)
+
+	const id = "77777777-7777-7777-7777-777777777777"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, '{}', '{}')`, id, KindTablePlacement, StateFailed)
+	wf := &placementWorkflow{id: id, state: StateFailed, stage: StageFailed,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default", ReplicaIdentityFull: []int32{0}},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	p := &Placer{Pool: pool, Shards: realShards{dsn}}
+
+	if err := p.dropSourceReplication(ctx, wf, 0); err != nil {
+		t.Fatalf("dropping the source replication: %v", err)
+	}
+	var ident string
+	if err := cat.QueryRow(ctx, `SELECT relreplident::text FROM pg_class WHERE oid = 'ledger'::regclass`).Scan(&ident); err != nil {
+		t.Fatal(err)
+	}
+	if ident != "i" {
+		t.Errorf("the replica identity is %q after the teardown, want \"i\": the move recorded a FULL it had raised, but the table had been set to USING INDEX since, and putting back DEFAULT changes what every UPDATE and DELETE ships to every subscriber", ident)
+	}
+}
+
+// alterReplicaIdentityDies stands in for a controller that dies as it
+// widens a replica identity.
+type alterReplicaIdentityDies struct {
+	ShardConn
+	before func()
+}
+
+func (c alterReplicaIdentityDies) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
+	if strings.Contains(sql, "REPLICA IDENTITY FULL") {
+		c.before()
+		return nil, errors.New("the controller died here")
+	}
+	return c.ShardConn.Exec(ctx, sql, args...)
+}
+
+// TestARecheckRefusesAnIdentityTheMoveDidNotRaise (PGS-859, from the
+// pre-merge audit): the recheck before the swap exempted "replica identity
+// FULL" wherever it found it, rather than only where this workflow had
+// raised it.
+//
+// The preflight refuses any non-default replica identity, so a table that
+// reaches the copy is at DEFAULT and the shadow is built from that. Set FULL
+// between the preflight and the copy and the workflow never records it --
+// ensureReplication only records what it raises, and the table is already
+// FULL -- so the exemption swallowed a dependent the move cannot carry, and
+// the swap put back a table at DEFAULT, silently breaking the downstream
+// logical replication of its UPDATEs and DELETEs.
+func TestARecheckRefusesAnIdentityTheMoveDidNotRaise(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExec(t, cat, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	const id = "77777777-7777-7777-7777-777777777777"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, '{}', '{}')`, id, KindTablePlacement, StateRunning)
+	p := &Placer{Pool: pool, Shards: realShards{dsn}}
+	newWF := func() *placementWorkflow {
+		return &placementWorkflow{id: id, state: StateRunning, stage: StagePlacementCopying,
+			spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+			st:    placementState{SourceSet: "default"},
+			from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+			shape: rowShape{Schema: "public", Name: "ledger"}}
+	}
+
+	// At DEFAULT, with nothing else on the table, the recheck passes.
+	if err := p.recheckDependents(ctx, newWF()); err != nil {
+		t.Fatalf("a table with no dependents was refused: %v", err)
+	}
+
+	// FULL that the workflow did not raise is a dependent like any other.
+	mustExec(t, cat, `ALTER TABLE ledger REPLICA IDENTITY FULL`)
+	err = p.recheckDependents(ctx, newWF())
+	if err == nil {
+		t.Fatal("a replica identity the move never raised was taken for its own; the swap would have dropped it")
+	}
+	if !strings.Contains(err.Error(), "replica identity FULL") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+
+	// The same identity, recorded as this workflow's, is its own to ignore.
+	wf := newWF()
+	wf.st.ReplicaIdentityFull = []int32{0}
+	if err := p.recheckDependents(ctx, wf); err != nil {
+		t.Fatalf("the workflow's own widened identity was refused: %v", err)
+	}
+}
+
+// TestRetirementDropsTheOldTableThroughAWritePause (PGS-859, from the
+// pre-merge audit): dropOld was the one cleanup of the family that was not
+// given the write-through.
+//
+// Retirement lasts an hour by default, and a barrier pauses every serving
+// group for its own run, so the DROP TABLE and the constraint and index
+// renames are refused with 25006 just as the shadow and replication
+// cleanups were. A retirement that cannot finish keeps the placement
+// active, and an active placement makes a reshard wait and an upgrade fail
+// its preconditions -- with a whole second copy of the table still on disk
+// on every shard.
+func TestRetirementDropsTheOldTableThroughAWritePause(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+	wf := &placementWorkflow{id: "55555555-5555-5555-5555-555555555555", stage: StagePlacementRetiring,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default"},
+		from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+		rt:    &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0, ids: []int32{0}},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+	// The table as the swap leaves it: the live one carrying the shadow's
+	// index names, and the retired one alongside it.
+	mustExec(t, admin, `CREATE TABLE ledger (id int PRIMARY KEY, v text)`)
+	mustExec(t, admin, `CREATE INDEX `+QuoteIdent("ledger_v_idx"+ShadowSuffix)+` ON ledger (v)`)
+	mustExec(t, admin, `CREATE TABLE `+QuoteIdent(wf.old())+` (id int PRIMARY KEY, v text)`)
+	if err := markPlacementArtifact(ctx, pgxShardConn{admin}, "public", wf.old(), wf.placementMarker()); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, `ALTER SYSTEM SET default_transaction_read_only = on`)
+	mustExec(t, admin, `SELECT pg_reload_conf()`)
+	waitReadOnly(t, dsn, true)
+
+	p := &Placer{Shards: realShards{dsn}}
+	if err := p.dropOld(ctx, wf); err != nil {
+		t.Fatalf("retiring on a paused shard: %v", err)
+	}
+	check := connect(t, dsn)
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_class WHERE relname = $1`, wf.old()); n != 0 {
+		t.Errorf("the retired table survived its own retirement")
+	}
+	if n := queryOne[int64](t, check, `SELECT count(*) FROM pg_class WHERE relname LIKE '%' || $1 || '%'`, ShadowSuffix); n != 0 {
+		t.Errorf("%d relation(s) kept a shadow-suffixed name after retirement", n)
+	}
+	// The shard is still paused: only this session wrote through it.
+	waitReadOnly(t, dsn, true)
+}
