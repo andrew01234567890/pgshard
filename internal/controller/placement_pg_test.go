@@ -2375,3 +2375,117 @@ func TestRetiringGivesUpItsLockRatherThanQueueing(t *testing.T) {
 		t.Fatalf("the reader was disturbed by the drop's wait: %v", err)
 	}
 }
+
+// readOnlySetDies fails exactly the statement writeThroughPause sends, so a
+// teardown can be driven through a source whose pause cannot be written
+// through.
+type readOnlySetDies struct{ ShardConn }
+
+func (c readOnlySetDies) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
+	if strings.Contains(sql, "default_transaction_read_only") {
+		return nil, errors.New("the pause could not be written through")
+	}
+	return c.ShardConn.Exec(ctx, sql, args...)
+}
+
+type shardsDialing struct{ conn ShardConn }
+
+func (s shardsDialing) Dial(context.Context, string, int32) (ShardConn, error) { return s.conn, nil }
+func (s shardsDialing) DialDatabase(context.Context, string, int32, string) (ShardConn, error) {
+	return s.conn, nil
+}
+
+// TestTheTeardownDropsItsSlotEvenWhenThePauseCannotBeWrittenThrough
+// (PGS-944): dropping a replication slot is not a write to the table, so no
+// pause refuses it. Gating it behind writeThroughPause meant a failed SET
+// left the slot standing, and a slot left behind pins WAL on the source for
+// as long as it stands -- the more expensive failure of the two.
+func TestTheTeardownDropsItsSlotEvenWhenThePauseCannotBeWrittenThrough(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+
+	const id = "66666666-6666-6666-6666-666666666666"
+	wf := &placementWorkflow{id: id, stage: StageFailed,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default"},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+
+	slot := wf.slotName(0)
+	mustExec(t, admin, `SELECT pg_create_physical_replication_slot($1)`, slot)
+	if n := queryOne[int64](t, admin, `SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1`, slot); n != 1 {
+		t.Fatalf("the slot was not created, so the assertion below would pass for the wrong reason")
+	}
+
+	p := &Placer{Shards: shardsDialing{conn: readOnlySetDies{pgxShardConn{connect(t, dsn)}}}}
+	err := p.dropSourceReplication(ctx, wf, 0)
+	if err == nil {
+		t.Fatal("the write-through was supposed to fail, so this test proves nothing")
+	}
+	if n := queryOne[int64](t, admin, `SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1`, slot); n != 0 {
+		t.Errorf("the slot is still there after a teardown whose write-through failed: it pins WAL on the source for as long as it stands")
+	}
+}
+
+// dialFails stands in for a source that cannot be reached at all.
+type dialFails struct{}
+
+func (dialFails) Dial(context.Context, string, int32) (ShardConn, error) {
+	return nil, errors.New("the source is unreachable")
+}
+func (dialFails) DialDatabase(context.Context, string, int32, string) (ShardConn, error) {
+	return nil, errors.New("the source is unreachable")
+}
+
+// TestAFailedPlacementRecordsWhatItCouldNotClean (PGS-945): fail() drops the
+// replication objects and the shadows best-effort, and RECORDS the failures
+// rather than returning them -- a source that cannot be reached must not
+// stop the workflow being marked failed, or the next pass gives up the fence
+// and the lock again and the workflow never ends.
+//
+// The recording is the whole point. What is left behind pins WAL on the
+// source, and a replica identity left widened makes every UPDATE and DELETE
+// ship the whole old row to every subscriber. status.leaked is the only
+// place an operator learns either happened, and nothing asserted it was
+// written -- a status field written by one path and asserted by none is how
+// one silently stops being written.
+func TestAFailedPlacementRecordsWhatItCouldNotClean(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	cat := connect(t, dsn)
+	if err := catalog.Migrate(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	const id = "55555555-5555-5555-5555-555555555555"
+	mustExec(t, cat, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES ($1, $2, $3, '{}', '{}')`, id, KindTablePlacement, StateRunning)
+	wf := &placementWorkflow{id: id, state: StateRunning, stage: StagePlacementCopying,
+		spec:  placementSpec{Database: "postgres", SchemaName: "public", TableName: "ledger"},
+		st:    placementState{SourceSet: "default"},
+		from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
+		shape: rowShape{Schema: "public", Name: "ledger"}}
+
+	p := &Placer{Pool: pool, Shards: dialFails{}}
+	if err := p.fail(ctx, wf, errors.New("the move failed")); err != nil {
+		t.Fatalf("fail() returned %v; an unreachable source must not stop the workflow being marked failed", err)
+	}
+
+	state := queryOne[string](t, cat, `SELECT state FROM pgshard.workflows WHERE id = $1::uuid`, id)
+	if state != StateFailed {
+		t.Fatalf("the workflow is %q, want failed", state)
+	}
+	leaked := queryOne[string](t, cat, `SELECT coalesce(status->>'leaked', '') FROM pgshard.workflows WHERE id = $1::uuid`, id)
+	if leaked == "" {
+		t.Fatal("status.leaked is empty after a failure that could not reach its source: the replication objects it left pin WAL, and nothing tells the operator")
+	}
+	if !strings.Contains(leaked, "unreachable") {
+		t.Errorf("status.leaked = %q; it must name what went wrong, not merely that something did", leaked)
+	}
+}
