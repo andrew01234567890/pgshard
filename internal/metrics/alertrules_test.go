@@ -92,7 +92,7 @@ func registered(t *testing.T) map[string]bool {
 			add(f.GetName())
 		}
 	}
-	for _, set := range sets {
+	for _, set := range append(sets, processCollectors()) {
 		for _, c := range collectorsOf(set) {
 			descs := make(chan *prometheus.Desc, 64)
 			go func() { c.Describe(descs); close(descs) }()
@@ -113,6 +113,9 @@ func registered(t *testing.T) map[string]bool {
 // Reflection rather than a list, because a list is one more thing to forget
 // when a metric is added -- which is the failure this whole file is about.
 func collectorsOf(set any) []prometheus.Collector {
+	if cs, ok := set.([]prometheus.Collector); ok {
+		return cs
+	}
 	v := reflect.ValueOf(set)
 	for v.Kind() == reflect.Pointer {
 		v = v.Elem()

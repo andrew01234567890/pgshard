@@ -1,6 +1,7 @@
 package grpccreds_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -10,13 +11,18 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -170,6 +176,11 @@ func newTestCA(t *testing.T) *testCA {
 
 func (c *testCA) issue(t *testing.T, cn string, serial int64) (certPEM, keyPEM []byte) {
 	t.Helper()
+	return c.issueUntil(t, cn, serial, time.Now().Add(time.Hour))
+}
+
+func (c *testCA) issueUntil(t *testing.T, cn string, serial int64, notAfter time.Time) (certPEM, keyPEM []byte) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +189,7 @@ func (c *testCA) issue(t *testing.T, cn string, serial int64) (certPEM, keyPEM [
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:     []string{"localhost"},
@@ -608,4 +619,147 @@ func TestAListenerAcceptingPlaintextDropsAConnectionThatSendsNothing(t *testing.
 	if err := call(t, ln.Addr().String(), insecure.NewCredentials()); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("the listener stopped serving after dropping a silent connection: %v", err)
 	}
+}
+
+// TestARenewalThatCannotBeUsedIsReportedOnce (PGS-847): a renewal that
+// cannot be used keeps the last good material, and did so silently until
+// the certificate in use expired. It is logged and counted once per distinct
+// failure however many handshakes read it, and the expiry of the certificate
+// in use is exported so an alert can fire before it.
+func TestARenewalThatCannotBeUsedIsReportedOnce(t *testing.T) {
+	var logs syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dir := t.TempDir()
+	ca := newTestCA(t)
+	firstExpiry := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	srvCert, srvKey := ca.issueUntil(t, "server", 10, firstExpiry)
+	cliCert, cliKey := ca.issue(t, "client", 20)
+	certFile := writeFile(t, dir, "tls.crt", srvCert)
+	keyFile := writeFile(t, dir, "tls.key", srvKey)
+	caFile := writeFile(t, dir, "ca.crt", ca.pem)
+	creds, err := grpccreds.Listener(certFile, keyFile, caFile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same files dialled with as well, which is what the controller
+	// does: two loads of one file must still gather as one series.
+	if _, err := grpccreds.Dialer(certFile, keyFile, caFile, "", false); err != nil {
+		t.Fatal(err)
+	}
+	addr := serve(t, creds)
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(grpccreds.Collector())
+	metric := func(name string) float64 {
+		t.Helper()
+		families, err := reg.Gather()
+		if err != nil {
+			t.Fatalf("gather: %v", err)
+		}
+		for _, f := range families {
+			if f.GetName() != name {
+				continue
+			}
+			for _, m := range f.GetMetric() {
+				for _, l := range m.GetLabel() {
+					if l.GetName() == "cert_file" && l.GetValue() == certFile {
+						if f.GetType() == dto.MetricType_COUNTER {
+							return m.GetCounter().GetValue()
+						}
+						return m.GetGauge().GetValue()
+					}
+				}
+			}
+		}
+		t.Fatalf("no %s for %s", name, certFile)
+		return 0
+	}
+	handshake := func(want int64) {
+		t.Helper()
+		if serial, err := serverSerial(t, addr, ca.pem, cliCert, cliKey); err != nil || serial != want {
+			t.Fatalf("serial %d, %v; want %d", serial, err, want)
+		}
+	}
+	if got := metric("pgshard_tls_certificate_not_after_seconds"); got != float64(firstExpiry.Unix()) {
+		t.Fatalf("expiry exported as %v, want %d", got, firstExpiry.Unix())
+	}
+
+	writeFile(t, dir, "tls.crt", []byte("not a certificate"))
+	for range 3 {
+		handshake(10)
+	}
+	if got := metric("pgshard_tls_material_reload_failures_total"); got != 1 {
+		t.Fatalf("one unusable renewal read by three handshakes counted %v times", got)
+	}
+	reported := 0
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "could not be reloaded") && strings.Contains(line, certFile) {
+			reported++
+		}
+	}
+	if n := reported; n != 1 {
+		t.Fatalf("one unusable renewal logged %d times:\n%s", n, logs.String())
+	}
+
+	// A read that lands in the middle of a swap -- a certificate without its
+	// key -- heals at the next read and is not a failure worth an alert.
+	writeFile(t, dir, "tls.crt", srvCert)
+	halfCert, halfKey := ca.issueUntil(t, "server", 13, firstExpiry)
+	writeFile(t, dir, "tls.crt", halfCert)
+	handshake(10)
+	writeFile(t, dir, "tls.key", halfKey)
+	handshake(13)
+	if got := metric("pgshard_tls_material_reload_failures_total"); got != 1 {
+		t.Fatalf("a swap caught half way and healed by the next read: counted %v, want still 1", got)
+	}
+
+	// A different unusable renewal is another failure, noticed by the
+	// scrape itself with no connection being made.
+	otherCert, _ := ca.issue(t, "server", 12)
+	writeFile(t, dir, "tls.crt", otherCert)
+	metric("pgshard_tls_material_reload_failures_total")
+	if got := metric("pgshard_tls_material_reload_failures_total"); got != 2 {
+		t.Fatalf("a second, different unusable renewal read by two scrapes: counted %v, want 2", got)
+	}
+
+	// So is a file that cannot be read -- once, however often it is tried.
+	if err := os.Remove(filepath.Join(dir, "tls.key")); err != nil {
+		t.Fatal(err)
+	}
+	handshake(13)
+	handshake(13)
+	if got := metric("pgshard_tls_material_reload_failures_total"); got != 3 {
+		t.Fatalf("an unreadable key tried repeatedly: counted %v, want 3", got)
+	}
+
+	// A usable one takes over, and the exported expiry follows it.
+	renewedExpiry := firstExpiry.Add(90 * 24 * time.Hour)
+	renewedCert, renewedKey := ca.issueUntil(t, "server", 11, renewedExpiry)
+	writeFile(t, dir, "tls.key", renewedKey)
+	writeFile(t, dir, "tls.crt", renewedCert)
+	handshake(11)
+	if got := metric("pgshard_tls_certificate_not_after_seconds"); got != float64(renewedExpiry.Unix()) {
+		t.Fatalf("expiry after renewal exported as %v, want %d", got, renewedExpiry.Unix())
+	}
+}
+
+// syncBuffer is a bytes.Buffer a logger can write from a handshake's
+// goroutine while the test reads it.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

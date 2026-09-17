@@ -14,13 +14,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/andrew01234567890/pgshard/internal/buildinfo"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 )
 
-// NewRegistry returns a registry preloaded with the Go runtime and process
-// collectors and a pgshard_build_info gauge identifying process.
+// processCollectors are registered on every process's registry.
+func processCollectors() []prometheus.Collector {
+	return []prometheus.Collector{collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), grpccreds.Collector()}
+}
+
+// NewRegistry returns a registry preloaded with the Go runtime, process and
+// internal TLS collectors and a pgshard_build_info gauge identifying process.
 func NewRegistry(process string) *prometheus.Registry {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(processCollectors()...)
 	info := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "pgshard_build_info",
 		Help: "Build metadata; the value is always 1.",
