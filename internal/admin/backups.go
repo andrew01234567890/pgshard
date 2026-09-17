@@ -13,6 +13,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/controller"
+	"github.com/andrew01234567890/pgshard/internal/operator"
 )
 
 // PolicySummary is a backup policy as the UI shows it: store location and
@@ -80,6 +81,14 @@ type RestorePoint struct {
 	// CatalogSuperseded: the catalog was rebuilt by a major upgrade since,
 	// so a restore to this point is refused.
 	CatalogSuperseded bool `json:"catalogSuperseded,omitempty"`
+	// CatalogUnidentified: the manifest does not say WHICH catalog system
+	// its restore point belongs to, and this cluster's catalog has been
+	// rebuilt since. The restore gate refuses that combination too, for the
+	// same reason -- the point is in the old catalog's repository -- but
+	// ListBarriers cannot tell: it runs against the catalog, and the
+	// catalog generation is in the cluster's status. The page can, because
+	// it reads both (PGS-946).
+	CatalogUnidentified bool `json:"catalogUnidentified,omitempty"`
 }
 
 // GroupRestore is one group's progress inside a restore.
@@ -199,11 +208,12 @@ func BuildBackupsPage(ctx context.Context, c client.Reader, src CatalogSource, n
 		if err != nil {
 			page.RestorePointError = err.Error()
 		}
-		for _, rp := range points {
+		converted := ConvertRestorePoints(points, catalogRebuilt(clusters.Items))
+		for _, rp := range converted {
 			if len(page.RestorePoints) == RestorePointsLimit {
 				break
 			}
-			page.RestorePoints = append(page.RestorePoints, convertRestorePoint(rp))
+			page.RestorePoints = append(page.RestorePoints, rp)
 		}
 	}
 	return page, nil
@@ -397,6 +407,56 @@ func describeTarget(t pgshardv1alpha1.RestoreTarget) (kind, value string) {
 		return "immediate", ""
 	}
 	return "latest", ""
+}
+
+// ConvertRestorePoints renders restore points for the page and the API,
+// marking those a restore would refuse.
+//
+// Shared so the two cannot disagree. CatalogSuperseded reaches both already,
+// because the controller computes it and it travels on the point; this flag
+// does not -- it needs the cluster, which only these two callers have. The
+// page had that and the API did not, so the API would have reported a
+// barrier the UI calls not restorable as fine.
+//
+// rebuilt says the cluster's catalog has been replaced by a major upgrade,
+// which the CONTROLLER cannot know -- it reads the catalog, and the catalog
+// generation lives in the cluster's status.
+func ConvertRestorePoints(points []controller.RestorePoint, rebuilt bool) []RestorePoint {
+	out := make([]RestorePoint, 0, len(points))
+	for _, rp := range points {
+		p := convertRestorePoint(rp)
+		if rebuilt && !p.CatalogSuperseded && catalogUnidentified(rp) {
+			p.CatalogUnidentified = true
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// catalogRebuilt reports a catalog replaced by a major upgrade, and only
+// when ONE cluster is in scope: the restore points come from the single
+// catalog this admin reads, so with several clusters listed there is no
+// telling whose generation applies, and marking a barrier not restorable on
+// the wrong cluster's account is worse than not marking it.
+func catalogRebuilt(clusters []pgshardv1alpha1.PgShardCluster) bool {
+	return len(clusters) == 1 && operator.CatalogGeneration(&clusters[0]) > 1
+}
+
+// catalogUnidentified reports a manifest that recorded no system identifier
+// for the catalog -- one written before they were recorded. It says nothing
+// about which catalog system the point belongs to, so on a cluster whose
+// catalog has been rebuilt it cannot be trusted.
+//
+// A point with no catalog group at all is not this: it is covered by the
+// gate's "has no restore point on group(s) catalog" refusal, which the
+// listing shows as the group simply being absent.
+func catalogUnidentified(rp controller.RestorePoint) bool {
+	for _, g := range rp.Groups {
+		if g.Group == controller.CatalogGroup {
+			return g.SystemIdentifier == ""
+		}
+	}
+	return false
 }
 
 func convertRestorePoint(rp controller.RestorePoint) RestorePoint {

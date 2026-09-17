@@ -244,3 +244,56 @@ func TestABarrierFromBeforeACatalogUpgradeIsShownAsNotRestorable(t *testing.T) {
 		t.Fatalf("restore points: %+v", points)
 	}
 }
+
+// TestABarrierWithNoCatalogIdentityIsFlaggedOnceTheCatalogWasRebuilt
+// (PGS-946): a manifest written before catalog identifiers were recorded
+// says nothing about which catalog system its restore point belongs to. The
+// restore gate refuses it on a cluster past catalog generation 1, for the
+// same reason it refuses a superseded one -- the point is in the old
+// catalog's repository. ListBarriers cannot tell, because the catalog
+// generation is in the cluster's STATUS; this page reads both, so it can.
+func TestABarrierWithNoCatalogIdentityIsFlaggedOnceTheCatalogWasRebuilt(t *testing.T) {
+	unidentified := controller.RestorePoint{Name: "no-identity", CreatedAt: time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC),
+		Groups: []controller.GroupRestorePoint{{Group: controller.CatalogGroup, LSN: 1}}}
+	identified := controller.RestorePoint{Name: "identified", CreatedAt: time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC),
+		Groups: []controller.GroupRestorePoint{{Group: controller.CatalogGroup, LSN: 2, SystemIdentifier: "7300000000000000001"}}}
+	src := fakeCatalog{points: []controller.RestorePoint{unidentified, identified}}
+	marker := "not restorable: taken before the catalog was identified"
+
+	// Generation 1: the catalog has never been rebuilt, so an unidentified
+	// manifest is trustworthy and must NOT be flagged.
+	s, _ := newTestServer(t, src, populated()...)
+	if body := get(t, s, "/backups").Body.String(); strings.Contains(body, marker) {
+		t.Fatalf("flagged on a cluster whose catalog was never rebuilt:\n%s", body)
+	}
+
+	// Generation 2: it cannot be trusted, and the gate refuses it.
+	objs := populated()
+	for _, o := range objs {
+		if pc, ok := o.(*pgshardv1alpha1.PgShardCluster); ok {
+			pc.Status.CatalogGeneration = 2
+		}
+	}
+	s, _ = newTestServer(t, src, objs...)
+	body := get(t, s, "/backups").Body.String()
+	if strings.Count(body, marker) != 1 {
+		t.Fatalf("want exactly the unidentified barrier flagged:\n%s", body)
+	}
+	at, un, id := strings.Index(body, marker), strings.Index(body, "no-identity"), strings.Index(body, "identified")
+	if at < un {
+		t.Fatalf("the marker is not on the unidentified barrier (marker %d, barrier %d)", at, un)
+	}
+	_ = id
+
+	var points []RestorePoint
+	if err := json.Unmarshal(get(t, s, "/api/v1/restore-points").Body.Bytes(), &points); err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 2 || !points[0].CatalogUnidentified || points[1].CatalogUnidentified {
+		t.Fatalf("restore points: %+v", points)
+	}
+	// It is a different fact from CatalogSuperseded, and must not borrow it.
+	if points[0].CatalogSuperseded {
+		t.Error("an unidentified manifest was reported as superseded; only the controller can say that")
+	}
+}

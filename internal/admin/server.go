@@ -18,6 +18,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
@@ -351,9 +353,15 @@ func (s *Server) handleAPIRestorePoints(w http.ResponseWriter, r *http.Request) 
 			s.fail(w, err)
 			return
 		}
-		for _, rp := range points {
-			out = append(out, convertRestorePoint(rp))
+		// The cluster, for the same marking the page does: this flag cannot
+		// be computed from the catalog alone, so without it the JSON would
+		// report a barrier the UI calls not restorable as fine (PGS-946).
+		var clusters pgshardv1alpha1.PgShardClusterList
+		if err := s.Client.List(r.Context(), &clusters, client.InNamespace(s.Namespace)); err != nil {
+			s.fail(w, err)
+			return
 		}
+		out = ConvertRestorePoints(points, catalogRebuilt(onlyCluster(clusters.Items, s.Cluster)))
 	}
 	writeJSON(w, out)
 }
