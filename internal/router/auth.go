@@ -67,11 +67,18 @@ func MockAuthNonce(ctx context.Context, q catalog.Querier) ([]byte, error) {
 // DefaultRolesStaleFor is how long past the ttl a router keeps serving the
 // roles it last read while it cannot read them again.
 //
-// A revocation is written to the catalog, so one cannot be issued through a
-// catalog this router cannot reach either; what the window really covers is
-// a partition that reaches the catalog but not this router, and there it
-// buys the same time the sessions already open have anyway.
-const DefaultRolesStaleFor = time.Minute
+// Sized to the outage it covers, not to a round number: the catalog gap
+// measured during a move to issued TLS was about eleven seconds (PGS-926),
+// and this is roughly three times that. Longer would buy no more
+// availability and would widen the one cost below.
+//
+// That cost is a revocation honoured late. It is bounded and narrow: a
+// revocation is written to the catalog, so one cannot even be issued
+// through a catalog this router cannot reach; it applies to NEW connections
+// only, since open sessions are not re-authenticated; and what the window
+// really covers is a partition that reaches the catalog but not this
+// router, where it buys the same time those open sessions have anyway.
+const DefaultRolesStaleFor = 30 * time.Second
 
 // NewRoleCache builds a cache over q; ttl <= 0 means 5s.
 func NewRoleCache(q catalog.Querier, ttl time.Duration) *RoleCache {

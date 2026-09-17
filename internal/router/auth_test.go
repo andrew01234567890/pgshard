@@ -150,7 +150,10 @@ func TestRoleCacheReloadsOnMissAndTTL(t *testing.T) {
 	// right credentials that they were wrong, and 28P01 is final to every
 	// driver there is.
 	q.err = errors.New("catalog down")
-	now = now.Add(2 * time.Minute)
+	// Inside the window, expressed against the window itself: the size is
+	// tuned to the outage it covers (PGS-926), and a hard-coded advance
+	// here turns tuning it into a test failure that says nothing.
+	now = now.Add(c.ttl + c.staleFor/2)
 	if v, err := c.Lookup(ctx, "alice"); err != nil || v != "v3" {
 		t.Fatalf("through a catalog outage the roles last read must still serve: %q %v", v, err)
 	}
