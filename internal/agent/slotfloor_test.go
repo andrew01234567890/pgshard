@@ -31,12 +31,35 @@ func TestSlotRetentionHasAFloorWithoutTuning(t *testing.T) {
 		t.Fatalf("an untuned cluster retains WAL without bound: max_slot_wal_keep_size = %q", got)
 	}
 
-	// A derived value wins: the floor must not override tuning, which knows
-	// the disk size and this does not.
-	tuned := renderPostgresqlConf(&Config{Port: 5432,
-		Postgres: PostgresSettings{Parameters: map[string]string{"max_slot_wal_keep_size": "64GB"}}}, false, false)
-	if got := setting(tuned, "max_slot_wal_keep_size"); got != "64GB" {
-		t.Fatalf("the floor overrode a derived value: %q", got)
+	// A derived value still wins, and this is the mechanism. pgtune's
+	// settings do NOT arrive as parameters: the operator writes them to the
+	// override file, which this file includes LAST, so whatever it names
+	// beats the floor above.
+	//
+	// This used to be asserted by passing the derived value in as a
+	// parameter -- a path the operator never takes. It sends only
+	// spec.postgresql.parameters that way, and a user override of this key
+	// is now refused, because it is on pgtune's unsafe list precisely for
+	// being derived from the disk size (PGS-833).
+	floorAt, includeAt := -1, -1
+	for i, line := range strings.Split(bare, "\n") {
+		switch {
+		case strings.HasPrefix(line, "max_slot_wal_keep_size = "):
+			floorAt = i
+		case strings.HasPrefix(line, "include_if_exists = '"+overrideConf+"'"):
+			includeAt = i
+		}
+	}
+	if floorAt < 0 || includeAt < 0 {
+		t.Fatalf("expected both the floor and the override include: floor=%d include=%d", floorAt, includeAt)
+	}
+	if includeAt < floorAt {
+		t.Fatal("the override file is included before the floor, so the floor would override the derived value")
+	}
+	if got := setting(renderPostgresqlConf(&Config{Port: 5432,
+		Postgres: PostgresSettings{Parameters: map[string]string{"max_slot_wal_keep_size": "64GB"}}}, false, false),
+		"max_slot_wal_keep_size"); got != "20GB" {
+		t.Fatalf("a user override of a derived key reached postgresql.conf: %q", got)
 	}
 
 	// idle_replication_slot_timeout is deliberately NOT floored: it
