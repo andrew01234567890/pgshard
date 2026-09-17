@@ -1874,57 +1874,147 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 	// pause fails their apply with 25006 until someone lifts it by hand, so
 	// that rollback can never finish (PGS-837). Its own Complete pauses the
 	// set when it ends.
-	others, err := o.otherReplicationInto(ctx, set, ids)
-	if err != nil || others > 0 {
-		o.c.logger().Info("reshard complete: retired set left writable, another workflow may still replicate into it",
-			"workflow", o.wf.id, "set", set, "subscriptions", others, "err", err)
+	// Per primary, because the answer is per primary. Asking for the whole
+	// set meant one primary nobody could reach left every other primary
+	// writable too, including the ones that were asked and had nothing on
+	// them (PGS-846).
+	blocked, err := o.liveReplicationInto(ctx, set, ids)
+	if err != nil {
+		o.c.logger().Info("reshard complete: retired set left writable, its replication could not be read",
+			"workflow", o.wf.id, "set", set, "err", err)
+		return nil
+	}
+	pause := make([]int32, 0, len(ids))
+	held := make([]int32, 0)
+	for _, s := range ids {
+		if blocked[s] {
+			held = append(held, s)
+			continue
+		}
+		pause = append(pause, s)
+	}
+	if len(held) > 0 {
+		o.c.logger().Info("reshard complete: part of the retired set left writable, another workflow may still replicate into it",
+			"workflow", o.wf.id, "set", set, "writable", held, "paused", pause)
+	}
+	if len(pause) == 0 {
 		return nil
 	}
 	// Best effort, and last: a set that cannot be reached is already
 	// beyond reach of a client too, and a retirement that has otherwise
 	// finished must not be undone by it.
 	//
-	// Unclaimed, and any claim on the set is abandoned first. This pause is
-	// permanent and belongs to nobody; WritePauseSweep lifts claimed pauses
-	// whose workflow is gone or finished, and this workflow is about to be
-	// both.
+	// Unclaimed, and any claim on the set is abandoned first -- on the whole
+	// set, not just what is paused here: this workflow is ending, so every
+	// claim it holds is stale whether or not this pauses that primary. The
+	// pause itself is permanent and belongs to nobody; WritePauseSweep lifts
+	// claimed pauses whose workflow is gone or finished, and this workflow is
+	// about to be both.
 	if err := o.abandonPauseClaim(ctx, set, ids); err != nil {
 		o.c.logger().Info("reshard complete: a stale write-pause claim could not be cleared; the sweep may lift the retirement pause",
 			"workflow", o.wf.id, "set", set, "err", err)
 	}
-	if err := o.pauseSet(ctx, set, ids, true); err != nil {
+	if err := o.pauseSet(ctx, set, pause, true); err != nil {
 		o.c.logger().Info("reshard complete: retired set not made read-only", "workflow", o.wf.id, "set", set, "err", err)
 	}
 	return nil
 }
 
-// otherReplicationInto counts the reverse subscriptions on a set's
-// primaries that belong to another generation than this run's -- another
-// workflow's way back into the set. Forward subscriptions are left out: they
-// apply INTO the set only while it is a target, never once it is retired,
-// and a later workflow's frozen ones must not keep a retired set writable.
-// pg_subscription is shared by every database of a server, so one query per
-// primary sees them all.
-func (o *pgCutover) otherReplicationInto(ctx context.Context, set string, ids []int32) (int64, error) {
-	var total int64
+// liveReplicationInto reports, per primary of set, whether another workflow
+// that has NOT finished still has a way back into it: a reverse subscription
+// of a generation other than this run's.
+//
+// Forward subscriptions are left out: they apply INTO the set only while it
+// is a target, never once it is retired, and a later workflow's frozen ones
+// must not keep a retired set writable. pg_subscription is shared by every
+// database of a server, so one query per primary sees them all.
+//
+// Per primary, and a primary that cannot be asked blocks only itself. It used
+// to abort the whole scan, so one unreachable primary left every other
+// primary writable -- and a retired primary that stays writable acknowledges
+// writes nothing will read again. Refusing what can be refused beats refusing
+// nothing, which is the same reasoning pauseSet is already best-effort for.
+//
+// Narrowed to generations whose workflow has not finished. A completed,
+// failed or cancelled workflow's leftover reverse subscriptions are nobody's
+// way back -- they are what an unreachable source kept when the rest was torn
+// down -- and this tail runs once, so counting them left the set writable for
+// good.
+//
+// pg_subscription stays the source of truth and the catalog only says which
+// generations are still live. Deciding from the catalog alone would let two
+// tails each conclude the other's subscriptions were already gone.
+//
+// NOT narrowed to enabled subscriptions: the other workflow's reverse
+// subscriptions are disabled between its flip and its swap, which is exactly
+// when the abandon that brings a workflow here fires.
+func (o *pgCutover) liveReplicationInto(ctx context.Context, set string, ids []int32) (map[int32]bool, error) {
+	blocked := map[int32]bool{}
+	gens := map[int32][]int64{}
+	var all []int64
 	for _, s := range ids {
 		conn, err := o.c.Shards.Dial(ctx, set, s)
 		if err != nil {
-			return 0, err
+			o.c.logger().Info("reshard complete: a retired primary could not be asked about other workflows' replication; leaving it writable",
+				"workflow", o.wf.id, "set", set, "shard", s, "err", err)
+			blocked[s] = true
+			continue
 		}
-		rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_subscription WHERE subname LIKE 'pgshard\_reshard\_g%\_rev\_s%' AND subname NOT LIKE $1`,
+		rows, err := conn.Query(ctx, `SELECT DISTINCT (regexp_match(subname, '^pgshard_reshard_g(\d+)_rev_s'))[1]::bigint
+			FROM pg_subscription WHERE subname LIKE 'pgshard\_reshard\_g%\_rev\_s%' AND subname NOT LIKE $1`,
 			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_%%", o.wf.gen))
-		var n int64
+		var found []int64
 		if err == nil {
-			n, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
+			found, err = pgx.CollectRows(rows, pgx.RowTo[int64])
 		}
 		_ = conn.Close(ctx)
 		if err != nil {
-			return 0, err
+			o.c.logger().Info("reshard complete: a retired primary's replication could not be read; leaving it writable",
+				"workflow", o.wf.id, "set", set, "shard", s, "err", err)
+			blocked[s] = true
+			continue
 		}
-		total += n
+		gens[s] = found
+		all = append(all, found...)
 	}
-	return total, nil
+	if len(all) == 0 {
+		return blocked, nil
+	}
+	live, err := o.liveGenerations(ctx, all)
+	if err != nil {
+		return nil, err
+	}
+	for s, found := range gens {
+		for _, g := range found {
+			if live[g] {
+				blocked[s] = true
+				break
+			}
+		}
+	}
+	return blocked, nil
+}
+
+// liveGenerations reports which of gens belong to a copy workflow that has
+// not reached a terminal state. A generation with no workflow row at all is
+// not live: the run is gone and what it left behind is litter, not a claim.
+func (o *pgCutover) liveGenerations(ctx context.Context, gens []int64) (map[int64]bool, error) {
+	rows, err := o.c.Pool.Query(ctx, `SELECT DISTINCT s.generation
+		FROM pgshard.shard_sets s JOIN pgshard.workflows w ON w.spec->>'shard_set' = s.shard_set
+		WHERE s.generation = ANY($1) AND w.kind = ANY($2) AND NOT (w.state = ANY($3))`,
+		gens, copyKinds, []string{StateCompleted, StateFailed, StateCancelled})
+	if err != nil {
+		return nil, err
+	}
+	found, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[int64]bool, len(found))
+	for _, g := range found {
+		live[g] = true
+	}
+	return live, nil
 }
 
 // setIsServing reports whether a shard set is the one routing goes to.
