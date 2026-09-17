@@ -2328,3 +2328,50 @@ func TestRetirementDropsTheOldTableThroughAWritePause(t *testing.T) {
 	// The shard is still paused: only this session wrote through it.
 	waitReadOnly(t, dsn, true)
 }
+
+// TestRetiringGivesUpItsLockRatherThanQueueing (PGS-943): retirement writes
+// through a retired set's write pause, so its backend is counted as a
+// writer by any barrier running at the same time. Queued unboundedly on the
+// old table's AccessExclusiveLock behind a long reader, it holds an open
+// transaction for as long as that reader lasts -- and a barrier taken
+// meanwhile waits on it until DrainTimeout and fails.
+//
+// Retirement is re-driven by the next pass, so giving up costs a pass. A
+// lost barrier costs the operator the restore point they were taking, and
+// the cause would be nowhere near the symptom.
+func TestRetiringGivesUpItsLockRatherThanQueueing(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	admin := connect(t, dsn)
+	mustExec(t, admin, `CREATE TABLE ledger__pgshard_old (id int PRIMARY KEY, v text)`)
+	mustExec(t, admin, `COMMENT ON TABLE ledger__pgshard_old IS 'pgshard:placement:77777777-7777-7777-7777-777777777777'`)
+
+	// A reader that outlasts every try, on its own connection.
+	tx, err := connect(t, dsn).Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT count(*) FROM ledger__pgshard_old`); err != nil {
+		t.Fatal(err)
+	}
+
+	conn := pgxShardConn{connect(t, dsn)}
+	started := time.Now()
+	_, derr := dropArtifactTable(ctx, conn, "public", "ledger__pgshard_old", "pgshard:placement:77777777-7777-7777-7777-777777777777")
+	waited := time.Since(started)
+
+	var pgErr *pgconn.PgError
+	if !errors.As(derr, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("the drop answered %v, want a 55P03 lock timeout: unbounded, it holds an open transaction for as long as the reader runs and fails any barrier drained meanwhile", derr)
+	}
+	if waited > 4*artifactDropLockWait {
+		t.Errorf("the drop waited %s for its lock, bound is %s: it is not giving up", waited, artifactDropLockWait)
+	}
+	// The reader was never blocked by it, which is the other half: a
+	// request queued on AccessExclusive also queues every later reader.
+	if _, err := tx.Exec(ctx, `SELECT count(*) FROM ledger__pgshard_old`); err != nil {
+		t.Fatalf("the reader was disturbed by the drop's wait: %v", err)
+	}
+}
