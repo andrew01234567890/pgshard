@@ -262,3 +262,54 @@ func TestAPartitionedParentIndexIsNotWreckage(t *testing.T) {
 		t.Error("the partitioned parent index is gone")
 	}
 }
+
+// TestAFailedIndexBuildDropsTheWreckageOnItsOwnTable (PGS-941): two invalid
+// indexes can share a name -- one per table -- and the cleanup picked between
+// them by SEARCH PATH POSITION. A failed build on a table in a later schema
+// had the earlier schema's invalid index dropped instead, so its own wreckage
+// survived and the retry failed 42P07 on it. PGS-890 stopped this destroying
+// a VALID index; the invalid one it still got wrong.
+//
+// Against real PostgreSQL because the bug IS which row the catalog scan
+// returns.
+func TestAFailedIndexBuildDropsTheWreckageOnItsOwnTable(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	raw := connect(t, startPostgres(t))
+	conn := pgxShardConn{raw}
+	mustExec(t, raw, `CREATE SCHEMA app`)
+	mustExec(t, raw, `SET search_path = app, public`)
+	// Wreckage of someone else's failed build, EARLIER on the path.
+	mustExec(t, raw, `CREATE TABLE app.dup (y int)`)
+	mustExec(t, raw, `INSERT INTO app.dup VALUES (1), (1)`)
+	if _, err := raw.Exec(ctx, `CREATE UNIQUE INDEX CONCURRENTLY idx ON app.dup (y)`); err == nil {
+		t.Fatal("the unique build over duplicate rows was expected to fail")
+	}
+	// Our own failed build, on a table LATER on the path.
+	mustExec(t, raw, `CREATE TABLE public.t (x int)`)
+	mustExec(t, raw, `INSERT INTO public.t VALUES (1), (1)`)
+	if _, err := raw.Exec(ctx, `CREATE UNIQUE INDEX CONCURRENTLY idx ON public.t (x)`); err == nil {
+		t.Fatal("the unique build over duplicate rows was expected to fail")
+	}
+	invalid := func(schema string) int64 {
+		return queryOne[int64](t, raw, `SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = 'idx' AND NOT i.indisvalid`, schema)
+	}
+	if invalid("app") != 1 || invalid("public") != 1 {
+		t.Fatalf("the premise is one invalid idx in each schema; app=%d public=%d", invalid("app"), invalid("public"))
+	}
+
+	// The statement named the table unqualified, as a client on this path
+	// would, so the object carries the table and no schema.
+	dropped, err := dropInvalidIndex(ctx, conn, catalog.MigrationObject{Kind: "relation", Name: "idx", Table: "t"})
+	if err != nil || !dropped {
+		t.Fatalf("dropInvalidIndex = %v, %v; want it to drop this build's wreckage", dropped, err)
+	}
+	if invalid("public") != 0 {
+		t.Error("the invalid public.idx -- this build's own wreckage -- survived; the retry will fail 42P07 on it")
+	}
+	if invalid("app") != 1 {
+		t.Error("the invalid app.idx on another table was dropped; it was picked by path position, not by table")
+	}
+}
