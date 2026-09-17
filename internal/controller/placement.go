@@ -186,6 +186,16 @@ type Placer struct {
 	DropOldAfter time.Duration
 	// CopyBatch is the keyset page of the initial copy.
 	CopyBatch int
+	// IdentityRestoreAttempts, IdentityLockWait and IdentityRetryPause bound
+	// putting a source's replica identity back when a placement is torn
+	// down. The teardown does this once per source while it holds the
+	// workflow's claim, so the whole fail path is N sources x attempts x
+	// (wait + pause) -- inside the owner lease today, but the constants said
+	// nothing about that and a test of the retry had to sit through it.
+	// Zero means the defaults.
+	IdentityRestoreAttempts int
+	IdentityLockWait        time.Duration
+	IdentityRetryPause      time.Duration
 	// Now overrides the clock in tests.
 	Now func() time.Time
 }

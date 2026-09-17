@@ -1987,7 +1987,13 @@ func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
 		st:    placementState{SourceSet: "default", ReplicaIdentityFull: []int32{0}},
 		from:  &placementRouter{placement: TablePlacement{Placement: "unsharded"}, home: 0},
 		shape: rowShape{Schema: "public", Name: "ledger"}}
-	p := &Placer{Shards: realShards{dsn}}
+	// The defaults are 3 tries of a 5s lock wait a second apart, so this
+	// test used to sit through ~26s of them. The bounds are Placer fields
+	// (PGS-864), and what it asserts is the SHAPE of the retry, not the
+	// constants: a reader that ends part-way through is waited out, one that
+	// never ends is given up on, and new readers get through in between.
+	const lockWait, retryPause = time.Second, 250 * time.Millisecond
+	p := &Placer{Shards: realShards{dsn}, IdentityLockWait: lockWait, IdentityRetryPause: retryPause}
 	identity := func() string {
 		return queryOne[string](t, connect(t, dsn), `SELECT relreplident::text FROM pg_class WHERE oid = 'public.ledger'::regclass`)
 	}
@@ -2007,7 +2013,7 @@ func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
 		tx := holdLedger()
 		committed := make(chan error, 1)
 		go func() {
-			time.Sleep(replicaIdentityLockWait + replicaIdentityLockWait/2)
+			time.Sleep(lockWait + lockWait/2)
 			committed <- tx.Commit(ctx)
 		}()
 		if err := p.dropReplication(ctx, wf); err != nil {
@@ -2025,7 +2031,7 @@ func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
 	t.Run("a reader that outlasts every try", func(t *testing.T) {
 		tx := holdLedger()
 		defer func() { _ = tx.Rollback(ctx) }()
-		runCtx, cancel := context.WithTimeout(ctx, 6*replicaIdentityLockWait)
+		runCtx, cancel := context.WithTimeout(ctx, 6*lockWait)
 		defer cancel()
 		done := make(chan error, 1)
 		go func() { done <- p.dropReplication(runCtx, wf) }()
@@ -2039,7 +2045,7 @@ func TestPuttingBackTheReplicaIdentityWaitsBoundedlyForItsLock(t *testing.T) {
 			queued = queryOne[bool](t, watch, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'public.ledger'::regclass AND NOT granted)`)
 			time.Sleep(20 * time.Millisecond)
 		}
-		readCtx, cancelRead := context.WithTimeout(ctx, 2*replicaIdentityLockWait)
+		readCtx, cancelRead := context.WithTimeout(ctx, 2*lockWait)
 		defer cancelRead()
 		var n int64
 		if err := connect(t, dsn).QueryRow(readCtx, `SELECT count(*) FROM ledger`).Scan(&n); err != nil {
