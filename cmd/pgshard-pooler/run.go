@@ -64,6 +64,8 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	epoch := fs.Uint64("epoch", 0, "static primary epoch")
 	maxBackends := fs.Int("max-backends", 100, "backend budget for the shard")
 	maxPerRole := fs.Int("max-per-role", 0, "backend budget per role (0 = same as --max-backends)")
+	superuserRole := fs.String("superuser-role", "", "role whose backends are superuser connections and must not take the control plane's reserve")
+	maxPerSuperuser := fs.Int("max-per-superuser", 0, "backend budget for a superuser role (0 = the built-in default, below the reserve)")
 	maxLifetime := fs.Duration("backend-max-lifetime", time.Hour, "retire backends older than this")
 	maxIdle := fs.Duration("backend-max-idle", 10*time.Minute, "close backends idle longer than this")
 	reserveTimeout := fs.Duration("reserve-timeout", 5*time.Minute, "release a reserved session whose Execute stream has been gone this long")
@@ -175,7 +177,12 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	reg := metrics.NewRegistry("pooler")
 	var pm *metrics.Pooler
+	var superusers []string
+	if *superuserRole != "" {
+		superusers = []string{*superuserRole}
+	}
 	poolCfg := pooler.PoolConfig{MaxBackends: *maxBackends, MaxPerRole: *maxPerRole,
+		SuperuserRoles: superusers, MaxPerSuperuser: *maxPerSuperuser,
 		MaxLifetime: *maxLifetime, MaxIdleTime: *maxIdle}
 	var pool *pooler.Pool
 	pm = metrics.NewPooler(reg,

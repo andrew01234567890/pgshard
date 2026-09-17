@@ -74,7 +74,7 @@ const (
 	logicalDecodingBudget = 64 * MiB
 	walBuffers            = 16 * MiB
 	workMemFloor          = 1 * MiB
-	reservedConnections   = 8
+	reservedConnections   = ReservedConnections
 	minMemory             = 512 * MiB
 )
 
@@ -240,6 +240,15 @@ func connectionSettings(maxBackends int) Settings {
 		fmt.Sprintf("keep the %d connections above the pooler budget for the control plane, rather than the default 3", reservedConnections))
 	return s
 }
+
+// ReservedConnections is the headroom above the pooler's budget that
+// max_connections adds and superuser_reserved_connections then holds back,
+// for the control plane: the agent's probes, the operator, the resolver and
+// backups. Exported because a superuser client BYPASSES that reservation --
+// PostgreSQL does not hold a superuser back with it, nor with a role's
+// CONNECTION LIMIT -- so the pooler has to bound such backends itself, below
+// this number, and the two cannot be allowed to drift apart (PGS-830).
+const ReservedConnections = 8
 
 // Connections is what Derive sets without a memory budget: the connection
 // limit and the superuser reserve. Left to PostgreSQL's defaults (100, of

@@ -59,7 +59,12 @@ only for want of a connection slot (SQLSTATE 53300, "too many clients") is not
 unhealthy: `Status` reports it running with that error, and `/readyz` passes.
 The superuser reserve (`superuser_reserved_connections`) is shared by every
 superuser connection the control plane opens — agent, operator, controller,
-backups — so a busy but healthy primary can run out of it, and failing over
+backups — so a busy but healthy primary can run out of it. A client logged in
+through the router as the cluster superuser draws on that same reserve, since
+PostgreSQL exempts a superuser from the reservation; the pooler therefore caps
+one superuser role's backends below it (`--max-per-superuser`, see
+[pooler.md](pooler.md)) so client traffic cannot take it. A busy primary can
+still run out, and failing over
 from that server would fence it without freeing a slot. Nothing ends it
 automatically either: a primary that stays full for a minute turns the
 cluster's `PrimaryHealthy` condition to reason `ConnectionSlotsExhausted`

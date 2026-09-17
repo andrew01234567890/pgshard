@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/andrew01234567890/pgshard/internal/pgtune"
 )
 
 func TestPoolBudgetCapsBackends(t *testing.T) {
@@ -395,5 +397,56 @@ func TestABackendIsReleasedOnce(t *testing.T) {
 			}
 			p.Release(b2)
 		})
+	}
+}
+
+// TestASuperuserRoleIsCappedBelowTheReserve (PGS-830): a client can log in as
+// the cluster superuser, and PostgreSQL gives such a backend none of the
+// limits that hold everyone else back -- superuser_reserved_connections does
+// not apply to it, and nor does the role's CONNECTION LIMIT. So its pooled
+// backends could take the headroom the control plane depends on, which is the
+// PGS-819 exhaustion. The owner's decision was to cap them rather than refuse
+// the sessions, so the sessions must keep working.
+func TestASuperuserRoleIsCappedBelowTheReserve(t *testing.T) {
+	pg := newFakePG()
+	p := newPool(PoolConfig{MaxBackends: 8, MaxPerRole: 6, MaxPerSuperuser: 2,
+		SuperuserRoles: []string{"postgres"}, AcquireTimeout: 100 * time.Millisecond}, pg.dial)
+	ctx := context.Background()
+
+	// It works, twice: capped is not refused.
+	for i := 0; i < 2; i++ {
+		if _, err := p.Acquire(ctx, "db", "postgres", nil, nil); err != nil {
+			t.Fatalf("a superuser session must still work: %v", err)
+		}
+	}
+	if _, err := p.Acquire(ctx, "db", "postgres", nil, nil); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("the superuser took a third backend past its cap: %v", err)
+	}
+	// The cap is on the role, not on each of its databases -- otherwise a
+	// client could take the reserve one database at a time.
+	if _, err := p.Acquire(ctx, "other", "postgres", nil, nil); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("the superuser got its cap again in a second database: %v", err)
+	}
+	// An ordinary role keeps the larger per-role cap.
+	for i := 0; i < 4; i++ {
+		if _, err := p.Acquire(ctx, "db", "alice", nil, nil); err != nil {
+			t.Fatalf("an ordinary role was capped like a superuser: %v", err)
+		}
+	}
+}
+
+// TestTheSuperuserCapCannotExceedTheReserveItProtects: the default has to stay
+// below pgtune's reserve, because that reserve is the thing it exists to keep
+// free. Asserted rather than left to the comment on either constant -- they
+// live in different packages and nothing else ties them together.
+func TestTheSuperuserCapCannotExceedTheReserveItProtects(t *testing.T) {
+	if DefaultMaxPerSuperuser >= pgtune.ReservedConnections {
+		t.Fatalf("DefaultMaxPerSuperuser = %d, pgtune.ReservedConnections = %d: a superuser could take the whole reserve",
+			DefaultMaxPerSuperuser, pgtune.ReservedConnections)
+	}
+	// And a configured cap never exceeds the per-role budget, or it is not a cap.
+	got := PoolConfig{MaxBackends: 4, MaxPerRole: 3, MaxPerSuperuser: 99}.withDefaults()
+	if got.MaxPerSuperuser != 3 {
+		t.Fatalf("MaxPerSuperuser = %d, want it clamped to MaxPerRole", got.MaxPerSuperuser)
 	}
 }

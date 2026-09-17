@@ -64,6 +64,17 @@
   role so a hot role cannot starve others. When the shard budget is full of
   idle backends of other roles one is evicted. Backends retire after
   `--backend-max-lifetime` and `--backend-max-idle`.
+- **The superuser gets a smaller cap of its own.** `--superuser-role` names
+  the role whose backends are superuser connections (the operator passes the
+  cluster superuser), and `--max-per-superuser` caps them — 7 by default,
+  below the reserve of 8 that `superuser_reserved_connections` keeps for the
+  control plane. PostgreSQL applies neither that reservation nor the role's
+  `CONNECTION LIMIT` to a superuser, so this is the only thing standing
+  between a client logged in as the superuser and the headroom the agent, the
+  operator, the 2PC resolver and backups depend on. Such sessions are *not*
+  refused — they keep working, they simply cannot take the reserve. The
+  pooler has to be told which role it is: the catalog does not record
+  superuser-ness, because pgshard refuses to grant it.
 - **Fencing.** Every `Execute` message, every `Reserve` and every
   change-stream call (`Stream`, `StreamChanges`, `Ack`, `CopyTables`) carries
   `Generation{shard_map_generation, primary_epoch}`. A mismatch with the
