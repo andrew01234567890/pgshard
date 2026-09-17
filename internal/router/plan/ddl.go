@@ -642,7 +642,14 @@ func (w *walker) rename(s *pgquerypb.RenameStmt) error {
 		if err != nil {
 			return err
 		}
-		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRelationType()), Scope: scope})
+		// The parser leaves the relation type unset for these, which named
+		// every one of them ALTER ACCESS_METHOD. A table constraint is
+		// renamed through ALTER TABLE; the others have their own statement.
+		kind := "ALTER " + objectWord(s.GetRenameType())
+		if s.GetRenameType() == pgquerypb.ObjectType_OBJECT_TABCONSTRAINT {
+			kind = "ALTER TABLE"
+		}
+		return w.migration(Migration{Kind: kind, Scope: scope})
 	}
 	return w.unfannable("ALTER " + objectWord(s.GetRenameType()) + " RENAME")
 }
@@ -691,6 +698,10 @@ func objectWord(t pgquerypb.ObjectType) string {
 		return "SERVER"
 	case pgquerypb.ObjectType_OBJECT_FDW:
 		return "FOREIGN DATA WRAPPER"
+	case pgquerypb.ObjectType_OBJECT_MATVIEW:
+		return "MATERIALIZED VIEW"
+	case pgquerypb.ObjectType_OBJECT_FOREIGN_TABLE:
+		return "FOREIGN TABLE"
 	}
 	return strings.TrimPrefix(t.String(), "OBJECT_")
 }
