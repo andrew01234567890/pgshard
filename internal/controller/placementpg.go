@@ -1106,6 +1106,17 @@ func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker
 		return false, err
 	}
 	defer func() { _, _ = conn.Exec(ctx, "ROLLBACK") }()
+	// Bounded, because waiting here is not free to anyone else. A retiring
+	// set's teardown writes through the write pause, so this backend counts
+	// as a writer to a barrier's drain (barrier.go, WritersSince): queued on
+	// AccessExclusive behind a long reader it holds an open transaction, and
+	// a barrier taken meanwhile waits on it until DrainTimeout and FAILS --
+	// the barrier, not the retirement. Retirement is re-driven by the next
+	// pass, so giving up costs a pass; a lost barrier costs the operator the
+	// restore point they were taking (PGS-943).
+	if _, err := conn.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", artifactDropLockWait.Milliseconds())); err != nil {
+		return false, err
+	}
 	qual := QuoteIdent(schema) + "." + QuoteIdent(name)
 	if _, err := conn.Exec(ctx, "LOCK TABLE "+qual+" IN ACCESS EXCLUSIVE MODE"); err != nil {
 		return false, err
@@ -2969,6 +2980,13 @@ func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflo
 // transaction would stall the user's reads for as long as that runs.
 const replicaIdentityLockWait = 5 * time.Second
 
+// artifactDropLockWait bounds how long retirement and shadow teardown wait
+// for the AccessExclusiveLock they need. Same reasoning as the one above,
+// plus one more: these run while the set is paused and write through that
+// pause, so a request queued here is counted as a writer by any barrier
+// running at the same time.
+const artifactDropLockWait = 5 * time.Second
+
 // setReplicaIdentity sets a table's replica identity with a bounded lock
 // wait, trying again after a lock timeout up to attempts times in all.
 func setReplicaIdentity(ctx context.Context, conn ShardConn, table, identity string, attempts int) error {
@@ -3074,7 +3092,8 @@ func renameShadowIndexes(ctx context.Context, conn ShardConn, wf *placementWorkf
 		return err
 	}
 	for _, name := range cons {
-		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s RENAME CONSTRAINT %s TO %s", table, QuoteIdent(name), QuoteIdent(strings.Replace(name, ShadowSuffix, "", 1)))); err != nil {
+		if err := execWithLockWait(ctx, conn, artifactDropLockWait,
+			fmt.Sprintf("ALTER TABLE %s RENAME CONSTRAINT %s TO %s", table, QuoteIdent(name), QuoteIdent(strings.Replace(name, ShadowSuffix, "", 1)))); err != nil {
 			return err
 		}
 	}
