@@ -2931,14 +2931,19 @@ func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflo
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
+	// The slot first, and before the write-through, because it needs
+	// neither. Dropping a slot is not a write to the table, so no pause
+	// refuses it -- and gating it behind a SET that can fail meant a failed
+	// SET left the slot standing, pinning WAL on the source for as long as
+	// it stood. That is the more expensive failure of the two.
+	if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, wf.slotName(s)); err != nil {
+		return err
+	}
 	// A source under a barrier's pause, or a switch's, refuses DROP
 	// PUBLICATION and ALTER TABLE with 25006, and the fail path does not
 	// come back: the replica identity would stay widened for good. This
 	// session writes through; the shard stays paused.
 	if err := writeThroughPause(ctx, conn); err != nil {
-		return err
-	}
-	if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, wf.slotName(s)); err != nil {
 		return err
 	}
 	if _, err := conn.Exec(ctx, "DROP PUBLICATION IF EXISTS "+QuoteIdent(wf.publicationName())); err != nil {
