@@ -463,7 +463,7 @@ func waitingForPlacements(n int) error {
 func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error {
 	// The replication objects go with the workflow. A failed workflow is
 	// NEVER revisited -- list() selects pending, running and cancelling, and
-	// CancelWorkflow accepts only pending or paused -- so a slot left on a
+	// CancelWorkflow accepts only pending, or paused while pending -- so a slot left on a
 	// serving source is left for good. Once the targets are torn down it
 	// goes inactive and pins WAL on a PRIMARY until pg_wal fills the disk,
 	// which is a shard outage caused by a failed copy nobody was watching.
