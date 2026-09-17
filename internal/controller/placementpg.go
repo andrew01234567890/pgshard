@@ -2288,6 +2288,9 @@ func (p *Placer) releaseShardFence(ctx context.Context, wf *placementWorkflow) e
 	}
 	var failed error
 	for _, t := range ids {
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return errors.Join(failed, err)
+		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			failed = errors.Join(failed, err)
@@ -2926,6 +2929,16 @@ func (p *Placer) dropReplication(ctx context.Context, wf *placementWorkflow) err
 }
 
 func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflow, s int32) error {
+	// Per shard, and BEFORE anything is dialled or dropped. A cleanup walks
+	// every source and each one can take a while, so the claim this pass
+	// started with may have passed to another controller partway through --
+	// and the objects being dropped here are the ones a resumed workflow
+	// under the new owner is relying on. Checking once at the top of the
+	// loop leaves the rest of the walk running on a claim that is gone
+	// (PGS-843).
+	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		return err
+	}
 	conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
 	if err != nil {
 		return err

@@ -403,6 +403,7 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
 		return err
 	}
+	stage := wf.stage
 	if wf.rt != nil {
 		if err := p.releaseFence(ctx, wf); err != nil {
 			return err
@@ -427,7 +428,9 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 	// workflow never ends.
 	var residue []string
 	if wf.from != nil {
-		if err := p.dropReplication(ctx, wf); err != nil {
+		if err := p.dropReplication(ctx, wf); errors.Is(err, errNotOwner) {
+			return err
+		} else if err != nil {
 			residue = append(residue, err.Error())
 			p.logger().Warn("failed placement left replication objects behind; they pin WAL on the source until dropped",
 				"workflow", wf.id, "table", wf.spec.TableName, "err", err)
@@ -438,12 +441,33 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 	// to build over a shadow another workflow marked. Once a swap has begun
 	// a shadow may be the only copy of what that shard should now hold, so
 	// what is there is left for whoever repairs the table.
-	if wf.rt != nil && len(wf.st.Swapped) == 0 {
-		if err := p.dropShadows(ctx, wf); err != nil {
+	switch {
+	case wf.rt != nil && len(wf.st.Swapped) == 0:
+		if err := p.dropShadows(ctx, wf); errors.Is(err, errNotOwner) {
+			return err
+		} else if err != nil {
 			residue = append(residue, err.Error())
 			p.logger().Warn("failed placement left its shadow tables behind; the next move of the table refuses to start until they are dropped",
 				"workflow", wf.id, "table", wf.spec.TableName, "err", err)
 		}
+	case wf.rt == nil && stage != StagePlacementPreparing:
+		// The routing could not be built -- the serving set changed, or the
+		// database is gone -- so the shards a shadow was built on are not
+		// known and nothing is dropped. Saying nothing would leave the next
+		// move of the table refusing to start with no record of why.
+		if len(wf.st.Swapped) == 0 {
+			residue = append(residue, "shadow tables may remain on the shards of the new placement: its routing could not be loaded to find them")
+		} else {
+			residue = append(residue, "a swap had begun and the routing could not be loaded: the table's shards are left as they are for repair")
+		}
+		if wf.from == nil {
+			residue = append(residue, "replication slots and publications may remain on the sources: their routing could not be loaded either")
+		}
+	}
+	// The drops dial shard after shard and can outlast the lease; once they
+	// have, the lock belongs to whoever claimed the workflow since.
+	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		return err
 	}
 	// The lock goes last, after the best-effort drops: released first, the
 	// next move of the table could start and build its shadow while this
@@ -808,6 +832,9 @@ func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
 	if err := p.dropShadows(ctx, wf); err != nil {
 		return err
 	}
+	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		return err
+	}
 	return p.unlock(ctx, wf)
 }
 
@@ -815,10 +842,15 @@ func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
 // one on. A table under the shadow's name without this workflow's marker is
 // left alone.
 func (p *Placer) dropShadows(ctx context.Context, wf *placementWorkflow) error {
-	// Every shard is tried: one that cannot be reached must not leave the
-	// shadows on the others, each of which would refuse the next move.
+	// Every holder is tried: one that cannot be reached must not leave the
+	// shadows on the others, each of which would refuse the next move. The
+	// claim is checked before each, as ensureShadows does: a pass that has
+	// lost it would be dropping a shadow the new owner is copying into.
 	var failed error
-	for _, t := range wf.rt.ids {
+	for _, t := range wf.rt.Holders() {
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return err
+		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err))
