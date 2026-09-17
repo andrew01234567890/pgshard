@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
+	"github.com/andrew01234567890/pgshard/internal/pgtune"
 )
 
 // Files rendered by the agent under PGDATA.
@@ -42,10 +43,42 @@ func renderRecoveryConf(c *Config) string { return renderPostgresqlConf(c, false
 // underscore, then letters, digits, underscores and dots.
 var gucName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
 
+// unsafeParams are the settings pgtune refuses as overrides, indexed for the
+// check below. pgtune owns the list and the reason for each entry.
+var unsafeParams = func() map[string]bool {
+	m := make(map[string]bool, len(pgtune.UnsafeKeys()))
+	for _, k := range pgtune.UnsafeKeys() {
+		m[k] = true
+	}
+	return m
+}()
+
+// unsafeParam reports a user parameter that must never reach
+// postgresql.conf, whatever the spec says.
+//
+// pgtune already refuses these, but only inside Derive -- which runs only
+// when spec.resources names a memory budget, and whose error the operator
+// records as a TuningApplied=false condition and then carries on. The
+// parameters themselves travel to the agent on their own path, so the
+// refusal never refused anything: standard_conforming_strings=off reached
+// postgresql.conf on any cluster, and the router parses shard keys out of
+// string literals assuming it is on (PGS-833).
+//
+// The name is folded the way PostgreSQL reads a setting name. The ownership
+// check above matches exactly, which is safe there only because a
+// differently-cased duplicate sorts before the agent's own line and loses to
+// it; nothing like that would save this list.
+func unsafeParam(name string) bool {
+	return unsafeParams[strings.ToLower(strings.TrimSpace(name))]
+}
+
 func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 	set := ownedSettings(c, standby, recovering)
 	for k, v := range c.Postgres.Parameters {
 		if _, owned := set[k]; owned {
+			continue
+		}
+		if unsafeParam(k) {
 			continue
 		}
 		if !gucName.MatchString(k) {
@@ -60,8 +93,11 @@ func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 		set[k] = quote(v)
 	}
 	// Applied only where nothing else said anything: a floor, not an
-	// override. pgtune derives a better value from the disk size and it
-	// arrives above as a parameter, which wins.
+	// override. pgtune derives a better value from the disk size; it does
+	// NOT come through the loop above -- the operator's derived settings go
+	// to the override file, which this file includes last, so the derived
+	// value still wins over the floor. It is written here as though the
+	// override were one of these parameters, and it never was.
 	for k, v := range defaultSettings {
 		if _, have := set[k]; !have {
 			set[k] = quote(v)
