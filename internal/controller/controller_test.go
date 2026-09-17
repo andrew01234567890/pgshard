@@ -331,7 +331,36 @@ func TestController(t *testing.T) {
 		if _, err := srv.CancelWorkflow(ctx, &pgshardv1.CancelWorkflowRequest{Id: id}); status.Code(err) != codes.FailedPrecondition {
 			t.Fatalf("cancelling a running workflow: %v", err)
 		}
-		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'pending' WHERE id::text = $1`, id)
+		// Paused is not the same as not started. A workflow paused FROM
+		// RUNNING holds everything a running one holds -- shadows, slots,
+		// publications, a fence -- so cancelling it here would abandon all
+		// of it while recording "cancelled before it started", which is
+		// not true. It is refused, and the refusal says which paused it is
+		// and what to do instead (PGS-865).
+		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'running' WHERE id::text = $1`, id)
+		if _, err := srv.PauseWorkflow(ctx, &pgshardv1.PauseWorkflowRequest{Id: id}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = srv.CancelWorkflow(ctx, &pgshardv1.CancelWorkflowRequest{Id: id})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("cancelling a workflow paused from running: %v", err)
+		}
+		if !strings.Contains(err.Error(), "paused from running") || !strings.Contains(err.Error(), "Resume it") {
+			t.Errorf("the refusal must say which paused it is and what to do: %v", err)
+		}
+		if st := queryOne[string](t, conn, `SELECT state FROM pgshard.workflows WHERE id::text = $1`, id); st != "paused" {
+			t.Errorf("the workflow is %q after a refused cancel, want it still paused", st)
+		}
+		// Paused from PENDING is the case the plain state change is for,
+		// and it still works.
+		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'pending', status = status - 'paused_from' WHERE id::text = $1`, id)
+		if _, err := srv.PauseWorkflow(ctx, &pgshardv1.PauseWorkflowRequest{Id: id}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := srv.CancelWorkflow(ctx, &pgshardv1.CancelWorkflowRequest{Id: id}); err != nil {
+			t.Fatalf("cancelling a workflow paused from pending must still work: %v", err)
+		}
+		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'pending', status = '{}' WHERE id::text = $1`, id)
 
 		// A pending one has claimed nothing. Without this it stayed for
 		// ever: pgshard_admin is SELECT-only on pgshard.workflows, so the

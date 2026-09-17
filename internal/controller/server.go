@@ -252,11 +252,20 @@ func (s *Server) PauseWorkflow(ctx context.Context, req *pgshardv1.PauseWorkflow
 
 // CancelWorkflow ends a workflow that has not started.
 //
-// A pending or paused workflow has provisioned nothing, copied nothing and
-// fenced nothing, so abandoning it is a state change and no more. A running
-// one has to be unwound -- subscriptions dropped, the fence lifted, serving
-// left where it was -- and that is a different operation, so it is refused
-// here rather than half-done.
+// A pending workflow, or one paused before it started, has provisioned
+// nothing, copied nothing and fenced nothing, so abandoning it is a state
+// change and no more. A running one has to be unwound -- subscriptions
+// dropped, the fence lifted, serving left where it was -- and that is a
+// different operation, so it is refused here rather than half-done.
+//
+// PAUSED IS NOT THE SAME AS NOT STARTED, which is what this used to assume.
+// A workflow paused from RUNNING holds everything a running one holds:
+// shadow tables, replication slots, publications, a raised replica identity,
+// a fence. Cancelling it with a plain state change left all of it behind --
+// the slots pinning WAL, the shadows blocking the next move of the table --
+// and the row said "cancelled before it started", which was not true. The
+// state it was paused FROM is the thing that matters, so that is what is
+// read.
 //
 // Without this, an in-place reshard created by editing pgshard.shard_ranges
 // stayed pending for ever with no way to remove it: pgshard_admin is
@@ -269,8 +278,10 @@ func (s *Server) CancelWorkflow(ctx context.Context, req *pgshardv1.CancelWorkfl
 	if err := s.transition(ctx, req.GetId(), `
 		UPDATE pgshard.workflows
 		SET state = $2, status = (status - 'paused_from') || jsonb_build_object('message', 'cancelled before it started'), updated_at = now()
-		WHERE id::text = $1 AND state IN ($3, $4)`, StateCancelled, StatePending, StatePaused); err != nil {
-		return nil, err
+		WHERE id::text = $1
+		  AND (state = $3 OR (state = $4 AND coalesce(status->>'paused_from', $3) = $3))`,
+		StateCancelled, StatePending, StatePaused); err != nil {
+		return nil, s.explainCancel(ctx, req.GetId(), err)
 	}
 	w, err := s.getWorkflow(ctx, req.GetId())
 	if err != nil {
@@ -295,6 +306,23 @@ func (s *Server) ResumeWorkflow(ctx context.Context, req *pgshardv1.ResumeWorkfl
 		return nil, err
 	}
 	return &pgshardv1.ResumeWorkflowResponse{Workflow: w}, nil
+}
+
+// explainCancel turns the generic "workflow X is paused" into the reason
+// the cancel was actually refused, when the reason is the one this call has
+// to explain: paused is not the same as not started, and an operator told
+// only the state cannot tell which paused they have.
+func (s *Server) explainCancel(ctx context.Context, id string, err error) error {
+	if status.Code(err) != codes.FailedPrecondition {
+		return err
+	}
+	var from string
+	if qerr := s.Pool.QueryRow(ctx, `SELECT coalesce(status->>'paused_from', '') FROM pgshard.workflows
+		WHERE id::text = $1 AND state = $2`, id, StatePaused).Scan(&from); qerr != nil || from != StateRunning {
+		return err
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"workflow %s is paused from running: it holds shadow tables, replication slots and a fence, so cancelling it here would abandon them. Resume it and cancel the running workflow, which unwinds what it holds.", id)
 }
 
 func (s *Server) transition(ctx context.Context, id, sql string, args ...any) error {
