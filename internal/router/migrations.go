@@ -265,7 +265,11 @@ func (q *PGMigrationQueue) Wait(ctx context.Context, id string, waiting func([]c
 	}
 	if beat == nil {
 		beat = func(ctx context.Context) (time.Duration, bool, error) {
-			return catalog.ControllerHeartbeatAge(ctx, q.Pool, catalog.HeartbeatApplier)
+			// The applier's PASS, not its liveness goroutine: the
+			// goroutine beats on its own timer and keeps beating through a
+			// pass that never returns, so waiting on it meant waiting for
+			// ever on a wedged controller (PGS-907).
+			return catalog.ApplierProgressAge(ctx, q.Pool)
 		}
 	}
 	every := q.BlockersEvery

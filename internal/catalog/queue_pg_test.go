@@ -984,3 +984,42 @@ func TestTheQueueNamesTheObjectOfEveryMigration(t *testing.T) {
 		}
 	}
 }
+
+// TestAWedgedPassGoesStaleWhileLivenessKeepsBeating (PGS-907): the applier's
+// liveness goroutine beats on its own timer, so it keeps beating through a
+// pass that never returns. A router waiting on a migration read that beat and
+// waited for ever, where its no-progress rule would have given up. The pass
+// signal is what it reads now, and a fresh liveness beat must not refresh it.
+func TestAWedgedPassGoesStaleWhileLivenessKeepsBeating(t *testing.T) {
+	conn, pool, _ := queueCatalog(t)
+	ctx := context.Background()
+	// BeatController writes only under the current term.
+	mustExec(t, conn, `UPDATE pgshard.leader_term SET term = 1`)
+
+	// Before any pass has finished, the liveness beat stands in -- that is
+	// the documented residual, and a controller too old to record passes
+	// must not read as dead.
+	if err := BeatController(ctx, pool, HeartbeatApplier, 1); err != nil {
+		t.Fatal(err)
+	}
+	if age, found, err := ApplierProgressAge(ctx, pool); err != nil || !found || age > time.Minute {
+		t.Fatalf("with no pass recorded the liveness beat must stand in: age %s found %v %v", age, found, err)
+	}
+
+	// Once a pass has finished, that is the signal.
+	if err := BeatController(ctx, pool, HeartbeatApplierPass, 1); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `UPDATE pgshard.controller_heartbeat SET beat_at = now() - interval '1 hour' WHERE component = $1`, HeartbeatApplierPass)
+	// The liveness goroutine keeps beating, as it does through a wedged pass.
+	if err := BeatController(ctx, pool, HeartbeatApplier, 1); err != nil {
+		t.Fatal(err)
+	}
+	age, found, err := ApplierProgressAge(ctx, pool)
+	if err != nil || !found {
+		t.Fatalf("progress age: found %v, %v", found, err)
+	}
+	if age < 30*time.Minute {
+		t.Fatalf("progress age is %s: a fresh liveness beat refreshed it, so a wedged pass still reads as progress", age)
+	}
+}

@@ -1978,3 +1978,92 @@ func TestAHeldMigrationIsLoggedOncePerHoldAndNotCountedDone(t *testing.T) {
 		t.Fatalf("the held migration is %s", m.State)
 	}
 }
+
+// wedgeStore is a memStore whose pass blocks until released, and which
+// records the two heartbeats separately.
+type wedgeStore struct {
+	*memStore
+	release chan struct{}
+	mu      sync.Mutex
+	beats   int
+	passes  int
+}
+
+func (s *wedgeStore) Pending(ctx context.Context) ([]catalog.DDLMigration, error) {
+	<-s.release
+	return s.memStore.Pending(ctx)
+}
+
+func (s *wedgeStore) Beat(context.Context, int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.beats++
+	return nil
+}
+
+func (s *wedgeStore) BeatPass(context.Context, int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.passes++
+	return nil
+}
+
+func (s *wedgeStore) counts() (beats, passes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.beats, s.passes
+}
+
+// TestAWedgedPassRecordsNoProgressWhileStillBeatingAlive (PGS-907): the
+// liveness beat comes from its own goroutine, so it keeps beating through a
+// pass that never returns. The pass beat is recorded only when the pass has
+// RETURNED, which is what lets a router waiting on a migration tell a long
+// queue from a wedged controller.
+func TestAWedgedPassRecordsNoProgressWhileStillBeatingAlive(t *testing.T) {
+	f := newApplierFixture(t)
+	s := &wedgeStore{memStore: f.store, release: make(chan struct{})}
+	f.app.Store = s
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go f.app.Run(ctx, 10*time.Millisecond, func() bool { return true })
+
+	// The pass is stuck in Pending. Liveness must still be reported --
+	// there IS a leader -- and progress must not be.
+	//
+	// The liveness beat fires once on start and then every 15s, so this
+	// waits for that one and then SETTLES: breaking out on the first
+	// sighting let a pass beat fired just after it go unseen, and the test
+	// passed against a version that recorded progress BEFORE running the
+	// pass -- the very design this rejects. The pass loop ticks every 10ms,
+	// so 300ms is many chances for it to record something it should not.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		beats, passes := s.counts()
+		if passes > 0 {
+			t.Fatalf("a pass that has not returned recorded progress (%d)", passes)
+		}
+		if beats > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the liveness beat never fired, so this test proves nothing about the two being different")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if beats, passes := s.counts(); passes > 0 {
+		t.Fatalf("a pass that has not returned recorded progress (%d passes, %d liveness beats)", passes, beats)
+	}
+
+	close(s.release)
+	for deadline = time.Now().Add(5 * time.Second); ; {
+		if _, passes := s.counts(); passes > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a pass that returned recorded no progress")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

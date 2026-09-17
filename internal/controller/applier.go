@@ -97,6 +97,11 @@ func (s *PGMigrationStore) Beat(ctx context.Context, term int64) error {
 	return catalog.BeatController(ctx, s.Pool, catalog.HeartbeatApplier, term)
 }
 
+// BeatPass implements passHeartbeater.
+func (s *PGMigrationStore) BeatPass(ctx context.Context, term int64) error {
+	return catalog.BeatController(ctx, s.Pool, catalog.HeartbeatApplierPass, term)
+}
+
 // queueAware is a store that knows whether its catalog has the operation
 // queue; a store that does not is treated as one without it.
 type queueAware interface {
@@ -112,6 +117,16 @@ type homeShards interface {
 // migration to tell a long queue from no controller.
 type heartbeater interface {
 	Beat(ctx context.Context, term int64) error
+}
+
+// passHeartbeater records that an applier pass RETURNED. Separate from
+// heartbeater because the two say different things and a store may
+// implement only the first: the liveness beat comes from its own goroutine
+// and keeps ticking through a pass that never comes back, so it cannot tell
+// a router the difference between a long queue and a wedged controller
+// (PGS-907).
+type passHeartbeater interface {
+	BeatPass(ctx context.Context, term int64) error
 }
 
 // Pending implements MigrationStore.
@@ -406,9 +421,20 @@ func (a *Applier) Run(ctx context.Context, interval time.Duration, leader func()
 	if hb, ok := a.Store.(heartbeater); ok {
 		go a.beat(ctx, hb, leader)
 	}
+	pass, _ := a.Store.(passHeartbeater)
 	runLoopStoppable(ctx, interval, leader, a.logger, "applier", func(ctx context.Context) {
 		if _, err := a.RunOnce(ctx); err != nil && ctx.Err() == nil {
 			a.logger().Warn("applier pass failed", "err", err)
+		}
+		// Recorded because the pass RETURNED, not because it succeeded: a
+		// pass that fails and comes back is a controller that is getting
+		// somewhere, and one that never returns is the case this exists
+		// for. Beaten here rather than inside RunOnce so that it cannot be
+		// reached by a pass that is still running.
+		if pass != nil && ctx.Err() == nil {
+			if err := pass.BeatPass(ctx, a.term()); err != nil && ctx.Err() == nil {
+				a.logger().Warn("recording applier pass progress failed", "err", err)
+			}
 		}
 	})
 }
