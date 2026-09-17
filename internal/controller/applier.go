@@ -1158,7 +1158,7 @@ func (a *Applier) runStep(ctx context.Context, m *catalog.DDLMigration, id int32
 		return inTransaction(ctx, conn, st.SQL)
 	}
 	if st.Index != "" {
-		idx := catalog.MigrationObject{Kind: "relation", Schema: st.Skip.Schema, Name: st.Index}
+		idx := catalog.MigrationObject{Kind: "relation", Schema: st.Skip.Schema, Name: st.Index, Table: st.Skip.Table}
 		if _, err := dropInvalidIndex(ctx, conn, idx); err != nil {
 			return "", err
 		}
@@ -1318,10 +1318,7 @@ func (a *Applier) concurrently(ctx context.Context, conn ShardConn, m *catalog.D
 // an interrupted CREATE INDEX CONCURRENTLY is dropped, in the schema it is in,
 // so the statement builds it again.
 func resumeIndexOnTable(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (bool, error) {
-	table := pgx.Identifier{o.Table}.Sanitize()
-	if o.Schema != "" {
-		table = pgx.Identifier{o.Schema, o.Table}.Sanitize()
-	}
+	table := qualifiedTable(o)
 	rows, err := conn.Query(ctx, `SELECT n.nspname, i.indisvalid FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE i.indrelid = to_regclass($1) AND c.relname = $2`, table, o.Name)
@@ -1359,6 +1356,16 @@ func qualified(schema, name string) string {
 	return pgx.Identifier{name}.Sanitize()
 }
 
+// qualifiedTable renders the table an index object is built on, empty when
+// the object names none. Left unqualified it resolves through the search
+// path, which is how the statement resolved it.
+func qualifiedTable(o catalog.MigrationObject) string {
+	if o.Table == "" {
+		return ""
+	}
+	return qualified(o.Schema, o.Table)
+}
+
 // invalidIndex reports the schema of an invalid index named o.Name, and
 // whether it found one.
 //
@@ -1375,12 +1382,22 @@ func qualified(schema, name string) string {
 // partition's index is attached, so it is not the wreckage of a failed
 // build -- and DROP INDEX CONCURRENTLY refuses it with 0A000 anyway, which
 // made a resumed migration fail for good (PGS-891).
+//
+// With the table in hand it is the table that decides, the way
+// resumeIndexOnTable and the step checks decide. Two tables can each carry
+// their own invalid index of one name, and picking between them by path
+// position picked the other table's: this build's wreckage stayed and the
+// retry failed 42P07 on it (PGS-941). Without a table -- a migration recorded
+// before the object carried one -- the path search stands.
 func invalidIndex(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (string, bool, error) {
 	rows, err := conn.Query(ctx, `SELECT n.nspname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relname = $1 AND NOT i.indisvalid AND c.relkind <> 'I'
-		  AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)
-		ORDER BY array_position(current_schemas(false), n.nspname) LIMIT 1`, o.Name, o.Schema)
+		  AND CASE WHEN $3 <> '' THEN i.indrelid = pg_catalog.to_regclass($3)
+		           WHEN $2 <> '' THEN n.nspname = $2
+		           ELSE n.nspname = ANY (current_schemas(false)) END
+		ORDER BY array_position(current_schemas(false), n.nspname) LIMIT 1`,
+		o.Name, o.Schema, qualifiedTable(o))
 	if err != nil {
 		return "", false, err
 	}

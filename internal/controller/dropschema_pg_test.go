@@ -195,3 +195,61 @@ func TestAResumedCreateIndexIsLookedForOnItsTable(t *testing.T) {
 		t.Fatalf("the table in app named like the index was touched: %d %v", kept, err)
 	}
 }
+
+// TestAMultistepIndexFailureDropsTheWreckageOnItsOwnTable (PGS-941): the
+// step that builds an index CONCURRENTLY drops the invalid leftover of a
+// previous attempt before it runs and after it fails. It looked that leftover
+// up by name on the search path, so a same-named invalid index on ANOTHER
+// table, earlier on the path, was dropped instead of this step's own.
+//
+// The fake shard cannot hold this: it is handed an index name and asked
+// whether it is invalid, so it has no table to be wrong about.
+func TestAMultistepIndexFailureDropsTheWreckageOnItsOwnTable(t *testing.T) {
+	parallelPG(t)
+	pool, a, store := rewritePGFixture(t)
+	ctx := context.Background()
+	mustExecSQL(t, pool, `CREATE SCHEMA app`)
+	mustExecSQL(t, pool, `GRANT USAGE, CREATE ON SCHEMA app TO appowner`)
+	// Someone else's wreckage, earlier on the path and droppable by the role
+	// the migration runs as -- so nothing but the fix keeps it.
+	mustExecSQL(t, pool, `CREATE TABLE app.dup (y int)`)
+	mustExecSQL(t, pool, `ALTER TABLE app.dup OWNER TO appowner`)
+	mustExecSQL(t, pool, `INSERT INTO app.dup VALUES (1), (1)`)
+	if _, err := pool.Exec(ctx, `CREATE UNIQUE INDEX CONCURRENTLY dup_key ON app.dup (y)`); err == nil {
+		t.Fatal("the unique build over duplicate rows was expected to fail")
+	}
+	// The table this migration's step builds on, later on the path.
+	mustExecSQL(t, pool, `CREATE TABLE public.t (x int)`)
+	mustExecSQL(t, pool, `ALTER TABLE public.t OWNER TO appowner`)
+	mustExecSQL(t, pool, `INSERT INTO public.t VALUES (1), (1)`)
+
+	store.migrations = []catalog.DDLMigration{{
+		ID: "30000000-0000-0000-0000-000000000941", Database: "postgres",
+		Statement: `ALTER TABLE t ADD CONSTRAINT dup_key UNIQUE (x)`, Kind: "ALTER TABLE",
+		Strategy: "multistep", Scope: "all", State: catalog.MigrationRunning,
+		PerShard: map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning}},
+		Meta: catalog.MigrationMeta{RunAs: "appowner", SearchPath: "app, public", Steps: []catalog.MigrationStep{{
+			SQL:        `CREATE UNIQUE INDEX CONCURRENTLY "dup_key" ON "t" ("x")`,
+			Concurrent: true, Index: "dup_key",
+			Skip: catalog.MigrationCheck{Kind: "index_valid", Table: "t", Name: "dup_key"},
+		}}}}}
+	if _, err := a.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := func(schema, table string) int64 {
+		t.Helper()
+		var n int64
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			WHERE c.relname = 'dup_key' AND NOT i.indisvalid AND i.indrelid = to_regclass($1)`, schema+"."+table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if invalid("app", "dup") != 1 {
+		t.Error("the invalid app.dup_key on another table was dropped; the step picked its leftover by path position, not by table")
+	}
+	if invalid("public", "t") != 0 {
+		t.Error("the step's own wreckage on public.t survived; the retry fails 42P07 on it")
+	}
+}
