@@ -230,9 +230,23 @@ the rest with `0A000`. See *Routing* below.
   a backend repeating what the session already asked for is not news. The
   values advertised at startup are the router's own and are not yet read
   back from a backend.
-- **Not yet.** `Flush`-driven pipelining (results before `Sync`) and
-  `PortalSuspended` (`Execute` with a row limit) are not supported by the
-  pooler contract in this layer.
+- **`Flush`.** A `Flush` is answered -- the batch runs and its results
+  reach the client before `Sync` -- for a **plain single-shard read batch**
+  only. For anything else the router writes nothing and waits for the
+  `Sync`, which is correct for a client that always follows `Flush` with
+  `Sync`, and **hangs a client that flushes and waits**, which is what
+  `Flush` is for. The shapes that hang are: a scatter (a read needing more
+  than one shard), a batch carrying an injected statement, and any batch
+  holding a write, a transaction-control statement or a session-effect
+  statement such as `SET`.
+
+  So a pipelining client -- `pgconn.Pipeline` in pgx, or raw `Parse`/`Bind`/
+  `Execute`/`Flush` -- blocks in `GetResults` until its read deadline on
+  every shape but the narrowest. Until that is fixed (PGS-911), send `Sync`
+  rather than `Flush` when the batch is anything other than a single-shard
+  read.
+- **Not yet.** `PortalSuspended` (`Execute` with a row limit) is not
+  supported by the pooler contract in this layer.
 
 ## Routing
 
