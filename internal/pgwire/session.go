@@ -225,6 +225,9 @@ func (s *session) close() {
 		s.mu.Unlock()
 		return
 	}
+	// PGS-940 PROBE: temporary. Every socket close goes through here, so
+	// this says WHEN a session ended even when nothing says why.
+	s.server.logger.Info("PGS940 session close", "session", s.id, "serving", s.serving, "draining", s.draining)
 	s.closed = true
 	exec := s.exec
 	s.mu.Unlock()
@@ -349,6 +352,8 @@ func (s *session) drain() {
 }
 
 func (s *session) terminate(err error) {
+	// PGS-940 PROBE: temporary. A FATAL the client may or may not read.
+	s.server.logger.Info("PGS940 session terminate", "session", s.id, "err", fmt.Sprint(err))
 	er := toErrorResponse(err)
 	er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
 	_ = s.send(er)
