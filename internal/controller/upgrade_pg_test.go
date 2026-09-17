@@ -716,27 +716,70 @@ func TestCompleteLeavesARetiredSetWritableWhileAnotherWorkflowReplicatesIntoIt(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	isPaused := func(s int32) bool {
+		t.Helper()
+		return queryOne[string](t, connect(t, f.appDSN(ops.srcSet, s)), `SHOW default_transaction_read_only`) == "on"
+	}
 	paused := func() int {
 		t.Helper()
 		n := 0
 		for _, s := range ops.srcIDs {
-			if queryOne[string](t, connect(t, f.appDSN(ops.srcSet, s)), `SHOW default_transaction_read_only`) == "on" {
+			if isPaused(s) {
 				n++
 			}
 		}
 		return n
 	}
 
-	other := fmt.Sprintf("pgshard_reshard_g%d_rev_s0_t0", wf.gen+7)
+	// The other workflow has to exist for its subscriptions to mean
+	// anything. A generation whose workflow has finished left litter, not a
+	// claim on the set, and litter must not hold the retirement pause open
+	// for ever (PGS-846) -- so the stand-in gets a live workflow of its own.
+	otherGen := wf.gen + 7
+	mustExec(t, f.catalog, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('other', $1, 'retired')`, otherGen)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.workflows (id, kind, state, spec)
+		VALUES (gen_random_uuid(), $1, $2, '{"shard_set": "other"}'::jsonb)`, KindReshard, StateRunning)
+
+	other := fmt.Sprintf("pgshard_reshard_g%d_rev_s0_t0", otherGen)
 	home := connect(t, f.appDSN(ops.srcSet, ops.srcIDs[0]))
 	mustExec(t, home, `CREATE SUBSCRIPTION `+other+` CONNECTION 'host=elsewhere dbname=app' PUBLICATION elsewhere WITH (connect = false, slot_name = NONE)`)
 	if err := ops.Complete(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if n := paused(); n != 0 {
-		t.Fatalf("%d source(s) paused while another workflow still replicates into the set", n)
+	// The primary that carries the other workflow's way back stays writable;
+	// its rollback applies there and a pause would fail it with 25006. The
+	// decision is per primary (PGS-846), so a primary with nothing on it is
+	// still retired properly -- one unreachable or occupied primary used to
+	// leave the whole set writable.
+	if isPaused(ops.srcIDs[0]) {
+		t.Fatal("the primary another workflow still replicates into was paused; its rollback now fails with 25006")
+	}
+	if len(ops.srcIDs) < 2 {
+		t.Fatalf("this test needs a set of at least two primaries to tell per-primary from all-or-nothing; got %d", len(ops.srcIDs))
+	}
+	if !isPaused(ops.srcIDs[1]) {
+		t.Fatal("a primary nothing replicates into was left writable because ANOTHER primary was occupied; it accepts writes nothing reads again")
+	}
+	if err := ops.pauseSet(ctx, ops.srcSet, ops.srcIDs, false); err != nil {
+		t.Fatal(err)
 	}
 
+	// The same subscription, once that workflow has finished, is litter: it
+	// no longer holds the set writable. This tail runs once, so a workflow
+	// that ended without tearing its reverse subscriptions down used to cost
+	// the retirement pause permanently.
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET state = $1 WHERE spec->>'shard_set' = 'other'`, StateFailed)
+	if err := ops.Complete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := paused(); n != len(ops.srcIDs) {
+		t.Fatalf("%d of %d sources paused; a finished workflow's leftover subscription still held the set writable", n, len(ops.srcIDs))
+	}
+	if err := ops.pauseSet(ctx, ops.srcSet, ops.srcIDs, false); err != nil {
+		t.Fatal(err)
+	}
+
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET state = $1 WHERE spec->>'shard_set' = 'other'`, StateRunning)
 	mustExec(t, home, `DROP SUBSCRIPTION `+other)
 	// A forward subscription of another generation is not a way back into
 	// the set, and must not keep it writable.
