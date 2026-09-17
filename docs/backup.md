@@ -449,6 +449,42 @@ contradictions and unfenced. The decision table lives in
 restores a shard to points before PREPARE, between PREPARE and the decision
 and after it, and checks each outcome.
 
+#### A barrier restore can bring back a torn-down placement's artifacts
+
+A table placement's teardown -- dropping its shadow table, its slots and its
+publications -- writes *through* a barrier's write pause, because a pause
+would otherwise refuse the cleanup with `25006` and leave it undone. That is
+deliberate, and it has a consequence for restores: cleanup written through a
+pause can land *after* that barrier's restore point on some shards.
+
+Restoring from such a barrier therefore brings the artifacts back -- a marked
+shadow table, or the slot and publication of a placement that failed -- on the
+shards where the teardown landed late, while the placement workflow itself is
+terminal in the restored catalog and will never run again to clean them up.
+The next move of that table refuses to build over what it finds.
+
+Nothing detects this today. After restoring from a barrier taken close to a
+table placement's teardown, check for leftovers before moving that table
+again:
+
+```sql
+-- Shadow and retired tables. The comment carries the workflow that made them.
+SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class') AS marker
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname LIKE '%\_\_pgshard\_new' OR c.relname LIKE '%\_\_pgshard\_old';
+
+-- The slot and publication of a placement's copy.
+SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'pgshard\_place\_%';
+SELECT pubname FROM pg_publication WHERE pubname LIKE 'pgshard\_place\_%';
+```
+
+The table comment reads `pgshard:placement:<workflow id>`, and a slot or
+publication carries the first eight hex digits of the same id, so every
+artifact names the run that made it. They are safe to drop once
+`pgshard.workflows` shows that run in a terminal state (`completed`, `failed`
+or `cancelled`) -- and if it is not terminal, the run is still live and these
+are not leftovers at all.
+
 ### Non-barrier restores are not cluster-consistent
 
 A time, LSN, xid, name or immediate target is applied to every group

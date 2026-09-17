@@ -1865,7 +1865,8 @@ func (p *Placer) ensureReplication(ctx context.Context, wf *placementWorkflow, c
 			}
 			recorded = true
 		}
-		if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "FULL", 1); err != nil {
+		_, lockWait, _ := p.identityTiming()
+		if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "FULL", 1, lockWait, 0); err != nil {
 			// The ALTER is bounded and gets one try, so failing it is an
 			// ordinary outcome, not the crash the record above is for. A
 			// record that outlives a failed ALTER is a claim this workflow
@@ -2984,7 +2985,8 @@ func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflo
 			return err
 		}
 		if now == "f" {
-			if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "DEFAULT", 3); err != nil {
+			attempts, lockWait, pause := p.identityTiming()
+			if err := setReplicaIdentity(ctx, conn, wf.shape.qualified(wf.spec.TableName), "DEFAULT", attempts, lockWait, pause); err != nil {
 				return fmt.Errorf("putting back the default replica identity of %s: %w", wf.spec.table(), err)
 			}
 		}
@@ -2998,6 +3000,14 @@ func (p *Placer) dropSourceReplication(ctx context.Context, wf *placementWorkflo
 // transaction would stall the user's reads for as long as that runs.
 const replicaIdentityLockWait = 5 * time.Second
 
+// defaultIdentityRestoreAttempts and defaultIdentityRetryPause are the rest
+// of the retry the teardown uses when a lock timeout (55P03) says the table
+// was busy rather than that the statement was wrong.
+const (
+	defaultIdentityRestoreAttempts = 3
+	defaultIdentityRetryPause      = time.Second
+)
+
 // artifactDropLockWait bounds how long retirement and shadow teardown wait
 // for the AccessExclusiveLock they need. Same reasoning as the one above,
 // plus one more: these run while the set is paused and write through that
@@ -3007,9 +3017,9 @@ const artifactDropLockWait = 5 * time.Second
 
 // setReplicaIdentity sets a table's replica identity with a bounded lock
 // wait, trying again after a lock timeout up to attempts times in all.
-func setReplicaIdentity(ctx context.Context, conn ShardConn, table, identity string, attempts int) error {
+func setReplicaIdentity(ctx context.Context, conn ShardConn, table, identity string, attempts int, wait, pause time.Duration) error {
 	for attempt := 1; ; attempt++ {
-		err := execWithLockWait(ctx, conn, replicaIdentityLockWait, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY %s", table, identity))
+		err := execWithLockWait(ctx, conn, wait, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY %s", table, identity))
 		var pgErr *pgconn.PgError
 		if err == nil || attempt >= attempts || !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
 			return err
@@ -3017,9 +3027,25 @@ func setReplicaIdentity(ctx context.Context, conn ShardConn, table, identity str
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Second):
+		case <-time.After(pause):
 		}
 	}
+}
+
+// identityTiming resolves the bounds for putting a replica identity back.
+// Zero fields mean the defaults, as everywhere else on Placer.
+func (p *Placer) identityTiming() (attempts int, wait, pause time.Duration) {
+	attempts, wait, pause = p.IdentityRestoreAttempts, p.IdentityLockWait, p.IdentityRetryPause
+	if attempts <= 0 {
+		attempts = defaultIdentityRestoreAttempts
+	}
+	if wait <= 0 {
+		wait = replicaIdentityLockWait
+	}
+	if pause <= 0 {
+		pause = defaultIdentityRetryPause
+	}
+	return attempts, wait, pause
 }
 
 // execWithLockWait runs one statement in a transaction of its own whose
