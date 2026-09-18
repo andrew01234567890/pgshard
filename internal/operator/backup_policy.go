@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +22,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agent/backup"
 )
 
 // Policy conditions.
@@ -137,6 +139,10 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		valid.Status = metav1.ConditionFalse
 		valid.Reason = "InvalidSchedule"
 		valid.Message = err.Error()
+	} else if err := r.checkEncryptionSecret(ctx, &pol); err != nil {
+		valid.Status = metav1.ConditionFalse
+		valid.Reason = "SecretIncomplete"
+		valid.Message = err.Error()
 	}
 	if valid.Status == metav1.ConditionTrue {
 		pol.Status.Accepted = pol.Spec.DeepCopy()
@@ -182,6 +188,54 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: policyRequeue}, nil
+}
+
+// checkEncryptionSecret refuses a policy whose encryption Secret does not
+// carry the key the agent will look for.
+//
+// Accepting one is not a deferred error, it is an outage. The policy is part
+// of the member template, so accepting it rolls every member; the agent is
+// PID 1 and reads the passphrase from the mounted Secret at bootstrap, so a
+// Secret without that key makes it exit -- "cipher pass: open
+// /etc/pgshard-backup/encryption/passphrase: no such file or directory" --
+// postgres crash-loops, and the rollout holds on a member that cannot come
+// back (PGS-949). backup.go says why acceptance is the place to stop it:
+// "letting it through changes the member template, rolls the pods and can
+// leave a replacement agent refusing to start on configuration nothing
+// approved".
+//
+// Only the encryption Secret for now. The credential keys a store needs
+// vary by type AND by credentialType -- web-identity S3 needs none, GCS can
+// read the metadata server -- so getting that matrix wrong would refuse
+// working policies, which is worse than the gap it closes.
+//
+// The reconciler does NOT watch Secrets (see SetupWithManager), so nothing
+// wakes it when a Secret is corrected -- but Reconcile already returns
+// RequeueAfter: policyRequeue (one minute) on every pass, so a corrected
+// Secret is picked up within that. The messages say "will retry" so an
+// operator knows to wait rather than to go looking for a trigger.
+func (r *BackupPolicyReconciler) checkEncryptionSecret(ctx context.Context, pol *pgshardv1alpha1.PgShardBackupPolicy) error {
+	ref := pol.Spec.ObjectStore.Encryption.SecretRef
+	if ref == nil || ref.Name == "" {
+		return nil
+	}
+	var sec corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: pol.Namespace, Name: ref.Name}, &sec); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("encryption secret %q does not exist; will retry", ref.Name)
+		}
+		return err
+	}
+	if _, ok := sec.Data[backup.CredPassphrase]; !ok {
+		have := make([]string, 0, len(sec.Data))
+		for k := range sec.Data {
+			have = append(have, k)
+		}
+		sort.Strings(have)
+		return fmt.Errorf("encryption secret %q has no %q key (it has: %s); will retry",
+			ref.Name, backup.CredPassphrase, strings.Join(have, ", "))
+	}
+	return nil
 }
 
 func (r *BackupPolicyReconciler) validate(pol *pgshardv1alpha1.PgShardBackupPolicy) error {
