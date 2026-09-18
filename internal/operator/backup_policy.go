@@ -139,7 +139,7 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		valid.Status = metav1.ConditionFalse
 		valid.Reason = "InvalidSchedule"
 		valid.Message = err.Error()
-	} else if err := r.checkEncryptionSecret(ctx, &pol); err != nil {
+	} else if err := r.checkSecrets(ctx, &pol); err != nil {
 		valid.Status = metav1.ConditionFalse
 		valid.Reason = "SecretIncomplete"
 		valid.Message = err.Error()
@@ -204,36 +204,56 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // leave a replacement agent refusing to start on configuration nothing
 // approved".
 //
-// Only the encryption Secret for now. The credential keys a store needs
-// vary by type AND by credentialType -- web-identity S3 needs none, GCS can
-// read the metadata server -- so getting that matrix wrong would refuse
-// working policies, which is worse than the gap it closes.
+// Both Secrets. Which credential keys a store needs varies by type AND by
+// credentialType -- web-identity S3 needs none, GCS can read the metadata
+// server -- so the matrix is NOT restated here: backup.Repo.RequiredCredentials
+// is its single declaration, pinned to what the renderer actually reads by
+// TestRequiredCredentialsMatchesWhatRenderReads (PGS-950).
 //
 // The reconciler does NOT watch Secrets (see SetupWithManager), so nothing
 // wakes it when a Secret is corrected -- but Reconcile already returns
 // RequeueAfter: policyRequeue (one minute) on every pass, so a corrected
 // Secret is picked up within that. The messages say "will retry" so an
 // operator knows to wait rather than to go looking for a trigger.
-func (r *BackupPolicyReconciler) checkEncryptionSecret(ctx context.Context, pol *pgshardv1alpha1.PgShardBackupPolicy) error {
-	ref := pol.Spec.ObjectStore.Encryption.SecretRef
-	if ref == nil || ref.Name == "" {
+func (r *BackupPolicyReconciler) checkSecrets(ctx context.Context, pol *pgshardv1alpha1.PgShardBackupPolicy) error {
+	if err := r.requireKeys(ctx, pol, "encryption", pol.Spec.ObjectStore.Encryption.SecretRef, []string{backup.CredPassphrase}); err != nil {
+		return err
+	}
+	probe := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}, Spec: pgshardv1alpha1.PgShardClusterSpec{PostgreSQL: pgshardv1alpha1.PostgreSQLSpec{Major: 18}}}
+	// Defaulted, because KeyType decides the answer and is empty until
+	// WithDefaults fills it in.
+	want := BackupSettings(probe, Groups(probe)[0], &pol.Spec).WithDefaults().Repo.RequiredCredentials()
+	return r.requireKeys(ctx, pol, "credentials", pol.Spec.ObjectStore.Credentials.SecretRef, want)
+}
+
+// requireKeys refuses a policy whose named Secret is absent or does not
+// carry every key in want. An empty want needs no Secret at all, which is
+// how web-identity S3 and metadata-server GCS stay valid with none.
+func (r *BackupPolicyReconciler) requireKeys(ctx context.Context, pol *pgshardv1alpha1.PgShardBackupPolicy, what string, ref *corev1.LocalObjectReference, want []string) error {
+	if len(want) == 0 {
 		return nil
+	}
+	if ref == nil || ref.Name == "" {
+		return fmt.Errorf("%s secret is not set, but this object store needs %s; will retry", what, strings.Join(want, ", "))
 	}
 	var sec corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: pol.Namespace, Name: ref.Name}, &sec); err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("encryption secret %q does not exist; will retry", ref.Name)
+			return fmt.Errorf("%s secret %q does not exist; will retry", what, ref.Name)
 		}
 		return err
 	}
-	if _, ok := sec.Data[backup.CredPassphrase]; !ok {
+	for _, k := range want {
+		if _, ok := sec.Data[k]; ok {
+			continue
+		}
 		have := make([]string, 0, len(sec.Data))
-		for k := range sec.Data {
-			have = append(have, k)
+		for h := range sec.Data {
+			have = append(have, h)
 		}
 		sort.Strings(have)
-		return fmt.Errorf("encryption secret %q has no %q key (it has: %s); will retry",
-			ref.Name, backup.CredPassphrase, strings.Join(have, ", "))
+		return fmt.Errorf("%s secret %q has no %q key (it has: %s); will retry",
+			what, ref.Name, k, strings.Join(have, ", "))
 	}
 	return nil
 }

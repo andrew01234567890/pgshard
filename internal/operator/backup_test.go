@@ -39,6 +39,17 @@ func repoKeySecret() *corev1.Secret {
 	}
 }
 
+// minioCredsSecret is the Secret newPolicy's credentials ref names. Its s3
+// store defaults to credentialType "shared", which needs both keys; a policy
+// missing them is refused for the same reason as a missing passphrase, and
+// for the same consequence (PGS-950).
+func minioCredsSecret() *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-creds", Namespace: "default"},
+		Data:       map[string][]byte{"key": []byte("minioadmin"), "keySecret": []byte("miniosecret")},
+	}
+}
+
 func newPolicy() *pgshardv1alpha1.PgShardBackupPolicy {
 	no := false
 	return &pgshardv1alpha1.PgShardBackupPolicy{
@@ -639,7 +650,7 @@ func TestBackupPolicyReconcilerStatusAndSchedules(t *testing.T) {
 		Status: pgshardv1alpha1.PgShardBackupStatus{Phase: "Completed", CompletedAt: &done}}
 	other := &pgshardv1alpha1.PgShardBackup{ObjectMeta: metav1.ObjectMeta{Name: "o", Namespace: "default"}, Spec: pgshardv1alpha1.PgShardBackupSpec{ClusterName: "other", Type: "incremental"},
 		Status: pgshardv1alpha1.PgShardBackupStatus{Phase: "Completed", CompletedAt: &done}}
-	cl := fakeClient(t, c, pol, repoKeySecret(), full, other)
+	cl := fakeClient(t, c, pol, repoKeySecret(), minioCredsSecret(), full, other)
 	sched := NewBackupScheduler(cl)
 	now := done.Add(10 * time.Minute)
 	r := &BackupPolicyReconciler{Client: cl, Scheduler: sched, Now: func() time.Time { return now }}
@@ -783,7 +794,7 @@ func TestPolicyBindingAndWatches(t *testing.T) {
 
 func TestBackupPolicyStatusWithoutClusters(t *testing.T) {
 	pol := newPolicy()
-	cl := fakeClient(t, pol, repoKeySecret())
+	cl := fakeClient(t, pol, repoKeySecret(), minioCredsSecret())
 	r := &BackupPolicyReconciler{Client: cl, Scheduler: NewBackupScheduler(cl)}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pol)}); err != nil {
 		t.Fatal(err)
@@ -1128,5 +1139,76 @@ func TestBackupWaitsWhileAGroupIsRollingItsMembers(t *testing.T) {
 	}
 	if c := meta.FindStatusCondition(got.Status.Conditions, "Progressing"); c == nil || !strings.Contains(c.Message, "rolling") {
 		t.Errorf("the wait should say what it is waiting for: %+v", c)
+	}
+}
+
+// TestAPolicyIsRefusedWhenItsCredentialsSecretCannotBeUsed is the credentials
+// half of PGS-949, with the same consequence: render.go errors on a missing
+// credential file, the agent is PID 1 and exits at bootstrap, postgres
+// crash-loops, and the rollout holds on a member that cannot come back.
+//
+// The cases that must NOT be refused matter as much as the ones that must:
+// web-identity S3 and metadata-server GCS legitimately carry no credentials
+// Secret at all, and refusing those would break working policies -- which is
+// why the matrix lives in backup.Repo.RequiredCredentials rather than being
+// restated here.
+func TestAPolicyIsRefusedWhenItsCredentialsSecretCannotBeUsed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*pgshardv1alpha1.ObjectStoreSpec)
+		secret  *corev1.Secret
+		refused string
+	}{
+		{"absent", nil, nil, `credentials secret "minio-creds" does not exist`},
+		{"missingOneKey", nil, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "minio-creds", Namespace: "default"},
+			Data: map[string][]byte{"key": []byte("minioadmin")}}, `has no "keySecret" key (it has: key)`},
+		// Refused ALREADY, by validate() earlier in the chain, with its own
+		// message -- so requireKeys' "not set" branch never sees this case
+		// for s3. It stays as a backstop for any store whose validation does
+		// not cover it, and this case is here so nobody "fixes" the branch by
+		// making it unreachable-looking code they delete.
+		{"notSetAtAll", func(st *pgshardv1alpha1.ObjectStoreSpec) { st.Credentials.SecretRef = nil }, nil,
+			`s3 shared credentials need credentialsDir`},
+		// Needs none: accepted with no credentials Secret anywhere.
+		{"webIdentityS3", func(st *pgshardv1alpha1.ObjectStoreSpec) {
+			st.Credentials.SecretRef = nil
+			st.CredentialType = "web-id"
+		}, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pol := newPolicy()
+			if tc.mutate != nil {
+				tc.mutate(&pol.Spec.ObjectStore)
+			}
+			objs := []client.Object{pol, repoKeySecret()}
+			if tc.secret != nil {
+				objs = append(objs, tc.secret)
+			}
+			cl := fakeClient(t, objs...)
+			r := &BackupPolicyReconciler{Client: cl, Scheduler: NewBackupScheduler(cl)}
+			key := client.ObjectKeyFromObject(pol)
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
+			var got pgshardv1alpha1.PgShardBackupPolicy
+			if err := cl.Get(context.Background(), key, &got); err != nil {
+				t.Fatal(err)
+			}
+			cnd := meta.FindStatusCondition(got.Status.Conditions, ConditionPolicyValid)
+			if tc.refused == "" {
+				if cnd == nil || cnd.Status != metav1.ConditionTrue {
+					t.Fatalf("a store that needs no credentials must validate without a Secret: %+v", cnd)
+				}
+				return
+			}
+			// The reason differs by which check caught it; what matters is
+			// that it was refused and nothing was accepted.
+			if cnd == nil || cnd.Status != metav1.ConditionFalse || !strings.Contains(cnd.Message, tc.refused) {
+				t.Fatalf("condition %+v, want False containing %q", cnd, tc.refused)
+			}
+			if got.Status.AcceptedGeneration != 0 || got.Status.Accepted != nil {
+				t.Errorf("a refused policy was accepted: generation %d", got.Status.AcceptedGeneration)
+			}
+		})
 	}
 }

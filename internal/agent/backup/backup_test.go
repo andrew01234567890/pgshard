@@ -6,6 +6,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -339,5 +340,70 @@ func TestRepoFieldCannotInjectAnOption(t *testing.T) {
 	}
 	if n := strings.Count(out, "repo1-s3-endpoint="); n != 1 {
 		t.Errorf("repo1-s3-endpoint appears %d times", n)
+	}
+}
+
+// TestRequiredCredentialsMatchesWhatRenderReads pins RequiredCredentials to
+// the keys renderStore actually reads, so the two cannot drift. The operator
+// refuses a policy whose credentials Secret lacks one of these (PGS-950), and
+// a list that disagreed with the renderer would either refuse a policy that
+// works or accept one that stops an agent at bootstrap.
+//
+// Only the keys renderStore READS can be pinned this way. gcs "service" and
+// sftp hand pgbackrest the key file's PATH without opening it, so rendering
+// succeeds with the file absent and pgBackRest fails later; for those two
+// RequiredCredentials is the only thing that notices, and they are asserted
+// by value below rather than by rendering.
+func TestRequiredCredentialsMatchesWhatRenderReads(t *testing.T) {
+	read := map[string]Repo{
+		"s3":        {Type: TypeS3, Bucket: "b", Endpoint: "e", Region: "r"},
+		"azure":     {Type: TypeAzure, Bucket: "b"},
+		"gcs-token": {Type: TypeGCS, Bucket: "b", KeyType: "token"},
+	}
+	for name, repo := range read {
+		t.Run(name, func(t *testing.T) {
+			// Defaulted, because KeyType decides the answer and is empty until
+			// WithDefaults fills it in.
+			s := Settings{Stanza: "demo-catalog-pg18", Repo: repo}.WithDefaults()
+			s.Repo.CredentialsDir = t.TempDir() // exists, and is empty
+			want := s.Repo.RequiredCredentials()
+			if len(want) == 0 {
+				t.Fatalf("%s should require credentials", name)
+			}
+			_, err := Render(s, "/var/lib/postgresql/data/pgdata", 5432)
+			if err == nil {
+				t.Fatalf("rendering %s with no credentials should fail; RequiredCredentials says it needs %v", name, want)
+			}
+			// The renderer stops at the first missing one, so it names a
+			// member of the list rather than all of it.
+			named := false
+			for _, k := range want {
+				if strings.Contains(err.Error(), k) {
+					named = true
+				}
+			}
+			if !named {
+				t.Errorf("%s: render failed with %q, which names none of %v -- the list and the renderer disagree", name, err, want)
+			}
+		})
+	}
+
+	// The two that are referenced by path, and the ones that need nothing.
+	for name, tc := range map[string]struct {
+		repo Repo
+		want []string
+	}{
+		"gcs-service": {Repo{Type: TypeGCS, Bucket: "b"}, []string{CredGCSKeyFile}},
+		"sftp":        {Repo{Type: TypeSFTP, Host: "h", HostUser: "u"}, []string{CredSFTPKey}},
+		"s3-web-id":   {Repo{Type: TypeS3, Bucket: "b", KeyType: "web-id"}, nil},
+		"gcs-auto":    {Repo{Type: TypeGCS, Bucket: "b", KeyType: "auto"}, nil},
+		"posix":       {Repo{Type: TypePosix, Path: "/backups"}, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := Settings{Repo: tc.repo}.WithDefaults().Repo.RequiredCredentials()
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("RequiredCredentials = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
