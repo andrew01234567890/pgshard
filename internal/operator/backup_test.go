@@ -26,6 +26,19 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
 )
 
+// repoKeySecret is the Secret newPolicy's encryption ref names. A policy
+// whose encryption Secret is absent or lacks "passphrase" is refused now
+// (PGS-949): accepting one used to roll every member onto a configuration
+// the agent cannot start with, which held the rollout on a member that
+// never came back. The fixture carries the Secret because a policy without
+// one is not a policy that should validate.
+func repoKeySecret() *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "repo-key", Namespace: "default"},
+		Data:       map[string][]byte{"passphrase": []byte("repo-passphrase")},
+	}
+}
+
 func newPolicy() *pgshardv1alpha1.PgShardBackupPolicy {
 	no := false
 	return &pgshardv1alpha1.PgShardBackupPolicy{
@@ -626,7 +639,7 @@ func TestBackupPolicyReconcilerStatusAndSchedules(t *testing.T) {
 		Status: pgshardv1alpha1.PgShardBackupStatus{Phase: "Completed", CompletedAt: &done}}
 	other := &pgshardv1alpha1.PgShardBackup{ObjectMeta: metav1.ObjectMeta{Name: "o", Namespace: "default"}, Spec: pgshardv1alpha1.PgShardBackupSpec{ClusterName: "other", Type: "incremental"},
 		Status: pgshardv1alpha1.PgShardBackupStatus{Phase: "Completed", CompletedAt: &done}}
-	cl := fakeClient(t, c, pol, full, other)
+	cl := fakeClient(t, c, pol, repoKeySecret(), full, other)
 	sched := NewBackupScheduler(cl)
 	now := done.Add(10 * time.Minute)
 	r := &BackupPolicyReconciler{Client: cl, Scheduler: sched, Now: func() time.Time { return now }}
@@ -770,7 +783,7 @@ func TestPolicyBindingAndWatches(t *testing.T) {
 
 func TestBackupPolicyStatusWithoutClusters(t *testing.T) {
 	pol := newPolicy()
-	cl := fakeClient(t, pol)
+	cl := fakeClient(t, pol, repoKeySecret())
 	r := &BackupPolicyReconciler{Client: cl, Scheduler: NewBackupScheduler(cl)}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pol)}); err != nil {
 		t.Fatal(err)
@@ -1021,5 +1034,60 @@ func TestBackupRunsItsGroupsConcurrently(t *testing.T) {
 	// operator reads does not depend on a race.
 	if len(got.Status.Groups) != 2 || got.Status.Groups[0].Group != "catalog" || got.Status.Groups[1].Group != "shard-0" {
 		t.Fatalf("groups out of topology order: %+v", got.Status.Groups)
+	}
+}
+
+// TestAPolicyIsRefusedWhenItsEncryptionSecretCannotBeUsed: accepting such a
+// policy is not a deferred error, it is an outage.
+//
+// The policy is part of the member template, so acceptance rolls every
+// member; the agent is PID 1 and reads the passphrase from the mounted
+// Secret at bootstrap, so a Secret without that key makes it exit, postgres
+// crash-loops, and the rollout holds on a member that cannot come back.
+// That is PGS-949, found when an e2e fixture named the key "key".
+//
+// Refusing at acceptance is what keeps the members on the configuration
+// that last validated, which is the guarantee backup.go already states.
+func TestAPolicyIsRefusedWhenItsEncryptionSecretCannotBeUsed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		secret *corev1.Secret
+		want   string
+	}{
+		{"absent", nil, `encryption secret "repo-key" does not exist`},
+		{"wrongKey", &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "repo-key", Namespace: "default"},
+			Data: map[string][]byte{"key": []byte("x"), "other": []byte("y")}}, `has no "passphrase" key (it has: key, other)`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pol := newPolicy()
+			objs := []client.Object{pol}
+			if tc.secret != nil {
+				objs = append(objs, tc.secret)
+			}
+			cl := fakeClient(t, objs...)
+			r := &BackupPolicyReconciler{Client: cl, Scheduler: NewBackupScheduler(cl)}
+			key := client.ObjectKeyFromObject(pol)
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
+			var got pgshardv1alpha1.PgShardBackupPolicy
+			if err := cl.Get(context.Background(), key, &got); err != nil {
+				t.Fatal(err)
+			}
+			cnd := meta.FindStatusCondition(got.Status.Conditions, ConditionPolicyValid)
+			if cnd == nil || cnd.Status != metav1.ConditionFalse || cnd.Reason != "SecretIncomplete" || !strings.Contains(cnd.Message, tc.want) {
+				t.Fatalf("condition %+v, want False/SecretIncomplete containing %q", cnd, tc.want)
+			}
+			// The guarantee that matters: nothing is accepted, so the member
+			// template does not change and no member is rolled onto it.
+			if got.Status.AcceptedGeneration != 0 || got.Status.Accepted != nil {
+				t.Errorf("a refused policy was accepted: generation %d, accepted %v", got.Status.AcceptedGeneration, got.Status.Accepted)
+			}
+			// And it says to wait, because nothing watches Secrets -- the
+			// one-minute requeue is what picks up a correction.
+			if !strings.Contains(cnd.Message, "will retry") {
+				t.Errorf("the message should tell an operator to wait: %q", cnd.Message)
+			}
+		})
 	}
 }
