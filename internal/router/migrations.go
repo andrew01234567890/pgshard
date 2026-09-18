@@ -475,8 +475,12 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 		err.Hint = "start the router with a catalog connection that may write pgshard.migrations"
 		return err
 	}
+	// The statement's snapshot, not the live one: this records where a
+	// scope=home migration is to run, and it must be the home shard the
+	// statement was planned against rather than one a reload has since
+	// moved it to.
 	req := catalog.DDLMigration{Database: e.info.Database, Statement: m.Statement, Kind: m.Kind, Strategy: m.Strategy, Scope: m.Scope,
-		HomeShard: e.Home().ID, Meta: catalog.MigrationMeta{
+		HomeShard: e.homeAt(e.stmtSnap).ID, Meta: catalog.MigrationMeta{
 			SearchPath:    e.recordedSearchPath(),
 			Object:        catalog.MigrationObject{Kind: m.Object.Kind, Schema: m.Object.Schema, Name: m.Object.Name, Table: m.Object.Table, Expect: m.Object.Expect},
 			Target:        m.Target,
