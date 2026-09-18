@@ -715,11 +715,25 @@ func (e *Executor) checkFanoutDDL(ctx context.Context) error {
 		return nil
 	}
 	if snap := e.r.cfg.Snapshot(); snap != nil && snap.Resharding() {
-		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
-		err.Hint = "retry once the reshard completes; a catalog migrated to the operation queue queues the statement instead of refusing it"
-		return err
+		return reshardingDDLRefusal()
 	}
 	return nil
+}
+
+// reshardingDDLRefusal is the refusal both DDL paths give while a reshard
+// holds the shard map.
+//
+// The hint names the FAILED case as well as the running one, because the
+// snapshot cannot tell them apart: Resharding() is true while any set is in
+// provisioning (snapshot.go), and a reshard that failed leaves its set
+// exactly there. So "retry once the reshard completes" -- which was the
+// whole hint -- is advice that can never come true for the case an operator
+// is most likely to be in when they hit this, and a failed reshard is
+// precisely when they need DDL to repair or work around (PGS-876).
+func reshardingDDLRefusal() *pgwire.Error {
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
+	err.Hint = "retry once the reshard completes; if it has FAILED it holds the shard map until it is cleared, which reverting spec.shards to the serving count does (or deleting the set's rows for a catalog-sourced one) -- see docs/resharding.md. A catalog migrated to the operation queue queues the statement instead of refusing it"
+	return err
 }
 
 // checkHomeDDL refuses DDL a local database runs directly on its home shard
@@ -736,7 +750,11 @@ func (e *Executor) checkHomeDDL(ctx context.Context) error {
 	}
 	if !queued {
 		if snap := e.r.cfg.Snapshot(); snap != nil && snap.Resharding() {
-			return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
+			// The same refusal as checkFanoutDDL, hint included: this one
+			// carried none at all, so which of the two paths a statement
+			// took decided whether the client was told anything about
+			// recovering.
+			return reshardingDDLRefusal()
 		}
 		return nil
 	}
