@@ -415,14 +415,25 @@ spec:
 		// that lands fails with "no backup policy configured for this
 		// member". The backup suite never sees this because it creates its
 		// cluster with the policy already set.
-		waitFor(ctx, t, "BackupHealthy on the policy", 5*time.Minute, func() bool {
-			return jsonpath(ctx, t, c, "pgshardbackuppolicy", clusterName+"-policy",
-				`{.status.conditions[?(@.type=="BackupHealthy")].status}`) == "True"
+		//
+		// NOT BackupHealthy, on either object: both derive that condition
+		// from COMPLETED backups, so waiting for it before taking one is
+		// circular -- it cannot go true until the thing it is gating has
+		// already happened. What says the policy is usable is that it was
+		// accepted: "members archive to what the policy last accepted, not
+		// to its spec".
+		waitFor(ctx, t, "the backup policy to be accepted", 5*time.Minute, func() bool {
+			gen := jsonpath(ctx, t, c, "pgshardbackuppolicy", clusterName+"-policy", "{.metadata.generation}")
+			acc := jsonpath(ctx, t, c, "pgshardbackuppolicy", clusterName+"-policy", "{.status.acceptedGeneration}")
+			return gen != "" && gen == acc
 		})
-		waitFor(ctx, t, "BackupHealthy on the cluster", 5*time.Minute, func() bool {
-			return jsonpath(ctx, t, c, "pgshardcluster", clusterName,
-				`{.status.conditions[?(@.type=="BackupHealthy")].status}`) == "True"
-		})
+		// And then for the members to be rendered with it: the accepted
+		// policy changes the member template, so the pods roll, and Ready
+		// again is when they are carrying it.
+		if err := waitCondition(ctx, c, "Ready", 10*time.Minute); err != nil {
+			gatherNamespace(ctx, c)
+			t.Fatal(err)
+		}
 
 		// The backup is an operator -> agent call carrying the per-cluster
 		// <cluster>-tls-operator credential.
