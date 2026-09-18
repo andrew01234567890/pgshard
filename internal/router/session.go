@@ -1168,20 +1168,24 @@ func (e *Executor) forgetNamedStatements() {
 // connection is retried once after the snapshot moves, provided nothing has
 // reached the client and no transaction is open (see decideFailover).
 func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run func(pgwire.ResultWriter) error) error {
+	return e.withFailoverEnd(ctx, endSync, w, run)
+}
+
+func (e *Executor) withFailoverEnd(ctx context.Context, end batchEnd, w pgwire.ResultWriter, run func(pgwire.ResultWriter) error) error {
 	inTxn := e.inClientTransaction()
 	if e.r.blocking(e.shard) {
 		switch decideFailover(true, inTxn, false, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 		case failoverFailTxn:
 			e.dropStream()
 			e.failTxn()
-			return e.afterBatch(ctx, failoverInTxnError())
+			return e.settle(ctx, end, failoverInTxnError())
 		case failoverRefuse:
-			return e.afterBatch(ctx, e.bufferFull())
+			return e.settle(ctx, end, e.bufferFull())
 		case failoverWait:
 			if ok, err := e.r.awaitConsistent(ctx, e.shard, false, e.r.cfg.Buffering.Window); err != nil {
-				return e.afterBatch(ctx, err)
+				return e.settle(ctx, end, err)
 			} else if !ok {
-				return e.afterBatch(ctx, pgwire.Errorf(codeConnectionFailure, "shard %s/%d has no serving primary", e.shard.Set, e.shard.ID))
+				return e.settle(ctx, end, pgwire.Errorf(codeConnectionFailure, "shard %s/%d has no serving primary", e.shard.Set, e.shard.ID))
 			}
 		}
 	}
@@ -1238,7 +1242,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 	if poolerReason(err) == pgshardv1.Reason_REASON_STALE_GENERATION && (!cw.wrote || inTxn) {
 		err = failoverInTxnError()
 	}
-	return e.afterBatch(ctx, err)
+	return e.settle(ctx, end, err)
 }
 
 // inClientTransaction reports whether the client is inside a transaction,
@@ -1776,83 +1780,71 @@ func (e *Executor) Sync(ctx context.Context) error {
 	return e.guard("Sync", func() error { return e.sync(ctx) })
 }
 
+// batchEnd is the client message a staged batch runs under. A Sync ends the
+// batch; a Flush answers everything staged so far and leaves it open.
+type batchEnd int
+
+const (
+	endSync batchEnd = iota
+	endFlush
+)
+
+func endReq(end batchEnd) *pgshardv1.ExecuteRequest {
+	if end == endFlush {
+		return flushReq()
+	}
+	return syncReq()
+}
+
+// settle does a batch's end-of-batch bookkeeping, and for a Flush that left
+// the backend holding the batch open, only the part that is true of a batch
+// still running.
+//
+// The distinction is not cosmetic. afterBatch drops what a finished batch
+// no longer owns -- two-phase-commit participation, savepoints, parked
+// shards, staged GUCs -- and a flushed write has recorded exactly that
+// participation moments earlier and is still inside the batch that owns it.
+// The client's Sync closes the backend batch and settles it then.
+func (e *Executor) settle(ctx context.Context, end batchEnd, err error) error {
+	if end == endFlush && e.backendOpen {
+		// The relayed requests are answered; a later Execute in this same
+		// batch must not be matched against their completions.
+		e.completions, e.clientReqs = nil, nil
+		return err
+	}
+	return e.afterBatch(ctx, err)
+}
+
 // Flush answers a client's Flush: the extended batch staged so far runs and
 // its responses reach the client, with no ReadyForQuery and the portals
 // left open, so a pipelined client gets its rows before it sends Sync.
 //
-// Only a plain single-shard read batch takes this path. A scatter, an
-// injected statement, a write, a transaction control statement and a
-// session-effect statement each need the machinery Sync runs around them,
-// and for those the Flush stays what it has always been -- nothing, with
-// the client's answers arriving at Sync as before. That is not a
-// regression, and a wrong guess here is a hung session.
+// It runs the same batch runner Sync does, so a write, a transaction
+// control statement, a session-effect statement and an injected statement
+// are all answered here: each is a single-target passthrough, and running
+// it at the Flush leaves the backend's implicit transaction open exactly as
+// running it at the Sync would. That is what PostgreSQL does, and a client
+// that sends Flush and waits -- which is what Flush is for -- used to block
+// until its read deadline on every one of those shapes (PGS-911).
+//
+// A scatter is the exception and stays staged for the Sync. Answering a
+// cross-shard write early commits it on each shard before the client's
+// Sync, and the router cannot undo that if the batch goes on to fail, where
+// PostgreSQL would have rolled the whole unsynced batch back. Trading a
+// visible hang for a silent atomicity break needs a decision, not a patch.
 func (e *Executor) Flush(ctx context.Context, w pgwire.ResultWriter) error {
 	e.enterStatement(ctx)
 	return e.guard("Flush", func() error { return e.flush(ctx, w) })
 }
 
 func (e *Executor) flush(ctx context.Context, w pgwire.ResultWriter) error {
+	// Nothing staged: PostgreSQL answers a Flush with nothing staged by
+	// writing nothing, and so does this. A failed batch has already sent
+	// its error and is cleared at the Sync.
 	if e.batchFailed || len(e.batch) == 0 || e.batchScatter != nil {
 		return nil
 	}
-	for _, injected := range e.batchInject {
-		if len(injected) > 0 {
-			return nil
-		}
-	}
-	for _, item := range e.batchExec {
-		if item.class.Write || item.class.Txn != plan.TxnNone || item.class.Session != plan.SessionNone {
-			return nil
-		}
-	}
-	batch, executed := e.batch, e.batchExec
-	if e.batchWriter != nil {
-		w = e.batchWriter
-	}
-	target := e.shard
-	if e.batchTarget != nil {
-		target = *e.batchTarget
-	}
-	fresh := map[string]bool{}
-	for _, name := range e.batchStmts {
-		fresh[name] = true
-	}
-	// The messages are about to be sent, so the Sync that follows must not
-	// send them again. The portals stay: that is the point of a Flush.
-	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec, e.batchBinds = nil, nil, nil, nil, nil, nil
-	e.batchDDL = nil
-	e.pendingDescribes, e.describes = e.describes, nil
-	if w == nil {
-		w = discardWriter{}
-	}
-	if err := e.moveTo(ctx, target); err != nil {
-		return e.afterBatch(ctx, err)
-	}
-	if err := e.acquire(ctx, fresh); err != nil {
-		return e.afterBatch(ctx, err)
-	}
-	// A flushed batch spans two client messages, so the backend has to be
-	// the same one when the Sync arrives.
-	if err := e.ensurePinned(ctx); err != nil {
-		return e.afterBatch(ctx, err)
-	}
-	for _, req := range batch {
-		if err := e.send(req); err != nil {
-			return e.afterBatch(ctx, err)
-		}
-	}
-	if err := e.send(flushReq()); err != nil {
-		return e.afterBatch(ctx, err)
-	}
-	e.backendOpen = true
-	err := e.pump(ctx, w)
-	if err == nil {
-		for _, item := range executed {
-			e.noteExecuted(item.sql, item.local)
-			e.noteSessionEffect(item.class, item.sql)
-		}
-	}
-	return e.afterBatch(ctx, err)
+	return e.runBatch(ctx, endFlush, w)
 }
 
 // closeBackendBatch ends a batch this session flushed but never synced.
@@ -1878,6 +1870,15 @@ func (e *Executor) sync(ctx context.Context) error {
 		e.batchFailed = false
 		return e.closeBackendBatch(ctx)
 	}
+	return e.runBatch(ctx, endSync, nil)
+}
+
+// runBatch ships the staged batch and relays its responses. end says which
+// message terminates it: a Sync ends the batch, a Flush answers it and
+// leaves the backend holding it open for the Sync still to come. fallback
+// is the writer to relay to when the batch staged none of its own, which is
+// how a Flush reaches the client that asked for it.
+func (e *Executor) runBatch(ctx context.Context, end batchEnd, fallback pgwire.ResultWriter) error {
 	batch, w, executed, binds, ddl := e.batch, e.batchWriter, e.batchExec, e.batchBinds, e.batchDDL
 	target := e.shard
 	if e.batchTarget != nil {
@@ -1905,6 +1906,9 @@ func (e *Executor) sync(ctx context.Context) error {
 		return e.closeBackendBatch(ctx)
 	}
 	if w == nil {
+		w = fallback
+	}
+	if w == nil {
 		w = discardWriter{}
 	}
 	for _, item := range executed {
@@ -1912,14 +1916,14 @@ func (e *Executor) sync(ctx context.Context) error {
 			before := e.currentSnapshot()
 			if err := e.gateWrite(ctx, target, item.tables); err != nil {
 				e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-				return e.afterBatch(ctx, err)
+				return e.settle(ctx, end, err)
 			}
 			if e.currentSnapshot() != before && len(binds) > 0 {
 				var batchTarget *Shard
 				var err error
 				if batchTarget, scatterPlan, scatterStmt, err = e.reaim(ctx, binds); err != nil {
 					e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-					return e.afterBatch(ctx, err)
+					return e.settle(ctx, end, err)
 				}
 				if batchTarget != nil {
 					target = *batchTarget
@@ -1928,6 +1932,11 @@ func (e *Executor) sync(ctx context.Context) error {
 			break
 		}
 	}
+	// A scatter never reaches here from a Flush -- flush declines one --
+	// except when the re-aim just above turned this batch into one because
+	// the shard map moved under it. The batch is already consumed by then,
+	// so it runs rather than being lost, which is the same fan-out the Sync
+	// would have run a moment later.
 	if scatterPlan != nil && isReferenceWrite(*scatterPlan) && !hasExecute(batch) {
 		// Parse/Describe of a reference write is answered by the current
 		// shard alone; the fan-out starts with Execute.
@@ -1935,54 +1944,56 @@ func (e *Executor) sync(ctx context.Context) error {
 	}
 	if handled, err := e.nextvalBatch(ctx, batch, parsed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-		return e.afterBatch(ctx, err)
+		return e.settle(ctx, end, err)
 	}
 	if handled, err := e.explainBatch(batch, parsed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-		return e.afterBatch(ctx, err)
+		return e.settle(ctx, end, err)
 	}
 	if handled, err := e.migrationBatch(ctx, batch, ddl, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-		return e.afterBatch(ctx, err)
+		return e.settle(ctx, end, err)
 	}
 	if scatterPlan != nil {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		if isReferenceWrite(*scatterPlan) {
 			st, ok := e.stmts[scatterStmt]
 			if !ok {
-				return e.afterBatch(ctx, pgwire.Errorf("26000", "prepared statement %q does not exist", scatterStmt))
+				return e.settle(ctx, end, pgwire.Errorf("26000", "prepared statement %q does not exist", scatterStmt))
 			}
 			// shardSQL, not the client's text: a reference write on a
 			// table under an online rewrite carries a column list the
 			// client did not write, and RETURNING * is expanded to the
 			// visible columns.
 			if err := e.answerStagedCompletions(w, batch); err != nil {
-				return e.afterBatch(ctx, err)
+				return e.settle(ctx, end, err)
 			}
-			return e.afterBatch(ctx, e.referenceWrite(ctx, *scatterPlan, unnamedBatch(st.shardSQL(), st.shardOIDs(), batch), w))
+			return e.settle(ctx, end, e.referenceWrite(ctx, *scatterPlan, unnamedBatch(st.shardSQL(), st.shardOIDs(), batch), w))
 		}
 		if err := e.answerStagedCompletions(w, batch); err != nil {
-			return e.afterBatch(ctx, err)
+			return e.settle(ctx, end, err)
 		}
-		return e.afterBatch(ctx, e.scatterBatch(ctx, *scatterPlan, scatterStmt, batch, w))
+		return e.settle(ctx, end, e.scatterBatch(ctx, *scatterPlan, scatterStmt, batch, w))
 	}
 	if handled, err := e.txnControlBatch(ctx, batch, executed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-		return e.afterBatch(ctx, err)
+		return e.settle(ctx, end, err)
 	}
 	e.unsent = fresh
 	err := e.moveTo(ctx, target)
 	e.unsent = nil
 	if err != nil {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-		return e.afterBatch(ctx, err)
+		return e.settle(ctx, end, err)
 	}
-	return e.withFailover(ctx, w, func(cw pgwire.ResultWriter) error {
+	return e.withFailoverEnd(ctx, end, w, func(cw pgwire.ResultWriter) error {
 		if err := e.acquire(ctx, fresh); err != nil {
 			e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 			return err
 		}
-		if pin || len(e.staged) > e.stagedMark {
+		// A flushed batch spans two client messages, so the backend has
+		// to be the same one when the Sync arrives.
+		if end == endFlush || pin || len(e.staged) > e.stagedMark {
 			if err := e.ensurePinned(ctx); err != nil {
 				e.staged = e.staged[:e.stagedMark]
 				return err
@@ -2044,10 +2055,10 @@ func (e *Executor) sync(ctx context.Context) error {
 				}
 			}
 		}
-		if err := e.send(syncReq()); err != nil {
+		if err := e.send(endReq(end)); err != nil {
 			return err
 		}
-		e.backendOpen = false
+		e.backendOpen = end == endFlush
 		e.hiddenExec = hidden
 		err := e.pump(ctx, cw)
 		e.hiddenExec = nil

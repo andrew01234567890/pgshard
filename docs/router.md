@@ -230,21 +230,25 @@ the rest with `0A000`. See *Routing* below.
   a backend repeating what the session already asked for is not news. The
   values advertised at startup are the router's own and are not yet read
   back from a backend.
-- **`Flush`.** A `Flush` is answered -- the batch runs and its results
-  reach the client before `Sync` -- for a **plain single-shard read batch**
-  only. For anything else the router writes nothing and waits for the
-  `Sync`, which is correct for a client that always follows `Flush` with
-  `Sync`, and **hangs a client that flushes and waits**, which is what
-  `Flush` is for. The shapes that hang are: a scatter (a read needing more
-  than one shard), a batch carrying an injected statement, and any batch
-  holding a write, a transaction-control statement or a session-effect
-  statement such as `SET`.
+- **`Flush`.** A `Flush` is answered -- the batch runs and its results reach
+  the client before `Sync`, with no `ReadyForQuery` and the portals left
+  open -- for **every batch the router runs against one shard**: a read, a
+  write, a transaction-control statement, a session-effect statement such as
+  `SET`, a batch carrying an injected statement, and the batches the router
+  answers itself rather than sending to a shard (`nextval` over a global
+  sequence, `EXPLAIN (PGSHARD)`, a DDL migration). Running one of those at
+  the `Flush` is what PostgreSQL does and
+  leaves the backend's implicit transaction open exactly as running it at
+  the `Sync` would.
 
-  So a pipelining client -- `pgconn.Pipeline` in pgx, or raw `Parse`/`Bind`/
-  `Execute`/`Flush` -- blocks in `GetResults` until its read deadline on
-  every shape but the narrowest. Until that is fixed (PGS-911), send `Sync`
-  rather than `Flush` when the batch is anything other than a single-shard
-  read.
+  **A scatter is the exception**: it stays staged and its answers arrive at
+  the `Sync`, so a client that flushes and waits on a multi-shard statement
+  blocks until its read deadline. Answering a cross-shard write early
+  commits it on each shard before the client's `Sync`, and the router cannot
+  undo that if the batch goes on to fail, where PostgreSQL would have rolled
+  the whole unsynced batch back. Until that trade is decided (PGS-911), send
+  `Sync` rather than `Flush` for a statement that reaches more than one
+  shard.
 - **Not yet.** `PortalSuspended` (`Execute` with a row limit) is not
   supported by the pooler contract in this layer.
 

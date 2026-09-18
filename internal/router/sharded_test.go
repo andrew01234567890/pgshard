@@ -841,11 +841,12 @@ func TestFlushAnswersBeforeSync(t *testing.T) {
 	}
 }
 
-// TestFlushOnAWriteBatchStillAnswersAtSync: only a plain single-shard read
-// takes the early-answer path. A write needs the gating and failover
-// machinery Sync runs around it, so its Flush stays what it always was --
-// nothing. The batch must still be intact for Sync, not lost or half-sent.
-func TestFlushOnAWriteBatchStillAnswersAtSync(t *testing.T) {
+// TestAFlushedWriteBatchStillEndsAtItsSync: the write is answered at the
+// Flush (PGS-911), and the Sync that follows must still end the batch --
+// one ReadyForQuery, no second copy of the write's answer, and the backend
+// batch the Flush left open closed rather than carried into the next
+// statement.
+func TestAFlushedWriteBatchStillEndsAtItsSync(t *testing.T) {
 	h := newShardedHarness(t)
 	conn, err := pgx.Connect(context.Background(), h.dsn())
 	if err != nil {
@@ -868,6 +869,7 @@ func TestFlushOnAWriteBatchStillAnswersAtSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	var completed bool
+	var completions int
 	for {
 		msg, err := fe.Receive()
 		if err != nil {
@@ -878,6 +880,7 @@ func TestFlushOnAWriteBatchStillAnswersAtSync(t *testing.T) {
 		}
 		if _, ok := msg.(*pgproto3.CommandComplete); ok {
 			completed = true
+			completions++
 		}
 		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
 			break
@@ -885,6 +888,9 @@ func TestFlushOnAWriteBatchStillAnswersAtSync(t *testing.T) {
 	}
 	if !completed {
 		t.Fatal("the write was neither answered early nor at Sync: the batch was lost")
+	}
+	if completions != 1 {
+		t.Fatalf("the write was answered %d times; a batch answered at its Flush must not be answered again at its Sync", completions)
 	}
 }
 
