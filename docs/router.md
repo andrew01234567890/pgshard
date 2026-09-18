@@ -237,14 +237,23 @@ the rest with `0A000`. See *Routing* below.
   `Sync`, and **hangs a client that flushes and waits**, which is what
   `Flush` is for. The shapes that hang are: a scatter (a read needing more
   than one shard), a batch carrying an injected statement, and any batch
-  holding a write, a transaction-control statement or a session-effect
-  statement such as `SET`.
+  holding a write, a transaction-control statement, an SQL-level `PREPARE`
+  or a `DISCARD ALL`.
+
+  **A plain `SET` or `RESET` is answered**, and an earlier version of this
+  entry said it hung. Those are the only two session-effect kinds the
+  planner records (`plan.SessionPrepare` and `plan.SessionDiscardAll`); a
+  `SET` is a separate classification and was never declined.
 
   So a pipelining client -- `pgconn.Pipeline` in pgx, or raw `Parse`/`Bind`/
   `Execute`/`Flush` -- blocks in `GetResults` until its read deadline on
-  every shape but the narrowest. Until that is fixed (PGS-911), send `Sync`
-  rather than `Flush` when the batch is anything other than a single-shard
-  read.
+  each of those. Until that is fixed (PGS-911), send `Sync` rather than
+  `Flush` for a batch that writes, controls a transaction, or reaches more
+  than one shard.
+
+  In pgx, note that `Pipeline.Flush` sends **no** protocol `Flush` -- it
+  empties pgx's own write buffer and nothing more. `SendFlushRequest()` is
+  the call that puts the message on the wire.
 - **Not yet.** `PortalSuspended` (`Execute` with a row limit) is not
   supported by the pooler contract in this layer.
 
