@@ -1091,3 +1091,42 @@ func TestAPolicyIsRefusedWhenItsEncryptionSecretCannotBeUsed(t *testing.T) {
 		})
 	}
 }
+
+// TestBackupWaitsWhileAGroupIsRollingItsMembers: a backup asked for while a
+// group is being rolled must WAIT, not fail.
+//
+// It matters most for the rollout that delivers a policy. The policy is part
+// of the member template rather than of the settings an agent can reload, so
+// attaching one replaces every member, and a member that has not been
+// replaced yet answers "no backup policy configured for this member" -- the
+// same words a cluster with no policyRef at all answers. The operator
+// recorded a rollout it was itself running as the user's misconfiguration,
+// on a Failed backup with duration 0s (PGS-948).
+//
+// Pending is what the reconciler already does for a group with no primary or
+// an unready one, and a member being replaced is the same kind of "not yet".
+func TestBackupWaitsWhileAGroupIsRollingItsMembers(t *testing.T) {
+	agents := &fakeBackupAgents{}
+	r, cl, b := backupFixture(t, agents)
+	ctx := context.Background()
+	var pg pgshardv1alpha1.PgShardGroup
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "demo-shard-0"}, &pg); err != nil {
+		t.Fatal(err)
+	}
+	pg.Status.Rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseRestarting, Member: "demo-shard-0-1", Reason: "template changed"}
+	if err := cl.Status().Update(ctx, &pg); err != nil {
+		t.Fatal(err)
+	}
+	res, got := reconcileBackup(t, r, b)
+	if got.Status.Phase != pgshardv1alpha1.BackupPhasePending || res.RequeueAfter != backupPollInterval {
+		t.Fatalf("a backup during a roll should wait: %+v %v", got.Status, res)
+	}
+	// And nothing was asked of any agent: the point is not to call a member
+	// that is being replaced and then report its refusal as a failure.
+	if n := len(agents.journal()); n != 0 {
+		t.Errorf("%d agent calls made during the roll: %v", n, agents.journal())
+	}
+	if c := meta.FindStatusCondition(got.Status.Conditions, "Progressing"); c == nil || !strings.Contains(c.Message, "rolling") {
+		t.Errorf("the wait should say what it is waiting for: %+v", c)
+	}
+}

@@ -244,6 +244,23 @@ func primariesOf(ctx context.Context, k client.Client, c *pgshardv1alpha1.PgShar
 		if pg.Status.Primary == "" {
 			return nil, fmt.Sprintf("group %s has no primary yet", g.Name()), nil
 		}
+		// A group being rolled is not ready to be backed up, for the same
+		// reason as the cases either side of this one: the member that
+		// would answer is being replaced.
+		//
+		// It matters most for the rollout that DELIVERS a policy. The
+		// policy is part of the member template rather than of the settings
+		// an agent can reload -- render.go keeps Backup outside Settings
+		// because "it changes the pod (mounted Secrets) and archive_mode,
+		// so it is part of the pod hash" -- so attaching one replaces every
+		// member, and a member that has not been replaced yet answers
+		// "no backup policy configured for this member". Those are the same
+		// words a cluster with no policyRef at all answers, so the operator
+		// recorded a rollout it was itself running as the user's
+		// misconfiguration, on a Failed backup with duration 0s (PGS-948).
+		if pg.Status.Rollout != nil && pg.Status.Rollout.Phase == pgshardv1alpha1.RolloutPhaseRestarting {
+			return nil, fmt.Sprintf("group %s is rolling its members", g.Name()), nil
+		}
 		var pod corev1.Pod
 		if err := k.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: pg.Status.Primary}, &pod); err != nil {
 			if apierrors.IsNotFound(err) {
