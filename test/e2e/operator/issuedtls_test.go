@@ -492,9 +492,24 @@ spec:
 		// on -- the only thing that reports the agent's view is asking it.
 		// This retries for that reason, and an operator meeting the same
 		// error has the same recourse and no better signal.
+		// MEASURED, not guessed: on a CI runner this roll takes 15-16
+		// minutes for six members -- one at a time, each a restart behind
+		// Ready and caught-up gates, after this suite's TLS move and a
+		// failover. A 15 minute window missed it by about a minute: the
+		// last attempt failed at 13:02 and the must-gather a minute later
+		// showed every member on the new template with the backup mounts,
+		// and the rollout Idle.
+		//
+		// The structurally better fix is to create the cluster WITH the
+		// policy so no roll is needed -- this subtest wants to prove a
+		// backup and a barrier cross mTLS, not to exercise attaching a
+		// policy to a running cluster, which is an accidental requirement
+		// of patching it in afterwards. That needs clusterManifestTLS to
+		// take a backup section, and it is shared with the other operator
+		// suites, so it is left as a follow-up rather than done here.
 		var last string
 		succeeded := false
-		deadline := time.Now().Add(15 * time.Minute)
+		deadline := time.Now().Add(25 * time.Minute)
 		for time.Now().Before(deadline) && !succeeded {
 			if err := c.Apply(ctx, backup); err != nil {
 				t.Fatal(err)
