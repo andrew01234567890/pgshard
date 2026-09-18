@@ -44,11 +44,12 @@ func env(key, def string) string {
 }
 
 func clusterManifest(major string, image string) string {
-	return clusterManifestTLS(major, image, "    insecure: true\n")
+	return clusterManifestTLS(major, image, "    insecure: true\n", "")
 }
 
-// clusterManifestTLS is clusterManifest with the spec.internalTLS block given.
-func clusterManifestTLS(major, image, internalTLS string) string {
+// clusterManifestTLS is clusterManifest with the spec.internalTLS block
+// given, and extraSpec appended to spec at the same indentation.
+func clusterManifestTLS(major, image, internalTLS, extraSpec string) string {
 	img := ""
 	if image != "" {
 		img = "    image: " + image + "\n"
@@ -80,7 +81,7 @@ spec:
     requests:
       cpu: 50m
       memory: 128Mi
-`, testNamespace, clusterName, major, img, internalTLS)
+%[6]s`, testNamespace, clusterName, major, img, internalTLS, extraSpec)
 }
 
 func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, image string) {
