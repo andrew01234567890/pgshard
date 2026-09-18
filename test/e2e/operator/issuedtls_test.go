@@ -379,7 +379,11 @@ stringData: {key: minioadmin, keySecret: minioadmin}
 apiVersion: v1
 kind: Secret
 metadata: {name: %[1]s-repo-key, namespace: %[2]s}
-stringData: {key: %[1]s-repo-passphrase}
+# The key must be named passphrase: the agent reads
+# /etc/pgshard-backup/encryption/passphrase from this Secret's mount, and
+# any other key name leaves the file absent. Naming it "key" here is what
+# crash-looped demo-catalog-1 and held the rollout (docs/backup.md:32).
+stringData: {passphrase: %[1]s-repo-passphrase}
 ---
 apiVersion: pgshard.io/v1alpha1
 kind: PgShardBackupPolicy
