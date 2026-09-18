@@ -23,6 +23,25 @@
   `--tls-accept-plaintext` also serves plaintext callers on the same port
   for the length of a move to mutual TLS; a TLS caller still gets the full
   check (see [router.md](router.md#running)).
+- **What a router certificate authorises, in full.** The pooler admits
+  exactly one caller role (`internal/pki`: `callers[RolePooler] =
+  {RoleRouter}`), so everything below is what the holder of *any* router
+  certificate may do on that shard — the certificate identifies the
+  component, not a tenant, database or stream.
+  - Execute statements as any PostgreSQL role it can present SCRAM keys
+    for. Those keys come from the client's own authentication, so this is
+    bounded by what the client proved, not by the certificate.
+  - **Open a change stream on, or acknowledge, any logical replication slot
+    on the shard** — including one pgshard did not create. `slotOf`
+    (`internal/pooler/stream.go`) accepts any caller-supplied slot name
+    matching PostgreSQL's own rule and uses it verbatim; only the *derived*
+    path is namespaced (`pgshard_<stream>_shard<n>`). Acknowledging advances
+    `confirmed_flush_lsn`, which discards WAL the slot's real consumer has
+    not read, and both the read and the discard are silent to that consumer.
+    This is deliberate today rather than an oversight — no shipped caller
+    sets the slot explicitly, so narrowing it would break nothing, but
+    whether a router certificate *should* carry it is an open decision
+    (PGS-797). Recorded here because it is the thing nobody could look up.
 - **Backend authentication.** A backend connection is accepted only after
   a complete SCRAM-SHA-256 exchange whose server signature verified against
   the forwarded ServerKey; an `AuthenticationOk` without it (trust or
