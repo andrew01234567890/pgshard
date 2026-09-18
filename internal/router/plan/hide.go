@@ -16,10 +16,16 @@ func (w *walker) hideRewriteColumns() error {
 	// Ahead of the switch below, because a DDL statement plans as
 	// MigrationKind and used to walk straight past this: ALTER TABLE ...
 	// DROP COLUMN on a working column, RENAME COLUMN, and CREATE INDEX on
-	// one were all accepted. Introspection still lists the working column
-	// (PGS-590), so a migration tool that diffs the schema proposes exactly
-	// those, and dropping the column mid-rewrite destroys the backfill and
-	// the dual-write triggers with it.
+	// one were all accepted. A migration tool that diffs the schema
+	// proposes exactly those, and dropping the column mid-rewrite destroys
+	// the backfill and the dual-write triggers with it.
+	//
+	// Introspection no longer lists the working column (#774 filters
+	// information_schema.columns and pg_catalog.pg_attribute), so the
+	// commonest way to arrive here is closed -- but not every way: that
+	// filter stands aside for a schema-qualified column reference, and a
+	// statement can always name the column without having read it
+	// anywhere. This refusal is what makes it safe regardless.
 	//
 	// The rewrite's own steps do not come through here -- the applier runs
 	// them on the shards directly -- so nothing legitimate names a working
