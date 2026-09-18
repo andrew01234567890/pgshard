@@ -419,17 +419,23 @@ spec:
 		// NOT BackupHealthy, on either object: both derive that condition
 		// from COMPLETED backups, so waiting for it before taking one is
 		// circular -- it cannot go true until the thing it is gating has
-		// already happened. What says the policy is usable is that it was
-		// accepted: "members archive to what the policy last accepted, not
-		// to its spec".
-		waitFor(ctx, t, "the backup policy to be accepted", 5*time.Minute, func() bool {
-			gen := jsonpath(ctx, t, c, "pgshardbackuppolicy", clusterName+"-policy", "{.metadata.generation}")
-			acc := jsonpath(ctx, t, c, "pgshardbackuppolicy", clusterName+"-policy", "{.status.acceptedGeneration}")
-			return gen != "" && gen == acc
+		// already happened.
+		//
+		// Nor the POLICY's acceptedGeneration, which is what this waited on
+		// first and is the wrong object: it says the policy validated, not
+		// that this cluster picked it up. Ready was wrong for a second
+		// reason -- it was already true from the subtest before, so the
+		// wait returned at once. Together the gate passed in 14 seconds and
+		// every group failed the backup with "no backup policy configured
+		// for this member". The cluster's own observedGeneration is what
+		// says the operator has processed THIS patch.
+		gen := jsonpath(ctx, t, c, "pgshardcluster", clusterName, "{.metadata.generation}")
+		if gen == "" {
+			t.Fatal("the cluster reports no metadata.generation after the policyRef patch")
+		}
+		waitFor(ctx, t, "the operator to observe the policyRef patch", 5*time.Minute, func() bool {
+			return jsonpath(ctx, t, c, "pgshardcluster", clusterName, "{.status.observedGeneration}") == gen
 		})
-		// And then for the members to be rendered with it: the accepted
-		// policy changes the member template, so the pods roll, and Ready
-		// again is when they are carrying it.
 		if err := waitCondition(ctx, c, "Ready", 10*time.Minute); err != nil {
 			gatherNamespace(ctx, c)
 			t.Fatal(err)
@@ -437,30 +443,67 @@ spec:
 
 		// The backup is an operator -> agent call carrying the per-cluster
 		// <cluster>-tls-operator credential.
-		if err := c.Apply(ctx, fmt.Sprintf(`
+		backup := fmt.Sprintf(`
 apiVersion: pgshard.io/v1alpha1
 kind: PgShardBackup
 metadata: {name: %[1]s-tls-backup, namespace: %[2]s}
 spec:
   clusterName: %[1]s
   type: full
-`, clusterName, testNamespace)); err != nil {
-			t.Fatal(err)
-		}
+`, clusterName, testNamespace)
 		phase := func() string {
 			out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup",
 				"-o", "jsonpath={.status.phase}")
 			return strings.TrimSpace(out)
 		}
-		waitFor(ctx, t, "the backup of an issuing cluster to finish", 15*time.Minute, func() bool {
-			p := phase()
-			if p == "Failed" {
-				out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup", "-o", "yaml")
-				gatherNamespace(ctx, c)
-				t.Fatalf("the backup failed on an issuing cluster, so the operator -> agent mTLS call did not carry:\n%s", out)
+
+		// Observing the reconcile is not the same as every agent having
+		// reloaded its configuration, and NOTHING reports an agent's view
+		// of the policy: the member answers ErrNoBackupPolicy from its own
+		// config (internal/agent/backupops.go), and no per-member status
+		// names the policy it holds. So there is no condition left to wait
+		// on -- the only thing that reports the agent's view is asking it.
+		// This retries for that reason, and an operator meeting the same
+		// error has the same recourse and no better signal.
+		var last string
+		succeeded := false
+		deadline := time.Now().Add(15 * time.Minute)
+		for time.Now().Before(deadline) && !succeeded {
+			if err := c.Apply(ctx, backup); err != nil {
+				t.Fatal(err)
 			}
-			return p == "Succeeded"
-		})
+			for time.Now().Before(deadline) {
+				p := phase()
+				if p == "Succeeded" {
+					succeeded = true
+					break
+				}
+				if p == "Failed" {
+					last, _ = c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup",
+						clusterName+"-tls-backup", "-o", "yaml")
+					break
+				}
+				time.Sleep(2 * time.Second)
+			}
+			if succeeded {
+				break
+			}
+			// Any other failure is the thing this subtest is here to catch:
+			// the operator -> agent mTLS call not carrying.
+			if !strings.Contains(last, "no backup policy configured") {
+				gatherNamespace(ctx, c)
+				t.Fatalf("the backup failed on an issuing cluster, so the operator -> agent mTLS call did not carry:\n%s", last)
+			}
+			if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pgshardbackup",
+				clusterName+"-tls-backup", "--ignore-not-found"); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(5 * time.Second)
+		}
+		if !succeeded {
+			gatherNamespace(ctx, c)
+			t.Fatalf("the backup of an issuing cluster never succeeded; last state:\n%s", last)
+		}
 
 		// And the barrier: the operator asks the CONTROLLER, over mTLS. Read
 		// through the router's pgshard database, which routes to the catalog
