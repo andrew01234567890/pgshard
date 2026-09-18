@@ -436,6 +436,25 @@ spec:
 		waitFor(ctx, t, "the operator to observe the policyRef patch", 5*time.Minute, func() bool {
 			return jsonpath(ctx, t, c, "pgshardcluster", clusterName, "{.status.observedGeneration}") == gen
 		})
+
+		// And then for the ROLL, which is what actually delivers the policy
+		// and is why this subtest is expensive. The policy is part of the
+		// MEMBER TEMPLATE, not of the settings the agent can reload:
+		// render.go puts Backup outside Settings because "it changes the pod
+		// (mounted Secrets) and archive_mode, so it is part of the pod
+		// hash". So attaching a policy to a running cluster replaces every
+		// member of every group, one at a time, behind the usual gates.
+		//
+		// Until that finishes, a member that has not been replaced yet
+		// answers "no backup policy configured for this member" -- the same
+		// words as a cluster with no policyRef at all, which is PGS-948.
+		// Waiting for the settings-hash annotation instead would wait for
+		// ever: it covers Settings alone and cannot move for this change.
+		waitFor(ctx, t, "every group to finish the rollout that delivers the policy", 20*time.Minute, func() bool {
+			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardgroups",
+				"-o", "jsonpath={.items[*].status.phase}")
+			return err == nil && out != "" && !strings.Contains(out, "Restarting")
+		})
 		if err := waitCondition(ctx, c, "Ready", 10*time.Minute); err != nil {
 			gatherNamespace(ctx, c)
 			t.Fatal(err)
