@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/test/e2e"
 )
 
@@ -453,6 +454,11 @@ spec:
 		if err := c.Apply(ctx, backup); err != nil {
 			t.Fatal(err)
 		}
+		// The API's own constants, not string literals. This wait read
+		// "Succeeded", which is not one of the four phases a PgShardBackup
+		// ever reports -- the terminal one is Completed -- so it could only
+		// ever end in its own timeout. The backup underneath was finishing
+		// in five seconds.
 		phase := func() string {
 			out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup",
 				"-o", "jsonpath={.status.phase}")
@@ -460,9 +466,9 @@ spec:
 		}
 		waitFor(ctx, t, "the backup of an issuing cluster to finish", 15*time.Minute, func() bool {
 			p := phase()
-			return p == "Succeeded" || p == "Failed"
+			return p == pgshardv1alpha1.BackupPhaseCompleted || p == pgshardv1alpha1.BackupPhaseFailed
 		})
-		if phase() != "Succeeded" {
+		if phase() != pgshardv1alpha1.BackupPhaseCompleted {
 			out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup", "-o", "yaml")
 			gatherNamespace(ctx, c)
 			// Two different defects reach here and the state below says
