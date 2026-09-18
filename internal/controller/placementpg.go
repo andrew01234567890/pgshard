@@ -902,7 +902,17 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 	rows, err := conn.Query(ctx, `WITH t AS (
 			SELECT c.oid, c.reltype, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
 			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE n.nspname = $1 AND c.relname = $2)
+			WHERE n.nspname = $1 AND c.relname = $2),
+		-- Every stored expression the table owns, for the two regclass scans
+		-- below. Hoisted so a source added here is read by both: a scan that
+		-- quietly covers fewer places than its sibling is the same defect as
+		-- one that covers fewer constant shapes.
+		src AS (
+			SELECT 'pg_constraint'::regclass AS classid, c.oid AS objid, c.conbin::text AS expr FROM pg_constraint c, t WHERE c.conrelid = t.oid
+			UNION ALL SELECT 'pg_attrdef'::regclass, a.oid, a.adbin::text FROM pg_attrdef a, t WHERE a.adrelid = t.oid
+			UNION ALL SELECT 'pg_class'::regclass, i.indexrelid, concat(i.indexprs::text, i.indpred::text) FROM pg_index i, t WHERE i.indrelid = t.oid
+			UNION ALL SELECT 'pg_trigger'::regclass, tg.oid, tg.tgqual::text FROM pg_trigger tg, t WHERE tg.tgrelid = t.oid
+			UNION ALL SELECT 'pg_statistic_ext'::regclass, x.oid, x.stxexprs::text FROM pg_statistic_ext x, t WHERE x.stxrelid = t.oid)
 		SELECT DISTINCT f FROM (
 			SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END AS f
 				FROM t WHERE t.relreplident <> 'd'
@@ -939,15 +949,50 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 				  AND d.classid NOT IN ('pg_rewrite'::regclass, 'pg_proc'::regclass, 'pg_policy'::regclass)
 				  AND NOT (d.classid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = d.objid))
 			UNION ALL SELECT 'reference to the table by OID in ' || pg_describe_object(e.classid, e.objid, 0)
-				FROM t, LATERAL (
-					SELECT 'pg_constraint'::regclass AS classid, c.oid AS objid, c.conbin::text AS expr FROM pg_constraint c WHERE c.conrelid = t.oid
-					UNION ALL SELECT 'pg_attrdef'::regclass, a.oid, a.adbin::text FROM pg_attrdef a WHERE a.adrelid = t.oid
-					UNION ALL SELECT 'pg_class'::regclass, i.indexrelid, concat(i.indexprs::text, i.indpred::text) FROM pg_index i WHERE i.indrelid = t.oid
-					UNION ALL SELECT 'pg_trigger'::regclass, tg.oid, tg.tgqual::text FROM pg_trigger tg WHERE tg.tgrelid = t.oid
-					UNION ALL SELECT 'pg_statistic_ext'::regclass, x.oid, x.stxexprs::text FROM pg_statistic_ext x WHERE x.stxrelid = t.oid
-				) e, regexp_matches(e.expr, ':consttype 2205 [^{}]*:constisnull false [^{}]*:constvalue 4 \[ (-?\d+) (-?\d+) (-?\d+) (-?\d+) ', 'g') b
+				FROM t, src e, regexp_matches(e.expr, ':consttype 2205 [^{}]*:constisnull false [^{}]*:constvalue 4 \[ (-?\d+) (-?\d+) (-?\d+) (-?\d+) ', 'g') b
 				WHERE (b[1]::int + 256) % 256 + (b[2]::int + 256) % 256 * 256 + (b[3]::int + 256) % 256 * 65536
 					+ (b[4]::bigint + 256) % 256 * 16777216 = t.oid::bigint
+			-- The same OID inside a regclass ARRAY constant (consttype 2210).
+			-- PostgreSQL records no dependency for one of these either, and
+			-- the scan above matches 2205 alone, so without this branch LIKE
+			-- INCLUDING ALL copies the OIDs onto the shadow, the retired
+			-- table drops cleanly because nothing depends on it, and the
+			-- constraint is left comparing against a freed OID that
+			-- PostgreSQL can reuse -- with no diagnostic anywhere (PGS-936).
+			--
+			-- The bytes are an ArrayType: a 4-byte varlena header, then
+			-- ndim, dataoffset and elemtype, then ndim dimensions and ndim
+			-- lower bounds, then the elements. So the first element sits at
+			-- 16 + 8*ndim, unless the array carries NULLs, when dataoffset
+			-- is non-zero and points past the null bitmap instead. Read off
+			-- real node trees rather than guessed: verified against a 1-D
+			-- array, a 2-D one, one carrying a NULL and one whose match is
+			-- the last element, plus an array naming only another table,
+			-- which must not match.
+			--
+			-- What that start does and does not do, because no test can
+			-- pin it and someone will otherwise simplify it away: every
+			-- offset in the header is a multiple of four, so a start that
+			-- is too small stays aligned on the real elements and still
+			-- finds them. It bounds what is READ, not what is found -- it
+			-- keeps the header's own words out of the comparison. dims[0]
+			-- is the element count, so an array of 16384 or more entries
+			-- has a header word in user-OID territory, and scanning from a
+			-- fixed offset would let that word be mistaken for the table
+			-- and refuse a move that was fine.
+			UNION ALL SELECT 'reference to the table by OID in ' || pg_describe_object(e.classid, e.objid, 0)
+				FROM t, src e,
+					regexp_matches(e.expr, ':consttype 2210 [^{}]*:constisnull false [^{}]*:constvalue [0-9]+ \[ ([-0-9 ]*)\]', 'g') m,
+					LATERAL (SELECT string_to_array(btrim(m[1]), ' ')::bigint[] AS b) v,
+					LATERAL (SELECT
+						(v.b[5]+256)%256 + (v.b[6]+256)%256*256 + (v.b[7]+256)%256*65536 + (v.b[8]+256)%256*16777216 AS ndim,
+						(v.b[9]+256)%256 + (v.b[10]+256)%256*256 + (v.b[11]+256)%256*65536 + (v.b[12]+256)%256*16777216 AS dataoffset,
+						(v.b[13]+256)%256 + (v.b[14]+256)%256*256 + (v.b[15]+256)%256*65536 + (v.b[16]+256)%256*16777216 AS elemtype) h
+				WHERE h.elemtype = 2205 AND EXISTS (
+					SELECT 1 FROM generate_series(
+						CASE WHEN h.dataoffset > 0 THEN h.dataoffset ELSE 16 + 8*h.ndim END + 1,
+						array_length(v.b, 1) - 3, 4) k
+					WHERE (v.b[k]+256)%256 + (v.b[k+1]+256)%256*256 + (v.b[k+2]+256)%256*65536 + (v.b[k+3]+256)%256*16777216 = t.oid::bigint)
 			UNION ALL SELECT DISTINCT CASE
 					WHEN d.classid = 'pg_rewrite'::regclass AND r.rulename = '_RETURN'
 					THEN 'row type used by ' || pg_describe_object('pg_class'::regclass, r.ev_class, 0)

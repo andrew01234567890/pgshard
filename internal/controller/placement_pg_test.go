@@ -1841,21 +1841,54 @@ func TestTheRegclassScanFindsItsConstantOnEveryMajor(t *testing.T) {
 			// the node-tree decode does. A constant in ANOTHER object -- a
 			// check on a second table -- is found by the dependency branch
 			// whatever the decode does, so it would prove nothing here.
-			mustExec(t, conn, `CREATE TABLE named (a int CHECK (a <> 'named'::regclass::int),
-				g int GENERATED ALWAYS AS (a + 'named'::regclass::int) STORED)`)
+			mustExec(t, conn, `CREATE TABLE elsewhere (id int)`)
+			// Four shapes, four constraints, each naming the table ITSELF:
+			// a scalar constant, the same constant inside a regclass array,
+			// a two-dimensional array, and an array carrying a NULL -- the
+			// last two because the element data begins at 16 + 8*ndim, or
+			// past the null bitmap at dataoffset when there is one, so a
+			// decode that reads a fixed offset finds the first three and
+			// misses the fourth.
+			mustExec(t, conn, `CREATE TABLE named (
+				a regclass CHECK (a::int <> 'named'::regclass::int),
+				g int GENERATED ALWAYS AS ('named'::regclass::int) STORED,
+				CONSTRAINT flat CHECK (a <> ALL ('{named}'::regclass[])),
+				CONSTRAINT nested CHECK (a <> ALL ('{{elsewhere,named}}'::regclass[])),
+				CONSTRAINT nulled CHECK (a <> ALL ('{NULL,named}'::regclass[])))`)
 			found, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "named")
 			if err != nil {
 				t.Fatal(err)
 			}
-			var byOID int
+			byOID := map[string]bool{}
 			for _, f := range found {
-				if strings.HasPrefix(f, "reference to the table by OID in ") {
-					byOID++
+				if name, ok := strings.CutPrefix(f, "reference to the table by OID in constraint "); ok {
+					byOID[name[:strings.Index(name, " ")]] = true
 				}
 			}
-			if byOID < 2 {
-				t.Errorf("the regclass scan found %d of the 2 constants the table stores about itself: %v\n"+
-					"the decode of the printed pg_node_tree has stopped matching on this major, so the refusal it drives is silently not firing", byOID, found)
+			for _, want := range []string{"flat", "nested", "nulled"} {
+				if !byOID[want] {
+					t.Errorf("the regclass scan missed constraint %s, which names the table inside a regclass array: %v\n"+
+						"the ArrayType decode has stopped matching on this major, so the refusal it drives is silently not firing", want, found)
+				}
+			}
+			if len(found) == 0 {
+				t.Errorf("the regclass scan found nothing at all: %v", found)
+			}
+
+			// The negative control, and the reason the count above is not
+			// the assertion: a decode that matched any four bytes anywhere
+			// would satisfy every check so far. This table's array names
+			// ONLY another table, so nothing may be reported about it.
+			mustExec(t, conn, `CREATE TABLE innocent (a regclass,
+				CONSTRAINT points_elsewhere CHECK (a <> ALL ('{elsewhere}'::regclass[])))`)
+			clean, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "innocent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range clean {
+				if strings.HasPrefix(f, "reference to the table by OID in ") {
+					t.Errorf("the regclass scan reported %q for a table whose array names only another table: the decode matches bytes that are not its OID", f)
+				}
 			}
 		})
 	}
