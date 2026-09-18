@@ -195,3 +195,40 @@ func (s Settings) Validate() error {
 	}
 	return errors.Join(errs...)
 }
+
+// RequiredCredentials names the keys this repository's credentials Secret
+// must carry, given its type and key type. It is the single declaration of
+// that matrix: renderStore branches on the same conditions to build
+// pgbackrest.conf, and the operator asks this before accepting a policy, so
+// a Secret that would stop an agent starting is refused rather than rolled
+// out (PGS-949, PGS-950).
+//
+// Call it on a DEFAULTED Repo. KeyType is empty until WithDefaults fills it
+// in -- "shared" for s3 and azure, "service" for gcs -- and an undefaulted
+// Repo therefore looks like it needs nothing.
+//
+// Two of these are referenced by PATH rather than read: gcs service hands
+// pgbackrest the key file's location, and so does sftp. renderStore
+// therefore does NOT fail for them when the file is absent -- pgBackRest
+// does, later -- so for those two this function is the only thing that
+// notices, and the drift test below cannot cover them.
+func (r Repo) RequiredCredentials() []string {
+	switch r.Type {
+	case TypeS3:
+		if r.KeyType == "shared" {
+			return []string{CredS3Key, CredS3KeySecret}
+		}
+	case TypeAzure:
+		return []string{CredAzureAccount, CredAzureKey}
+	case TypeGCS:
+		switch r.KeyType {
+		case "service":
+			return []string{CredGCSKeyFile}
+		case "token":
+			return []string{CredGCSToken}
+		}
+	case TypeSFTP:
+		return []string{CredSFTPKey}
+	}
+	return nil
+}
