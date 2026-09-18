@@ -487,9 +487,9 @@ const refusalWriteTimeout = 5 * time.Second
 // PGS-940 -- five mechanisms are already eliminated by evidence and the
 // remaining question is simply WHICH exit the dead connections take, which
 // no amount of reading has settled.
-func (s *session) probeExit(reason string) {
-	s.server.logger.Info("PGS940-EXIT", "reason", reason, "session", s.id,
-		"remote", s.conn.RemoteAddr().String())
+func (s *session) probeExit(reason string, args ...any) {
+	s.server.logger.Info("PGS940-EXIT", append([]any{"reason", reason, "session", s.id,
+		"remote", s.conn.RemoteAddr().String()}, args...)...)
 }
 
 func (s *session) run() {
@@ -545,7 +545,11 @@ func (s *session) run() {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, errCancelRequest) {
 			log.Debug("startup failed", "err", err)
 		}
-		s.probeExit("startup_failed")
+		s.probeExit("startup_failed", "err", err, "errType", fmt.Sprintf("%T", err),
+			"deadlineExceeded", errors.Is(err, context.DeadlineExceeded),
+			"netTimeout", func() bool { var ne net.Error; return errors.As(err, &ne) && ne.Timeout() }(),
+			"eof", errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF),
+			"closed", errors.Is(err, net.ErrClosed))
 		return
 	}
 	// The whole of startup counts as one message, so active stays set until
@@ -575,7 +579,7 @@ func (s *session) run() {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
 				s.terminate(Errorf(CodeProtocolViolation, "invalid frontend message: %v", err))
 			}
-			s.probeExit("receive_error")
+			s.probeExit("receive_error", "err", err)
 			return
 		}
 		if !s.beginMessage() {
