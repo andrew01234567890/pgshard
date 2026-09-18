@@ -240,29 +240,43 @@ func failoverInTxnError() error {
 
 // countingWriter records whether any protocol message reached the client;
 // once one has, the statement can no longer be transparently retried.
+// answerKind indexes the answers that say a batch progressed rather than
+// what it produced. Each is counted on its own, so an attempt that takes a
+// different route than the one before it still drops only the messages the
+// client actually has.
+type answerKind int
+
+const (
+	answerParse answerKind = iota
+	answerBind
+	answerClose
+	answerParameterDescription
+	answerNoData
+	answerKinds
+)
+
 type countingWriter struct {
 	w     pgwire.ResultWriter
 	wrote bool
-	// sent counts the describe answers that have reached the client, and
-	// seen those this attempt has produced. A retry re-sends the whole
-	// batch, so it produces the same describe answers again; the ones the
-	// client already has are dropped rather than written twice.
-	sent int
-	seen int
+	// sent counts the answers of each kind that have reached the client,
+	// and seen those this attempt has produced. A retry re-sends the whole
+	// batch, so it produces the same answers again; the ones the client
+	// already has are dropped rather than written twice.
+	sent [answerKinds]int
+	seen [answerKinds]int
 }
 
 // retrying starts another attempt at the same batch. What the client has
 // already been told stands; this attempt's repeat of it is dropped.
-func (c *countingWriter) retrying() { c.seen = 0 }
+func (c *countingWriter) retrying() { c.seen = [answerKinds]int{} }
 
-// describeAnswer writes one message of a Describe's answer unless the
-// client has it from an earlier attempt.
-func (c *countingWriter) describeAnswer(write func() error) error {
-	c.seen++
-	if c.seen <= c.sent {
+// once writes one answer unless the client has it from an earlier attempt.
+func (c *countingWriter) once(k answerKind, write func() error) error {
+	c.seen[k]++
+	if c.seen[k] <= c.sent[k] {
 		return nil
 	}
-	c.sent++
+	c.sent[k]++
 	return write()
 }
 
@@ -296,20 +310,26 @@ func (c *countingWriter) EmptyQueryResponse() error { c.wrote = true; return c.w
 // statement takes the first answer and treats the second as a message it
 // cannot place. So they are written once, however many attempts it takes.
 func (c *countingWriter) ParameterDescription(o []uint32) error {
-	return c.describeAnswer(func() error { return c.w.ParameterDescription(o) })
+	return c.once(answerParameterDescription, func() error { return c.w.ParameterDescription(o) })
 }
 func (c *countingWriter) NoData() error {
-	return c.describeAnswer(c.w.NoData)
+	return c.once(answerNoData, c.w.NoData)
 }
 func (c *countingWriter) PortalSuspended() error { c.wrote = true; return c.w.PortalSuspended() }
 
 // ParseComplete, BindComplete and CloseComplete say that a statement was
 // prepared, bound or closed, not that it produced anything. A statement
 // retried after them has still told the client nothing about its outcome,
-// so like ParameterDescription they do not count as output.
-func (c *countingWriter) ParseComplete() error { return c.w.ParseComplete() }
-func (c *countingWriter) BindComplete() error  { return c.w.BindComplete() }
-func (c *countingWriter) CloseComplete() error { return c.w.CloseComplete() }
+// so like ParameterDescription they do not count as output -- and for the
+// same reason they are written once however many attempts it takes. A
+// second ParseComplete or BindComplete for one Parse or Bind is not a
+// protocol PostgreSQL ever produces, and pgx answers a message it cannot
+// place by destroying the connection: every later statement on it fails
+// with "conn closed" while the router's session, which did nothing wrong
+// and heard nothing about it, stays healthy (PGS-940).
+func (c *countingWriter) ParseComplete() error { return c.once(answerParse, c.w.ParseComplete) }
+func (c *countingWriter) BindComplete() error  { return c.once(answerBind, c.w.BindComplete) }
+func (c *countingWriter) CloseComplete() error { return c.once(answerClose, c.w.CloseComplete) }
 func (c *countingWriter) Notice(n *pgproto3.NoticeResponse) error {
 	c.wrote = true
 	return c.w.Notice(n)
