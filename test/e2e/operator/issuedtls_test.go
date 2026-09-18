@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -341,5 +342,105 @@ func TestAnIssuedTLSClusterReachedFromPlaintextUnderLoad(t *testing.T) {
 			gatherNamespace(ctx, c)
 			t.Fatal(err)
 		}
+	})
+
+	// PGS-861. The two remaining operator-initiated mTLS hops that PGS-860's
+	// acceptance listed and its cell never took. Both are covered by unit
+	// handshake tests; neither had been made against a real cluster.
+	//
+	// The barrier is taken by SCHEDULE rather than by this test, and that is
+	// the whole point: an in-process barrier (as the backup suite takes)
+	// speaks to the catalog directly and would prove nothing about mTLS. A
+	// scheduled one makes the OPERATOR call the controller, verifying
+	// <cluster>-controller.<ns>.svc and the controller role.
+	t.Run("ABackupAndAScheduledBarrierOnAnIssuingCluster", func(t *testing.T) {
+		if _, err := c.Kubectl(ctx, nil, "apply", "-f", filepath.Join(root, "hack/objectstores/k8s/minio.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			_, _ = c.Kubectl(ctx, nil, "delete", "namespace", "objectstores", "--ignore-not-found", "--wait=false")
+		})
+		if err := c.WaitPodsReady(ctx, "objectstores", "app=minio", 5*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Kubectl(ctx, nil, "-n", "objectstores", "wait", "--for=condition=complete",
+			"job/minio-create-bucket", "--timeout=5m"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := c.Apply(ctx, fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata: {name: %[1]s-store-credentials, namespace: %[2]s}
+stringData: {key: minioadmin, keySecret: minioadmin}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: %[1]s-repo-key, namespace: %[2]s}
+stringData: {key: %[1]s-repo-passphrase}
+---
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardBackupPolicy
+metadata: {name: %[1]s-policy, namespace: %[2]s}
+spec:
+  objectStore:
+    type: s3
+    bucket: pgshard
+    endpoint: http://minio.objectstores.svc:9000
+    region: us-east-1
+    uriStyle: path
+    verifyTLS: false
+    prefix: /%[1]s
+    credentials:
+      secretRef: {name: %[1]s-store-credentials}
+    encryption:
+      secretRef: {name: %[1]s-repo-key}
+  barrierSchedule: "* * * * *"
+  retention:
+    full: 2
+`, clusterName, testNamespace)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "patch", "pgshardcluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"backup":{"policyRef":"`+clusterName+`-policy"}}}`); err != nil {
+			t.Fatal(err)
+		}
+
+		// The backup is an operator -> agent call carrying the per-cluster
+		// <cluster>-tls-operator credential.
+		if err := c.Apply(ctx, fmt.Sprintf(`
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardBackup
+metadata: {name: %[1]s-tls-backup, namespace: %[2]s}
+spec:
+  clusterName: %[1]s
+  type: full
+`, clusterName, testNamespace)); err != nil {
+			t.Fatal(err)
+		}
+		phase := func() string {
+			out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup",
+				"-o", "jsonpath={.status.phase}")
+			return strings.TrimSpace(out)
+		}
+		waitFor(ctx, t, "the backup of an issuing cluster to finish", 15*time.Minute, func() bool {
+			p := phase()
+			if p == "Failed" {
+				out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup", "-o", "yaml")
+				gatherNamespace(ctx, c)
+				t.Fatalf("the backup failed on an issuing cluster, so the operator -> agent mTLS call did not carry:\n%s", out)
+			}
+			return p == "Succeeded"
+		})
+
+		// And the barrier: the operator asks the CONTROLLER, over mTLS. Read
+		// through the router's pgshard database, which routes to the catalog
+		// set -- so this observation crosses router -> pooler mTLS too.
+		waitFor(ctx, t, "a scheduled barrier to reach the catalog", 10*time.Minute, func() bool {
+			out, err := psqlOn(ctx, c, router, "pgshard", "SELECT count(*) FROM pgshard.restore_points WHERE certified")
+			return err == nil && out != "" && out != "0"
+		})
 	})
 }
