@@ -441,24 +441,28 @@ spec:
 			return jsonpath(ctx, t, c, "pgshardcluster", clusterName, "{.status.observedGeneration}") == gen
 		})
 
-		// And then for the ROLL, which is what actually delivers the policy
-		// and is why this subtest is expensive. The policy is part of the
-		// MEMBER TEMPLATE, not of the settings the agent can reload:
-		// render.go puts Backup outside Settings because "it changes the pod
-		// (mounted Secrets) and archive_mode, so it is part of the pod
-		// hash". So attaching a policy to a running cluster replaces every
-		// member of every group, one at a time, behind the usual gates.
+		// What actually delivers the policy is a ROLL, and this subtest is
+		// expensive because of it. The policy is part of the MEMBER
+		// TEMPLATE, not of the settings the agent can reload: render.go puts
+		// Backup outside Settings because "it changes the pod (mounted
+		// Secrets) and archive_mode, so it is part of the pod hash". So
+		// attaching one replaces every member of every group, one at a time,
+		// behind the usual gates -- and until that finishes, a member that
+		// has not been replaced yet answers "no backup policy configured for
+		// this member" (PGS-948).
 		//
-		// Until that finishes, a member that has not been replaced yet
-		// answers "no backup policy configured for this member" -- the same
-		// words as a cluster with no policyRef at all, which is PGS-948.
-		// Waiting for the settings-hash annotation instead would wait for
-		// ever: it covers Settings alone and cannot move for this change.
-		waitFor(ctx, t, "every group to finish the rollout that delivers the policy", 20*time.Minute, func() bool {
-			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardgroups",
-				"-o", "jsonpath={.items[*].status.phase}")
-			return err == nil && out != "" && !strings.Contains(out, "Restarting")
-		})
+		// There is deliberately NO wait on the roll here. Two attempts at
+		// one were both wrong in ways worth recording: the settings-hash
+		// annotation cannot move for this change at all, since it covers
+		// Settings alone; and PgShardGroup has no status.phase -- the phase
+		// is on status.rollout, which is ABSENT once the roll is done, so a
+		// wait written against the wrong path sat at the empty string for
+		// twenty minutes whatever the cluster was doing. A wait that cannot
+		// succeed is worse than no wait.
+		//
+		// The retry below is what carries it, and it is honest about what it
+		// is waiting for: it asks the member, which is the only thing that
+		// reports the member's own view of the policy.
 		if err := waitCondition(ctx, c, "Ready", 10*time.Minute); err != nil {
 			gatherNamespace(ctx, c)
 			t.Fatal(err)
