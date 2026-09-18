@@ -483,6 +483,15 @@ func (s *session) queryCancelled() bool {
 // slower than this is a peer that is not reading.
 const refusalWriteTimeout = 5 * time.Second
 
+// probeExit records which return of run() ended a session. PROBE ONLY for
+// PGS-940 -- five mechanisms are already eliminated by evidence and the
+// remaining question is simply WHICH exit the dead connections take, which
+// no amount of reading has settled.
+func (s *session) probeExit(reason string) {
+	s.server.logger.Info("PGS940-EXIT", "reason", reason, "session", s.id,
+		"remote", s.conn.RemoteAddr().String())
+}
+
 func (s *session) run() {
 	log := s.server.logger.With("session", s.id, "remote", s.conn.RemoteAddr().String())
 	// Whatever budget a half-read body still holds goes back when the
@@ -491,6 +500,7 @@ func (s *session) run() {
 	defer func() { s.framed.close() }()
 	ctx := context.Background()
 	if !s.beginMessage() {
+		s.probeExit("begin_message_refused_pre_startup")
 		return
 	}
 	if !s.server.acquireStartup() {
@@ -500,6 +510,7 @@ func (s *session) run() {
 		// socket on a write nobody is taking -- which is a way to keep a
 		// server busy with connections it has just refused.
 		_ = s.conn.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
+		s.probeExit("startup_slots_exhausted")
 		s.terminate(Errorf(CodeTooManyConnections, "sorry, too many clients already (startup)"))
 		return
 	}
@@ -534,6 +545,7 @@ func (s *session) run() {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, errCancelRequest) {
 			log.Debug("startup failed", "err", err)
 		}
+		s.probeExit("startup_failed")
 		return
 	}
 	// The whole of startup counts as one message, so active stays set until
@@ -548,6 +560,7 @@ func (s *session) run() {
 	drained := s.draining && !s.inTxn
 	s.mu.Unlock()
 	if drained {
+		s.probeExit("drained_after_startup")
 		s.terminate(Errorf(CodeAdminShutdown, "terminating connection due to administrator command"))
 		return
 	}
@@ -562,9 +575,11 @@ func (s *session) run() {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
 				s.terminate(Errorf(CodeProtocolViolation, "invalid frontend message: %v", err))
 			}
+			s.probeExit("receive_error")
 			return
 		}
 		if !s.beginMessage() {
+			s.probeExit("begin_message_refused_in_loop")
 			s.terminate(Errorf(CodeAdminShutdown, "terminating connection due to administrator command"))
 			return
 		}
@@ -572,9 +587,11 @@ func (s *session) run() {
 		s.endMessage()
 		if err != nil {
 			log.Debug("session ended", "err", err)
+			s.probeExit("dispatch_error")
 			return
 		}
 		if !cont {
+			s.probeExit("dispatch_stop")
 			return
 		}
 		s.mu.Lock()
@@ -582,6 +599,7 @@ func (s *session) run() {
 		terminate := s.draining && !s.inTxn
 		s.mu.Unlock()
 		if terminate {
+			s.probeExit("drained_in_loop")
 			s.terminate(Errorf(CodeAdminShutdown, "terminating connection due to administrator command"))
 			return
 		}
