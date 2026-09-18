@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	pgoperator "github.com/andrew01234567890/pgshard/internal/operator"
 	"github.com/andrew01234567890/pgshard/test/e2e"
 )
 
@@ -681,8 +682,22 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 			t.Fatalf("precondition: primary=%s epoch=%d", oldPrimary, oldEpoch)
 		}
 		w := startWriter(ctx, c, rw, lastID)
+		// Deleting the pod takes its logs with it, so what the old primary
+		// wrote while it stopped is read as it is written.
+		logCtx, stopLogs := context.WithTimeout(ctx, 3*time.Minute)
+		defer stopLogs()
+		stopping := c.FollowLogs(logCtx, testNamespace, oldPrimary, "postgres")
 		time.Sleep(5 * time.Second)
-		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pod", oldPrimary, "--wait=false"); err != nil {
+		// The stream replays the log from the start, so an empty one has not
+		// attached, and attaching after the delete would read the new pod.
+		waitFor(ctx, t, "the old primary's log stream to attach", 30*time.Second, func() bool {
+			return stopping.Read() != ""
+		})
+		// Deleted with the grace the operator fences a primary with, so the
+		// kubelet's SIGKILL lands where the fence's would: a stop that no
+		// longer fits inside PodFenceGrace shows up below.
+		grace := fmt.Sprint(int64(pgoperator.PodFenceGrace / time.Second))
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pod", oldPrimary, "--wait=false", "--grace-period="+grace); err != nil {
 			t.Fatal(err)
 		}
 		waitFor(ctx, t, "promotion of a standby", 4*time.Minute, func() bool {
@@ -739,6 +754,37 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		assertAgentPID1(oldPrimary)
 		if out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'"); err != nil || out != "2" {
 			t.Fatalf("streaming replicas after failover: %q %v", out, err)
+		}
+		// The pod was deleted on a healthy node, so the old primary had the
+		// whole grace the operator fences with, and its agent answers
+		// SIGTERM with a fast shutdown bounded inside it (PGS-800). It has to
+		// have finished: a stop the kubelet cut short with SIGKILL leaves the
+		// rejoin to recover a crashed data directory first (PGS-818).
+		stopped := stopping.Wait()
+		for _, want := range []string{"received fast shutdown request", "database system is shut down"} {
+			if !strings.Contains(stopped, want) {
+				t.Fatalf("the old primary's stop did not log %q, so it did not shut down cleanly inside its grace:\n%s", want, tail(stopped, 40))
+			}
+		}
+		// "database system is shut down" is also the last line of an
+		// immediate shutdown, which writes no shutdown checkpoint.
+		for _, refused := range []string{"received smart shutdown request", "received immediate shutdown request"} {
+			if strings.Contains(stopped, refused) {
+				t.Fatalf("the old primary's stop logged %q: a smart one spends the grace waiting on sessions, an immediate one leaves a crashed data directory:\n%s", refused, tail(stopped, 40))
+			}
+		}
+		// pg_rewind checks the target was shut down cleanly before anything
+		// else, and says so when it was not; it has to have run for its
+		// silence to mean anything.
+		rejoined, err := c.Kubectl(ctx, nil, "-n", testNamespace, "logs", oldPrimary, "-c", "postgres")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(rejoined, "pg_rewind finished") {
+			t.Fatalf("the old primary rejoined without a successful pg_rewind, so nothing below shows how it was stopped:\n%s", tail(rejoined, 40))
+		}
+		if strings.Contains(rejoined, "for target server to complete crash recovery") {
+			t.Fatalf("pg_rewind had to run crash recovery on the old primary, so it was not shut down cleanly:\n%s", tail(rejoined, 40))
 		}
 	})
 
@@ -1249,4 +1295,13 @@ func gatherNamespace(ctx context.Context, c *e2e.Cluster) {
 		}
 	}
 	save("operator-logs.txt", "-n", e2e.SystemNamespace, "logs", "-l", "app.kubernetes.io/name=pgshard-operator", "--tail=-1")
+}
+
+// tail is the last n lines of s, for a failure message that quotes a log.
+func tail(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }

@@ -49,7 +49,7 @@ const (
 	poolerMetricsPort = int32(9127)
 	poolerContainer   = "pooler"
 	// agentShutdownTimeout is how long a member's agent gives a fast shutdown
-	// on SIGTERM. It is most of podFenceGrace, which is derived from it: the
+	// on SIGTERM. It is most of PodFenceGrace, which is derived from it: the
 	// fence is the shortest grace a member is ever deleted with, and a fast
 	// shutdown that finishes inside it leaves a primary that rejoins by
 	// pg_rewind without crash recovery.

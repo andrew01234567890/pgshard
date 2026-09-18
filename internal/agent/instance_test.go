@@ -492,7 +492,7 @@ func TestASourceConnectionNamesADatabaseThatExists(t *testing.T) {
 // --no-ensure-shutdown skips the single-user recovery pg_rewind runs on a
 // target that crashed, and pg_rewind then refuses any target whose control
 // file is not DB_SHUTDOWNED or DB_SHUTDOWNED_IN_RECOVERY. Fencing deletes
-// the old primary's Pod with podFenceGrace -- ten seconds -- while the
+// the old primary's Pod with PodFenceGrace -- ten seconds -- while the
 // agent's own stop budget is three times ShutdownTimeout, so the SIGKILL
 // lands mid-shutdown and the target crashed. The flag therefore turned
 // "rewind, falling back to a full reclone" into "always reclone", and on a

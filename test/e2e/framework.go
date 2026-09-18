@@ -169,6 +169,58 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
+// LogFollow is a container log being streamed by FollowLogs.
+type LogFollow struct {
+	out  lockedBuffer
+	done chan struct{}
+	err  error
+}
+
+// Read is what the stream has delivered so far.
+func (f *LogFollow) Read() string {
+	if f.err != nil {
+		return ""
+	}
+	return f.out.String()
+}
+
+// Wait waits for the stream to end -- the container exited, or ctx ended --
+// and returns everything it delivered.
+func (f *LogFollow) Wait() string {
+	<-f.done
+	if f.err != nil {
+		return "kubectl logs: " + f.err.Error()
+	}
+	return f.out.String()
+}
+
+// FollowLogs streams a container's log from the start until the container
+// exits or ctx ends. A pod that is deleted takes its logs with it, so what
+// it wrote while stopping can only be read this way.
+func (c *Cluster) FollowLogs(ctx context.Context, namespace, pod, container string) *LogFollow {
+	args := []string{}
+	if c.Kubeconfig != "" {
+		args = append(args, "--kubeconfig", c.Kubeconfig)
+	}
+	if c.Context != "" {
+		args = append(args, "--context", c.Context)
+	}
+	args = append(args, "-n", namespace, "logs", "-f", pod, "-c", container)
+	f := &LogFollow{done: make(chan struct{})}
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd.Stdout, cmd.Stderr = &f.out, &f.out
+	if err := cmd.Start(); err != nil {
+		f.err = err
+		close(f.done)
+		return f
+	}
+	go func() {
+		defer close(f.done)
+		_ = cmd.Wait()
+	}()
+	return f
+}
+
 // Apply applies a manifest from memory.
 func (c *Cluster) Apply(ctx context.Context, manifest string) error {
 	_, err := c.Kubectl(ctx, []byte(manifest), "apply", "-f", "-")

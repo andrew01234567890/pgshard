@@ -9,7 +9,7 @@ import (
 )
 
 // TestAFencedPrimaryIsGivenTheTimeItsAgentTakesToStop: the operator fences an
-// old primary by deleting its Pod with podFenceGrace, and the kubelet
+// old primary by deleting its Pod with PodFenceGrace, and the kubelet
 // SIGKILLs whatever is still running when it runs out. The agent is told how
 // long to spend by the ShutdownTimeout the operator renders, and exits within
 // that plus agent.TerminationOverhead. This pins the relationship between the
@@ -23,12 +23,12 @@ func TestAFencedPrimaryIsGivenTheTimeItsAgentTakesToStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	budget := time.Duration(cfg.ShutdownTimeout) + agent.TerminationOverhead
-	if podFenceGrace < budget {
-		t.Fatalf("podFenceGrace %s is less than the %s a rendered agent may take to stop: a fenced primary is SIGKILLed mid-shutdown",
-			podFenceGrace, budget)
+	if PodFenceGrace < budget {
+		t.Fatalf("PodFenceGrace %s is less than the %s a rendered agent may take to stop: a fenced primary is SIGKILLed mid-shutdown",
+			PodFenceGrace, budget)
 	}
-	if podFenceGrace%time.Second != 0 {
-		t.Fatalf("podFenceGrace %s is not whole seconds, and the delete rounds it down to %ds", podFenceGrace, int64(podFenceGrace/time.Second))
+	if PodFenceGrace%time.Second != 0 {
+		t.Fatalf("PodFenceGrace %s is not whole seconds, and the delete rounds it down to %ds", PodFenceGrace, int64(PodFenceGrace/time.Second))
 	}
 	// Member Pods set no terminationGracePeriodSeconds, so an ordinary delete
 	// gets Kubernetes' default. If one is ever rendered, it has to cover the
