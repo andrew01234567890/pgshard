@@ -29,11 +29,19 @@ func TestTheReshardDDLRefusalNamesAWayOut(t *testing.T) {
 	// evidence that both call it: the fanned-out refusal carried the stale
 	// hint and the home-DDL one carried none at all.
 	for _, tc := range []struct {
-		name  string
+		name string
+		// local sends the statement down checkHomeDDL instead of
+		// checkFanoutDDL.
 		local bool
+		// queueable is whether the operation queue would have taken this
+		// statement. Home DDL cannot be queued -- checkHomeDDL's own
+		// comment says so -- so telling its caller that migrating the
+		// catalog would queue it sends them to do real work and meet the
+		// same wall.
+		queueable bool
 	}{
-		{"FannedOutDDL", false},
-		{"HomeDDL", true},
+		{name: "FannedOutDDL", local: false, queueable: true},
+		{name: "HomeDDL", local: true, queueable: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newDDLHarness(t, &fakeQueue{noQueue: true})
@@ -79,10 +87,28 @@ func TestTheReshardDDLRefusalNamesAWayOut(t *testing.T) {
 			// The recovery an operator can actually perform. Naming
 			// spec.shards is the point: it is the thing they revert, and
 			// before this nothing in the refusal said so.
-			for _, want := range []string{"FAILED", "spec.shards", "docs/resharding.md"} {
+			for _, want := range []string{"Failed", "spec.shards", "docs/resharding.md"} {
 				if !strings.Contains(pe.Hint, want) {
 					t.Errorf("the hint does not mention %q, so a failed reshard leaves the operator with advice that cannot come true:\n%s", want, pe.Hint)
 				}
+			}
+			// And the check BEFORE the action, which matters more than the
+			// action: cancellableOnRevert accepts Copying and Verifying as
+			// well as Failed, so reverting spec.shards on a reshard that is
+			// most of the way through its copy cancels it and deletes the
+			// target groups. The reader has just been told the router
+			// cannot tell failed from running, so a hint that says "if it
+			// has failed, revert" without saying where to look, and what it
+			// costs to be wrong, invites exactly that.
+			for _, want := range []string{"status.reshard", "RUNNING", "upgrade"} {
+				if !strings.Contains(pe.Hint, want) {
+					t.Errorf("the hint does not mention %q, so it recommends a destructive action without saying how to tell whether it applies:\n%s", want, pe.Hint)
+				}
+			}
+			// The operation-queue clause is true of a fanned-out migration
+			// and false of home DDL.
+			if got := strings.Contains(pe.Detail, "operation queue"); got != tc.queueable {
+				t.Errorf("operation-queue advice present = %v, want %v: home DDL cannot be queued, so offering it as a way out sends the operator to migrate a catalog and meet the same wall\ndetail: %q", got, tc.queueable, pe.Detail)
 			}
 		})
 	}
