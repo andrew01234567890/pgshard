@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -14,10 +15,80 @@ import (
 	"testing"
 	"time"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/test/e2e"
 )
 
 var writerError = regexp.MustCompile(`[0-9]+`)
+
+// deployMinIO brings up the object store this suite backs up to, and takes
+// it down with the namespace afterwards.
+func deployMinIO(ctx context.Context, t *testing.T, c *e2e.Cluster, root string) {
+	t.Helper()
+	if _, err := c.Kubectl(ctx, nil, "apply", "-f", filepath.Join(root, "hack/objectstores/k8s/minio.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		_, _ = c.Kubectl(ctx, nil, "delete", "namespace", "objectstores", "--ignore-not-found", "--wait=false")
+	})
+	if err := c.WaitPodsReady(ctx, "objectstores", "app=minio", 5*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Kubectl(ctx, nil, "-n", "objectstores", "wait", "--for=condition=complete",
+		"job/minio-create-bucket", "--timeout=5m"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// backupPolicyManifest is the policy the cluster is created with. It
+// carries no schedule: the barrier schedule is attached after the move to
+// issued TLS, so a certified restore point can only come from an mTLS call.
+//
+// It repeats the Namespace because it is applied before the cluster
+// manifest that usually creates it, and a Secret cannot be applied into a
+// namespace that does not exist yet.
+func backupPolicyManifest() string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Namespace
+metadata: {name: %[2]s}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: %[1]s-store-credentials, namespace: %[2]s}
+stringData: {key: minioadmin, keySecret: minioadmin}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: %[1]s-repo-key, namespace: %[2]s}
+# The key must be named passphrase: the agent reads
+# /etc/pgshard-backup/encryption/passphrase from this Secret's mount, and
+# any other key name leaves the file absent. Naming it "key" here is what
+# crash-looped demo-catalog-1 and held the rollout (docs/backup.md:32).
+stringData: {passphrase: %[1]s-repo-passphrase}
+---
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardBackupPolicy
+metadata: {name: %[1]s-policy, namespace: %[2]s}
+spec:
+  objectStore:
+    type: s3
+    bucket: pgshard
+    endpoint: http://minio.objectstores.svc:9000
+    region: us-east-1
+    uriStyle: path
+    verifyTLS: false
+    prefix: /%[1]s
+    credentials:
+      secretRef: {name: %[1]s-store-credentials}
+    encryption:
+      secretRef: {name: %[1]s-repo-key}
+  retention:
+    full: 2
+`, clusterName, testNamespace)
+}
 
 // TestAnIssuedTLSClusterReachedFromPlaintextUnderLoad runs a cluster whose
 // internal certificates the operator issues -- the mode internal TLS is to
@@ -39,7 +110,21 @@ func TestAnIssuedTLSClusterReachedFromPlaintextUnderLoad(t *testing.T) {
 	major := env("PG_MAJOR", "18")
 
 	deployOperator(ctx, t, c, root, env("OPERATOR_IMAGE", "pgshard-operator:e2e"))
-	manifest := clusterManifestTLS(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), "    insecure: true\n")
+
+	// The object store and the policy come first, and the cluster is
+	// created WITH the policyRef, the way test/e2e/backup does it. The
+	// alternative -- patching policyRef onto a running cluster -- costs a
+	// full rolling restart of every member: render.go puts Backup outside
+	// Settings because "it changes the pod (mounted Secrets) and
+	// archive_mode, so it is part of the pod hash". Measured on CI that
+	// roll took 15-16 minutes in one run and over 25 in the next, and it
+	// proves nothing this subtest is here for (PGS-861).
+	deployMinIO(ctx, t, c, root)
+	if err := c.Apply(ctx, backupPolicyManifest()); err != nil {
+		t.Fatal(err)
+	}
+	manifest := clusterManifestTLS(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), "    insecure: true\n",
+		"  backup:\n    policyRef: "+clusterName+"-policy\n")
 	if err := c.Apply(ctx, manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -341,5 +426,82 @@ func TestAnIssuedTLSClusterReachedFromPlaintextUnderLoad(t *testing.T) {
 			gatherNamespace(ctx, c)
 			t.Fatal(err)
 		}
+	})
+
+	// PGS-861. The two remaining operator-initiated mTLS hops that PGS-860's
+	// acceptance listed and its cell never took. Both are covered by unit
+	// handshake tests; neither had been made against a real cluster.
+	//
+	// The barrier is taken by SCHEDULE rather than by this test, and that is
+	// the whole point: an in-process barrier (as the backup suite takes)
+	// speaks to the catalog directly and would prove nothing about mTLS. A
+	// scheduled one makes the OPERATOR call the controller, verifying
+	// <cluster>-controller.<ns>.svc and the controller role.
+	t.Run("ABackupAndAScheduledBarrierOnAnIssuingCluster", func(t *testing.T) {
+		// The backup is an operator -> agent call carrying the per-cluster
+		// <cluster>-tls-operator credential. The policy has been on this
+		// cluster since it was created, so there is no roll to wait for and
+		// nothing here is retried: a member that answers "no backup policy
+		// configured for this member" now is a defect, not a race.
+		backup := fmt.Sprintf(`
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardBackup
+metadata: {name: %[1]s-tls-backup, namespace: %[2]s}
+spec:
+  clusterName: %[1]s
+  type: full
+`, clusterName, testNamespace)
+		if err := c.Apply(ctx, backup); err != nil {
+			t.Fatal(err)
+		}
+		// The API's own constants, not string literals. This wait read
+		// "Succeeded", which is not one of the four phases a PgShardBackup
+		// ever reports -- the terminal one is Completed -- so it could only
+		// ever end in its own timeout. The backup underneath was finishing
+		// in five seconds.
+		phase := func() string {
+			out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup",
+				"-o", "jsonpath={.status.phase}")
+			return strings.TrimSpace(out)
+		}
+		waitFor(ctx, t, "the backup of an issuing cluster to finish", 15*time.Minute, func() bool {
+			p := phase()
+			return p == pgshardv1alpha1.BackupPhaseCompleted || p == pgshardv1alpha1.BackupPhaseFailed
+		})
+		if phase() != pgshardv1alpha1.BackupPhaseCompleted {
+			out, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackup", clusterName+"-tls-backup", "-o", "yaml")
+			gatherNamespace(ctx, c)
+			// Two different defects reach here and the state below says
+			// which: "no backup policy configured for this member" means a
+			// member is not running the template it was created with,
+			// anything else means the operator -> agent call did not carry.
+			t.Fatalf("the backup failed on an issuing cluster:\n%s", out)
+		}
+
+		// And the barrier: the operator asks the CONTROLLER, over mTLS. The
+		// schedule is attached HERE, not at creation, so that the first
+		// certified restore point can only have been taken after the move --
+		// a schedule running from creation would have filled the table while
+		// the cluster was still insecure and this assertion would pass
+		// without an mTLS call ever being made. Adding it now costs nothing:
+		// BackupSettings reads objectStore, retention, logLevel and
+		// processMax, so a schedule is not part of the member template and
+		// changing it rolls no member.
+		const certified = "SELECT count(*) FROM pgshard.restore_points WHERE certified"
+		if out, err := psqlRetryOn(ctx, c, router, "pgshard", certified, 3*time.Minute); err != nil {
+			t.Fatal(err)
+		} else if out != "0" {
+			t.Fatalf("%s certified restore points exist before the barrier schedule was attached, so the wait below would pass on a barrier taken while the cluster was still insecure", out)
+		}
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "patch", "pgshardbackuppolicy", clusterName+"-policy",
+			"--type=merge", "-p", `{"spec":{"barrierSchedule":"* * * * *"}}`); err != nil {
+			t.Fatal(err)
+		}
+		// Read through the router's pgshard database, which routes to the
+		// catalog set -- so this observation crosses router -> pooler mTLS too.
+		waitFor(ctx, t, "a scheduled barrier to reach the catalog", 10*time.Minute, func() bool {
+			out, err := psqlOn(ctx, c, router, "pgshard", certified)
+			return err == nil && out != "" && out != "0"
+		})
 	})
 }
