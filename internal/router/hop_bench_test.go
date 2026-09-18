@@ -143,3 +143,33 @@ func benchScatterStatement(b *testing.B, shards int) {
 		read()
 	}
 }
+
+// BenchmarkOpenStream prices the part of a participant that reusing or
+// multiplexing streams would actually remove: the Execute RPC, the
+// poolerStream and its four channels, the reader goroutine, and the
+// teardown.
+//
+// BenchmarkScatterStatementThroughRouter puts ~153us and ~310 allocations on
+// a participant, but that is open + send + receive + tear down -- a CEILING
+// on what PGS-616 could save, not the saving. This is the half of it that a
+// shared stream does not pay.
+//
+// abort() rather than close(): close waits out cancelGrace for the reader to
+// finish, which measures a timer rather than the teardown. A scatter
+// participant that is finished with its stream takes the same path.
+func BenchmarkOpenStream(b *testing.B) {
+	h := newShardedHarness(b)
+	client, err := h.r.cfg.Poolers.Client(Shard{Set: DefaultShardSet, ID: 0})
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		ps, err := openStream(ctx, client)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ps.abort()
+	}
+}
