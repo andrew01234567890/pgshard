@@ -20,6 +20,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
+	"github.com/andrew01234567890/pgshard/internal/pgparser/pg18"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/andrew01234567890/pgshard/internal/placement"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
@@ -670,6 +671,43 @@ func BenchmarkStatementFingerprint(b *testing.B) {
 }
 
 var sinkFingerprint string
+
+// BenchmarkStatementNormalize and BenchmarkStatementScan are the two ways
+// PGS-773 could reach a shared plan for a literal-varying statement, priced
+// against the 35us that parsing and planning one costs today.
+//
+// Normalize gives the placeholder TEXT and nothing else, so on its own it
+// keys a cache but cannot route: "tenant_id = 12" and "tenant_id = 13" share
+// a key and must not share a shard. Scan is the lexer, so it can hand back
+// the literal VALUES with their positions, which is what the bound-value
+// routing the extended protocol already does at Bind needs.
+func BenchmarkStatementNormalize(b *testing.B) {
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		s, err := pgparser.Normalize(fmt.Sprintf("SELECT * FROM orders WHERE tenant_id = %d", i))
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkFingerprint = s
+	}
+}
+
+func BenchmarkStatementScan(b *testing.B) {
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		r, err := pg18.Scan(fmt.Sprintf("SELECT * FROM orders WHERE tenant_id = %d", i))
+		if err != nil {
+			b.Fatal(err)
+		}
+		sinkTokens = len(r.GetTokens())
+	}
+}
+
+var sinkTokens int
 
 // BenchmarkPlannerPlanShardedVaryingLiteral is the workload PGS-773 is
 // about: the same statement shape with a different literal every time, which
