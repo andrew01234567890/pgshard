@@ -452,8 +452,7 @@ func scanStatement(root *pgquerypb.Node) preScan {
 		// DDL names a column as a plain string rather than a ColumnRef, so
 		// the two cases above miss it entirely: ALTER TABLE ... DROP COLUMN
 		// _pgshard_x, RENAME COLUMN, and CREATE INDEX on one were all
-		// accepted. That matters because introspection still lists the
-		// working column (PGS-590), so a migration tool that diffs the
+		// accepted. That matters because a migration tool that diffs the
 		// schema and writes SQL from it proposes exactly these statements
 		// -- and dropping the column mid-rewrite destroys the backfill and
 		// the dual-write triggers with it.
