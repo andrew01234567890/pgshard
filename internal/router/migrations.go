@@ -475,6 +475,13 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 		err.Hint = "start the router with a catalog connection that may write pgshard.migrations"
 		return err
 	}
+	// The LIVE home shard, deliberately, and not the statement's snapshot.
+	// A migration is applied in the future, so the home shard that matters
+	// is the one at apply time: catalog.SaveQueuedMigrationProgress rewrites
+	// this field when the migration starts and refuses queued -> running
+	// while it differs from pgshard.databases, precisely because "one queued
+	// before a cutover and held through it was recorded with the retired
+	// set's home shard". Pinning it to plan time is the wrong direction.
 	req := catalog.DDLMigration{Database: e.info.Database, Statement: m.Statement, Kind: m.Kind, Strategy: m.Strategy, Scope: m.Scope,
 		HomeShard: e.Home().ID, Meta: catalog.MigrationMeta{
 			SearchPath:    e.recordedSearchPath(),

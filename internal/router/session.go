@@ -570,11 +570,25 @@ func (e *Executor) searchPath() []string {
 
 // Home reports the home shard of the session's database in the serving
 // shard set: a reshard cutover moves both the set and the home shard id.
-func (e *Executor) Home() Shard {
+//
+// It reads the LIVE snapshot, which is right for a caller asking where the
+// home shard is now and wrong for one deriving anything about a statement
+// already planned. Those use homeAt with the statement's own snapshot.
+func (e *Executor) Home() Shard { return e.homeAt(e.r.cfg.Snapshot()) }
+
+// homeAt is Home against a snapshot the caller has already taken.
+//
+// The fallback to e.home is the session-start set, which after a cutover
+// names a stale one, so it is reached only when snap does not carry the
+// database at all -- a database dropped mid-session. Keeping it keyed to
+// the caller's snapshot rather than the live one is the point: a statement
+// planned against a snapshot that HAS the database must not fall back
+// because a reload in between dropped it.
+func (e *Executor) homeAt(snap *snapshot.Snapshot) Shard {
 	if e.catalogSession() {
 		return e.home
 	}
-	if snap := e.r.cfg.Snapshot(); snap != nil {
+	if snap != nil {
 		if d, ok := snap.Databases[e.info.Database]; ok {
 			return Shard{Set: snap.ServingShardSet(), ID: d.HomeShard}
 		}
@@ -611,7 +625,12 @@ func (e *Executor) planSession() plan.Session { return e.planSessionAt(e.current
 // taken, so planning and the generation stamped on what the plan sends come
 // from the same one.
 func (e *Executor) planSessionAt(snap *snapshot.Snapshot) plan.Session {
-	return plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, User: e.info.User,
+	// homeAt(snap), not Home(): Home reads the live snapshot, and the
+	// watcher swaps that pointer on every reload, so the plan was being
+	// built from two different snapshots -- Snapshot pinned by the caller
+	// and HomeShard from whatever had just landed. Pinning one and then
+	// reading the other defeats the pinning for exactly one field.
+	return plan.Session{Database: e.info.Database, HomeShard: e.homeAt(snap).ID, User: e.info.User,
 		SearchPath: e.searchPath(), Snapshot: snap, PinnedShard: e.pinnedShard()}
 }
 
