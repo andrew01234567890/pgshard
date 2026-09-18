@@ -367,22 +367,26 @@ func TestReshardCutoverUnderLoad(t *testing.T) {
 	ranges, _ := placement.Split(2)
 	// Long enough to outlast this test's own load, short enough that the
 	// run still reaches completed. This measures the cutover, not the
-	// retirement: at one second the old groups are now retired while the
-	// workload is still running against them, and every session pinned to
-	// one is closed under it -- 152 failed transfers. That was invisible
-	// while the retirement waited for a full reconcile pass rather than the
-	// window, and it is what retireOldGroupsAfter is for. Whether a
-	// retiring set should drain its sessions rather than close them is
-	// PGS-927.
-	// Out of reach while the load runs, and brought back within reach once
-	// it has stopped (below). A fixed short window is a race: it is counted
-	// from the switch the workflow made, while this test learns of the
-	// switch by POLLING, so on a slow runner it notices seconds late, sleeps
-	// two more with the load still running, and the window is gone. The old
-	// set then retires under sessions still pinned to it, every one is
-	// closed, and the test fails with "failed to deallocate cached
-	// statement(s): conn closed" -- which is PGS-927, the behaviour itself,
-	// not anything this test set out to measure.
+	// retirement: at one second the old groups retire while the workload is
+	// still running against them, which is what retireOldGroupsAfter is
+	// for, and whether a retiring set should drain its sessions rather than
+	// close them is PGS-927.
+	//
+	// The window is kept out of reach while the load runs and brought back
+	// within reach once it has stopped (below), because a fixed short one
+	// is a race: it is counted from the switch the workflow made, while
+	// this test learns of the switch by POLLING, so on a slow runner it
+	// notices seconds late, sleeps two more with the load still running,
+	// and the window is gone.
+	//
+	// What that used to fail with -- "failed to deallocate cached
+	// statement(s): conn closed", 152 of them -- turned out NOT to be the
+	// retirement. PGS-940 found the identical signature with this ten
+	// minute window, from a router protocol defect at the flip, and fixing
+	// that is what made this assertion hold. So the count is not evidence
+	// about retirement either way, and PGS-927 needs an assertion on the
+	// draining itself rather than on a failure count that is now zero for
+	// another reason.
 	spec := map[string]any{"shard_set": "g2", "generation": 2, "source_set": "default", "retire_after_seconds": 600,
 		"ranges": []map[string]any{{"shard_id": 0, "lower": ranges[0].Start, "upper": ranges[0].End}, {"shard_id": 1, "lower": ranges[1].Start, "upper": ranges[1].End}}}
 	var id string

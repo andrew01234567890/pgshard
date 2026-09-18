@@ -5,7 +5,8 @@ import (
 	"testing"
 )
 
-// describeRecorder records the describe answers that reach a client.
+// describeRecorder records the answers that reach a client before any
+// output does.
 type describeRecorder struct {
 	discardWriter
 	seen []string
@@ -18,6 +19,21 @@ func (d *describeRecorder) ParameterDescription([]uint32) error {
 
 func (d *describeRecorder) NoData() error {
 	d.seen = append(d.seen, "NoData")
+	return nil
+}
+
+func (d *describeRecorder) ParseComplete() error {
+	d.seen = append(d.seen, "ParseComplete")
+	return nil
+}
+
+func (d *describeRecorder) BindComplete() error {
+	d.seen = append(d.seen, "BindComplete")
+	return nil
+}
+
+func (d *describeRecorder) CloseComplete() error {
+	d.seen = append(d.seen, "CloseComplete")
 	return nil
 }
 
@@ -88,5 +104,67 @@ func TestARetryDoesNotDescribeTwice(t *testing.T) {
 	want = []string{"ParameterDescription", "NoData", "ParameterDescription", "NoData"}
 	if !slices.Equal(client.seen, want) {
 		t.Fatalf("a longer retry: the client saw %v, want %v", client.seen, want)
+	}
+}
+
+// TestARetryDoesNotAnswerParseOrBindTwice: the batch pgx sends on its
+// common path is Parse, Describe, Bind, Execute, Sync, and a failover
+// retry re-runs all of it. ParseComplete and BindComplete answer the
+// client's Parse and Bind, which it sent once, so a second one is a
+// message PostgreSQL never sends. pgx does not resynchronise on it: it
+// destroys the connection, and every later statement on that connection
+// fails with "conn closed" -- 152 of them in one cutover -- while the
+// router session that caused it is still healthy and has been told
+// nothing. That is PGS-940, and it is why these are counted like the
+// describe answers next to them rather than written on every attempt.
+func TestARetryDoesNotAnswerParseOrBindTwice(t *testing.T) {
+	client := &describeRecorder{}
+	cw := &countingWriter{w: client}
+
+	batch := func() {
+		for _, write := range []func() error{
+			cw.ParseComplete,
+			func() error { return cw.ParameterDescription([]uint32{20}) },
+			cw.NoData,
+			cw.BindComplete,
+		} {
+			if err := write(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	batch()
+	cw.retrying()
+	batch()
+
+	want := []string{"ParseComplete", "ParameterDescription", "NoData", "BindComplete"}
+	if !slices.Equal(client.seen, want) {
+		t.Fatalf("the client saw %v, want %v", client.seen, want)
+	}
+	if cw.wrote {
+		t.Fatal("a bound statement has told the client nothing about its outcome, so it stays retryable")
+	}
+
+	// An attempt that gets further than the last one still says the rest,
+	// and a Close answered once is not answered again either.
+	client.seen = nil
+	cw = &countingWriter{w: client}
+	if err := cw.ParseComplete(); err != nil {
+		t.Fatal(err)
+	}
+	cw.retrying()
+	batch()
+	if err := cw.CloseComplete(); err != nil {
+		t.Fatal(err)
+	}
+	cw.retrying()
+	batch()
+	if err := cw.CloseComplete(); err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"ParseComplete", "ParameterDescription", "NoData", "BindComplete", "CloseComplete"}
+	if !slices.Equal(client.seen, want) {
+		t.Fatalf("a longer attempt: the client saw %v, want %v", client.seen, want)
 	}
 }
