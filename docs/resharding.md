@@ -532,11 +532,13 @@ that ended within a day).
   as `'orders'::regclass` in any language. A body kept as text -- PL/pgSQL, or
   SQL in a quoted string -- names the table in text resolved when it runs, so
   it follows the swap and is not refused. So is any stored expression naming
-  the table as a regclass constant (`'orders'::regclass`), whether on its own
-  or inside a regclass array (`'{orders}'::regclass[]`): a default, a
+  the table as a regclass constant (`'orders'::regclass`): a default, a
   generated column, a constraint, an index, a trigger's `WHEN` or extended
-  statistics, on the table itself or anywhere else. **Stored expressions
-  only.** A row in an ordinary `regclass` *column* holding the table's own OID
+  statistics, on the table itself or anywhere else. The same OID **inside a
+  regclass array** (`'{orders}'::regclass[]`) is refused on the table's own
+  expressions only — PostgreSQL records no dependency for an array constant
+  anywhere, so one in another object's expression is not seen (PGS-936).
+  **Stored expressions only.** A row in an ordinary `regclass` *column* holding the table's own OID
   is data, not schema: it is copied verbatim and goes stale when the old table
   is retired, and nothing refuses or rewrites it. Store the table's name rather
   than its OID if the value has to survive a move. Anything bound to the table's

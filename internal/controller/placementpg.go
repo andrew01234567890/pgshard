@@ -970,20 +970,36 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 			-- the last element, plus an array naming only another table,
 			-- which must not match.
 			--
-			-- What that start does and does not do, because no test can
-			-- pin it and someone will otherwise simplify it away: every
-			-- offset in the header is a multiple of four, so a start that
-			-- is too small stays aligned on the real elements and still
-			-- finds them. It bounds what is READ, not what is found -- it
-			-- keeps the header's own words out of the comparison. dims[0]
-			-- is the element count, so an array of 16384 or more entries
-			-- has a header word in user-OID territory, and scanning from a
-			-- fixed offset would let that word be mistaken for the table
-			-- and refuse a move that was fine.
+			-- What that start does: it bounds what is READ, not what is
+			-- found. Every offset in the header is a multiple of four, so a
+			-- start that is too small stays aligned on the real elements and
+			-- still finds them -- what it also does is read the header's own
+			-- words, and two of those carry user-sized numbers. dims[0] is
+			-- the element count and lbound[] is whatever the array declared,
+			-- so a fixed start refuses a move over an array whose length or
+			-- lower bound happens to equal the table's OID.
+			-- TestTheRegclassScanIsNotFooledByAHeaderWord pins exactly that.
+			--
+			-- SCOPE, and it is narrower than it looks: src below is the
+			-- moved table's OWN expressions. An array constant in another
+			-- object is still missed, because PostgreSQL records no
+			-- dependency for one anywhere -- find_expr_references_walker
+			-- handles REGCLASSOID scalars only -- so the pg_depend branch
+			-- that covers other objects for a scalar covers nothing here.
+			-- PGS-936 stays open for it.
 			UNION ALL SELECT 'reference to the table by OID in ' || pg_describe_object(e.classid, e.objid, 0)
 				FROM t, src e,
 					regexp_matches(e.expr, ':consttype 2210 [^{}]*:constisnull false [^{}]*:constvalue [0-9]+ \[ ([-0-9 ]*)\]', 'g') m,
-					LATERAL (SELECT string_to_array(btrim(m[1]), ' ')::bigint[] AS b) v,
+					-- OFFSET 0, which is not decoration: without it the planner
+					-- FLATTENS this subquery, so v.b is not a value but the
+					-- string_to_array expression re-evaluated at every
+					-- reference -- four times per element, once per element.
+					-- Measured on PG 18: a 4096-element array constant took
+					-- 13.5s to scan and a 16536-element one took 295s, in a
+					-- query the preflight runs per source and recheckDependents
+					-- runs again immediately before the first rename, neither
+					-- with a timeout. With OFFSET 0 the same 16536 case is 16ms.
+					LATERAL (SELECT string_to_array(btrim(m[1]), ' ')::bigint[] AS b OFFSET 0) v,
 					LATERAL (SELECT
 						(v.b[5]+256)%256 + (v.b[6]+256)%256*256 + (v.b[7]+256)%256*65536 + (v.b[8]+256)%256*16777216 AS ndim,
 						(v.b[9]+256)%256 + (v.b[10]+256)%256*256 + (v.b[11]+256)%256*65536 + (v.b[12]+256)%256*16777216 AS dataoffset,
