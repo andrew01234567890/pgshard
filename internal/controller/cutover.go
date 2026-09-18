@@ -69,8 +69,24 @@ const (
 	DefaultCutoverTimeout = 60 * time.Second
 	// DefaultCutoverAttempts is how many undone switches fail the workflow.
 	DefaultCutoverAttempts = 3
-	// DefaultRetireAfter is how long the old groups stay after the switch.
-	DefaultRetireAfter = 24 * time.Hour
+	// DefaultRetireAfter is how long the old groups stay after the switch,
+	// keeping a rollback possible.
+	//
+	// One hour, not a day. The rollback this window advertises does NOT
+	// survive a schema change: DDL goes to the serving set and logical
+	// replication does not carry it, so the drift check refuses a rollback
+	// to a set whose schema has moved (PGS-405). A 24h advertisement was
+	// therefore a promise the cluster could not keep -- any DDL inside it
+	// ended the rollback silently, and the operator found out from a
+	// refusal. An hour is long enough to notice a bad reshard, which took
+	// far longer than that to run, and short enough that the promise is
+	// usually still true when it is read (PGS-529).
+	//
+	// Holding the DDL locks for the whole window instead -- so the promise
+	// always holds -- was the alternative, and it was rejected: it blocks
+	// every database's DDL for the window, which is a worse trade than a
+	// shorter window.
+	DefaultRetireAfter = time.Hour
 )
 
 // cutoverState is the cutover record under workflows.status->'cutover'.

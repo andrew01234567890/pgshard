@@ -12,6 +12,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+
+	"github.com/andrew01234567890/pgshard/internal/controller"
 )
 
 type fakeWorkflows struct {
@@ -349,7 +351,7 @@ func TestTheRetireTimeFollowsTheMirroredWindow(t *testing.T) {
 		retire *time.Time
 		want   time.Time
 	}{
-		{reshardSpec{RetireAfterSeconds: 0}, nil, switched.Add(24 * time.Hour)},
+		{reshardSpec{RetireAfterSeconds: 0}, nil, switched.Add(controller.DefaultRetireAfter)},
 		{reshardSpec{RetireAfterMS: &zero}, nil, switched},
 		{reshardSpec{RetireAfterSeconds: 3600, RetireAfterMS: &hour}, nil, switched.Add(time.Hour)},
 		{reshardSpec{RetireAfterMS: &zero}, &recorded, recorded},

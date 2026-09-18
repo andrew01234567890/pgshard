@@ -287,7 +287,13 @@ type ReshardingSpec struct {
 	// RetireOldGroupsAfter is how long the old groups stay after the write
 	// switch, keeping a rollback possible. 0 deletes them as soon as the
 	// reshard completes.
-	// +kubebuilder:default="24h"
+	//
+	// The rollback it keeps possible does not survive a schema change: DDL
+	// reaches the serving set only, and a rollback to a set whose schema has
+	// moved is refused. So this is an upper bound on the promise, not a
+	// guarantee of it -- raise it and the advertisement outlives what the
+	// cluster can actually do (PGS-529).
+	// +kubebuilder:default="1h"
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="retireOldGroupsAfter must not be negative"
 	// +optional
 	RetireOldGroupsAfter *metav1.Duration `json:"retireOldGroupsAfter,omitempty"`

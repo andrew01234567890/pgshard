@@ -401,11 +401,21 @@ and defer migrations of affected tables while a row exists.
 
 ## Complete
 
-`switched` holds for `spec.resharding.retireOldGroupsAfter` (default 24h)
+`switched` holds for `spec.resharding.retireOldGroupsAfter` (default 1h)
 and, when `pauseBefore` is `complete`, for `pgshard.io/proceed: complete`.
 At `0s` it does not hold at all: the run completes and the operator deletes
 the old groups on the pass that sees the switch, so there is no window to
-switch back in. `pauseBefore: complete` still holds a `0s` run, because an
+switch back in.
+
+The window is an **upper bound on the rollback, not a guarantee of it**. DDL
+goes to the serving set and logical replication does not carry it, so a
+schema change inside the window ends the rollback: the drift check refuses a
+switch back to a set whose schema has moved, and the operator finds out from
+the refusal rather than from the advertisement. The default is an hour
+because that is long enough to notice a bad reshard -- which took far longer
+than an hour to run -- and short enough that the promise is usually still
+true when it is read. Raising it widens the gap between what is advertised
+and what the cluster can do (PGS-529). `pauseBefore: complete` still holds a `0s` run, because an
 operator's pause is not a timer.
 
 The operator mirrors the window into the workflow spec as

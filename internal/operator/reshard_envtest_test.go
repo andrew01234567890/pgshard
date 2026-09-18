@@ -17,6 +17,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/controller"
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
@@ -262,8 +263,8 @@ func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
 	fp.mu.Lock()
 	last := fp.cutoverSpecs[len(fp.cutoverSpecs)-1]
 	fp.mu.Unlock()
-	if last != "wf-2:switchWrites::24h0m0s" {
-		t.Fatalf("mirrored spec: %q", last)
+	if want := "wf-2:switchWrites::" + controller.DefaultRetireAfter.String(); last != want {
+		t.Fatalf("mirrored spec: %q, want the retirement window mirrored from controller.DefaultRetireAfter", last)
 	}
 
 	// A plain reshard can ask to be rolled back. The controller's rollback
@@ -291,7 +292,7 @@ func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
 	fp.mu.Lock()
 	last = fp.cutoverSpecs[len(fp.cutoverSpecs)-1]
 	fp.mu.Unlock()
-	if last != "wf-2:switchWrites:switchWrites+complete:24h0m0s" {
+	if want := "wf-2:switchWrites:switchWrites+complete:" + controller.DefaultRetireAfter.String(); last != want {
 		t.Fatalf("proceed annotation must reach the workflow: %q", last)
 	}
 	// No window at all is mirrored as one, not as the default (PGS-901).
