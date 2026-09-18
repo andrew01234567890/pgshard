@@ -112,8 +112,11 @@ func TestClusterDefaultsApplied(t *testing.T) {
 	if s.Catalog.Replicas != 3 {
 		t.Errorf("catalog.replicas = %d, want 3", s.Catalog.Replicas)
 	}
-	if s.Resharding.RetireOldGroupsAfter == nil || s.Resharding.RetireOldGroupsAfter.Duration != 24*time.Hour {
-		t.Errorf("retireOldGroupsAfter = %v, want 24h", s.Resharding.RetireOldGroupsAfter)
+	// The CRD default, which is deliberately an hour rather than a day: the
+	// rollback it keeps possible does not survive a schema change, so a
+	// longer window advertises more than the cluster can keep (PGS-529).
+	if s.Resharding.RetireOldGroupsAfter == nil || s.Resharding.RetireOldGroupsAfter.Duration != time.Hour {
+		t.Errorf("retireOldGroupsAfter = %v, want 1h", s.Resharding.RetireOldGroupsAfter)
 	}
 	if s.Resharding.PauseBefore != "none" {
 		t.Errorf("pauseBefore = %q, want none", s.Resharding.PauseBefore)
@@ -479,7 +482,7 @@ func TestClusterShardsAndReshardingValidation(t *testing.T) {
 	if err := create(t, c); err != nil {
 		t.Fatal(err)
 	}
-	if c.Spec.Resharding.PauseBefore != "none" || c.Spec.Resharding.RetireOldGroupsAfter == nil || c.Spec.Resharding.RetireOldGroupsAfter.Duration != 24*time.Hour {
+	if c.Spec.Resharding.PauseBefore != "none" || c.Spec.Resharding.RetireOldGroupsAfter == nil || c.Spec.Resharding.RetireOldGroupsAfter.Duration != time.Hour {
 		t.Fatalf("resharding defaults %+v", c.Spec.Resharding)
 	}
 	c.Status.EffectiveShards = 2
