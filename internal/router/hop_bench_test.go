@@ -94,3 +94,52 @@ func benchScatterRows(b *testing.B, cols, width int) {
 		read()
 	}
 }
+
+// BenchmarkScatterStatementThroughRouter measures a scatter whose result is
+// ONE ROW PER SHARD, so what moves the number is the per-statement fan-out
+// -- a pooler stream opened, a goroutine started and torn down for every
+// participant -- and not the rows. Its neighbour above deliberately measures
+// the other thing and says so: "the response count -- not the statement
+// count -- is what the transport costs". At 250 rows and ~20k allocations a
+// handful of stream opens is invisible there, so it cannot show a change to
+// them either way.
+//
+// It runs across shard counts because the SLOPE is the answer: the gap
+// between one shard and eight, divided by seven, is what one participant
+// costs. That is the number PGS-616 is about, and nothing measured it.
+func BenchmarkScatterStatementThroughRouter(b *testing.B) {
+	for _, shards := range []int{1, 2, 4, 8} {
+		b.Run(fmt.Sprintf("shards=%d", shards), func(b *testing.B) { benchScatterStatement(b, shards) })
+	}
+}
+
+func benchScatterStatement(b *testing.B, shards int) {
+	h := newShardedHarnessShards(b, Config{}, shards)
+	conn, err := pgx.Connect(context.Background(), h.dsn()+"&default_query_exec_mode=simple_protocol")
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	for i, fp := range h.poolers {
+		fp.script("select * from orders", script{
+			cols: []scriptCol{{name: "c0", oid: 25}},
+			rows: [][]string{{strconv.Itoa(i)}},
+		})
+	}
+	read := func() {
+		rows, err := conn.Query(ctx, "select * from orders")
+		if err != nil {
+			b.Fatal(err)
+		}
+		for rows.Next() {
+		}
+		if rows.Err() != nil {
+			b.Fatal(rows.Err())
+		}
+	}
+	read()
+	b.ReportAllocs()
+	for b.Loop() {
+		read()
+	}
+}
