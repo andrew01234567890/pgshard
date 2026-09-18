@@ -408,6 +408,22 @@ spec:
 			t.Fatal(err)
 		}
 
+		// Wait for the policy to REACH the members before asking for a
+		// backup. Patching policyRef onto a running cluster is not the same
+		// as creating one with it: the operator still has to render each
+		// member's pgbackrest configuration, and a backup asked for before
+		// that lands fails with "no backup policy configured for this
+		// member". The backup suite never sees this because it creates its
+		// cluster with the policy already set.
+		waitFor(ctx, t, "BackupHealthy on the policy", 5*time.Minute, func() bool {
+			return jsonpath(ctx, t, c, "pgshardbackuppolicy", clusterName+"-policy",
+				`{.status.conditions[?(@.type=="BackupHealthy")].status}`) == "True"
+		})
+		waitFor(ctx, t, "BackupHealthy on the cluster", 5*time.Minute, func() bool {
+			return jsonpath(ctx, t, c, "pgshardcluster", clusterName,
+				`{.status.conditions[?(@.type=="BackupHealthy")].status}`) == "True"
+		})
+
 		// The backup is an operator -> agent call carrying the per-cluster
 		// <cluster>-tls-operator credential.
 		if err := c.Apply(ctx, fmt.Sprintf(`
