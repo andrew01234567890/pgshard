@@ -715,11 +715,44 @@ func (e *Executor) checkFanoutDDL(ctx context.Context) error {
 		return nil
 	}
 	if snap := e.r.cfg.Snapshot(); snap != nil && snap.Resharding() {
-		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
-		err.Hint = "retry once the reshard completes; a catalog migrated to the operation queue queues the statement instead of refusing it"
-		return err
+		return reshardingDDLRefusal(true)
 	}
 	return nil
+}
+
+// reshardingDDLRefusal is the refusal both DDL paths give while a reshard
+// holds the shard map. queueable says whether the operation queue would
+// have taken this statement, which is true of a fanned-out migration and
+// NOT of home DDL -- checkHomeDDL's own comment says it cannot wait its
+// turn in the queue the way a migration does, so telling its caller that
+// migrating the catalog would queue the statement sends them to do
+// non-trivial work and meet the same wall.
+//
+// THE HINT NAMES A CHECK BEFORE IT NAMES AN ACTION, and that is the point.
+// The snapshot cannot tell a failed reshard from a running one:
+// Resharding() is true while any set is in provisioning (snapshot.go) and a
+// failed run leaves its set exactly there. So "retry once the reshard
+// completes" -- which was the whole hint -- can never come true for the
+// case an operator is most likely to be in. But the remedy is not
+// conditional on failure in the code either: cancellableOnRevert
+// (internal/operator/reshard.go) accepts Pending, Provisioning, Copying and
+// Verifying as well as Failed, so reverting spec.shards on a reshard that is
+// most of the way through its copy CANCELS it and deletes the target groups.
+// A hint that says "if it has failed, revert" to a reader who has just been
+// told they cannot tell would invite exactly that, so it says where to look
+// first and what the action costs if they are wrong.
+//
+// An upgrade is excluded deliberately: it materialises a set the same way,
+// so it reaches this refusal, but reshard.go excludes upgrade-mode runs from
+// revert-cancel and spec.shards already equals the serving count for one, so
+// the revert would be a no-op (PGS-876).
+func reshardingDDLRefusal(queueable bool) *pgwire.Error {
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
+	err.Hint = "check status.reshard first: if it reports Failed, reverting spec.shards to the serving count clears it, and a catalog-sourced set is cleared by dropping its shard_status, shard_ranges and shard_sets rows. Reverting a reshard that is still RUNNING cancels it and deletes its target groups, and a major-version upgrade is not cleared this way at all. See docs/resharding.md"
+	if queueable {
+		err.Detail = "A catalog migrated to the operation queue queues this statement instead of refusing it."
+	}
+	return err
 }
 
 // checkHomeDDL refuses DDL a local database runs directly on its home shard
@@ -736,7 +769,7 @@ func (e *Executor) checkHomeDDL(ctx context.Context) error {
 	}
 	if !queued {
 		if snap := e.r.cfg.Snapshot(); snap != nil && snap.Resharding() {
-			return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
+			return reshardingDDLRefusal(false)
 		}
 		return nil
 	}
