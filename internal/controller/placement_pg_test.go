@@ -1862,7 +1862,8 @@ func TestTheRegclassScanFindsItsConstantOnEveryMajor(t *testing.T) {
 			byOID := map[string]bool{}
 			for _, f := range found {
 				if name, ok := strings.CutPrefix(f, "reference to the table by OID in constraint "); ok {
-					byOID[name[:strings.Index(name, " ")]] = true
+					constraint, _, _ := strings.Cut(name, " ")
+					byOID[constraint] = true
 				}
 			}
 			for _, want := range []string{"flat", "nested", "nulled"} {
