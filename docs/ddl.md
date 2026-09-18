@@ -170,7 +170,10 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    placement conflicts with DDL in its database until it has swapped; and
    two migrations conflict in the same database, or when either is about
    roles or databases. The statement is not refused for any of that — it
-   waits, and the session is told what it waits for. Otherwise the applier
+   waits, and the session is told what it waits for. A migration that does
+   run after a reshard or upgrade has switched makes that run's rollback
+   refuse, because the old groups no longer carry the schema the new ones
+   have ([upgrade.md](upgrade.md)). Otherwise the applier
    takes queued and running migrations oldest first, one at a time, and
    runs each on its targets in shard order. Client statements never run on
    a superuser session: the applier logs into the shard's primary as

@@ -224,3 +224,54 @@ func TestATargetOffersOnlyWhatEveryShardHas(t *testing.T) {
 		})
 	}
 }
+
+// TestARollbackThatCannotFinishGivesUpAndStaysSwitched (PGS-934): the
+// rolling_back stage joins the applier's DDL hold, deliberately -- it closes
+// the window between the rollback's drift check and the flip back. So a
+// rollback that can never finish used to freeze DDL on every database in the
+// cluster for as long as it kept asking to run again, because the retry had
+// no bound at all.
+//
+// It gives up now, and lands in the state a refused rollback already lands
+// in: switched, which releases the hold and completes the run as scheduled.
+// The operator asked for a rollback and is not getting one, so it must say
+// so -- silently abandoning it would be the one way to get this wrong.
+func TestARollbackThatCannotFinishGivesUpAndStaysSwitched(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitched)
+	h.wf.spec.Rollback = true
+	if !h.pass(t) || h.wf.stage != StageRollingBack {
+		t.Fatalf("rollback request must advance the stage; got %s", h.wf.stage)
+	}
+
+	// Reverse replication never catches up, which is the errRetry path.
+	h.ops.reverseCaughtUp = false
+	attempts := 0
+	for range 20 {
+		if h.wf.stage != StageRollingBack {
+			break
+		}
+		h.pass(t)
+		attempts++
+	}
+	if h.wf.stage != StageSwitched {
+		t.Fatalf("a rollback that cannot finish left the stage %s after %d passes; it must give up and stay switched, or DDL stays held", h.wf.stage, attempts)
+	}
+	if attempts > DefaultCutoverAttempts {
+		t.Errorf("it took %d passes to give up, more than the %d-attempt bound", attempts, DefaultCutoverAttempts)
+	}
+	if h.wf.cutover.RollbackRefused == "" {
+		t.Error("the run gave up on the rollback and recorded no reason; an operator asked for it and must be told")
+	}
+	if h.wf.cutover.RollbackRetries == 0 {
+		t.Error("the attempt count was not recorded")
+	}
+
+	// Withdrawing the request clears it, so a new one is looked at afresh
+	// rather than inheriting a spent budget.
+	h.wf.spec.Rollback = false
+	h.pass(t)
+	if h.wf.cutover.RollbackRefused != "" || h.wf.cutover.RollbackRetries != 0 {
+		t.Errorf("withdrawing the request left refused=%q retries=%d", h.wf.cutover.RollbackRefused, h.wf.cutover.RollbackRetries)
+	}
+}
