@@ -1833,29 +1833,134 @@ func TestTheRegclassScanFindsItsConstantOnEveryMajor(t *testing.T) {
 			parallelPG(t)
 			ctx := context.Background()
 			conn := connect(t, startPostgresImage(t, image, nil))
-			// The table's OWN check constraint and generated column. These
-			// are the shapes that need the decode: for a table's own
-			// expressions PostgreSQL replaces the whole-object dependency
-			// with a sub-object one (eliminate_duplicate_dependencies), so
-			// the pg_depend branch of the scan does not see them and only
-			// the node-tree decode does. A constant in ANOTHER object -- a
-			// check on a second table -- is found by the dependency branch
-			// whatever the decode does, so it would prove nothing here.
-			mustExec(t, conn, `CREATE TABLE named (a int CHECK (a <> 'named'::regclass::int),
-				g int GENERATED ALWAYS AS (a + 'named'::regclass::int) STORED)`)
+			// The table's OWN expressions. These are the shapes that need
+			// the decode: for a table's own expressions PostgreSQL replaces
+			// the whole-object dependency with a sub-object one
+			// (eliminate_duplicate_dependencies), so the pg_depend branch of
+			// the scan does not see them and only the node-tree decode does.
+			//
+			// For a SCALAR constant, one in another object is found by the
+			// dependency branch whatever the decode does, so it would prove
+			// nothing. That is NOT true of an array: PostgreSQL records no
+			// dependency for an array constant anywhere, so one in another
+			// object is missed by both branches and this suite cannot assert
+			// it is caught. PGS-936 stays open for that half.
+			mustExec(t, conn, `CREATE TABLE elsewhere (id int)`)
+			// Four shapes, four constraints, each naming the table ITSELF:
+			// a scalar constant, the same constant inside a regclass array,
+			// a two-dimensional array, and an array carrying a NULL. The
+			// last two are coverage of the header arithmetic (the element
+			// data begins at 16 + 8*ndim, or past the null bitmap at
+			// dataoffset when there is one), NOT proof of it: every offset
+			// in the header is a multiple of four, so a decode reading a
+			// fixed offset stays aligned and finds these too. What proves
+			// the arithmetic is the header-word test below.
+			mustExec(t, conn, `CREATE TABLE named (
+				a regclass CHECK (a::int <> 'named'::regclass::int),
+				g int GENERATED ALWAYS AS ('named'::regclass::int) STORED,
+				CONSTRAINT flat CHECK (a <> ALL ('{named}'::regclass[])),
+				CONSTRAINT nested CHECK (a <> ALL ('{{elsewhere,named}}'::regclass[])),
+				CONSTRAINT nulled CHECK (a <> ALL ('{NULL,named}'::regclass[])))`)
 			found, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "named")
 			if err != nil {
 				t.Fatal(err)
 			}
-			var byOID int
+			byOID := map[string]bool{}
 			for _, f := range found {
-				if strings.HasPrefix(f, "reference to the table by OID in ") {
-					byOID++
+				if name, ok := strings.CutPrefix(f, "reference to the table by OID in constraint "); ok {
+					constraint, _, _ := strings.Cut(name, " ")
+					byOID[constraint] = true
 				}
 			}
-			if byOID < 2 {
-				t.Errorf("the regclass scan found %d of the 2 constants the table stores about itself: %v\n"+
-					"the decode of the printed pg_node_tree has stopped matching on this major, so the refusal it drives is silently not firing", byOID, found)
+			for _, want := range []string{"flat", "nested", "nulled"} {
+				if !byOID[want] {
+					t.Errorf("the regclass scan missed constraint %s, which names the table inside a regclass array: %v\n"+
+						"the ArrayType decode has stopped matching on this major, so the refusal it drives is silently not firing", want, found)
+				}
+			}
+			if len(found) == 0 {
+				t.Errorf("the regclass scan found nothing at all: %v", found)
+			}
+
+			// The negative control, and the reason the count above is not
+			// the assertion: a decode that matched any four bytes anywhere
+			// would satisfy every check so far. This table's array names
+			// ONLY another table, so nothing may be reported about it.
+			mustExec(t, conn, `CREATE TABLE innocent (a regclass,
+				CONSTRAINT points_elsewhere CHECK (a <> ALL ('{elsewhere}'::regclass[])))`)
+			clean, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "innocent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range clean {
+				if strings.HasPrefix(f, "reference to the table by OID in ") {
+					t.Errorf("the regclass scan reported %q for a table whose array names only another table: the decode matches bytes that are not its OID", f)
+				}
+			}
+		})
+	}
+}
+
+// TestTheRegclassScanIsNotFooledByAHeaderWord (PGS-936): the array decode
+// computes where the elements start from the ArrayType header rather than
+// reading from a fixed offset. Every offset in that header is a multiple of
+// four, so a fixed start stays ALIGNED on the real elements and still finds
+// them -- which is why the shapes in the test above cannot tell a computed
+// start from a fixed one, and why a comment here once claimed nothing could.
+//
+// What a fixed start also does is read the header's own words, and two of
+// them carry user-sized numbers: dims[0] is the element count, and lbound[]
+// is whatever the array declared. So an array whose LOWER BOUND equals the
+// table's own OID is reported by a decode starting at 24 and ignored by one
+// that starts at 16 + 8*ndim. The constant names another table entirely;
+// nothing about this table may be refused because of it.
+func TestTheRegclassScanIsNotFooledByAHeaderWord(t *testing.T) {
+	for _, image := range []string{
+		"ghcr.io/andrew01234567890/pgshard-postgres:18",
+		"ghcr.io/andrew01234567890/pgshard-postgres:19",
+	} {
+		t.Run(image[strings.LastIndex(image, ":")+1:], func(t *testing.T) {
+			parallelPG(t)
+			ctx := context.Background()
+			conn := connect(t, startPostgresImage(t, image, nil))
+			mustExec(t, conn, `CREATE TABLE decoy (id int)`)
+			mustExec(t, conn, `CREATE TABLE bounded (a regclass)`)
+			var oid int64
+			if err := conn.QueryRow(ctx, `SELECT 'bounded'::regclass::oid::bigint`).Scan(&oid); err != nil {
+				t.Fatal(err)
+			}
+			// A 2-D array whose first lower bound is this table's own OID.
+			// The elements start at 16 + 8*2 = 32; the lower bound sits at
+			// byte 24, exactly where a fixed start would begin reading.
+			mustExec(t, conn, fmt.Sprintf(
+				`ALTER TABLE bounded ADD CONSTRAINT lower_bound_looks_like_an_oid
+					CHECK (a <> ALL ('[%d:%d][1:1]={{decoy}}'::regclass[]))`, oid, oid))
+			got, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "bounded")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range got {
+				if strings.HasPrefix(f, "reference to the table by OID in ") {
+					t.Errorf("the scan reported %q for a table named only by an array LOWER BOUND: the decode is reading header words as elements, so it refuses moves that are fine", f)
+				}
+			}
+			// And the control: the same table, named for real in an array,
+			// must still be refused -- so this is not passing because the
+			// scan stopped finding anything.
+			mustExec(t, conn, `ALTER TABLE bounded ADD CONSTRAINT names_itself
+				CHECK (a <> ALL ('{bounded}'::regclass[]))`)
+			got, err = unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "bounded")
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, f := range got {
+				if strings.Contains(f, "names_itself") {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("the scan missed the constraint that really does name the table: %v", got)
 			}
 		})
 	}

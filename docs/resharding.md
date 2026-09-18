@@ -534,7 +534,14 @@ that ended within a day).
   it follows the swap and is not refused. So is any stored expression naming
   the table as a regclass constant (`'orders'::regclass`): a default, a
   generated column, a constraint, an index, a trigger's `WHEN` or extended
-  statistics, on the table itself or anywhere else. Anything bound to the table's
+  statistics, on the table itself or anywhere else. The same OID **inside a
+  regclass array** (`'{orders}'::regclass[]`) is refused on the table's own
+  expressions only — PostgreSQL records no dependency for an array constant
+  anywhere, so one in another object's expression is not seen (PGS-936).
+  **Stored expressions only.** A row in an ordinary `regclass` *column* holding the table's own OID
+  is data, not schema: it is copied verbatim and goes stale when the old table
+  is retired, and nothing refuses or rewrites it. Store the table's name rather
+  than its OID if the value has to survive a move. Anything bound to the table's
   **row type**, which the rename takes with the table, is refused too: a
   function taking or returning the row (whatever its language), another
   table's or a composite type's column of it, a view casting to it. The
