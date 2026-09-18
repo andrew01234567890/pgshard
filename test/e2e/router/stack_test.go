@@ -5,6 +5,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
@@ -152,14 +153,65 @@ func dockerHostPort(tb testing.TB, container string) string {
 // the last possible moment, so nothing but the child can win the race.
 func freePort(tb testing.TB) int {
 	tb.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatal(err)
-	}
+	l := listenBelowEphemeral(tb)
 	port := l.Addr().(*net.TCPAddr).Port
 	reservedPorts.Store(port, l)
 	tb.Cleanup(func() { releasePort(port) })
 	return port
+}
+
+// listenBelowEphemeral binds a port the kernel will NOT hand out on its own.
+//
+// The reservation above closes the window against this process; it cannot
+// close it against the rest of the machine, because a port from
+// net.Listen(":0") comes from the EPHEMERAL RANGE -- 32768-60999 by default
+// on Linux -- which is exactly the range the kernel draws from for every
+// outgoing connection. So in the instant between releasing the reservation
+// and the child's bind, any unrelated socket on a busy runner could be
+// given the same number, and on 2026-09-15 one was, eight days after the
+// reservation landed (PGS-908).
+//
+// Binding below that range removes the kernel as a competitor: what is left
+// is only another process deliberately choosing the same port, which is
+// rare rather than routine. It falls back to :0 if it cannot find one, so
+// it is never worse than picking from the ephemeral range.
+func listenBelowEphemeral(tb testing.TB) net.Listener {
+	tb.Helper()
+	const attempts = 64
+	low, high := 10000, ephemeralFloor()
+	if high-low < attempts {
+		low, high = 10000, 32768
+	}
+	for range attempts {
+		port := low + rand.IntN(high-low)
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			return l
+		}
+	}
+	// Every attempt was taken, which says more about the machine than about
+	// the range. An ephemeral port is still better than no port.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return l
+}
+
+// ephemeralFloor is the bottom of the kernel's ephemeral range, so the
+// choice above adapts to a machine whose range has been widened downwards
+// rather than assuming the default.
+func ephemeralFloor() int {
+	b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		return 32768
+	}
+	if lo, _, ok := strings.Cut(strings.TrimSpace(string(b)), "\t"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(lo)); err == nil && n > 10000 {
+			return n
+		}
+	}
+	return 32768
 }
 
 // reservedPorts holds a listener per port this process has handed out and
@@ -523,4 +575,33 @@ func (s *stack) connect(tb testing.TB) *pgx.Conn {
 	}
 	tb.Cleanup(func() { _ = conn.Close(context.Background()) })
 	return conn
+}
+
+// TestFreePortAvoidsTheEphemeralRange: the reservation in freePort closes
+// the release-to-bind window against this process, and cannot close it
+// against the rest of the machine. A port from net.Listen(":0") comes from
+// the kernel's ephemeral range, which is the range it draws from for every
+// outgoing connection -- so the number handed to a child is one the kernel
+// may give to an unrelated socket in that instant, which is what PGS-908
+// recorded happening eight days after the reservation landed.
+//
+// Choosing below that range removes the kernel as a competitor. This
+// asserts the choice, because the failure it prevents cannot be reproduced
+// on demand: without it the ports look perfectly normal, and only a busy
+// machine tells the difference.
+func TestFreePortAvoidsTheEphemeralRange(t *testing.T) {
+	floor := ephemeralFloor()
+	if floor <= 10000 {
+		t.Skipf("the ephemeral range starts at %d, so there is no room below it to choose from", floor)
+	}
+	for range 32 {
+		p := freePort(t)
+		if p >= floor {
+			t.Fatalf("freePort chose %d, inside the kernel's ephemeral range (starts at %d): "+
+				"the kernel can hand that number to another socket between the release and the child's bind", p, floor)
+		}
+		if p < 1024 {
+			t.Fatalf("freePort chose %d, a privileged port", p)
+		}
+	}
 }
