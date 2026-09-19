@@ -611,7 +611,17 @@ func (e *Executor) localOnly() bool {
 func (e *Executor) catalogSession() bool { return e.home.Set == CatalogShardSet }
 
 // userSet is the shard set the session's user data lives in right now.
-func (e *Executor) userSet() string { return e.Home().Set }
+//
+// A statement in flight reads it from the snapshot it was planned against:
+// its shard ids name shards of that snapshot's set, and generation() stamps
+// the epoch from the same one, so reading the live set could name a shard
+// the stamp has no epoch for (PGS-962).
+func (e *Executor) userSet() string {
+	if e.stmtSnap != nil {
+		return e.homeAt(e.stmtSnap).Set
+	}
+	return e.Home().Set
+}
 
 // Shard reports the shard the session's stream is on.
 func (e *Executor) Shard() Shard { return e.shard }
@@ -915,8 +925,18 @@ func (e *Executor) asWritePause(err error) error {
 // SimpleQuery implements pgwire.Executor.
 func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
 	e.enterStatement(ctx)
+	defer e.endStatement()
 	return e.guard("SimpleQuery", func() error { return e.simpleQuery(ctx, sql, w) })
 }
+
+// endStatement forgets the snapshot the statement just ended was planned
+// against. pump does it on a relayed ReadyForQuery, but a statement the
+// router answers itself -- a refusal, EXPLAIN, nextval, a failed
+// transaction's COMMIT -- relays none, and the snapshot then outlived it:
+// a later Bind of a cached statement needs no re-plan, so nothing set it
+// again, and that statement was stamped and targeted from an older map
+// than the one it was checked against (PGS-962).
+func (e *Executor) endStatement() { e.stmtSnap = nil }
 
 // refuseTxnControlInBatch refuses a transaction control statement inside a
 // batch this executor opened a transaction for.
@@ -2097,6 +2117,7 @@ func (e *Executor) failBatch() {
 // Sync and relays every response.
 func (e *Executor) Sync(ctx context.Context) error {
 	e.enterStatement(ctx)
+	defer e.endStatement()
 	return e.guard("Sync", func() error { return e.sync(ctx) })
 }
 
