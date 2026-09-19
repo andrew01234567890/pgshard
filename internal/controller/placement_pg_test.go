@@ -2661,3 +2661,79 @@ func TestAFailedPlacementRecordsWhatItCouldNotClean(t *testing.T) {
 		t.Errorf("status.leaked = %q; it must name what went wrong, not merely that something did", leaked)
 	}
 }
+
+// TestTheRegclassScanSeesDomainArraysAndCompositeLiterals (PGS-936): the two
+// shapes the array scan still missed, measured on real node trees rather
+// than read off the source.
+//
+// An array of a DOMAIN over regclass has the regclass[] layout, but its own
+// array type is not 2210 and its element type is the domain's OID, not 2205,
+// so both the match and the element check skipped it -- nested domains too.
+// A composite LITERAL ('(moved,1)'::pair) is one Const holding a packed
+// tuple, where ROW('moved'::regclass, 1)::pair keeps its fields as separate
+// Consts that the scalar scan already read. PostgreSQL records a dependency
+// for neither, so after a move each goes on holding the retired table's OID.
+//
+// Two shapes that looked like gaps and are NOT, pinned so nobody "fixes"
+// them: a scalar domain constant ('moved'::rcd) is folded by PostgreSQL to a
+// plain regclass Const, and the ROW() form of a composite is separate Consts.
+func TestTheRegclassScanSeesDomainArraysAndCompositeLiterals(t *testing.T) {
+	for _, image := range []string{
+		"ghcr.io/andrew01234567890/pgshard-postgres:18",
+		"ghcr.io/andrew01234567890/pgshard-postgres:19",
+	} {
+		t.Run(image[strings.LastIndex(image, ":")+1:], func(t *testing.T) {
+			parallelPG(t)
+			ctx := context.Background()
+			conn := connect(t, startPostgresImage(t, image, nil))
+			mustExec(t, conn, `CREATE TABLE moved (id int PRIMARY KEY)`)
+			mustExec(t, conn, `CREATE TABLE elsewhere (id int)`)
+			mustExec(t, conn, `CREATE DOMAIN rcd AS regclass`)
+			mustExec(t, conn, `CREATE DOMAIN rcd2 AS rcd`)
+			mustExec(t, conn, `CREATE TYPE pair AS (r regclass, n int)`)
+			mustExec(t, conn, `CREATE TABLE s_dom (a rcd, CONSTRAINT scalar_dom CHECK (a <> 'moved'::rcd))`)
+			mustExec(t, conn, `CREATE TABLE a_dom (a rcd, CONSTRAINT array_dom CHECK (a <> ALL ('{moved}'::rcd[])))`)
+			mustExec(t, conn, `CREATE TABLE a_dom2 (a rcd2, CONSTRAINT array_dom2 CHECK (a <> ALL ('{moved}'::rcd2[])))`)
+			mustExec(t, conn, `CREATE TABLE comp_row (p pair, CONSTRAINT composite_row CHECK (p <> ROW('moved'::regclass, 1)::pair))`)
+			mustExec(t, conn, `CREATE TABLE comp_lit (p pair, CONSTRAINT composite_lit CHECK (p <> '(moved,1)'::pair))`)
+			// A domain array carrying a NULL has a non-zero dataoffset, which
+			// moves where the elements start.
+			mustExec(t, conn, `CREATE TABLE a_dom_null (a rcd, CONSTRAINT array_dom_null CHECK (a <> ALL ('{NULL,moved}'::rcd[])))`)
+
+			found, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "moved")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"array_dom ", "array_dom2", "array_dom_null", "composite_lit", "scalar_dom", "composite_row"} {
+				seen := false
+				for _, f := range found {
+					if strings.Contains(f, want) && strings.HasPrefix(f, "reference to the table by OID in ") {
+						seen = true
+					}
+				}
+				if !seen {
+					t.Errorf("%s names the table and was not reported, so the move would proceed and leave it holding a freed OID: %v", strings.TrimSpace(want), found)
+				}
+			}
+
+			// The negatives, and they matter more: every source this widening
+			// adds is a way to refuse a move that was fine. The same shapes
+			// naming a DIFFERENT table must report nothing -- including a
+			// composite whose int field is an ordinary value, and one whose
+			// header words (typmod -1, the type OID, the ctid) the scan must
+			// never read.
+			mustExec(t, conn, `CREATE TABLE innocent (id int)`)
+			mustExec(t, conn, `CREATE TABLE n_dom (a rcd, CONSTRAINT n_array_dom CHECK (a <> ALL ('{elsewhere}'::rcd2[])))`)
+			mustExec(t, conn, `CREATE TABLE n_comp (p pair, CONSTRAINT n_composite_lit CHECK (p <> '(elsewhere,7)'::pair))`)
+			clean, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "innocent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range clean {
+				if strings.HasPrefix(f, "reference to the table by OID in ") {
+					t.Errorf("a move of a table nothing names was refused -- a false positive from the widened scan: %s", f)
+				}
+			}
+		})
+	}
+}
