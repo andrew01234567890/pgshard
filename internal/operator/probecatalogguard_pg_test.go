@@ -41,7 +41,7 @@ func TestCutoverCarriesTheShardMapGeneration(t *testing.T) {
 	}
 	waitCatalogRow(t, tgt.side.DSN, "before-cutover", "the copy never reached the target")
 	for deadline := time.Now().Add(60 * time.Second); ; {
-		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN)
+		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN, tgt.side.DSN)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,7 +98,7 @@ func TestCutoverCarriesTheRolesGeneration(t *testing.T) {
 	}
 	waitCatalogRow(t, tgt.side.DSN, "before-cutover", "the copy never reached the target, so the carry is not what is being tested")
 	for deadline := time.Now().Add(60 * time.Second); ; {
-		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN)
+		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN, tgt.side.DSN)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -181,7 +181,7 @@ func TestTheNewCatalogCanStillDeclareAShardedTable(t *testing.T) {
 	}
 	waitCatalogRow(t, tgt.side.DSN, "app", "the copy never reached the target")
 	for deadline := time.Now().Add(60 * time.Second); ; {
-		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN)
+		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN, tgt.side.DSN)
 		if err != nil {
 			t.Fatal(err)
 		}

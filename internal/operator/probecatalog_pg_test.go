@@ -162,7 +162,7 @@ func runCatalogUpgradeCycle(ctx context.Context, t *testing.T, src, tgt catalogN
 
 	caughtUp := false
 	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); {
-		ok, lag, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN)
+		ok, lag, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN, tgt.side.DSN)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -255,6 +255,21 @@ func TestCatalogUpgradeRetirementDropsTheReverseSlotOnPostgres(t *testing.T) {
 	p := PgxProber{}
 	if err := p.EnsureCatalogCopy(ctx, src.side, tgt.side); err != nil {
 		t.Fatalf("ensure copy: %v", err)
+	}
+	// The operator cuts over only once the gate says the copy is done; a
+	// cutover straight after the copy starts is one it refuses (PGS-947).
+	for deadline := time.Now().Add(60 * time.Second); ; {
+		ok, lag, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN, tgt.side.DSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the copy never caught up: %s", lag)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	if err := p.CutoverCatalog(ctx, src.side, tgt.side); err != nil {
 		t.Fatalf("cutover: %v", err)
