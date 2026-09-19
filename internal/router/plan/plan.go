@@ -376,6 +376,24 @@ func appendUnique(s []int32, v int32) []int32 {
 	return append(s, v)
 }
 
+// ReshardRecoveryHint is what every refusal that fires while a reshard
+// holds the shard map tells the operator. It NAMES A CHECK BEFORE IT NAMES
+// AN ACTION, and that is the point: the snapshot cannot tell a failed
+// reshard from a running one -- Resharding() is true while any set is in
+// provisioning and a failed run leaves its set exactly there -- so "wait
+// for the reshard to complete" can never come true for the case an
+// operator is most likely to be in. The remedy is not conditional on
+// failure in the code either: cancellableOnRevert accepts Pending,
+// Provisioning, Copying and Verifying as well as Failed, so reverting
+// spec.shards on a reshard most of the way through its copy CANCELS it and
+// deletes the target groups.
+//
+// It lives here because the DDL refusals and the TRUNCATE one must not
+// drift apart; they did, and the TRUNCATE one kept the dead end for longer
+// because it is the one with no operation-queue guard in front of it and so
+// fires on every catalog (PGS-954).
+const ReshardRecoveryHint = "check status.reshard first: if it reports Failed, reverting spec.shards to the serving count clears it, and a catalog-sourced set is cleared by dropping its shard_status, shard_ranges and shard_sets rows. Reverting a reshard that is still RUNNING cancels it and deletes its target groups, and a major-version upgrade is not cleared this way at all. See docs/resharding.md"
+
 // notYet builds the 0A000 refusal every unsupported shape reports.
 func notYet(msg, hint string) *pgwire.Error {
 	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%s", msg)

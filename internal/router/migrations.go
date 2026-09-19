@@ -762,7 +762,7 @@ func (e *Executor) checkFanoutDDL(ctx context.Context) error {
 // the revert would be a no-op (PGS-876).
 func reshardingDDLRefusal(queueable bool) *pgwire.Error {
 	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "DDL is not available while a reshard is active: the copy replicates rows only, and a schema change on the serving shards would break the new shards' apply")
-	err.Hint = "check status.reshard first: if it reports Failed, reverting spec.shards to the serving count clears it, and a catalog-sourced set is cleared by dropping its shard_status, shard_ranges and shard_sets rows. Reverting a reshard that is still RUNNING cancels it and deletes its target groups, and a major-version upgrade is not cleared this way at all. See docs/resharding.md"
+	err.Hint = plan.ReshardRecoveryHint
 	if queueable {
 		err.Detail = "A catalog migrated to the operation queue queues this statement instead of refusing it."
 	}
