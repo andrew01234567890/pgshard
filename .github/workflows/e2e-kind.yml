@@ -4,6 +4,32 @@ on:
   pull_request:
   push:
     branches: [main]
+  # One cell, on a ref of your choosing, so a flake can be given a RATE.
+  # Nothing else here can: repeat.yml never stands up kind and none of its
+  # targets reaches test/e2e, and pull_request fires the whole matrix at
+  # the wrong granularity and only once per push. hack/e2e/repeat.sh drives
+  # this N times and reports the rate (PGS-952).
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Which e2e suite to run
+        required: true
+        type: choice
+        options:
+          - smoke
+          - operator
+          - backup
+          - reshard
+          - reshard-split
+          - reshard-merge
+          - upgrade
+          - tls
+      pg:
+        description: PostgreSQL major
+        required: true
+        default: "18"
+        type: choice
+        options: ["18", "19"]
 
 permissions:
   contents: read
@@ -13,7 +39,10 @@ concurrency:
   # right there. On main it is not: cancelling means the merge that follows
   # kills the run proving the merge before it, and a run of merges leaves
   # every composition in between unverified.
-  group: e2e-kind-${{ github.ref }}
+  # A dispatch gets a group of its OWN, keyed by run id: rate-measuring
+  # means N runs of one cell on one ref, and they would otherwise queue
+  # behind each other on this ref's single group -- 50 runs in series.
+  group: e2e-kind-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -66,7 +95,12 @@ jobs:
           fi
 
   e2e:
-    name: e2e (pg${{ matrix.pg }}, ${{ matrix.suite }})
+    # A dispatched cell is named DIFFERENTLY on purpose. Required contexts
+    # are matched by name against the head SHA, so a dispatch aimed at a
+    # pull request's branch would otherwise publish "e2e (pg18, operator)"
+    # on that SHA and satisfy the gate without the pull request's own matrix
+    # having run.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'e2e repeat' || 'e2e' }} (pg${{ matrix.pg }}, ${{ matrix.suite }})
     needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: ${{ (matrix.suite == 'upgrade' || matrix.suite == 'tls' || startsWith(matrix.suite, 'reshard-')) && 120 || 80 }}
@@ -95,6 +129,14 @@ jobs:
           - pg: 18
             suite: tls
     env:
+      # Whether this cell is the one a dispatch asked for. The matrix stays
+      # exactly as it is -- it defines the required contexts, and rebuilding
+      # it from an input is how one would go missing -- so a dispatch runs
+      # the whole matrix and every cell but the requested one does nothing.
+      # A job-level `if` cannot see `matrix`, which is why this is an env
+      # the steps gate on, beside the docs-only gate that already works this
+      # way.
+      CELL: ${{ (github.event_name != 'workflow_dispatch' || (matrix.suite == inputs.suite && matrix.pg == fromJSON(inputs.pg))) && 'yes' || 'no' }}
       PG_MAJOR: ${{ matrix.pg }}
       # The CRD refuses a beta major without an explicit image, so a suite
       # that runs one names it. This is the same image the load step puts
@@ -103,10 +145,10 @@ jobs:
       E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         id: checkout
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         id: setup_go
         with:
           go-version-file: go.mod
@@ -117,7 +159,7 @@ jobs:
       # required context and roughly forty minutes of somebody's rerun.
       # The SHA stays pinned; only the attempt is repeated.
       - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         id: install_kind
         continue-on-error: true
         with:
@@ -125,7 +167,7 @@ jobs:
           install_only: true
       - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         id: install_kind_retry
-        if: steps.install_kind.outcome == 'failure' && needs.changes.outputs.code == 'true'
+        if: steps.install_kind.outcome == 'failure' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         continue-on-error: true
         with:
           version: v0.32.0
@@ -137,7 +179,7 @@ jobs:
       # fetches against the checksum database.
       - name: Install kind from the module proxy
         id: install_kind_go
-        if: steps.install_kind_retry.outcome == 'failure' && needs.changes.outputs.code == 'true'
+        if: steps.install_kind_retry.outcome == 'failure' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: |
           set -euo pipefail
           hack/ci/retry.sh -- go install sigs.k8s.io/kind@v0.32.0
@@ -148,15 +190,15 @@ jobs:
           driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
         id: setup_buildx
         continue-on-error: true
-        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           version: v0.36.1
           driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
         id: setup_buildx_retry
-        if: matrix.suite != 'smoke' && steps.setup_buildx.outcome == 'failure' && needs.changes.outputs.code == 'true'
+        if: matrix.suite != 'smoke' && steps.setup_buildx.outcome == 'failure' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
       - name: Warm the module and base-image caches
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         id: warm_caches
         # The failures that take a cell down are usually somebody else's
         # network: a registry answering 403, a module proxy dropping a
@@ -193,7 +235,7 @@ jobs:
           done < <(hack/ci/base-images.sh)
       - name: Build PostgreSQL image
         id: build_postgres
-        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
@@ -203,7 +245,7 @@ jobs:
           CI: "true"
       - name: Build operator and admin images
         id: build_control
-        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: |
           set -euo pipefail
           # The overrides point every FROM at the mirrored copy of the same
@@ -218,14 +260,14 @@ jobs:
         id: build_controller
         # Every cluster gets a controller from the operator now, not just
         # the suites that drive a workflow through one.
-        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: |
           set -euo pipefail
           mapfile -t mirror < <(PGSHARD_MIRROR_PRESENT="$RUNNER_TEMP/mirror-present.txt" hack/ci/mirror-args.sh)
           hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
         id: build_postgres_target
-        if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true'
+        if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
@@ -234,32 +276,32 @@ jobs:
         env:
           CI: "true"
       - name: Create kind cluster
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         id: kind_up
         # A cluster that does not come up leaves nothing worth keeping, and
         # a second attempt cannot reuse the first one's half-built cluster.
         run: hack/ci/retry.sh -n 2 -d 15 -c hack/kind/down.sh -- hack/kind/up.sh
       - name: Load images into kind
         id: load_images
-        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e pgshard-router:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Load controller image into kind
         id: load_controller
-        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: hack/kind/load-images.sh pgshard-controller:e2e
       - name: Load the target-major image into kind
         id: load_target
-        if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true'
+        if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: hack/kind/load-images.sh "ghcr.io/andrew01234567890/pgshard-postgres:19"
       - name: Load the object-store images into kind
         id: load_stores
-        if: matrix.suite == 'backup' && needs.changes.outputs.code == 'true'
+        if: matrix.suite == 'backup' && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: |
           set -euo pipefail
           mapfile -t images < <(hack/ci/objectstore-images.sh)
           hack/kind/load-registry-images.sh "${images[@]}"
       - name: Run e2e suite
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         id: run_suite
         run: |
           set -o pipefail
@@ -282,7 +324,7 @@ jobs:
           ADMIN_IMAGE: pgshard-admin:e2e
           CONTROLLER_IMAGE: pgshard-controller:e2e
       - name: Say whether the cell reached its tests
-        if: failure() && needs.changes.outputs.code == 'true'
+        if: failure() && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         env:
           SUITE: ${{ matrix.suite }}
           PG: ${{ matrix.pg }}
@@ -321,18 +363,18 @@ jobs:
             echo "**e2e ($PG, $SUITE): failed outside setup and tests**" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Collect cluster state on failure
-        if: failure() && needs.changes.outputs.code == 'true'
+        if: failure() && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: |
           kubectl get all -A -o yaml > "$E2E_ARTIFACTS/all.yaml" || true
           kubectl get events -A --sort-by=.lastTimestamp > "$E2E_ARTIFACTS/events.txt" || true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always() && needs.changes.outputs.code == 'true'
+        if: always() && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         with:
           name: e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
           path: artifacts/
           if-no-files-found: ignore
       - name: Delete kind cluster
-        if: always() && needs.changes.outputs.code == 'true'
+        if: always() && needs.changes.outputs.code == 'true' && env.CELL == 'yes'
         run: hack/kind/down.sh
 
   gate:
