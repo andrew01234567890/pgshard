@@ -1194,18 +1194,31 @@ func TestWaitAsksWhatAMigrationWaitsForAndSaysSoOnlyWhenItChanges(t *testing.T) 
 	state := catalog.MigrationQueued
 	blockers := []catalog.Blocker{reshard, earlier}
 	asked, loads := 0, 0
+	// seen is the state the waiter last OBSERVED, and it is what the
+	// assertions below are written against. Wait decides whether to ask
+	// from the state its own load returned, so a poll that read "queued"
+	// and has not yet reached its blocker query is not stopped by this
+	// test switching to running underneath it. The ask it then makes is
+	// about the state it read -- exactly what the code promises -- and
+	// counting it as a breach made this test flake (PGS-955).
+	seen := state
+	askedRunning, toldRunning := 0, 0
 	q := &PGMigrationQueue{
 		Poll: time.Millisecond, MaxWait: 10 * time.Second, BlockersEvery: 2 * time.Millisecond,
 		load: func(context.Context, string) (catalog.DDLMigration, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			loads++
+			seen = state
 			return catalog.DDLMigration{State: state}, nil
 		},
 		blockers: func(context.Context, string) ([]catalog.Blocker, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			asked++
+			if seen == catalog.MigrationRunning {
+				askedRunning++
+			}
 			return blockers, nil
 		},
 		queue: func(context.Context) (bool, error) { return true, nil },
@@ -1218,6 +1231,9 @@ func TestWaitAsksWhatAMigrationWaitsForAndSaysSoOnlyWhenItChanges(t *testing.T) 
 			mu.Lock()
 			defer mu.Unlock()
 			told = append(told, bs)
+			if seen == catalog.MigrationRunning {
+				toldRunning++
+			}
 		})
 		done <- err
 	}()
@@ -1240,11 +1256,15 @@ func TestWaitAsksWhatAMigrationWaitsForAndSaysSoOnlyWhenItChanges(t *testing.T) 
 	// moment after zeroing it would hold whatever the code did.
 	waitFor(t, 10*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return loads-from > 30 }, "the wait to poll on while the migration runs")
 	mu.Lock()
-	if asked != 0 {
-		t.Errorf("a running migration was asked what it waits for %d times", asked)
+	// Attributed to the state the waiter had SEEN, not to wall-clock time
+	// since the switch. "asked == 0 after waiting a while" cannot tell a
+	// breach from a poll that read queued before the switch and asked
+	// after it, and that is the one this test kept catching.
+	if askedRunning != 0 {
+		t.Errorf("a migration the wait had already seen RUNNING was asked what it waits for %d times", askedRunning)
 	}
-	if len(told) != 2 {
-		t.Errorf("a running migration was reported as waiting: %v", told)
+	if toldRunning != 0 {
+		t.Errorf("a migration the wait had already seen RUNNING was reported as waiting %d times: %v", toldRunning, told)
 	}
 	state = catalog.MigrationComplete
 	mu.Unlock()
@@ -1253,7 +1273,11 @@ func TestWaitAsksWhatAMigrationWaitsForAndSaysSoOnlyWhenItChanges(t *testing.T) 
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(told) != 2 || len(told[0]) != 2 || told[0][0] != reshard || len(told[1]) != 1 {
+	// The first two reports are deterministic and are the behaviour under
+	// test: one for the first set, one for the change. A third can only be
+	// the benign late poll described above, and toldRunning above is what
+	// rules out the report this test exists to forbid.
+	if len(told) < 2 || len(told[0]) != 2 || told[0][0] != reshard || len(told[1]) != 1 {
 		t.Fatalf("what the session was told: %v", told)
 	}
 }
