@@ -766,12 +766,25 @@ func (o *pgCutover) Reverse(ctx context.Context) error {
 // enumsortorder is included because ADD VALUE ... BEFORE reorders labels,
 // which is a change even though the set of labels is the same.
 //
-// Functions, triggers and extensions are still NOT counted, deliberately
-// for now: pgshard installs its own triggers during a placement move
-// (placementfence.go) and pgroll installs functions and triggers during an
-// online DDL, so counting them risks reading pgshard's own work as user
-// drift and refusing a rollback that should proceed -- the failure this
-// comment's next paragraph is about. They want their own exclusion list.
+// A FUNCTION A CONSTRAINT OR INDEX CALLS is here by its body. CREATE OR
+// REPLACE keeps the function's OID, so the constraint's text -- which names
+// the function -- does not change while what it accepts does. DDL after the
+// switch reaches only the targets, so a looser body there lets rows in that
+// the source's old body rejects, and the reverse apply fails on them. Scoped
+// to what a constraint or index depends on, which is the only way a body
+// decides what a row may be; a function nothing references cannot break a
+// reverse apply however it changes.
+//
+// TRIGGERS AND EXTENSIONS are deliberately not counted, on evidence rather
+// than for convenience. A trigger added to the targets never touches the
+// source, and the apply worker runs as session_replication_role = replica
+// (logical/worker.c), so an ordinary one does not fire on apply at all.
+// Counting them would also read pgshard's own placement-fence triggers
+// (placementfence.go) and pgroll's as user drift. An extension matters to a
+// reverse apply only through a type a column uses or a function a
+// constraint calls, and both of those are already here. Measured on PG 18:
+// neither a new trigger nor a new extension moved the fingerprint, and
+// neither can make a row the source accepted become one it rejects.
 //
 // pgshard_journal is excluded for a reason worth keeping: the journal table
 // is created on the sources at StepJournal, which runs AFTER the
@@ -822,6 +835,16 @@ FROM (
       JOIN pg_type t ON t.oid = k.contypid
       JOIN pg_namespace n ON n.oid = t.typnamespace
      WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+    UNION ALL
+    SELECT DISTINCT 'fn ' || n.nspname || ' ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') '
+        || md5(p.prosrc || ' ' || coalesce(p.probin, ''))
+      FROM pg_depend d
+      JOIN pg_proc p ON p.oid = d.refobjid
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE d.refclassid = 'pg_proc'::regclass
+       AND (d.classid = 'pg_constraint'::regclass
+         OR (d.classid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class i WHERE i.oid = d.objid AND i.relkind = 'i')))
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
 ) parts`
 
 // scalarString runs a query that returns exactly one text value.

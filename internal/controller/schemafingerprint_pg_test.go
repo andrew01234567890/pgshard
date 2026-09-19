@@ -46,8 +46,9 @@ func TestSchemaFingerprintIgnoresTheJournal(t *testing.T) {
 //
 // Measured before the fix, all five unchanged where a new column moved it:
 // enum value added, domain constraint added, new domain, new function, new
-// extension. The first three are closed here. Functions and extensions are
-// deliberately still out -- see the comment on schemaFingerprintSQL.
+// extension. The first three are closed here. A new function or extension
+// still does not move it, and correctly -- see
+// TestSchemaFingerprintSeesTheBodyOfAFunctionAConstraintCalls.
 func TestSchemaFingerprintSeesEnumValuesAndDomains(t *testing.T) {
 	parallelPG(t)
 	f := newPlacementFixture(t)
@@ -77,5 +78,70 @@ func TestSchemaFingerprintSeesEnumValuesAndDomains(t *testing.T) {
 	mustExec(t, conn, `CREATE DOMAIN `+JournalSchema+`.internal_positive AS int CHECK (VALUE > 0)`)
 	if after := queryOne[string](t, conn, schemaFingerprintSQL); after != before {
 		t.Error("a type in the journal schema moved the fingerprint: a rollback would refuse on a set nobody touched")
+	}
+}
+
+// TestSchemaFingerprintSeesTheBodyOfAFunctionAConstraintCalls (PGS-889): the
+// half of this ticket left open, closed on evidence rather than by counting
+// everything.
+//
+// CREATE OR REPLACE keeps a function's OID, so a CHECK that calls it keeps
+// the same text -- and the same fingerprint line -- while what it accepts
+// changes. DDL after the switch reaches only the targets, so a LOOSER body
+// there admits rows the source's old body rejects, and the reverse apply
+// fails on them and the rollback waits for ever. Measured on origin/main: the
+// fingerprint did not move.
+//
+// The negatives are the design. A function nothing references cannot make a
+// row illegal. A trigger added to the targets never touches the source, and
+// the apply worker runs as session_replication_role = replica, so an
+// ordinary one does not fire on apply at all; counting triggers would also
+// read pgshard's own placement-fence triggers as user drift. An extension
+// matters only through a column type or a called function, both already
+// counted.
+func TestSchemaFingerprintSeesTheBodyOfAFunctionAConstraintCalls(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	conn := f.app(0)
+	mustExec(t, conn, `CREATE FUNCTION legal(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0'`)
+	mustExec(t, conn, `CREATE FUNCTION small(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 < 1000'`)
+	mustExec(t, conn, `CREATE FUNCTION bucket(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 / 10'`)
+	mustExec(t, conn, `CREATE FUNCTION unused(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1'`)
+	mustExec(t, conn, `CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'`)
+	mustExec(t, conn, `CREATE DOMAIN bounded AS int CHECK (small(VALUE))`)
+	mustExec(t, conn, `CREATE TABLE guarded (id bigint PRIMARY KEY, x int CHECK (legal(x)), b bounded, k int)`)
+	mustExec(t, conn, `CREATE UNIQUE INDEX guarded_bucket ON guarded (bucket(k))`)
+
+	for _, c := range []struct {
+		name, sql string
+		moves     bool
+	}{
+		{"the body of a function a table CHECK calls", `CREATE OR REPLACE FUNCTION legal(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > -100'`, true},
+		{"the body of a function a domain CHECK calls", `CREATE OR REPLACE FUNCTION small(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 < 5000'`, true},
+		{"the body of a function a unique index is built on", `CREATE OR REPLACE FUNCTION bucket(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 / 100'`, true},
+		{"the body of a function nothing references", `CREATE OR REPLACE FUNCTION unused(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1'`, false},
+		{"a trigger added to a replicated table", `CREATE TRIGGER t BEFORE INSERT ON guarded FOR EACH ROW EXECUTE FUNCTION trg()`, false},
+		{"the body of a trigger's function", `CREATE OR REPLACE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN NEW.k := 0; RETURN NEW; END'`, false},
+		{"an extension created", `CREATE EXTENSION IF NOT EXISTS pgcrypto`, false},
+	} {
+		before := queryOne[string](t, conn, schemaFingerprintSQL)
+		mustExec(t, conn, c.sql)
+		moved := queryOne[string](t, conn, schemaFingerprintSQL) != before
+		switch {
+		case c.moves && !moved:
+			t.Errorf("%s did not move the fingerprint: a looser body on the targets admits rows the source rejects, and the rollback's reverse apply fails on them", c.name)
+		case !c.moves && moved:
+			t.Errorf("%s moved the fingerprint: it cannot make a row the source accepted become one it rejects, so a rollback would refuse on a set nothing broke", c.name)
+		}
+	}
+
+	// And pgshard's own work is still not user drift.
+	mustExec(t, conn, `CREATE SCHEMA IF NOT EXISTS `+JournalSchema)
+	mustExec(t, conn, `CREATE FUNCTION `+JournalSchema+`.internal_ok(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT true'`)
+	mustExec(t, conn, `CREATE TABLE `+JournalSchema+`.internal_t (x int CHECK (`+JournalSchema+`.internal_ok(x)))`)
+	before := queryOne[string](t, conn, schemaFingerprintSQL)
+	mustExec(t, conn, `CREATE OR REPLACE FUNCTION `+JournalSchema+`.internal_ok(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT false'`)
+	if after := queryOne[string](t, conn, schemaFingerprintSQL); after != before {
+		t.Error("a function in the journal schema moved the fingerprint: a rollback would refuse on a set nobody touched")
 	}
 }
