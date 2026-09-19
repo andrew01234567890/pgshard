@@ -317,3 +317,88 @@ func TestARealDriverRecoversFromAKilledTransaction(t *testing.T) {
 		t.Fatalf("the session after the recovery: %v", err)
 	}
 }
+
+// TestTheFailedStateSurvivesTheWaysAroundIt (PGS-957): three routes that
+// each restored the whole defect on their own, found by an adversarial
+// audit of the first version of this fix. Every one ends the same way --
+// the client's COMMIT answers COMMIT on a fresh backend -- so each subtest
+// finishes by sending one.
+func TestTheFailedStateSurvivesTheWaysAroundIt(t *testing.T) {
+	// A Parse is not an Execute. Deciding "this batch ends the
+	// transaction" from the statement's presence let a driver's bare
+	// Parse of a COMMIT -- which PostgreSQL answers in an aborted
+	// transaction, and which pgConn.Prepare sends on its own -- end the
+	// transaction before the client had executed anything. The session
+	// then read Idle and the client's real COMMIT was routed.
+	t.Run("APreparedCommitDoesNotEndTheTransaction", func(t *testing.T) {
+		h, s := killedExtendedSession(t)
+		code, _, status := s.send("prepare a commit", &pgproto3.Parse{Name: "cmt", Query: "commit"}, &pgproto3.Sync{})
+		if code != "" {
+			t.Fatalf("preparing a COMMIT in a failed transaction reported %q; PostgreSQL admits it", code)
+		}
+		if status != 'E' {
+			t.Errorf("ReadyForQuery reported %c after merely PREPARING a commit, want E: the transaction ended without the client executing anything", status)
+		}
+		_, tags, status := s.send("execute it",
+			&pgproto3.Bind{DestinationPortal: "p", PreparedStatement: "cmt"},
+			&pgproto3.Execute{Portal: "p"}, &pgproto3.Sync{})
+		if len(tags) != 1 || tags[0] != "ROLLBACK" {
+			t.Errorf("the COMMIT answered %v, want [ROLLBACK]", tags)
+		}
+		if status != 'I' {
+			t.Errorf("ReadyForQuery reported %c after the COMMIT, want I", status)
+		}
+		for i := range h.poolers {
+			for _, q := range h.poolers[i].ran() {
+				if strings.ToLower(strings.TrimSpace(q)) == "commit" {
+					t.Errorf("shard %d was sent a COMMIT for the killed transaction", i)
+				}
+			}
+		}
+	})
+
+	// Flush is the OTHER place a staged batch reaches a pooler, and the
+	// first version of this fix guarded only Sync. A Describe terminated
+	// by Flush stages no Execute, so flush's own decline list passed it
+	// through to acquire, and the fresh backend's relayed ReadyForQuery
+	// cleared the failed state before the client's Sync was read.
+	//
+	// Refused rather than declined silently: a pipelined client BLOCKS on
+	// its Flush, so answering nothing would hang it.
+	t.Run("AFlushDoesNotReachABackend", func(t *testing.T) {
+		h, s := killedExtendedSession(t)
+		s.fe.Send(&pgproto3.Describe{ObjectType: 'S', Name: "sel"})
+		s.fe.Send(&pgproto3.Flush{})
+		if err := s.fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		code, _, status := s.send("sync after the flush", &pgproto3.Sync{})
+		if code != "25P02" {
+			t.Errorf("a Describe terminated by Flush reported %q, want 25P02: it reached a backend and cleared the failed state", code)
+		}
+		if status != 'E' {
+			t.Errorf("ReadyForQuery reported %c, want E", status)
+		}
+		assertCommitRollsBack(t, h, s)
+	})
+
+	// EXPLAIN (pgshard) is answered in a failed transaction on purpose --
+	// refuseSelfAnsweredInFailedTxn says so: it is how a user sees why the
+	// statement that failed was routed the way it was, without first
+	// losing the transaction. simpleQuery answers it before any of these
+	// checks and the extended protocol must not disagree; the first
+	// version of this fix refused it with 25P02.
+	t.Run("ExplainIsStillAnswered", func(t *testing.T) {
+		_, s := killedExtendedSession(t)
+		code, tags, status := s.extended("explain", "explain (pgshard) select id from items where id = 9901")
+		if code != "" {
+			t.Errorf("EXPLAIN (pgshard) reported %q; it touches no shard and is deliberately available here", code)
+		}
+		if len(tags) != 1 || tags[0] != "EXPLAIN" {
+			t.Errorf("EXPLAIN answered %v, want [EXPLAIN]", tags)
+		}
+		if status != 'E' {
+			t.Errorf("ReadyForQuery reported %c, want E: EXPLAIN must not end the transaction", status)
+		}
+	})
+}
