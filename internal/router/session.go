@@ -263,6 +263,10 @@ type Executor struct {
 	// the ones whose responses are the router's own and not the client's.
 	batchInject map[int][]*pgshardv1.ExecuteRequest
 	hiddenExec  []bool
+	// execDone counts the client's Executes in the batch being pumped whose
+	// response ended -- in CommandComplete, EmptyQueryResponse or
+	// PortalSuspended -- and so reached the client as having run.
+	execDone int
 	// batchBinds records the binds of the batch so the targets can be
 	// aimed again when the shard map moves while the batch waits out a
 	// write fence.
@@ -2222,13 +2226,9 @@ func (e *Executor) flush(ctx context.Context, w pgwire.ResultWriter) error {
 		return e.afterBatch(ctx, err)
 	}
 	e.backendOpen = true
+	e.execDone = 0
 	err := e.pump(ctx, w)
-	if err == nil {
-		for _, item := range executed {
-			e.noteExecuted(item.sql, item.local, item.class)
-			e.noteSessionEffect(item.class, item.sql)
-		}
-	}
+	e.noteBatch(executed)
 	return e.afterBatch(ctx, err)
 }
 
@@ -2429,16 +2429,28 @@ func (e *Executor) sync(ctx context.Context) error {
 		}
 		e.backendOpen = false
 		e.hiddenExec = hidden
+		e.execDone = 0
 		err := e.pump(ctx, cw)
 		e.hiddenExec = nil
-		if err == nil {
-			for _, item := range executed {
-				e.noteExecuted(item.sql, item.local, item.class)
-				e.noteSessionEffect(item.class, item.sql)
-			}
-		}
+		e.noteBatch(executed)
 		return err
 	})
+}
+
+// noteBatch records the statements of a pumped batch that ran: all of them
+// when it succeeded, and the ones before its failure when it did not.
+//
+// Recording only a batch that succeeded in full lost what the client had
+// already been told: the pump relays each CommandComplete as it arrives, so
+// a batch whose last statement failed had shown the client its SAVEPOINT
+// and its write succeed, and the router recorded neither -- the
+// transaction read as untouched, with no savepoint (PGS-959). The
+// statements after a failure never ran: PostgreSQL skips to the Sync.
+func (e *Executor) noteBatch(executed []execItem) {
+	for _, item := range executed[:min(e.execDone, len(executed))] {
+		e.noteExecuted(item.sql, item.local, item.class)
+		e.noteSessionEffect(item.class, item.sql)
+	}
 }
 
 // bindsUnnamed reports whether the batch binds the unnamed statement.
@@ -2852,11 +2864,13 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			}
 		case *pgshardv1.ExecuteResponse_CommandComplete:
 			if !e.popHidden() {
+				e.execDone++
 				e.lastTag = m.CommandComplete.Tag
 				werr = w.CommandComplete(m.CommandComplete.Tag)
 			}
 		case *pgshardv1.ExecuteResponse_EmptyQuery:
 			if !e.popHidden() {
+				e.execDone++
 				werr = w.EmptyQueryResponse()
 			}
 		case *pgshardv1.ExecuteResponse_FlushComplete:
@@ -2872,6 +2886,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			// believing the result set had ended, so a row-limited fetch
 			// returned short with no error.
 			if !e.popHidden() {
+				e.execDone++
 				werr = w.PortalSuspended()
 			}
 		case *pgshardv1.ExecuteResponse_Error:
