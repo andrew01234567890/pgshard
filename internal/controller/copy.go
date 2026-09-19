@@ -89,6 +89,10 @@ type Copier struct {
 	// how many undone attempts fail the workflow.
 	CutoverTimeout  time.Duration
 	CutoverAttempts int
+	// CancelGiveUp is how long a cancelled run's cleanup may keep failing
+	// before the shards it cannot reach are left with what it could not
+	// drop, so the run leaves the operation queue.
+	CancelGiveUp time.Duration
 	// LockTimeout bounds each SHARE lock of the sweep.
 	LockTimeout time.Duration
 	// Now overrides the clock in tests.
@@ -119,6 +123,10 @@ type copyState struct {
 	// reshard panel reads.
 	Targets map[string]CopyProgress `json:"targets,omitempty"`
 	Skipped []string                `json:"skipped,omitempty"`
+	// CancelFailingSince is when a cancelled run's cleanup first failed and
+	// has failed on every pass since; Leaked is what it gave up dropping.
+	CancelFailingSince *time.Time `json:"cancel_failing_since,omitempty"`
+	Leaked             []string   `json:"leaked,omitempty"`
 }
 
 type copyWorkflow struct {
@@ -174,6 +182,13 @@ func (c *Copier) logger() *slog.Logger {
 		return c.Logger
 	}
 	return slog.Default()
+}
+
+func (c *Copier) cancelGiveUp() time.Duration {
+	if c.CancelGiveUp > 0 {
+		return c.CancelGiveUp
+	}
+	return DefaultCancelGiveUp
 }
 
 func (c *Copier) now() time.Time {
@@ -234,7 +249,7 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 		wf.fence = wf.state
 		out.Driven++
 		if wf.stage == StageCancelling {
-			err = c.cancel(ctx, wf)
+			err = c.cancelBounded(ctx, wf)
 			if err == nil {
 				out.Cancelled++
 			}
@@ -1447,10 +1462,54 @@ func (c *Copier) forEachSubscription(ctx context.Context, wf *copyWorkflow, srcI
 	return nil
 }
 
+// cancelBounded is cancel with a limit on how long a shard it cannot reach
+// holds the run -- and with it, through the operation queue, every DDL
+// migration, placement and reshard behind it (PGS-906). No RPC can cancel
+// a cancelled run and pgshard_admin cannot write the workflow, so without
+// the limit only the cleanup itself succeeding ever released the queue.
+//
+// Until the cleanup has failed for cancelGiveUp it is retried as before,
+// so a shard that restarts is cleaned properly. After that the objects on
+// the shards it cannot reach are recorded and left. That is bounded harm:
+// they are named for this run's generation, so no later run adopts them,
+// and pgtune's idle_replication_slot_timeout and max_slot_wal_keep_size cap
+// the WAL a leaked slot can hold.
+//
+// Only the forward objects are ever left. Undoing a started cutover still
+// has to succeed: the write fence it lifts is what keeps the sources
+// unwritable, and leaving that would trade a held queue for a shard nobody
+// can write to.
+func (c *Copier) cancelBounded(ctx context.Context, wf *copyWorkflow) error {
+	since := wf.copy.CancelFailingSince
+	abandon := since != nil && c.now().Sub(*since) >= c.cancelGiveUp()
+	err := c.cancel(ctx, wf, abandon)
+	if err == nil || errors.Is(err, errNotOwner) {
+		return err
+	}
+	if since == nil {
+		now := c.now()
+		wf.copy.CancelFailingSince = &now
+		since = &now
+	}
+	return fmt.Errorf("cleanup failing since %s; what it cannot reach is left behind from %s: %w",
+		since.UTC().Format(time.RFC3339), since.Add(c.cancelGiveUp()).UTC().Format(time.RFC3339), err)
+}
+
 // cancel drops the subscriptions on the targets that are still reachable,
 // then the slots and publications on the sources, and marks the workflow
-// cancelled. Targets the operator already deleted are skipped.
-func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
+// cancelled. Targets the operator already deleted are skipped. With abandon
+// set, what cannot be dropped from the shards is recorded in
+// wf.copy.Leaked instead of failing the pass.
+func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow, abandon bool) error {
+	wf.copy.Leaked = nil
+	leave := func(what string, err error) error {
+		if !abandon {
+			return err
+		}
+		c.logger().Warn("reshard cancel gave up on cleanup", "workflow", wf.id, "left", what, "err", err)
+		wf.copy.Leaked = append(wf.copy.Leaked, fmt.Sprintf("%s: %v", what, err))
+		return nil
+	}
 	// Cleanup has to run against the source this workflow actually built its
 	// publications and slots on. Asking which set is serving now would leave
 	// them behind on the old one, holding WAL for good.
@@ -1491,37 +1550,45 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 		}
 	}
 	if failed != nil {
-		return failed
+		if err := leave(fmt.Sprintf("subscriptions pgshard_reshard_g%d_* on the targets, which keep their slots on the sources active", wf.gen), failed); err != nil {
+			return err
+		}
 	}
 	for _, s := range srcIDs {
 		conn, err := c.Shards.Dial(ctx, srcSet, s)
-		if err != nil {
-			return err
+		if err == nil {
+			err = dropSlots(ctx, conn, wf.gen)
+			_ = conn.Close(ctx)
 		}
-		err = dropSlots(ctx, conn, wf.gen)
-		_ = conn.Close(ctx)
 		if err != nil {
-			return err
+			if err := leave(fmt.Sprintf("replication slots pgshard_reshard_g%d_* on %s shard %d, which hold WAL there until dropped", wf.gen, srcSet, s), err); err != nil {
+				return err
+			}
+			continue
 		}
 		for _, db := range dbs {
 			conn, err := c.Shards.DialDatabase(ctx, srcSet, s, db.name)
-			if err != nil {
-				return err
-			}
-			// Another workflow may have retired these sources since, and a
-			// retired set refuses writes: this workflow's own publications
-			// are still its to drop (PGS-836).
-			err = writeThroughPause(ctx, conn)
 			if err == nil {
-				err = dropPublications(ctx, conn, wf.gen)
+				// Another workflow may have retired these sources since,
+				// and a retired set refuses writes: this workflow's own
+				// publications are still its to drop (PGS-836).
+				err = writeThroughPause(ctx, conn)
+				if err == nil {
+					err = dropPublications(ctx, conn, wf.gen)
+				}
+				_ = conn.Close(ctx)
 			}
-			_ = conn.Close(ctx)
 			if err != nil {
-				return err
+				if err := leave(fmt.Sprintf("publications pgshard_reshard_g%d_* in database %s on %s shard %d", wf.gen, db.name, srcSet, s), err); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	message := "copy cancelled: subscriptions, slots and publications dropped"
+	if len(wf.copy.Leaked) > 0 {
+		message = "copy cancelled; cleanup gave up on shards it could not reach and left: " + strings.Join(wf.copy.Leaked, "; ")
+	}
 	// Past the fence the forward cleanup above is not the whole undo: the
 	// write fence is still raised on the sources and the reverse replication
 	// still attached to them, and neither is anyone else's to remove. Without
@@ -1554,7 +1621,7 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 	if err := ownedExec(ctx, c.Pool, wf.owner,
 		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
 		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
-		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": message}), nullIfEmpty(wf.owner), wf.fence); err != nil {
+		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": message, "copy": wf.copy}), nullIfEmpty(wf.owner), wf.fence); err != nil {
 		return err
 	}
 	wf.fence = StateCancelled
