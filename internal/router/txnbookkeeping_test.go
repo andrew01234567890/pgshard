@@ -74,3 +74,42 @@ func TestAPanicForgetsTheTransactionsSavepoints(t *testing.T) {
 		t.Fatal("a savepoint of the transaction the panic reset is still recorded")
 	}
 }
+
+// TestAFailedBatchRecordsTheStatementsTheClientSawSucceed (PGS-959 item 1):
+// an extended batch recorded its statements' effect on the transaction only
+// when the whole batch succeeded, while the pump had already relayed each
+// statement's CommandComplete as it came. A batch whose last statement
+// failed left no record of the SAVEPOINT and the write before it, although
+// the client had watched both succeed -- so the transaction read as
+// untouched, with no savepoint.
+func TestAFailedBatchRecordsTheStatementsTheClientSawSucceed(t *testing.T) {
+	h := newShardedHarness(t)
+	keys := &pgwire.SCRAMKeys{ClientKey: make([]byte, 32), ServerKey: make([]byte, 32)}
+	e := newExecutor(h.r, pgwire.SessionInfo{ID: 1, Database: "app", User: "app", Auth: &pgwire.AuthResult{SCRAM: keys}}, Shard{Set: DefaultShardSet, ID: 0})
+	ctx := context.Background()
+	w := discardWriter{}
+	if err := e.SimpleQuery(ctx, "begin", w); err != nil {
+		t.Fatal(err)
+	}
+	for i, sql := range []string{"savepoint sp", "insert into items (id) values (9593)", "select bad"} {
+		name := string(rune('a' + i))
+		if err := e.Parse(ctx, name, sql, nil, w); err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		if err := e.Bind(ctx, name, name, nil, nil, nil, w); err != nil {
+			t.Fatalf("bind %q: %v", sql, err)
+		}
+		if err := e.Execute(ctx, name, 0, w); err != nil {
+			t.Fatalf("execute %q: %v", sql, err)
+		}
+	}
+	if err := e.Sync(ctx); err == nil {
+		t.Fatal("the batch's last statement must fail, or this test is not about a failed batch")
+	}
+	if e.savepointIndex("sp") < 0 {
+		t.Error("the SAVEPOINT the client saw succeed is not recorded")
+	}
+	if !e.txnTouched {
+		t.Error("the write the client saw succeed did not mark the transaction as touching its shard")
+	}
+}
