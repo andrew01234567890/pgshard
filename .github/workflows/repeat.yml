@@ -5,6 +5,13 @@
 #
 # Run it from the Actions tab, or:
 #   gh workflow run repeat.yml -f target=operator -f runs=50
+#
+# THIS ONE CANNOT MEASURE AN e2e SUITE. Its targets are go test invocations
+# over ./internal/... and its job never stands up kind, so reshard, upgrade
+# and the rest are out of reach here. repeat-e2e.yml does those:
+#   gh workflow run repeat-e2e.yml -f suite=upgrade -f pg=18 -f runs=12
+# Said here because two people have now gone looking for that, found this
+# file, and concluded no such thing existed (PGS-952).
 name: Repeat
 
 on:
