@@ -2032,7 +2032,8 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 	// name, not through e.portals[portal], because a deleted entry reads
 	// back as "" and would look up the UNNAMED statement -- executing one
 	// portal's plan checks against another statement.
-	if stmt, bound := e.portals[portal]; bound {
+	stmt, bound := e.portals[portal]
+	if bound {
 		if _, live := e.stmts[stmt]; !live {
 			e.failBatch()
 			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "portal %q cannot be executed: the prepared statement it was bound to has been closed", portal)
@@ -2040,7 +2041,15 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 			return err
 		}
 	}
-	if st, ok := e.stmts[e.portals[portal]]; ok {
+	// bound, not just the lookup: a portal this router never bound -- a
+	// cursor DECLAREd in SQL lives on the backend and is named in no Bind
+	// -- misses e.portals and reads back as "", the UNNAMED statement. The
+	// Execute itself is forwarded either way and the backend answers the
+	// real portal, but everything below acted on that unnamed statement:
+	// measured on a real stack, a SET left unnamed and never executed was
+	// recorded as session state and applied to the next backend the session
+	// used (PGS-942). Not refused, because the portal does exist there.
+	if st, ok := e.stmts[stmt]; ok && bound {
 		if st.plan.Explain == nil {
 			if err := e.refuseStagedInFailedTransaction(st.plan.Class); err != nil {
 				e.failBatch()

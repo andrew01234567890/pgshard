@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,9 @@ import (
 type rawConn struct {
 	fe  *pgproto3.Frontend
 	msg chan string
+	// lastRow is the values of the last DataRow received.
+	mu      sync.Mutex
+	lastRow []string
 }
 
 func newRawConn(fe *pgproto3.Frontend) *rawConn {
@@ -32,6 +36,15 @@ func newRawConn(fe *pgproto3.Frontend) *rawConn {
 			name := strings.TrimPrefix(fmt.Sprintf("%T", m), "*pgproto3.")
 			if e, ok := m.(*pgproto3.ErrorResponse); ok {
 				name += "(" + e.Code + " " + e.Message + ")"
+			}
+			if d, ok := m.(*pgproto3.DataRow); ok {
+				row := make([]string, len(d.Values))
+				for i, v := range d.Values {
+					row[i] = string(v)
+				}
+				r.mu.Lock()
+				r.lastRow = row
+				r.mu.Unlock()
 			}
 			r.msg <- name
 		}
@@ -120,4 +133,11 @@ func TestADDLStatementIsDescribedAndFlushedLikePostgreSQLDoes(t *testing.T) {
 	expect("the session afterwards",
 		r.batch(t, false, &pgproto3.Query{String: "select count(*) from pgs905_u"}),
 		"RowDescription", "DataRow", "CommandComplete", "ReadyForQuery")
+}
+
+// row returns the values of the last DataRow received.
+func (r *rawConn) row() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastRow
 }
