@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -108,6 +109,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		return plan, fmt.Errorf("shard sets: %w", err)
 	}
 	var serving, pending, retired *ShardSetInfo
+	var retiredSets []*ShardSetInfo
 	var maxGen int64
 	for i := range sets {
 		s := &sets[i]
@@ -122,6 +124,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 				pending = s
 			}
 		case catalog.ShardSetRetired:
+			retiredSets = append(retiredSets, s)
 			if retired == nil || s.Generation > retired.Generation {
 				retired = s
 			}
@@ -160,7 +163,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	want := c.Spec.Shards
 
 	if pending == nil && retired != nil {
-		done, err := r.reconcileRetirement(ctx, c, base, dsn, password, serving, retired, &plan)
+		done, err := r.reconcileRetirement(ctx, c, base, dsn, password, serving, retired, retiredSets, &plan)
 		if err != nil || !done {
 			return plan, err
 		}
@@ -416,7 +419,11 @@ func (r *ClusterReconciler) mirrorCutoverSpec(ctx context.Context, c *pgshardv1a
 // set is retired in the catalog and its groups stay up for reverse
 // replication until the workflow completes, then they are deleted. It
 // reports done=false when the pass is fully handled here.
-func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster, dsn, password string, serving, retired *ShardSetInfo, plan *reshardPlan) (bool, error) {
+//
+// retired is the newest retired set, which is the run's source unless the
+// workflow names another: after a rolled-back run is run again, the set it
+// rolled back from is retired too and newer than the real source (PGS-964).
+func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster, dsn, password string, serving, retired *ShardSetInfo, retiredSets []*ShardSetInfo, plan *reshardPlan) (bool, error) {
 	log := logf.FromContext(ctx)
 	record := &pgshardv1alpha1.PgShardReshard{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: ReshardName(c.Name, serving.Generation)}, record); err != nil {
@@ -426,11 +433,19 @@ func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pg
 		return false, err
 	}
 	if record.Status.Phase == pgshardv1alpha1.ReshardPhaseCompleted {
-		return true, nil
+		// The run that made this set serve is over and nothing can switch
+		// back to a retired set any more, so one still here was left behind
+		// -- by a retirement that deleted a different set than its source.
+		return true, r.deleteRetiredSets(ctx, c, dsn, retiredSets)
 	}
 	wf, err := r.mirrorCutoverSpec(ctx, c, dsn, serving.Name, record)
 	if err != nil {
 		return false, err
+	}
+	for _, s := range retiredSets {
+		if s.Name == wf.SourceSet {
+			retired = s
+		}
 	}
 	phase := reshardPhase(wf)
 	if phase == pgshardv1alpha1.ReshardPhaseCompleted {
@@ -540,6 +555,30 @@ func (r *ClusterReconciler) drainRetired(ctx context.Context, c *pgshardv1alpha1
 		return 0, nil
 	}
 	return open, nil
+}
+
+// deleteRetiredSets deletes the groups and catalog rows of every retired
+// set in sets that is still in the catalog. Called once the serving set's
+// run has completed, when no retired set can be switched back to. Groups
+// before rows, for the reason reconcileRetirement gives.
+func (r *ClusterReconciler) deleteRetiredSets(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string, sets []*ShardSetInfo) error {
+	current, err := r.Prober.ShardSets(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("shard sets: %w", err)
+	}
+	for _, s := range sets {
+		if !slices.ContainsFunc(current, func(cur ShardSetInfo) bool { return cur.Name == s.Name && cur.State == catalog.ShardSetRetired }) {
+			continue
+		}
+		logf.FromContext(ctx).Info("deleting a retired shard set no run can switch back to", "set", s.Name, "generation", s.Generation)
+		if err := r.deleteTargetGroups(ctx, c, s.Name); err != nil {
+			return err
+		}
+		if err := r.Prober.DropShardSet(ctx, dsn, s.Name); err != nil {
+			return fmt.Errorf("drop retired shard set %s: %w", s.Name, err)
+		}
+	}
+	return nil
 }
 
 func cutoverPause(wf WorkflowInfo) *metav1.Duration {
