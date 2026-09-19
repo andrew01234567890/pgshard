@@ -1737,6 +1737,29 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 		return nil
 	}
 	e.batchWriter = w
+	// A portal whose STATEMENT was closed still names it: Close of a
+	// statement deletes e.stmts[name] and leaves e.portals pointing at it.
+	// The lookup below then misses and every check it guards -- the
+	// multi-shard rule, the shard pin, and refuseShardStatementAfterDDL --
+	// is skipped, while the Execute is still appended to the batch. Probed:
+	// the request reached a shard with no statement behind it, inside a
+	// transaction that had already run DDL, which is the one thing that
+	// guard exists to stop (PGS-883 item 2).
+	//
+	// PostgreSQL closes a statement's portals with it, so such a portal
+	// cannot be executed there either; this says so rather than sending a
+	// request whose answer would be the backend's confusion. Checked by
+	// name, not through e.portals[portal], because a deleted entry reads
+	// back as "" and would look up the UNNAMED statement -- executing one
+	// portal's plan checks against another statement.
+	if stmt, bound := e.portals[portal]; bound {
+		if _, live := e.stmts[stmt]; !live {
+			e.failBatch()
+			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "portal %q cannot be executed: the prepared statement it was bound to has been closed", portal)
+			err.Hint = "closing a prepared statement closes the portals bound to it; bind a new portal"
+			return err
+		}
+	}
 	if st, ok := e.stmts[e.portals[portal]]; ok {
 		if multiShard(st.plan) && e.batchScatter == nil {
 			e.failBatch()
