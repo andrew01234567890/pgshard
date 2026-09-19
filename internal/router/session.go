@@ -928,6 +928,35 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 //
 // implicitTx is set after BeginImplicit's own BEGIN and cleared before
 // EndImplicit's COMMIT, so neither refuses itself.
+// refuseQueryDuringABufferedBatch refuses a simple Query sent while an
+// extended batch is still buffered, because the router would otherwise run
+// them in the wrong order.
+//
+// The extended batch is staged until its Sync; a Query is executed at once.
+// So a client that sends Parse/Bind/Execute and then a Query, without a
+// Sync in between, has the Query run FIRST and its own earlier statement
+// run afterwards. Measured: with an INSERT buffered and "select 1" sent
+// after it, the select ran and the insert followed at the Sync. Replace
+// the select with a CREATE TABLE and the buffered INSERT runs inside the
+// transaction after the DDL, which is not what the client wrote (PGS-883).
+//
+// Refusing rather than flushing first. Flushing would preserve the order,
+// but running a staged batch early is exactly what PGS-911 could not make
+// safe: the router tracks transaction state from the relayed
+// ReadyForQuery, which a Flush does not produce. Silent misordering is the
+// worse failure of the two, and no mainstream driver sends this sequence --
+// pgx, psycopg and the JDBC driver all Sync before leaving the extended
+// protocol.
+func (e *Executor) refuseQueryDuringABufferedBatch() error {
+	if len(e.batch) == 0 {
+		return nil
+	}
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
+		"a simple query is not available while an extended-protocol batch is still buffered: the batch runs at its Sync, so this statement would run before statements the client sent first")
+	err.Hint = "send Sync to end the extended batch before the simple query"
+	return err
+}
+
 func (e *Executor) refuseTxnControlInBatch(class StmtClass) error {
 	if !e.implicitTx || class.Txn == plan.TxnNone {
 		return nil
@@ -989,6 +1018,9 @@ func (e *Executor) EndImplicit(ctx context.Context, commit bool) error {
 }
 
 func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
+	if err := e.refuseQueryDuringABufferedBatch(); err != nil {
+		return err
+	}
 	pl, err := e.plan(ctx, sql)
 	if err != nil {
 		return err
