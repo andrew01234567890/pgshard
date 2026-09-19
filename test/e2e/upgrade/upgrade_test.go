@@ -127,6 +127,15 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 		return strings.HasPrefix(st, "completed:") &&
 			jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.servingPGMajor}") == "19"
 	})
+	// Every 18 group, not just the newest retired set: after the rollback
+	// both default (g3's real source) and g2 (the set rolled back from) are
+	// retired, and retirement used to delete g2 and leave default running
+	// for good (PGS-964).
+	waitFor(ctx, t, c, "no retired shard group left", 5*time.Minute, func() bool {
+		out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardgroup", "-o", "name",
+			"-l", "pgshard.io/shard-set in (default,g2)")
+		return err == nil && strings.TrimSpace(out) == ""
+	})
 
 	// The catalog group goes last: a new-major catalog group comes up, the
 	// pgshard database is copied over logical replication and the stable

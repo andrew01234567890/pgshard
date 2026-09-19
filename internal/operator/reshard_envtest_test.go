@@ -459,3 +459,70 @@ func TestRevertingShardsClearsAFailedReshard(t *testing.T) {
 		t.Fatalf("the next reshard's record: %+v", next.Spec)
 	}
 }
+
+// TestARerunAfterARollbackRetiresItsRealSource (PGS-964): an upgrade to g2
+// rolled back to default, then run again as g3. When g3 completed, both
+// default (its real source) and g2 (the set rolled back from) were retired,
+// and retirement took the newest, g2 -- so default's groups stayed up for
+// good, because on every later pass g3's record was already Completed.
+func TestARerunAfterARollbackRetiresItsRealSource(t *testing.T) {
+	r, fp, c := setup(t, "rrb")
+	bringUp(t, r, fp, c)
+	ctx := context.Background()
+	one, err := placement.Split(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fp.MaterializeShardSet(ctx, "", "g2", 2, catalog.ShardSetRetired, one, 18); err != nil {
+		t.Fatal(err)
+	}
+	if err := fp.MaterializeShardSet(ctx, "", "g3", 3, catalog.ShardSetServing, one, 19); err != nil {
+		t.Fatal(err)
+	}
+	fp.setShardSetState(catalog.DefaultShardSet, catalog.ShardSetRetired)
+	// What stands for each set's groups: deleteTargetGroups selects by the
+	// shard-set label, and a ConfigMap is one of the kinds it deletes.
+	for _, set := range []string{catalog.DefaultShardSet, "g2"} {
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "rrb-marker-" + set, Namespace: "default",
+			Labels: map[string]string{LabelCluster: "rrb", LabelShardSet: set}}}
+		if err := k8sClient.Create(ctx, cm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := &pgshardv1alpha1.PgShardReshard{ObjectMeta: metav1.ObjectMeta{Name: ReshardName("rrb", 3), Namespace: "default",
+		Labels: map[string]string{LabelCluster: "rrb"}},
+		Spec: pgshardv1alpha1.PgShardReshardSpec{ClusterName: "rrb", FromGeneration: 1, TargetGeneration: 3, TargetShardSet: "g3", TargetShards: 1,
+			TargetRanges: []pgshardv1alpha1.ReshardRange{{ShardID: 0}}, Mode: pgshardv1alpha1.ReshardModeUpgrade, TargetMajor: 19}}
+	if err := k8sClient.Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	// Inside the retirement window the set being retired -- the one the
+	// drain waits on and the status names -- is the run's source.
+	fp.mu.Lock()
+	fp.workflows = map[string]WorkflowInfo{"g3": {ID: "wf-3", State: "running", Stage: "switched", SourceSet: catalog.DefaultShardSet}}
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	get(t, "rrb", c)
+	if rs := c.Status.Reshard; rs == nil || rs.RetiredShardSet != catalog.DefaultShardSet {
+		t.Fatalf("the retiring set is %+v, want the run's source %s rather than the newer rolled-back g2", rs, catalog.DefaultShardSet)
+	}
+
+	fp.mu.Lock()
+	fp.workflows["g3"] = WorkflowInfo{ID: "wf-3", State: "completed", Stage: "completed", SourceSet: catalog.DefaultShardSet}
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	reconcile(t, r, c)
+
+	for _, set := range []string{catalog.DefaultShardSet, "g2"} {
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "rrb-marker-" + set}, &corev1.ConfigMap{})
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("the groups of retired set %s are still there after g3 completed (%v)", set, err)
+		}
+	}
+	sets, _ := fp.ShardSets(ctx, "")
+	for _, s := range sets {
+		if s.State == catalog.ShardSetRetired {
+			t.Errorf("retired set %s is still in the catalog", s.Name)
+		}
+	}
+}

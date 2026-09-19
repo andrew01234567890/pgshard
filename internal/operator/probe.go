@@ -364,6 +364,9 @@ type WorkflowInfo struct {
 	// is the single most important thing a responder needs to know and was
 	// visible only by connecting to the catalog directly.
 	JournalIDs []string
+	// SourceSet is the shard set the run switched from, once it has
+	// started its cutover.
+	SourceSet string
 }
 
 // PlacementWorkflowInfo is one pgshard.workflows row of kind
@@ -487,9 +490,9 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 	defer func() { _ = conn.Close(ctx) }()
 	var w WorkflowInfo
 	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), coalesce(status->>'message', ''),
-			coalesce((status->'cutover'->>'pause_ms')::bigint, 0), journal_ids FROM pgshard.workflows
+			coalesce((status->'cutover'->>'pause_ms')::bigint, 0), journal_ids, coalesce(status->'cutover'->>'source_set', '') FROM pgshard.workflows
 		WHERE kind IN ('reshard', 'upgrade') AND spec->>'shard_set' = $1
-		ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS, &w.JournalIDs)
+		ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS, &w.JournalIDs, &w.SourceSet)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WorkflowInfo{}, nil
 	}
