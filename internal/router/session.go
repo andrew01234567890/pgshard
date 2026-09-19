@@ -1434,6 +1434,112 @@ func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtCl
 	return nil
 }
 
+// failedTxnBatch is endFailedTxn for the extended protocol: the COMMIT or
+// ROLLBACK that ends a transaction whose backend is gone is answered here,
+// without a shard, and answers ROLLBACK because that is what became of it.
+//
+// Without this the batch acquired a FRESH backend and ran the COMMIT on it.
+// That backend had never heard of the transaction, so it answered a COMMIT
+// tag, and the client -- pgx, JDBC, anything not using the simple protocol
+// -- was told writes had landed that died with the old primary (PGS-957).
+//
+// Nothing else may reach a backend at all, and that is the rule rather than
+// a list of message types: ACQUIRING one is itself the damage. pump relays
+// the fresh backend's ReadyForQuery, so e.tx stops saying the transaction
+// failed, and the COMMIT after it answers COMMIT. Probed: a Describe-only
+// and a Close-only batch each reopened the whole defect that way, with no
+// Parse, Bind or Execute in them for the checks above to see.
+//
+// Close is answered here instead, because it needs no backend: the physical
+// statement it names died with the old one, and Close has already dropped
+// the router's own record of it. Refusing it would break a driver clearing
+// its statement cache on the way to the ROLLBACK it is about to send.
+// The transaction ends on the EXECUTE of a COMMIT or ROLLBACK and on
+// nothing else. Deciding it from the statement's presence anywhere in the
+// batch let a Parse of a COMMIT -- which a driver sends on its own, and
+// which PostgreSQL answers in an aborted transaction -- end the transaction
+// before the client had executed anything. The session then read Idle, the
+// client's real COMMIT was routed to a fresh backend, and the whole defect
+// was back.
+func (e *Executor) failedTxnBatch(batch []*pgshardv1.ExecuteRequest, w pgwire.ResultWriter) (bool, error) {
+	if e.tx != pgwire.TxFailed || e.conn != nil {
+		return false, nil
+	}
+	ends := false
+	for _, req := range batch {
+		switch r := req.Message.(type) {
+		case *pgshardv1.ExecuteRequest_Parse, *pgshardv1.ExecuteRequest_Bind, *pgshardv1.ExecuteRequest_Close:
+			// Answered below. A Parse or Bind that is still here is one
+			// refuseInFailedTransaction admitted, so it names a COMMIT or
+			// a ROLLBACK.
+		case *pgshardv1.ExecuteRequest_Execute:
+			if e.portalAnswersItself(r.Execute.Portal) {
+				// explainBatch answers it further down without a backend.
+				return false, nil
+			}
+			if !e.portalEndsTxn(r.Execute.Portal) {
+				return true, failedTxnRefusal()
+			}
+			ends = true
+		default:
+			// A Describe among them included. PostgreSQL would answer one
+			// of a COMMIT, but its name here is the PHYSICAL one and the
+			// statement behind it cannot be recovered to check -- and
+			// answering the wrong shape is worse than refusing, because a
+			// driver caches it for the life of the connection.
+			return true, failedTxnRefusal()
+		}
+	}
+	if ends {
+		e.finishTxn("ROLLBACK")
+	}
+	// One walk, interleaved: every batch the router answers itself still
+	// owes the client the ParseComplete and BindComplete a pooler would
+	// have relayed, and they belong where the backend would have sent
+	// them. Two passes put every completion ahead of every result.
+	for _, req := range batch {
+		var err error
+		if _, ok := req.Message.(*pgshardv1.ExecuteRequest_Execute); ok {
+			err = w.CommandComplete("ROLLBACK")
+		} else {
+			err = e.answerStagedCompletions(w, []*pgshardv1.ExecuteRequest{req})
+		}
+		if err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+// portalEndsTxn reports whether portal is bound to a COMMIT or a ROLLBACK.
+// Membership is tested before the lookup: a portal that was never bound
+// reads back as "" and would find the UNNAMED statement, so an Execute of
+// an unbound portal could end the transaction on another statement's plan.
+func (e *Executor) portalEndsTxn(portal string) bool {
+	stmt, bound := e.portals[portal]
+	if !bound {
+		return false
+	}
+	st, ok := e.stmts[stmt]
+	return ok && (st.plan.Class.Txn == plan.TxnCommit || st.plan.Class.Txn == plan.TxnRollback)
+}
+
+// portalAnswersItself reports whether portal is bound to a statement the
+// router answers without a backend, which stays available in a failed
+// transaction.
+func (e *Executor) portalAnswersItself(portal string) bool {
+	stmt, bound := e.portals[portal]
+	if !bound {
+		return false
+	}
+	st, ok := e.stmts[stmt]
+	return ok && st.plan.Explain != nil
+}
+
+func failedTxnRefusal() error {
+	return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+}
+
 // refuseInFailedTransaction answers what PostgreSQL answers while a
 // transaction is in the failed state: nothing runs until it is ended.
 func (e *Executor) refuseInFailedTransaction(class StmtClass) error {
@@ -1529,6 +1635,19 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 		return nil
 	}
 	pl, err := e.planOp(ctx, sql, "parse")
+	if err == nil && pl.Explain == nil {
+		// Before the rest, as in simpleQuery: a session whose transaction
+		// was killed needs to be told that, not that its statement is too
+		// wide. PostgreSQL refuses at Parse, Bind and Execute alike
+		// (postgres.c), so all three carry this.
+		//
+		// EXPLAIN (pgshard) is exempt for the reason
+		// refuseSelfAnsweredInFailedTxn gives: it is how a user sees why
+		// the statement that failed was routed the way it was, without
+		// first losing the transaction. simpleQuery answers it before any
+		// of these checks, and the extended protocol must not disagree.
+		err = e.refuseInFailedTransaction(pl.Class)
+	}
 	if err == nil {
 		err = checkTransactionMode(pl.Class)
 	}
@@ -1653,6 +1772,12 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 	if err := e.replanStale(ctx, statement); err != nil {
 		e.failBatch()
 		return err
+	}
+	if st, ok := e.stmts[statement]; ok && st.plan.Explain == nil {
+		if err := e.refuseInFailedTransaction(st.plan.Class); err != nil {
+			e.failBatch()
+			return err
+		}
 	}
 	if st, ok := e.stmts[statement]; ok && st.plan.Kind != plan.SessionLocal && st.plan.Kind != plan.MigrationKind {
 		pl := st.plan
@@ -1808,6 +1933,12 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 		}
 	}
 	if st, ok := e.stmts[e.portals[portal]]; ok {
+		if st.plan.Explain == nil {
+			if err := e.refuseInFailedTransaction(st.plan.Class); err != nil {
+				e.failBatch()
+				return err
+			}
+		}
 		if multiShard(st.plan) && e.batchScatter == nil {
 			e.failBatch()
 			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "a multi-shard portal must be bound and executed in the same batch")
@@ -1920,6 +2051,22 @@ func (e *Executor) flush(ctx context.Context, w pgwire.ResultWriter) error {
 	if e.batchFailed || len(e.batch) == 0 || e.batchScatter != nil {
 		return nil
 	}
+	// flush is the OTHER place a staged batch reaches a pooler, and it
+	// shipped without this guard: a Describe or a Close terminated by
+	// Flush stages no Execute, so every condition below passed, acquire
+	// opened a fresh backend, and its relayed ReadyForQuery cleared the
+	// failed state before the client's Sync was even read. The COMMIT
+	// after it answered COMMIT.
+	//
+	// Refused rather than left for Sync, because a Flush is what a
+	// pipelined client BLOCKS on: declining silently here would hang it
+	// until it sent a Sync it has no reason to send. pgwire reports this
+	// and skips to Sync, which is what PostgreSQL does after an error in
+	// an extended batch. A transaction-control statement never reaches
+	// here anyway -- the loop below declines those.
+	if e.tx == pgwire.TxFailed && e.conn == nil {
+		return failedTxnRefusal()
+	}
 	for _, injected := range e.batchInject {
 		if len(injected) > 0 {
 			return nil
@@ -2031,6 +2178,9 @@ func (e *Executor) sync(ctx context.Context) error {
 	}
 	if w == nil {
 		w = discardWriter{}
+	}
+	if handled, err := e.failedTxnBatch(batch, w); handled {
+		return e.afterBatch(ctx, err)
 	}
 	for _, item := range executed {
 		if item.class.Write {
