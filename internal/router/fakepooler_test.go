@@ -644,7 +644,14 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	if scripted {
 		return true, s.scripted(q, sc, s.described)
 	}
-	if b.tx == 'E' && q != "rollback" && q != "commit" {
+	// PostgreSQL admits ROLLBACK TO SAVEPOINT in an aborted block as well
+	// as ROLLBACK and COMMIT -- xact.c handles TBLOCK_ABORT and
+	// TBLOCK_SUBABORT there, and postgres.c's IsTransactionExitStmt lists
+	// TRANS_STMT_ROLLBACK_TO beside them. It is the whole point of a
+	// savepoint: recovering a transaction instead of losing it. A fake that
+	// refuses it is STRICTER than the thing it stands for, so a test can
+	// watch the router do the right thing and still see a refusal.
+	if b.tx == 'E' && q != "rollback" && q != "commit" && !strings.HasPrefix(q, "rollback to ") {
 		return true, s.errorf("25P02", "current transaction is aborted")
 	}
 	switch {
@@ -667,6 +674,13 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	case strings.HasPrefix(q, "savepoint "):
 		return true, s.complete("SAVEPOINT")
 	case strings.HasPrefix(q, "rollback to "):
+		// And it puts the block back in progress. PostgreSQL returns to
+		// TBLOCK_INPROGRESS here, so ReadyForQuery reports 'T' and the
+		// client can carry on -- a fake that left it 'E' would report a
+		// recovered transaction as still dead.
+		if b.tx == 'E' {
+			b.tx = 'T'
+		}
 		return true, s.complete("ROLLBACK")
 	case strings.HasPrefix(q, "release "):
 		return true, s.complete("RELEASE")
