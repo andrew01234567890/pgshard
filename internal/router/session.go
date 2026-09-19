@@ -2722,12 +2722,37 @@ func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
 	return e.replayStatements(ctx, skip)
 }
 
+// replayableHere reports whether a prepared statement can be parsed on the
+// shard the session is on. A plan that resolves to one other shard cannot:
+// its objects need not exist here. Anything unresolved -- a deferred plan
+// waiting for its keys, a scatter, a session-local statement -- is replayed,
+// because it either runs everywhere or runs wherever the session is.
+func (e *Executor) replayableHere(pl plan.Plan) bool {
+	if pl.Deferred || multiShard(pl) || pl.Kind == plan.SessionLocal {
+		return true
+	}
+	target, err := e.target(pl)
+	return err != nil || target == e.shard
+}
+
 // replayStatements parses the named statements the current backend lacks;
 // skip names those it already has.
 func (e *Executor) replayStatements(ctx context.Context, skip map[string]bool) error {
 	n := 0
 	for name, st := range e.stmts {
 		if name == "" || skip[name] {
+			continue
+		}
+		if !e.replayableHere(st.plan) {
+			// A statement that belongs to another shard is not parsed
+			// here. Its objects may not exist here at all -- a query over
+			// a database's local_schemas lives on the home shard alone --
+			// and PARSE resolves names, so replaying it failed the whole
+			// replay and left the session unable to run anything: measured
+			// with pgroll, where a cached SELECT pgroll.latest_version()
+			// broke every later statement of the session once it moved
+			// shard (PGS-882). It is parsed again when the session is on
+			// the shard that has it, which is where it routes.
 			continue
 		}
 		if err := e.send(parseReq(e.physical(name), st.shardSQL(), st.shardOIDs())); err != nil {

@@ -367,6 +367,79 @@ func TestPgrollAgainstAShardedDatabase(t *testing.T) {
 			}
 		}
 	})
+
+	// PGS-882 finding (1), measured rather than assumed: a migration whose
+	// FIRST operation pgshard can carry and whose SECOND touches the shard
+	// key. The ticket has it running the first operation and refusing the
+	// second, after which pgroll's rollback cannot undo the rename the
+	// first one made -- data loss reported as a clean rollback. Measured
+	// against the pgroll this test pins: the migration is refused at start
+	// with nothing changed, so the sequence the ticket feared does not
+	// happen here, and this keeps it that way.
+	step("09_keepme", `{
+	  "operations": [
+	    {"add_column": {"table": "orders", "column": {"name": "keepme", "type": "text", "nullable": true}}}
+	  ]
+	}`, func() {
+		for id := range s.shardDSNs {
+			if !s.columnOn(t, id, "orders", "keepme") {
+				t.Fatalf("shard %d has no keepme, so the experiment below proves nothing", id)
+			}
+		}
+	})
+
+	// A statement over the home-only pgroll schema is cached by the driver.
+	// The session then reads a tenant on ANOTHER shard: replaying that
+	// statement onto a shard where the schema does not exist used to fail
+	// the whole replay and leave the session unable to run anything.
+
+	if err := conn.QueryRow(ctx, `SELECT pgroll.latest_version('public')`).Scan(&version); err != nil {
+		t.Fatalf("reading pgroll's own state through the router: %v", err)
+	}
+	before := map[int]string{}
+	tenantOf := map[int]int64{1: t0, 2: t0, 3: t1}
+	for id, tenant := range tenantOf {
+		keep := fmt.Sprintf("keep-%d", id)
+		if _, err := conn.Exec(ctx, "update orders set keepme = $1 where tenant_id = $2 and id = $3", keep, tenant, id); err != nil {
+			t.Fatalf("a session that prepared a home-only statement cannot write on another shard: %v", err)
+		}
+		before[id] = keep
+	}
+
+	multi := dir + "/10_multi.json"
+	if err := os.WriteFile(multi, []byte(`{
+	  "operations": [
+	    {"alter_column": {"table": "orders", "column": "keepme", "type": "varchar(64)",
+	      "up": "keepme", "down": "keepme"}},
+	    {"drop_column": {"table": "orders", "column": "tenant_id", "down": "1"}}
+	  ]
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run("start multi-operation touching the shard key", "start", multi); err == nil {
+		t.Error("a migration whose second operation drops the shard key was accepted at start")
+	}
+	_, _ = run("rollback multi", "rollback")
+
+	// What matters is not the refusal but what it left behind.
+	for id, want := range before {
+		var got string
+		if err := conn.QueryRow(ctx, "select coalesce(keepme, '') from orders where tenant_id = $1 and id = $2", tenantOf[id], id).Scan(&got); err != nil {
+			t.Fatalf("reading keepme back for id %d: %v", id, err)
+		}
+		if got != want {
+			t.Errorf("row %d lost its value: %q, want %q -- the first operation ran and the rollback could not undo it", id, got, want)
+		}
+	}
+	for id := range s.shardDSNs {
+		if !s.columnOn(t, id, "orders", "tenant_id") {
+			t.Errorf("shard %d lost the shard key", id)
+		}
+		if s.columnOn(t, id, "orders", "_pgroll_new_keepme") {
+			t.Errorf("shard %d kept _pgroll_new_keepme after the rollback", id)
+		}
+	}
+
 }
 
 // constraintOn reports whether one shard's copy of a table has a named
