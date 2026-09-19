@@ -440,6 +440,73 @@ func TestPgrollAgainstAShardedDatabase(t *testing.T) {
 		}
 	}
 
+	// PGS-966 (3): a column operation on the REFERENCE table. The ticket
+	// expected pgroll to get as far as installing per-shard down triggers;
+	// measured, the first statement it sends is refused by name and pgroll
+	// rolls its own start back, so the triggers are never reached.
+	refColumn := dir + "/10_reference_add_column.json"
+	if err := os.WriteFile(refColumn, []byte(`{
+	  "operations": [
+	    {"add_column": {"table": "regions", "column": {"name": "note", "type": "text", "nullable": true}}}
+	  ]
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run("start a column operation on the reference table", "start", refColumn)
+	if err == nil {
+		t.Error("a pgroll column operation on a reference table was accepted")
+	} else if !strings.Contains(out, "reference table") {
+		t.Errorf("the refusal does not say why: %s", out)
+	}
+
+	// PGS-966 (2): drop_table of the reference table. The ticket's worry is
+	// that pgroll's automatic rollback renames the table back and that the
+	// rename back is refused too, leaving pgroll in_progress and the table
+	// under a name nothing routes to. Measured: the rename that starts the
+	// operation is refused, pgroll rolls the start back itself -- so
+	// `pgroll rollback` then reports "no active migration" -- and the table
+	// is untouched.
+	dropTable := dir + "/11_drop_table.json"
+	if err := os.WriteFile(dropTable, []byte(`{
+	  "operations": [
+	    {"drop_table": {"name": "regions"}}
+	  ]
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run("start drop_table of the reference table", "start", dropTable)
+	if err == nil {
+		t.Error("a pgroll drop_table of a reference table was accepted")
+	} else if !strings.Contains(out, "renaming the sharded or reference table") {
+		t.Errorf("the refusal does not say why: %s", out)
+	}
+	if out, rerr := run("rollback drop_table", "rollback"); rerr != nil && !strings.Contains(out, "no active migration") {
+		t.Errorf("a refused drop_table left pgroll holding something it cannot roll back: %v\n%s", rerr, out)
+	}
+	for id := range s.shardDSNs {
+		if !s.columnOn(t, id, "regions", "id") {
+			t.Errorf("shard %d no longer has the reference table under its own name", id)
+		}
+		if s.columnOn(t, id, "_pgroll_del_regions", "id") {
+			t.Errorf("shard %d has the table under pgroll's deleted name", id)
+		}
+	}
+
+	// And pgroll is not wedged by either refusal: it starts and completes
+	// the next migration. A refusal that wedges the tool is worse than one
+	// that does not happen.
+	step("12_after_refusals", `{
+	  "operations": [
+	    {"add_column": {"table": "orders", "column": {"name": "after_refusals", "type": "text", "nullable": true}}}
+	  ]
+	}`, func() {
+		for id := range s.shardDSNs {
+			if !s.columnOn(t, id, "orders", "after_refusals") {
+				t.Errorf("shard %d did not get the column pgroll added after the refusals", id)
+			}
+		}
+	})
+
 }
 
 // constraintOn reports whether one shard's copy of a table has a named
