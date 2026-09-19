@@ -216,7 +216,7 @@ func (f *fakeProber) EnsureCatalogCopy(_ context.Context, source, target Catalog
 	return nil
 }
 
-func (f *fakeProber) CatalogCopyCaughtUp(context.Context, string) (bool, string, error) {
+func (f *fakeProber) CatalogCopyCaughtUp(context.Context, string, string) (bool, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.catalogLag != "" {

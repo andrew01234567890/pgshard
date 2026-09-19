@@ -199,7 +199,7 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		up.Stage = CatalogUpgradeCatchingUp
 		up.Message = ""
 	case CatalogUpgradeCatchingUp:
-		ok, lag, err := r.Prober.CatalogCopyCaughtUp(ctx, dsn)
+		ok, lag, err := r.Prober.CatalogCopyCaughtUp(ctx, dsn, r.catalogTargetDSN(c, *target, password))
 		if err != nil {
 			up.Message = "catalog catch-up: " + err.Error()
 			break

@@ -248,14 +248,23 @@ func schemaTables(ctx context.Context, conn *pgx.Conn, schema string) ([]string,
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// CatalogCopyCaughtUp implements Prober: the subscription's slot on the
-// source must have confirmed the source's current WAL insert position.
-func (PgxProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, string, error) {
+// CatalogCopyCaughtUp implements Prober: every published table must be
+// copied on the target, and the subscription's slot on the source must
+// have confirmed the source's current WAL insert position.
+func (PgxProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN, tgtDSN string) (bool, string, error) {
 	conn, err := pgx.Connect(ctx, srcDSN)
 	if err != nil {
 		return false, "", err
 	}
 	defer func() { _ = conn.Close(ctx) }()
+	tgt, err := pgx.Connect(ctx, tgtDSN)
+	if err != nil {
+		return false, "", err
+	}
+	defer func() { _ = tgt.Close(ctx) }()
+	if missing, err := catalogCopyIncomplete(ctx, conn, tgt); err != nil || missing != "" {
+		return false, missing, err
+	}
 	var syncing int
 	var lag *int64
 	err = conn.QueryRow(ctx, `SELECT
@@ -344,6 +353,14 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, source, target CatalogSid
 	}
 	if err := carryRolesGeneration(ctx, src, tgt); err != nil {
 		return err
+	}
+	// Again after the drain, and not only at the gate: the fence has held
+	// the source still since then, so a table missing now is missing for
+	// good, and cutting over would serve a catalog without it.
+	if missing, err := catalogCopyIncomplete(ctx, src, tgt); err != nil {
+		return err
+	} else if missing != "" {
+		return fmt.Errorf("catalog copy incomplete, so the cutover is refused: %s", missing)
 	}
 	if err := catalogTargetIsReadable(ctx, tgt); err != nil {
 		return err
@@ -462,6 +479,50 @@ func carryHashVersions(ctx context.Context, src, tgt *pgx.Conn) error {
 		}
 	}
 	return nil
+}
+
+// catalogCopyIncomplete names the published tables the target has not
+// finished copying, or "" when every one is ready.
+//
+// The source alone cannot say. PostgreSQL starts a subscription's table
+// copies a few at a time (max_sync_workers_per_subscription), and between
+// one batch finishing and the next starting there is no sync slot on the
+// source and no WAL lag either -- so "no sync workers, no lag" read as caught
+// up with tables still uncopied. The catalog was cut over that way with
+// pgshard.shard_sets and pgshard.workflows never synced, and came up with no
+// serving shard set (PGS-947). Only the target's pg_subscription_rel lists
+// what has been copied, and only the source's publication what should be.
+func catalogCopyIncomplete(ctx context.Context, src, tgt *pgx.Conn) (string, error) {
+	rows, err := src.Query(ctx, `SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = $1`, CatalogUpgradePublication)
+	if err != nil {
+		return "", err
+	}
+	published, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", err
+	}
+	rows, err = tgt.Query(ctx, `SELECT n.nspname || '.' || c.relname FROM pg_subscription_rel r
+		JOIN pg_subscription s ON s.oid = r.srsubid
+		JOIN pg_class c ON c.oid = r.srrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE s.subname = $1 AND r.srsubstate = 'r'`, CatalogUpgradeSubscription)
+	if err != nil {
+		return "", err
+	}
+	ready, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", err
+	}
+	var missing []string
+	for _, table := range published {
+		if !slices.Contains(ready, table) {
+			missing = append(missing, table)
+		}
+	}
+	if len(missing) == 0 {
+		return "", nil
+	}
+	slices.Sort(missing)
+	return fmt.Sprintf("%d of %d catalog tables not copied yet: %s", len(missing), len(published), strings.Join(missing, ", ")), nil
 }
 
 // catalogTargetIsReadable refuses a cutover onto a catalog a router could

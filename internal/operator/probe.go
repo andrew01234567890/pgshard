@@ -124,9 +124,10 @@ type Prober interface {
 	// the source, truncate plus subscription with the initial copy on the
 	// target. Idempotent.
 	EnsureCatalogCopy(ctx context.Context, source, target CatalogSide) error
-	// CatalogCopyCaughtUp reports whether the catalog copy subscription
-	// consumed the source's current WAL position; lag describes the rest.
-	CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, string, error)
+	// CatalogCopyCaughtUp reports whether the catalog copy has every
+	// published table copied on the target and has consumed the source's
+	// current WAL position; lag describes the rest.
+	CatalogCopyCaughtUp(ctx context.Context, srcDSN, tgtDSN string) (bool, string, error)
 	// CutoverCatalog fences the old catalog primary (read-only default,
 	// backends terminated), waits for the subscription to drain, carries
 	// the sequence positions over and drops the subscription so the new
@@ -1275,10 +1276,10 @@ func (b boundedProber) EnsureCatalogCopy(ctx context.Context, source, target Cat
 	return b.Inner.EnsureCatalogCopy(ctx, source, target)
 }
 
-func (b boundedProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, string, error) {
+func (b boundedProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN, tgtDSN string) (bool, string, error) {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.CatalogCopyCaughtUp(ctx, srcDSN)
+	return b.Inner.CatalogCopyCaughtUp(ctx, srcDSN, tgtDSN)
 }
 
 func (b boundedProber) CutoverCatalog(ctx context.Context, source, target CatalogSide) error {
