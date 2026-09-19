@@ -907,12 +907,51 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 		-- below. Hoisted so a source added here is read by both: a scan that
 		-- quietly covers fewer places than its sibling is the same defect as
 		-- one that covers fewer constant shapes.
+		-- EVERY stored expression in the database, not only the moved
+		-- table's own. For a SCALAR regclass constant the pg_depend branch
+		-- below already covers other objects, so scoping this to the table
+		-- lost nothing. For an ARRAY constant it lost everything:
+		-- PostgreSQL records no dependency for one ANYWHERE
+		-- (find_expr_references_walker handles REGCLASSOID scalars only),
+		-- so an array naming the moved table from another table's CHECK,
+		-- another table's default, or an index predicate was seen by
+		-- neither branch and the move proceeded (PGS-936).
+		--
+		-- A domain constraint has conrelid = 0, so it is joined through
+		-- pg_type rather than pg_class and was missed for that reason too.
+		--
+		-- Both scans read this, so a scalar constant in another object can
+		-- now be reported twice -- once here and once by pg_depend. The
+		-- messages are identical strings and SELECT DISTINCT collapses
+		-- them.
 		src AS (
-			SELECT 'pg_constraint'::regclass AS classid, c.oid AS objid, c.conbin::text AS expr FROM pg_constraint c, t WHERE c.conrelid = t.oid
-			UNION ALL SELECT 'pg_attrdef'::regclass, a.oid, a.adbin::text FROM pg_attrdef a, t WHERE a.adrelid = t.oid
-			UNION ALL SELECT 'pg_class'::regclass, i.indexrelid, concat(i.indexprs::text, i.indpred::text) FROM pg_index i, t WHERE i.indrelid = t.oid
-			UNION ALL SELECT 'pg_trigger'::regclass, tg.oid, tg.tgqual::text FROM pg_trigger tg, t WHERE tg.tgrelid = t.oid
-			UNION ALL SELECT 'pg_statistic_ext'::regclass, x.oid, x.stxexprs::text FROM pg_statistic_ext x, t WHERE x.stxrelid = t.oid)
+			SELECT 'pg_constraint'::regclass AS classid, c.oid AS objid, c.conbin::text AS expr
+			  FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+			  JOIN pg_namespace n ON n.oid = r.relnamespace
+			 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+			UNION ALL SELECT 'pg_constraint'::regclass, c.oid, c.conbin::text
+			  FROM pg_constraint c JOIN pg_type y ON y.oid = c.contypid
+			  JOIN pg_namespace n ON n.oid = y.typnamespace
+			 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+			UNION ALL SELECT 'pg_attrdef'::regclass, a.oid, a.adbin::text
+			  FROM pg_attrdef a JOIN pg_class r ON r.oid = a.adrelid
+			  JOIN pg_namespace n ON n.oid = r.relnamespace
+			 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+			UNION ALL SELECT 'pg_class'::regclass, i.indexrelid, concat(i.indexprs::text, i.indpred::text)
+			  FROM pg_index i JOIN pg_class r ON r.oid = i.indrelid
+			  JOIN pg_namespace n ON n.oid = r.relnamespace
+			 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+			   AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)
+			UNION ALL SELECT 'pg_trigger'::regclass, tg.oid, tg.tgqual::text
+			  FROM pg_trigger tg JOIN pg_class r ON r.oid = tg.tgrelid
+			  JOIN pg_namespace n ON n.oid = r.relnamespace
+			 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+			   AND tg.tgqual IS NOT NULL
+			UNION ALL SELECT 'pg_statistic_ext'::regclass, x.oid, x.stxexprs::text
+			  FROM pg_statistic_ext x JOIN pg_class r ON r.oid = x.stxrelid
+			  JOIN pg_namespace n ON n.oid = r.relnamespace
+			 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+			   AND x.stxexprs IS NOT NULL)
 		SELECT DISTINCT f FROM (
 			SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END AS f
 				FROM t WHERE t.relreplident <> 'd'

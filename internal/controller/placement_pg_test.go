@@ -1901,6 +1901,67 @@ func TestTheRegclassScanFindsItsConstantOnEveryMajor(t *testing.T) {
 	}
 }
 
+// TestTheRegclassScanSeesAnArrayInAnotherObject (PGS-936): the scan's
+// expression sources were keyed to the moved table's own rows. For a
+// SCALAR constant that lost nothing, because the pg_depend branch covers
+// other objects. For an ARRAY constant it lost everything: PostgreSQL
+// records no dependency for one ANYWHERE, so an array naming the moved
+// table from another table's CHECK, another table's default, an index
+// predicate or a domain constraint was seen by neither branch, and the
+// move proceeded to leave those expressions holding a freed OID.
+func TestTheRegclassScanSeesAnArrayInAnotherObject(t *testing.T) {
+	for _, image := range []string{
+		"ghcr.io/andrew01234567890/pgshard-postgres:18",
+		"ghcr.io/andrew01234567890/pgshard-postgres:19",
+	} {
+		t.Run(image[strings.LastIndex(image, ":")+1:], func(t *testing.T) {
+			parallelPG(t)
+			ctx := context.Background()
+			conn := connect(t, startPostgresImage(t, image, nil))
+			mustExec(t, conn, `CREATE TABLE moved (id int PRIMARY KEY)`)
+			mustExec(t, conn, `CREATE TABLE elsewhere (id int)`)
+			mustExec(t, conn, `CREATE TABLE onlooker (a regclass, CONSTRAINT array_ref CHECK (a <> ALL ('{moved}'::regclass[])))`)
+			mustExec(t, conn, `CREATE TABLE defaulted (a regclass[] DEFAULT '{moved}'::regclass[])`)
+			mustExec(t, conn, `CREATE TABLE predicated (a regclass)`)
+			mustExec(t, conn, `CREATE INDEX predicated_idx ON predicated (a) WHERE a <> ALL ('{moved}'::regclass[])`)
+			// A domain constraint has conrelid = 0, so it is reached
+			// through pg_type rather than pg_class.
+			mustExec(t, conn, `CREATE DOMAIN dom AS regclass CHECK (VALUE <> ALL ('{moved}'::regclass[]))`)
+
+			found, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "moved")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"array_ref", "defaulted", "predicated_idx", "dom_check"} {
+				seen := false
+				for _, f := range found {
+					if strings.Contains(f, want) && strings.HasPrefix(f, "reference to the table by OID in ") {
+						seen = true
+					}
+				}
+				if !seen {
+					t.Errorf("an array constant naming the table from %s was not reported, so the move would proceed and leave it holding a freed OID: %v", want, found)
+				}
+			}
+
+			// The negative control, and the one that matters: an array in
+			// another object naming a DIFFERENT table must report nothing.
+			// Widening the sources to the whole database is what makes a
+			// false positive possible at all.
+			mustExec(t, conn, `CREATE TABLE innocent (a regclass, CONSTRAINT points_away CHECK (a <> ALL ('{elsewhere}'::regclass[])))`)
+			clean, err := unsupportedTableFeatures(ctx, pgxShardConn{conn}, "public", "innocent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range clean {
+				if strings.HasPrefix(f, "reference to the table by OID in ") {
+					t.Errorf("the scan reported %q for a table no array names: widening the sources made every expression in the database a candidate, so a false positive refuses a move that is fine", f)
+				}
+			}
+		})
+	}
+}
+
 // TestTheRegclassScanIsNotFooledByAHeaderWord (PGS-936): the array decode
 // computes where the elements start from the ArrayType header rather than
 // reading from a fixed offset. Every offset in that header is a multiple of
