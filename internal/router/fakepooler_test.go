@@ -334,7 +334,10 @@ func (f *fakePooler) detach(sid string) {
 }
 
 func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
-	if g == nil || g.ShardMapGeneration != f.gen || g.PrimaryEpoch != f.epoch {
+	f.mu.Lock()
+	gen, epoch := f.gen, f.epoch
+	f.mu.Unlock()
+	if g == nil || g.ShardMapGeneration != gen || g.PrimaryEpoch != epoch {
 		// The real pooler declares the reason; a fake that does not would
 		// let the router's fence handling pass a test it fails in
 		// production, where the SQLSTATE alone cannot tell a fence from a
