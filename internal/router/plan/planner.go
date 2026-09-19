@@ -1043,8 +1043,12 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		return w.derived(n.CreateTableAsStmt.GetInto().GetRel(), n.CreateTableAsStmt.GetQuery(), "CREATE TABLE AS")
 	case *pgquerypb.Node_TruncateStmt:
 		if w.sess.Snapshot != nil && w.sess.Snapshot.Resharding() {
+			// "wait for the reshard to complete" was the whole hint, and
+			// a failed reshard leaves its set in provisioning for ever,
+			// which is exactly what Resharding() keys on. DELETE stays and
+			// leads: it is the one remedy that needs no cluster surgery.
 			return notYet("TRUNCATE is not available while a reshard is active: the copy streams row changes only",
-				"DELETE the rows, or wait for the reshard to complete")
+				"DELETE the rows instead, which needs no cluster surgery. Otherwise "+ReshardRecoveryHint)
 		}
 		return w.maintenanceList("TRUNCATE", n.TruncateStmt.GetRelations())
 	case *pgquerypb.Node_RefreshMatViewStmt:
