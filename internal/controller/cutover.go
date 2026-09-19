@@ -69,6 +69,9 @@ const (
 	DefaultCutoverTimeout = 60 * time.Second
 	// DefaultCutoverAttempts is how many undone switches fail the workflow.
 	DefaultCutoverAttempts = 3
+	// DefaultCancelGiveUp is how long a cancelled run's cleanup is retried
+	// against shards it cannot reach before it leaves their objects behind.
+	DefaultCancelGiveUp = 30 * time.Minute
 	// DefaultRetireAfter is how long the old groups stay after the switch,
 	// keeping a rollback possible.
 	//

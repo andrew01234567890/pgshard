@@ -235,6 +235,16 @@ and the copier drops the subscriptions on the targets it can still
 reach, then every `pgshard_reshard_g<gen>_*` slot (terminating its
 walsender) and publication on the sources, and ends at
 `stage=cancelled`. Targets the operator already deleted are skipped.
+A cancelling run holds its place in `pgshard.operation_queue`, so what is
+queued behind it waits for its cleanup. If a source stays unreachable the
+cleanup is retried for 30 minutes, with the queue entry's detail reading
+`cleanup failing since …`; after that the run ends `cancelled` without
+the objects it could not reach, and names them under
+`status->'copy'->'leaked'`. They are named for that run's generation, which
+no later run reuses, and `idle_replication_slot_timeout` and
+`max_slot_wal_keep_size` bound the WAL a leaked slot can hold; drop them by
+hand when the shard is back. A run cancelled after its fence was raised
+still has to lift that fence, and does not give up on it.
 Runs past `Copying` cannot be cancelled: once the journal row exists the
 switch is the point of no return (see Cutover). A `Failed` run can: a
 reshard fails only before its journal or when its switch is abandoned
