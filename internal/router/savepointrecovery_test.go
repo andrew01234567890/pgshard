@@ -2,7 +2,6 @@ package router
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -118,9 +117,15 @@ func TestRollbackToSavepointRecoversAFailedSequentialDDLTransaction(t *testing.T
 
 	// A savepoint the transaction never set cannot be rolled back to, so
 	// the transaction stays failed rather than being silently reopened at
-	// its beginning -- and is told which of the two things is wrong, as
-	// PostgreSQL does (xact.c answers 3B001 here, not 25P02).
-	t.Run("AnUnknownSavepointSaysSo", func(t *testing.T) {
+	// its beginning.
+	//
+	// 25P02, not PostgreSQL's 3B001 for an unknown name, because the
+	// router's record cannot tell the two apart: a batch that fails
+	// partway records NONE of the statements the client already watched
+	// succeed, so a savepoint set in such a batch is missing here although
+	// it existed. "Does not exist" would then name the wrong problem in
+	// exactly the case where the transaction is dead (PGS-959).
+	t.Run("AnUnknownSavepointIsStillRefused", func(t *testing.T) {
 		h := newH(t)
 		ctx := context.Background()
 		conn := h.connect(t, h.dsn())
@@ -132,15 +137,64 @@ func TestRollbackToSavepointRecoversAFailedSequentialDDLTransaction(t *testing.T
 		if _, err := conn.Exec(ctx, "create table t8 (id int primary key)"); err == nil {
 			t.Fatal("the failing migration answered success")
 		}
-		_, err := conn.Exec(ctx, "rollback to savepoint other")
-		if sqlstate(err) != "3B001" {
-			t.Fatalf("ROLLBACK TO an unset savepoint reported %v, want 3B001: 25P02 sends the client to end a transaction whose only problem is the name", err)
-		}
-		if !strings.Contains(fmt.Sprint(err), `savepoint "other" does not exist`) {
-			t.Errorf("the refusal does not name the savepoint: %v", err)
+		if _, err := conn.Exec(ctx, "rollback to savepoint other"); sqlstate(err) != "25P02" {
+			t.Fatalf("ROLLBACK TO an unset savepoint reported %v, want 25P02", err)
 		}
 		if st := conn.PgConn().TxStatus(); st != 'E' {
 			t.Fatalf("ReadyForQuery reported %c, want E: the transaction is still failed", st)
+		}
+	})
+
+	// The DDL guard must survive the recovery when the migration was
+	// APPLIED and only the reopening failed. runMigration recorded
+	// txnRanDDL below that failure, so the flag stayed false on the one
+	// path where the DDL is in and the transaction still fails -- and a
+	// transaction recovered afterwards would run shard statements and
+	// commit them as though they were part of the DDL, which is the
+	// atomicity confusion the guard exists to prevent. The router had just
+	// told this client "the DDL stays applied; end this transaction".
+	t.Run("TheDDLGuardSurvivesARecoveredTransaction", func(t *testing.T) {
+		q := &fakeQueue{}
+		h := newDDLHarness(t, q)
+		app := h.snap.Databases["app"]
+		app.DDLTransactions = catalog.DDLTransactionsSequential
+		h.snap.Databases["app"] = app
+		ctx := context.Background()
+		conn := h.connect(t, h.dsn())
+
+		// The migration succeeds, and its poolers go away between the
+		// queue and the reopening -- which is the only window that
+		// produces "applied, but opening the transaction again failed".
+		q.outcome = func(m catalog.DDLMigration) catalog.DDLMigration {
+			for i := range h.poolers {
+				h.poolers[i].gone.Store(true)
+			}
+			return m
+		}
+		for _, sql := range []string{"begin", "savepoint sp"} {
+			if _, err := conn.Exec(ctx, sql); err != nil {
+				t.Fatalf("%s: %v", sql, err)
+			}
+		}
+		_, err := conn.Exec(ctx, "create table t9 (id int primary key)")
+		if err == nil {
+			t.Fatal("the DDL answered success although reopening the transaction had to fail")
+		}
+		if !strings.Contains(err.Error(), "was applied") {
+			t.Fatalf("this test needs the applied-but-not-reopened path, got: %v", err)
+		}
+		for i := range h.poolers {
+			h.poolers[i].gone.Store(false)
+		}
+		if _, err := conn.Exec(ctx, "rollback to savepoint sp"); err != nil {
+			t.Fatalf("recovering the transaction: %v", err)
+		}
+		_, err = conn.Exec(ctx, "insert into items (id) values (7704)")
+		if err == nil {
+			t.Fatal("a shard statement ran in a transaction recovered after DDL had been applied: it would commit as though it were part of the DDL, which is applied on its own")
+		}
+		if !strings.Contains(err.Error(), "not available after DDL in the same transaction") {
+			t.Errorf("refused with the wrong reason: %v", err)
 		}
 	})
 }

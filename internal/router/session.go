@@ -1412,13 +1412,14 @@ func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtCl
 		return nil
 	}
 	if e.savepointIndex(class.Savepoint) < 0 {
-		// PostgreSQL's own answer (xact.c, RollbackToSavepoint): the
-		// transaction stays failed either way, but 25P02 would send a
-		// client to end a transaction whose only problem is the name.
-		// Only once the state is otherwise recoverable -- a transaction a
-		// failover killed keeps 25P02, where the savepoint does exist and
-		// the work behind it does not.
-		return pgwire.Errorf("3B001", "savepoint %q does not exist", class.Savepoint)
+		// 25P02, not PostgreSQL's 3B001 for an unknown savepoint, because
+		// the router's record is not good enough to tell the two apart: a
+		// batch that fails partway records NONE of the statements the
+		// client already watched succeed, so a savepoint set in it is
+		// missing here although it existed. Answering "does not exist"
+		// would name the wrong problem in exactly the case where the
+		// transaction is dead (PGS-959).
+		return nil
 	}
 	e.tx = pgwire.TxIdle
 	if err := e.acquire(ctx, nil); err != nil {
