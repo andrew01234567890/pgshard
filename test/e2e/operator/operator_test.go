@@ -234,6 +234,27 @@ type writer struct {
 	lastFail   time.Time
 	lastAckAt  time.Time
 	firstAckAf time.Time
+	// firstErr and lastErr are what the failing writes said. A count and a
+	// window cannot tell a retirement's outage from one transient error,
+	// and a window of 151ns -- one isolated failure -- is exactly the case
+	// that needed the text to be diagnosable (PGS-956).
+	firstErr string
+	lastErr  string
+}
+
+// why describes the writer's failures: how many, over what window, and what
+// the first and last of them said.
+func (w *writer) why() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.failures == 0 {
+		return "no failed writes"
+	}
+	out := fmt.Sprintf("first failure: %s", w.firstErr)
+	if w.lastErr != w.firstErr {
+		out += fmt.Sprintf("; last: %s", w.lastErr)
+	}
+	return out
 }
 
 // ackedCount is the acknowledgements so far. Taking a high-water mark before
@@ -270,9 +291,19 @@ func startWriter(ctx context.Context, c *e2e.Cluster, rw string, start int64) *w
 				}
 			} else {
 				w.failures++
+				text := strings.TrimSpace(out)
+				if err != nil {
+					text = strings.TrimSpace(err.Error() + " " + text)
+				}
+				if text == "" {
+					text = "no output and no error"
+				}
+				text = strconv.Quote(clip(text, 300))
 				if w.firstFail.IsZero() {
 					w.firstFail = time.Now()
+					w.firstErr = text
 				}
+				w.lastErr = text
 				w.lastFail = time.Now()
 			}
 			w.mu.Unlock()
@@ -718,7 +749,7 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		})
 		time.Sleep(5 * time.Second)
 		acked, failures, pause := w.finish()
-		t.Logf("writer: %d acknowledged, %d failed, unavailability window %s", len(acked), failures, pause)
+		t.Logf("writer: %d acknowledged, %d failed, unavailability window %s; %s", len(acked), failures, pause, w.why())
 		if len(acked) > 0 {
 			lastID = acked[len(acked)-1]
 		}
@@ -818,7 +849,7 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		})
 		time.Sleep(5 * time.Second)
 		acked, failures, pause := w.finish()
-		t.Logf("switchover %s -> %s took %s from annotation to promotion; writer: %d acknowledged, %d failed, unavailability window %s", oldPrimary, target, time.Since(started).Round(time.Second), len(acked), failures, pause)
+		t.Logf("switchover %s -> %s took %s from annotation to promotion; writer: %d acknowledged, %d failed, unavailability window %s; %s", oldPrimary, target, time.Since(started).Round(time.Second), len(acked), failures, pause, w.why())
 		if len(acked) > 0 {
 			lastID = acked[len(acked)-1]
 		}
@@ -978,8 +1009,8 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		close(stopSampling)
 		<-sampled
 		acked, failures, pause := w.finish()
-		t.Logf("rolling restart took %s; writer: %d acknowledged, %d failed, unavailability window %s; max shard members away at once %d",
-			time.Since(started).Round(time.Second), len(acked), failures, pause, maxAway)
+		t.Logf("rolling restart took %s; writer: %d acknowledged, %d failed, unavailability window %s; max shard members away at once %d; %s",
+			time.Since(started).Round(time.Second), len(acked), failures, pause, maxAway, w.why())
 		if len(acked) > 0 {
 			lastID = acked[len(acked)-1]
 		}
@@ -1120,8 +1151,8 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		stopSampling()
 
 		acked, failures, pause := w.finish()
-		t.Logf("retiring two members took %s; writer: %d acknowledged, %d failed, unavailability window %s; fewest pods seen %d, saw the intermediate 4: %v",
-			time.Since(started).Round(time.Second), len(acked), failures, pause, minPods, sawFour)
+		t.Logf("retiring two members took %s; writer: %d acknowledged, %d failed, unavailability window %s; fewest pods seen %d, saw the intermediate 4: %v; %s",
+			time.Since(started).Round(time.Second), len(acked), failures, pause, minPods, sawFour, w.why())
 		if len(acked) > 0 {
 			lastID = acked[len(acked)-1]
 		}
@@ -1132,7 +1163,7 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		// a commit that was already acknowledged.
 		assertAllAcked(ctx, t, c, rw, acked)
 		if failures > 0 {
-			t.Errorf("retiring a standby must not fail a write: %d failed over %s", failures, pause)
+			t.Errorf("retiring a standby must not fail a write: %d failed over %s; %s", failures, pause, w.why())
 		}
 		if len(badSync) > 0 {
 			t.Errorf("synchronous_standby_names listed a member that was gone: %q", badSync[0])
@@ -1299,6 +1330,15 @@ func gatherNamespace(ctx context.Context, c *e2e.Cluster) {
 }
 
 // tail is the last n lines of s, for a failure message that quotes a log.
+// clip shortens a message to n characters for a one-line test report.
+func clip(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
+}
+
 func tail(s string, n int) string {
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
 	if len(lines) > n {
