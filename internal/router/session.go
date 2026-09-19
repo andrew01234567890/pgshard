@@ -2512,6 +2512,24 @@ func (e *Executor) replayPrelude(ctx context.Context) error {
 			return fmt.Errorf("router: replaying transaction prelude: %w", err)
 		}
 	}
+	// A RESET in the prelude restores the STARTUP search_path on this
+	// session and the SERVER default on the backend, which is the whole
+	// reason reapplyStartupSearchPath exists -- and the prelude does not
+	// record what that sent, because it is not a statement the client
+	// issued. Replaying the prelude alone therefore left the transaction
+	// running with a search_path the planner had not routed with, and the
+	// ROLLBACK that precedes the replay had already undone the original
+	// reapply. Re-asserting the session's EFFECTIVE path covers both the
+	// simple and the extended path, and is a no-op when the prelude ends
+	// on a SET rather than a RESET.
+	if e.startupSearchPath != nil {
+		if err := e.send(simpleQuery(searchPathSQL(e.searchPath()))); err != nil {
+			return err
+		}
+		if err := e.pump(ctx, discardWriter{}); err != nil {
+			return fmt.Errorf("router: restoring the search_path after replaying the prelude: %w", err)
+		}
+	}
 	return nil
 }
 
