@@ -1434,6 +1434,57 @@ func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtCl
 	return nil
 }
 
+// failedTxnBatch is endFailedTxn for the extended protocol: the COMMIT or
+// ROLLBACK that ends a transaction whose backend is gone is answered here,
+// without a shard, and answers ROLLBACK because that is what became of it.
+//
+// Without this the batch acquired a FRESH backend and ran the COMMIT on it.
+// That backend had never heard of the transaction, so it answered a COMMIT
+// tag, and the client -- pgx, JDBC, anything not using the simple protocol
+// -- was told writes had landed that died with the old primary (PGS-957).
+//
+// Nothing else may reach a backend at all, and that is the rule rather than
+// a list of message types: ACQUIRING one is itself the damage. pump relays
+// the fresh backend's ReadyForQuery, so e.tx stops saying the transaction
+// failed, and the COMMIT after it answers COMMIT. Probed: a Describe-only
+// and a Close-only batch each reopened the whole defect that way, with no
+// Parse, Bind or Execute in them for the checks above to see.
+//
+// Close is answered here instead, because it needs no backend: the physical
+// statement it names died with the old one, and Close has already dropped
+// the router's own record of it. Refusing it would break a driver clearing
+// its statement cache on the way to the ROLLBACK it is about to send.
+func (e *Executor) failedTxnBatch(batch []*pgshardv1.ExecuteRequest, parsed []string, w pgwire.ResultWriter) (bool, error) {
+	if e.tx != pgwire.TxFailed || e.conn != nil {
+		return false, nil
+	}
+	_, _, _, ending := e.routerAnswers(batch, parsed, func(pl plan.Plan) bool {
+		return pl.Class.Txn == plan.TxnCommit || pl.Class.Txn == plan.TxnRollback
+	})
+	if ending {
+		e.finishTxn("ROLLBACK")
+		// Every batch the router answers itself still owes the client the
+		// ParseComplete and BindComplete a pooler would have relayed.
+		// Without them a driver is a message short and desynchronises,
+		// which the raw-protocol test could not see and pgx does.
+		if err := e.answerStagedCompletions(w, batch); err != nil {
+			return true, err
+		}
+		return true, answerBatch(batch, nil, func(describe, _ bool) error {
+			if describe {
+				return w.NoData()
+			}
+			return w.CommandComplete("ROLLBACK")
+		}, w)
+	}
+	for _, req := range batch {
+		if _, ok := req.Message.(*pgshardv1.ExecuteRequest_Close); !ok {
+			return true, pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+		}
+	}
+	return true, e.answerStagedCompletions(w, batch)
+}
+
 // refuseInFailedTransaction answers what PostgreSQL answers while a
 // transaction is in the failed state: nothing runs until it is ended.
 func (e *Executor) refuseInFailedTransaction(class StmtClass) error {
@@ -1529,6 +1580,13 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 		return nil
 	}
 	pl, err := e.planOp(ctx, sql, "parse")
+	if err == nil {
+		// Before the rest, as in simpleQuery: a session whose transaction
+		// was killed needs to be told that, not that its statement is too
+		// wide. PostgreSQL refuses at Parse, Bind and Execute alike
+		// (postgres.c), so all three carry this.
+		err = e.refuseInFailedTransaction(pl.Class)
+	}
 	if err == nil {
 		err = checkTransactionMode(pl.Class)
 	}
@@ -1653,6 +1711,12 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 	if err := e.replanStale(ctx, statement); err != nil {
 		e.failBatch()
 		return err
+	}
+	if st, ok := e.stmts[statement]; ok {
+		if err := e.refuseInFailedTransaction(st.plan.Class); err != nil {
+			e.failBatch()
+			return err
+		}
 	}
 	if st, ok := e.stmts[statement]; ok && st.plan.Kind != plan.SessionLocal && st.plan.Kind != plan.MigrationKind {
 		pl := st.plan
@@ -1808,6 +1872,10 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 		}
 	}
 	if st, ok := e.stmts[e.portals[portal]]; ok {
+		if err := e.refuseInFailedTransaction(st.plan.Class); err != nil {
+			e.failBatch()
+			return err
+		}
 		if multiShard(st.plan) && e.batchScatter == nil {
 			e.failBatch()
 			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "a multi-shard portal must be bound and executed in the same batch")
@@ -2031,6 +2099,9 @@ func (e *Executor) sync(ctx context.Context) error {
 	}
 	if w == nil {
 		w = discardWriter{}
+	}
+	if handled, err := e.failedTxnBatch(batch, parsed, w); handled {
+		return e.afterBatch(ctx, err)
 	}
 	for _, item := range executed {
 		if item.class.Write {
