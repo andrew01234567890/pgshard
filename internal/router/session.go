@@ -616,14 +616,11 @@ func (e *Executor) userSet() string { return e.Home().Set }
 // Shard reports the shard the session's stream is on.
 func (e *Executor) Shard() Shard { return e.shard }
 
-// planSession describes this session to the planner. Sessions on the
+// planSessionAt describes this session to the planner as of snap, a
+// snapshot the caller has already taken, so planning and the generation
+// stamped on what the plan sends come from the same one. Sessions on the
 // catalog shard set see no table placement and plan everything onto their
 // home shard.
-func (e *Executor) planSession() plan.Session { return e.planSessionAt(e.currentSnapshot()) }
-
-// planSessionAt is planSession against a snapshot the caller has already
-// taken, so planning and the generation stamped on what the plan sends come
-// from the same one.
 func (e *Executor) planSessionAt(snap *snapshot.Snapshot) plan.Session {
 	// homeAt(snap), not Home(): Home reads the live snapshot, and the
 	// watcher swaps that pointer on every reload, so the plan was being
@@ -662,6 +659,11 @@ func (e *Executor) staleSnapshot() error {
 }
 
 func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, error) {
+	return e.planOpAt(ctx, e.currentSnapshot(), sql, opcode)
+}
+
+// planOpAt is planOp against a snapshot the caller has already taken.
+func (e *Executor) planOpAt(ctx context.Context, snap *snapshot.Snapshot, sql, opcode string) (plan.Plan, error) {
 	if err := e.staleSnapshot(); err != nil {
 		e.r.metrics.Refusals.WithLabelValues(codeStaleGeneration).Inc()
 		return plan.Plan{}, err
@@ -672,7 +674,7 @@ func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, e
 	// stamp a generation the plan was never made under -- and a pooler
 	// already at that generation admits it, which is the case the fence
 	// exists to refuse.
-	e.stmtSnap = e.currentSnapshot()
+	e.stmtSnap = snap
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSessionAt(e.stmtSnap), sql)
 	if err == nil && pl.Kind == plan.MigrationKind && e.catalogSession() {
 		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
@@ -1073,10 +1075,13 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		if err := e.gateWrite(ctx, e.writeTarget(pl), pl.Tables); err != nil {
 			return e.afterBatch(ctx, err)
 		}
-		if e.currentSnapshot() != before {
+		if snap := e.currentSnapshot(); snap != before {
 			// The shard map moved while the statement waited: plan it
-			// against the map it will run on.
-			if pl, err = e.r.cfg.Planner.Plan(ctx, e.planSession(), sql); err != nil {
+			// against the map it will run on, and stamp it from that map
+			// too. Keeping the old stamp let a pooler still serving the
+			// old generation admit a plan made for the new one (PGS-951).
+			e.stmtSnap = snap
+			if pl, err = e.r.cfg.Planner.Plan(ctx, e.planSessionAt(snap), sql); err != nil {
 				return err
 			}
 		}
@@ -1876,6 +1881,12 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 // prevent, and the one an online rewrite relies on: past MaxAge a router
 // has either reloaded and hides the working column, or has stopped.
 func (e *Executor) replanStale(ctx context.Context, statement string) error {
+	return e.replanStaleAt(ctx, statement, e.currentSnapshot())
+}
+
+// replanStaleAt is replanStale against a snapshot the caller has already
+// taken.
+func (e *Executor) replanStaleAt(ctx context.Context, statement string, snap *snapshot.Snapshot) error {
 	st, ok := e.stmts[statement]
 	if !ok {
 		return nil
@@ -1884,10 +1895,10 @@ func (e *Executor) replanStale(ctx context.Context, statement string) error {
 		e.r.metrics.Refusals.WithLabelValues(codeStaleGeneration).Inc()
 		return err
 	}
-	if snapshot.SamePlanning(st.snap, e.currentSnapshot()) {
+	if snapshot.SamePlanning(st.snap, snap) {
 		return nil
 	}
-	pl, err := e.planOp(ctx, st.sql, "parse")
+	pl, err := e.planOpAt(ctx, snap, st.sql, "parse")
 	if err == nil && sequenceShape(pl) != sequenceShape(st.plan) {
 		perr := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "the sequence columns of the table changed since statement %q was prepared", statement)
 		perr.Hint = "prepare the statement again"
@@ -1896,7 +1907,7 @@ func (e *Executor) replanStale(ctx context.Context, statement string) error {
 	if err != nil {
 		return err
 	}
-	st.plan, st.class, st.snap = pl, pl.Class, e.currentSnapshot()
+	st.plan, st.class, st.snap = pl, pl.Class, snap
 	e.stmts[statement] = st
 	return nil
 }
@@ -1920,13 +1931,15 @@ func (e *Executor) aimBound(pl plan.Plan, statement string, keys plan.Params) er
 }
 
 // reaim targets the batch again after the shard map moved while it waited
-// out a write fence: every bound statement is planned against the current
-// snapshot and resolved with its recorded keys.
+// out a write fence: every bound statement is planned against one current
+// snapshot -- planOpAt stamps the batch from it -- and resolved with its
+// recorded keys.
 func (e *Executor) reaim(ctx context.Context, binds []batchBind) (*Shard, *plan.Plan, string, error) {
 	e.batchTarget, e.batchScatter, e.batchScatterStmt = nil, nil, ""
 	defer func() { e.batchTarget, e.batchScatter, e.batchScatterStmt = nil, nil, "" }()
+	snap := e.currentSnapshot()
 	for _, b := range binds {
-		if err := e.replanStale(ctx, b.statement); err != nil {
+		if err := e.replanStaleAt(ctx, b.statement, snap); err != nil {
 			return nil, nil, "", err
 		}
 		st, ok := e.stmts[b.statement]
