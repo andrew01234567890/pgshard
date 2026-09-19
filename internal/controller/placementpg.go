@@ -899,10 +899,37 @@ var triggerEnableWords = map[string]string{"O": "ENABLE", "D": "DISABLE", "R": "
 // Reproduced rather than refused, each with its own function: row-level
 // security, user triggers, and the owner and table/column privileges.
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
-	rows, err := conn.Query(ctx, `WITH t AS (
+	rows, err := conn.Query(ctx, `WITH RECURSIVE t AS (
 			SELECT c.oid, c.reltype, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
 			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = $1 AND c.relname = $2),
+		-- regclass and every domain over it, at any depth. A domain value is
+		-- stored as its base type's, so an array of one has the regclass[]
+		-- layout -- but its element type is the DOMAIN's OID, and its own
+		-- array type is neither 2210 nor anything else fixed (PGS-936).
+		-- A SCALAR domain constant needs none of this: PostgreSQL folds the
+		-- cast and stores a plain regclass Const, measured on PG 18.
+		rctypes AS (
+			SELECT 'regclass'::regtype::oid AS oid
+			UNION
+			SELECT y.oid FROM pg_type y JOIN rctypes r ON y.typbasetype = r.oid WHERE y.typtype = 'd'),
+		-- The array types of those, as a regex alternation, so the array scan
+		-- below only decodes constants of a regclass-chain array type. Every
+		-- non-null Const prints bytes, so matching any consttype would decode
+		-- every array in the database.
+		rcarr AS (
+			SELECT '(' || string_agg(typarray::text, '|') || ')' AS pat
+			FROM pg_type WHERE oid IN (SELECT oid FROM rctypes) AND typarray <> 0),
+		-- Row types with a regclass-chain attribute, as an alternation. A
+		-- composite LITERAL of one ('(orders,1)'::pair) is a single Const
+		-- holding a packed tuple, where ROW('orders'::regclass, 1)::pair keeps
+		-- its fields as separate Consts the scalar scan already reads. NULL
+		-- when there is no such type, which is the usual case, and a NULL
+		-- pattern matches nothing.
+		rccomp AS (
+			SELECT '(' || string_agg(DISTINCT c.reltype::text, '|') || ')' AS pat
+			FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+			WHERE a.atttypid IN (SELECT oid FROM rctypes) AND a.attnum > 0 AND NOT a.attisdropped AND c.reltype <> 0),
 		-- Every stored expression the table owns, for the two regclass scans
 		-- below. Hoisted so a source added here is read by both: a scan that
 		-- quietly covers fewer places than its sibling is the same defect as
@@ -1019,16 +1046,13 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 			-- lower bound happens to equal the table's OID.
 			-- TestTheRegclassScanIsNotFooledByAHeaderWord pins exactly that.
 			--
-			-- SCOPE, and it is narrower than it looks: src below is the
-			-- moved table's OWN expressions. An array constant in another
-			-- object is still missed, because PostgreSQL records no
-			-- dependency for one anywhere -- find_expr_references_walker
-			-- handles REGCLASSOID scalars only -- so the pg_depend branch
-			-- that covers other objects for a scalar covers nothing here.
-			-- PGS-936 stays open for it.
+			-- The element type is any of rctypes, not 2205 alone: an array of
+			-- a domain over regclass has this layout with the DOMAIN's OID in
+			-- elemtype (read off '{moved}'::rcd[] on PG 18), and was missed
+			-- by both scans when this matched regclass[] only.
 			UNION ALL SELECT 'reference to the table by OID in ' || pg_describe_object(e.classid, e.objid, 0)
-				FROM t, src e,
-					regexp_matches(e.expr, ':consttype 2210 [^{}]*:constisnull false [^{}]*:constvalue [0-9]+ \[ ([-0-9 ]*)\]', 'g') m,
+				FROM t, src e, rcarr,
+					regexp_matches(e.expr, ':consttype ' || rcarr.pat || ' [^{}]*:constisnull false [^{}]*:constvalue [0-9]+ \[ ([-0-9 ]*)\]', 'g') m,
 					-- OFFSET 0, which is not decoration: without it the planner
 					-- FLATTENS this subquery, so v.b is not a value but the
 					-- string_to_array expression re-evaluated at every
@@ -1038,15 +1062,34 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 					-- query the preflight runs per source and recheckDependents
 					-- runs again immediately before the first rename, neither
 					-- with a timeout. With OFFSET 0 the same 16536 case is 16ms.
-					LATERAL (SELECT string_to_array(btrim(m[1]), ' ')::bigint[] AS b OFFSET 0) v,
+					LATERAL (SELECT string_to_array(btrim(m[2]), ' ')::bigint[] AS b OFFSET 0) v,
 					LATERAL (SELECT
 						(v.b[5]+256)%256 + (v.b[6]+256)%256*256 + (v.b[7]+256)%256*65536 + (v.b[8]+256)%256*16777216 AS ndim,
 						(v.b[9]+256)%256 + (v.b[10]+256)%256*256 + (v.b[11]+256)%256*65536 + (v.b[12]+256)%256*16777216 AS dataoffset,
 						(v.b[13]+256)%256 + (v.b[14]+256)%256*256 + (v.b[15]+256)%256*65536 + (v.b[16]+256)%256*16777216 AS elemtype) h
-				WHERE h.elemtype = 2205 AND EXISTS (
+				WHERE h.elemtype IN (SELECT oid FROM rctypes) AND EXISTS (
 					SELECT 1 FROM generate_series(
 						CASE WHEN h.dataoffset > 0 THEN h.dataoffset ELSE 16 + 8*h.ndim END + 1,
 						array_length(v.b, 1) - 3, 4) k
+					WHERE (v.b[k]+256)%256 + (v.b[k+1]+256)%256*256 + (v.b[k+2]+256)%256*65536 + (v.b[k+3]+256)%256*16777216 = t.oid::bigint)
+			-- The OID inside a composite LITERAL of a type with a regclass
+			-- attribute. The bytes are a HeapTupleHeader: datum length,
+			-- typmod, type OID, ctid, infomask2, infomask, then t_hoff at
+			-- byte 22, which is where the attributes begin. Read from t_hoff
+			-- in 4-byte steps: t_hoff is MAXALIGNed and a regclass attribute
+			-- is int-aligned, so every regclass field sits on one of those
+			-- steps, and the header's own words -- the -1 typmod, the type
+			-- OID, the ctid -- are never read. What can still match is
+			-- another int-aligned attribute of the SAME row whose value
+			-- happens to equal the table's OID; the type is restricted to
+			-- ones carrying a regclass attribute, which makes that narrow.
+			-- Measured on PG 18 against '(moved,1)'::pair.
+			UNION ALL SELECT 'reference to the table by OID in ' || pg_describe_object(e.classid, e.objid, 0)
+				FROM t, src e, rccomp,
+					regexp_matches(e.expr, ':consttype ' || rccomp.pat || ' [^{}]*:constisnull false [^{}]*:constvalue [0-9]+ \[ ([-0-9 ]*)\]', 'g') m,
+					LATERAL (SELECT string_to_array(btrim(m[2]), ' ')::bigint[] AS b OFFSET 0) v
+				WHERE array_length(v.b, 1) > 23 AND EXISTS (
+					SELECT 1 FROM generate_series((v.b[23]+256)%256 + 1, array_length(v.b, 1) - 3, 4) k
 					WHERE (v.b[k]+256)%256 + (v.b[k+1]+256)%256*256 + (v.b[k+2]+256)%256*65536 + (v.b[k+3]+256)%256*16777216 = t.oid::bigint)
 			UNION ALL SELECT DISTINCT CASE
 					WHEN d.classid = 'pg_rewrite'::regclass AND r.rulename = '_RETURN'
