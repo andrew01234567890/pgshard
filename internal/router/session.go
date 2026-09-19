@@ -1461,34 +1461,54 @@ func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtCl
 // before the client had executed anything. The session then read Idle, the
 // client's real COMMIT was routed to a fresh backend, and the whole defect
 // was back.
-func (e *Executor) failedTxnBatch(batch []*pgshardv1.ExecuteRequest, w pgwire.ResultWriter) (bool, error) {
+//
+// A ROLLBACK TO executed before anything else is the one statement that
+// may take a backend: recoverFailedTxnToSavepoint decides, as it does for
+// the simple protocol, and a transaction it reopens runs the rest of the
+// batch normally. The only Describe admitted is one of that portal, which
+// the backend answers once the transaction is back.
+func (e *Executor) failedTxnBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, w pgwire.ResultWriter) (bool, error) {
 	if e.tx != pgwire.TxFailed || e.conn != nil {
 		return false, nil
 	}
-	ends := false
+	ends, describedRollbackTo := false, false
 	for _, req := range batch {
 		switch r := req.Message.(type) {
 		case *pgshardv1.ExecuteRequest_Parse, *pgshardv1.ExecuteRequest_Bind, *pgshardv1.ExecuteRequest_Close:
 			// Answered below. A Parse or Bind that is still here is one
-			// refuseInFailedTransaction admitted, so it names a COMMIT or
-			// a ROLLBACK.
+			// refuseStagedInFailedTransaction admitted, so it names a
+			// COMMIT, a ROLLBACK or a ROLLBACK TO.
 		case *pgshardv1.ExecuteRequest_Execute:
 			if e.portalAnswersItself(r.Execute.Portal) {
 				// explainBatch answers it further down without a backend.
 				return false, nil
 			}
+			if class, ok := e.portalRollsBackToSavepoint(r.Execute.Portal); ok && !ends {
+				return e.recoverBatchToSavepoint(ctx, class)
+			}
 			if !e.portalEndsTxn(r.Execute.Portal) {
 				return true, failedTxnRefusal()
 			}
 			ends = true
+		case *pgshardv1.ExecuteRequest_Describe:
+			if _, ok := e.portalRollsBackToSavepoint(r.Describe.Name); ok && !ends && r.Describe.Kind == pgshardv1.Describe_KIND_PORTAL {
+				describedRollbackTo = true
+				continue
+			}
+			// PostgreSQL would answer one of a COMMIT, but a statement's
+			// name here is the PHYSICAL one and the statement behind it
+			// cannot be recovered to check -- and answering the wrong
+			// shape is worse than refusing, because a driver caches it
+			// for the life of the connection.
+			return true, failedTxnRefusal()
 		default:
-			// A Describe among them included. PostgreSQL would answer one
-			// of a COMMIT, but its name here is the PHYSICAL one and the
-			// statement behind it cannot be recovered to check -- and
-			// answering the wrong shape is worse than refusing, because a
-			// driver caches it for the life of the connection.
 			return true, failedTxnRefusal()
 		}
+	}
+	if describedRollbackTo {
+		// Described and never executed first: nothing reopened the
+		// transaction, and there is no backend to answer the Describe.
+		return true, failedTxnRefusal()
 	}
 	if ends {
 		e.finishTxn("ROLLBACK")
@@ -1524,6 +1544,30 @@ func (e *Executor) portalEndsTxn(portal string) bool {
 	return ok && (st.plan.Class.Txn == plan.TxnCommit || st.plan.Class.Txn == plan.TxnRollback)
 }
 
+// portalRollsBackToSavepoint reports whether portal is bound to a ROLLBACK
+// TO SAVEPOINT, and returns its class.
+func (e *Executor) portalRollsBackToSavepoint(portal string) (StmtClass, bool) {
+	stmt, bound := e.portals[portal]
+	if !bound {
+		return StmtClass{}, false
+	}
+	st, ok := e.stmts[stmt]
+	return st.plan.Class, ok && st.plan.Class.Txn == plan.TxnRollbackTo
+}
+
+// recoverBatchToSavepoint answers failedTxnBatch for a batch whose first
+// Execute is a ROLLBACK TO: handled, with the refusal, unless the
+// transaction was reopened, and then the batch goes to the backend.
+func (e *Executor) recoverBatchToSavepoint(ctx context.Context, class StmtClass) (bool, error) {
+	if err := e.recoverFailedTxnToSavepoint(ctx, class); err != nil {
+		return true, err
+	}
+	if e.tx == pgwire.TxFailed {
+		return true, failedTxnRefusal()
+	}
+	return false, nil
+}
+
 // portalAnswersItself reports whether portal is bound to a statement the
 // router answers without a backend, which stays available in a failed
 // transaction.
@@ -1550,6 +1594,17 @@ func (e *Executor) refuseInFailedTransaction(class StmtClass) error {
 		return nil
 	}
 	return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+}
+
+// refuseStagedInFailedTransaction is refuseInFailedTransaction for a
+// Parse, Bind or Execute, and also admits ROLLBACK TO, as PostgreSQL does
+// at all three: whether the router can recover the transaction to that
+// savepoint takes a backend, so failedTxnBatch decides it at Sync.
+func (e *Executor) refuseStagedInFailedTransaction(class StmtClass) error {
+	if class.Txn == plan.TxnRollbackTo {
+		return nil
+	}
+	return e.refuseInFailedTransaction(class)
 }
 
 // refuseSelfAnsweredInFailedTxn refuses nextval() over a global sequence in
@@ -1646,7 +1701,7 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 		// the statement that failed was routed the way it was, without
 		// first losing the transaction. simpleQuery answers it before any
 		// of these checks, and the extended protocol must not disagree.
-		err = e.refuseInFailedTransaction(pl.Class)
+		err = e.refuseStagedInFailedTransaction(pl.Class)
 	}
 	if err == nil {
 		err = checkTransactionMode(pl.Class)
@@ -1774,7 +1829,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 		return err
 	}
 	if st, ok := e.stmts[statement]; ok && st.plan.Explain == nil {
-		if err := e.refuseInFailedTransaction(st.plan.Class); err != nil {
+		if err := e.refuseStagedInFailedTransaction(st.plan.Class); err != nil {
 			e.failBatch()
 			return err
 		}
@@ -1934,7 +1989,7 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 	}
 	if st, ok := e.stmts[e.portals[portal]]; ok {
 		if st.plan.Explain == nil {
-			if err := e.refuseInFailedTransaction(st.plan.Class); err != nil {
+			if err := e.refuseStagedInFailedTransaction(st.plan.Class); err != nil {
 				e.failBatch()
 				return err
 			}
@@ -2179,7 +2234,7 @@ func (e *Executor) sync(ctx context.Context) error {
 	if w == nil {
 		w = discardWriter{}
 	}
-	if handled, err := e.failedTxnBatch(batch, w); handled {
+	if handled, err := e.failedTxnBatch(ctx, batch, w); handled {
 		return e.afterBatch(ctx, err)
 	}
 	for _, item := range executed {
