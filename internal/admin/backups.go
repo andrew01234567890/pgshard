@@ -89,6 +89,10 @@ type RestorePoint struct {
 	// catalog generation is in the cluster's status. The page can, because
 	// it reads both (PGS-946).
 	CatalogUnidentified bool `json:"catalogUnidentified,omitempty"`
+	// Inherited is why the operator refuses this point as one the cluster
+	// inherited from the cluster it was restored from; empty when it does
+	// not (PGS-961).
+	Inherited string `json:"inherited,omitempty"`
 }
 
 // GroupRestore is one group's progress inside a restore.
@@ -208,7 +212,11 @@ func BuildBackupsPage(ctx context.Context, c client.Reader, src CatalogSource, n
 		if err != nil {
 			page.RestorePointError = err.Error()
 		}
-		converted := ConvertRestorePoints(points, catalogRebuilt(clusters.Items))
+		cut, cerr := inheritedCutoff(ctx, c, clusters.Items)
+		if cerr != nil {
+			return nil, cerr
+		}
+		converted := ConvertRestorePoints(points, catalogRebuilt(clusters.Items), cut)
 		for _, rp := range converted {
 			if len(page.RestorePoints) == RestorePointsLimit {
 				break
@@ -421,16 +429,27 @@ func describeTarget(t pgshardv1alpha1.RestoreTarget) (kind, value string) {
 // rebuilt says the cluster's catalog has been replaced by a major upgrade,
 // which the CONTROLLER cannot know -- it reads the catalog, and the catalog
 // generation lives in the cluster's status.
-func ConvertRestorePoints(points []controller.RestorePoint, rebuilt bool) []RestorePoint {
+func ConvertRestorePoints(points []controller.RestorePoint, rebuilt bool, cut *operator.InheritedBarrierCutoff) []RestorePoint {
 	out := make([]RestorePoint, 0, len(points))
 	for _, rp := range points {
 		p := convertRestorePoint(rp)
 		if rebuilt && !p.CatalogSuperseded && catalogUnidentified(rp) {
 			p.CatalogUnidentified = true
 		}
+		p.Inherited = cut.Refusal(rp.Name, rp.CreatedAt)
 		out = append(out, p)
 	}
 	return out
+}
+
+// inheritedCutoff is the operator's inherited-barrier cut-off for the one
+// cluster in scope, and nil with several, for the reason catalogRebuilt
+// gives: the restore points are this catalog's, not each cluster's.
+func inheritedCutoff(ctx context.Context, c client.Reader, clusters []pgshardv1alpha1.PgShardCluster) (*operator.InheritedBarrierCutoff, error) {
+	if len(clusters) != 1 {
+		return nil, nil
+	}
+	return operator.InheritedBarrierCutoffOf(ctx, c, &clusters[0])
 }
 
 // catalogRebuilt reports a catalog replaced by a major upgrade, and only

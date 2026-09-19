@@ -50,7 +50,7 @@
 {{if .RestorePoints}}<table>
 <thead><tr><th>Name</th><th>Created</th><th>Shard map generation</th><th>Groups</th></tr></thead>
 <tbody>{{range .RestorePoints}}<tr>
-<td>{{.Name}}{{if .CatalogSuperseded}} <span class="bad">not restorable: taken before the catalog's major upgrade</span>{{else if .CatalogUnidentified}} <span class="bad">not restorable: taken before the catalog was identified, and this catalog has been rebuilt since</span>{{end}}</td><td>{{.CreatedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}</td><td>{{.ShardMapGeneration}}</td>
+<td>{{.Name}}{{if .CatalogSuperseded}} <span class="bad">not restorable: taken before the catalog's major upgrade</span>{{else if .CatalogUnidentified}} <span class="bad">not restorable: taken before the catalog was identified, and this catalog has been rebuilt since</span>{{else if .Inherited}} <span class="bad" title="{{.Inherited}}">not restorable: may belong to the cluster this one was restored from</span>{{end}}</td><td>{{.CreatedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}</td><td>{{.ShardMapGeneration}}</td>
 <td>{{range .Groups}}<div>{{.Group}} · {{.LSN}} · tli {{.Timeline}}</div>{{end}}</td>
 </tr>{{end}}</tbody></table>
 {{else}}<p class="notice">No certified restore points{{if not .RestorePointError}} (none recorded, or no catalog DSN configured){{end}}.</p>{{end}}

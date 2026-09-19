@@ -14,6 +14,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/controller"
+	"github.com/andrew01234567890/pgshard/internal/operator"
 )
 
 const secretKeyMaterial = "AKIAEXAMPLEKEYMATERIAL"
@@ -295,5 +296,64 @@ func TestABarrierWithNoCatalogIdentityIsFlaggedOnceTheCatalogWasRebuilt(t *testi
 	// It is a different fact from CatalogSuperseded, and must not borrow it.
 	if points[0].CatalogSuperseded {
 		t.Error("an unidentified manifest was reported as superseded; only the controller can say that")
+	}
+}
+
+// TestABarrierTheOperatorRefusesAsInheritedIsShownAsNotRestorable (PGS-961):
+// a cluster built by a restore carries its source's barriers, and the
+// operator refuses a restore to one recorded before that restore finished,
+// or within a minute after it. The page offered them as restorable, sending
+// an operator reaching for a recovery path straight into the refusal.
+func TestABarrierTheOperatorRefusesAsInheritedIsShownAsNotRestorable(t *testing.T) {
+	built := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	point := func(name string, at time.Time) controller.RestorePoint {
+		return controller.RestorePoint{Name: name, CreatedAt: at,
+			Groups: []controller.GroupRestorePoint{{Group: "demo-shard-0", LSN: 1}}}
+	}
+	src := fakeCatalog{points: []controller.RestorePoint{
+		point("taken-on-the-source", built.Add(-time.Hour)),
+		point("within-the-margin", built.Add(59*time.Second)),
+		point("taken-here", built.Add(time.Minute)),
+	}}
+	objs := populated()
+	for _, o := range objs {
+		if pc, ok := o.(*pgshardv1alpha1.PgShardCluster); ok {
+			pc.Labels = map[string]string{operator.LabelRestoredFrom: "demo-restore-9"}
+			pc.Annotations = map[string]string{operator.AnnotationRestoreCompletedAt: built.Format(time.RFC3339)}
+		}
+	}
+	s, _ := newTestServer(t, src, objs...)
+
+	var points []RestorePoint
+	if err := json.Unmarshal(get(t, s, "/api/v1/restore-points").Body.Bytes(), &points); err != nil {
+		t.Fatal(err)
+	}
+	inherited := map[string]string{}
+	for _, p := range points {
+		inherited[p.Name] = p.Inherited
+	}
+	for _, name := range []string{"taken-on-the-source", "within-the-margin"} {
+		if !strings.Contains(inherited[name], "demo-restore-9") {
+			t.Errorf("%s is offered as restorable, or without the operator's reason: %q", name, inherited[name])
+		}
+	}
+	if inherited["taken-here"] != "" {
+		t.Errorf("a barrier the operator accepts is marked inherited: %q", inherited["taken-here"])
+	}
+	body := get(t, s, "/backups").Body.String()
+	if n := strings.Count(body, "not restorable: may belong to the cluster this one was restored from"); n != 2 {
+		t.Fatalf("the page marks %d barriers as inherited, want 2:\n%s", n, body)
+	}
+
+	// A cluster no restore built inherits nothing.
+	s, _ = newTestServer(t, src, populated()...)
+	points = nil
+	if err := json.Unmarshal(get(t, s, "/api/v1/restore-points").Body.Bytes(), &points); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range points {
+		if p.Inherited != "" {
+			t.Errorf("%s marked inherited on a cluster no restore built", p.Name)
+		}
 	}
 }
