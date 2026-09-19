@@ -758,6 +758,21 @@ func (o *pgCutover) Reverse(ctx context.Context) error {
 // It is only ever compared with an earlier hash of the SAME set, so the two
 // sides of an upgrade never have to render identically across majors.
 //
+// ENUM LABELS AND DOMAINS are here because the column line carries
+// format_type, which is the type's NAME: adding a value to an enum, or a
+// constraint to a domain, changes what rows are legal without changing any
+// line above. A reverse apply that meets a row carrying the new enum value
+// then fails, and the rollback waits on catch-up for ever (PGS-889).
+// enumsortorder is included because ADD VALUE ... BEFORE reorders labels,
+// which is a change even though the set of labels is the same.
+//
+// Functions, triggers and extensions are still NOT counted, deliberately
+// for now: pgshard installs its own triggers during a placement move
+// (placementfence.go) and pgroll installs functions and triggers during an
+// online DDL, so counting them risks reading pgshard's own work as user
+// drift and refusing a rollback that should proceed -- the failure this
+// comment's next paragraph is about. They want their own exclusion list.
+//
 // pgshard_journal is excluded for a reason worth keeping: the journal table
 // is created on the sources at StepJournal, which runs AFTER the
 // fingerprints are taken at StepReverse. Including it made every recorded
@@ -788,6 +803,25 @@ FROM (
     SELECT 'idx ' || schemaname || ' ' || indexname || ' ' || indexdef
       FROM pg_indexes
      WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+    UNION ALL
+    SELECT 'enum ' || n.nspname || ' ' || t.typname || ' ' || e.enumsortorder::text || ' ' || e.enumlabel
+      FROM pg_enum e
+      JOIN pg_type t ON t.oid = e.enumtypid
+      JOIN pg_namespace n ON n.oid = t.typnamespace
+     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+    UNION ALL
+    SELECT 'dom ' || n.nspname || ' ' || t.typname || ' ' || format_type(t.typbasetype, t.typtypmod)
+        || ' ' || t.typnotnull::text || ' ' || coalesce(t.typdefault, '')
+      FROM pg_type t
+      JOIN pg_namespace n ON n.oid = t.typnamespace
+     WHERE t.typtype = 'd'
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
+    UNION ALL
+    SELECT 'domcon ' || n.nspname || ' ' || t.typname || ' ' || k.conname || ' ' || pg_get_constraintdef(k.oid)
+      FROM pg_constraint k
+      JOIN pg_type t ON t.oid = k.contypid
+      JOIN pg_namespace n ON n.oid = t.typnamespace
+     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
 ) parts`
 
 // scalarString runs a query that returns exactly one text value.
