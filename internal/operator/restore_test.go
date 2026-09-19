@@ -899,6 +899,10 @@ func TestRestoreRefusesABarrierItsSourceInheritedFromARestore(t *testing.T) {
 		// and routinely deleted, and the cut-off has to survive it.
 		stamped time.Time
 		refused bool
+		// withinMargin is a refusal of a barrier recorded AFTER the cut-off,
+		// inside the margin. The code cannot order it against the cut-off,
+		// so the message must not say it was recorded "before" (PGS-933).
+		withinMargin bool
 	}{
 		{name: "recorded before the source was built", recorded: built.Add(-time.Hour), refused: true},
 		{name: "recorded on the source since", recorded: built.Add(time.Hour)},
@@ -912,6 +916,15 @@ func TestRestoreRefusesABarrierItsSourceInheritedFromARestore(t *testing.T) {
 		// inherited in that window is accepted again.
 		{name: "recorded while replaying, with the restore object deleted", recorded: built.Add(time.Hour), stamped: built.Add(2 * time.Hour), refused: true},
 		{name: "recorded after it finished, with the restore object deleted", recorded: built.Add(3 * time.Hour), stamped: built.Add(2 * time.Hour)},
+		// The margin (PGS-933). The barrier's time is the source database's
+		// clock and the cut-off is the operator's, so a barrier recorded just
+		// after the cut-off cannot be told from one recorded just before it.
+		// The owner chose to err towards refusing: retaking a barrier a
+		// minute later is the cheap failure, a restore that crash-loops on an
+		// inherited restore point is the expensive one.
+		{name: "recorded 30s after it finished, inside the margin", recorded: built.Add(2*time.Hour + 30*time.Second), stamped: built.Add(2 * time.Hour), refused: true, withinMargin: true},
+		{name: "recorded exactly at the margin", recorded: built.Add(2*time.Hour + inheritedBarrierMargin), stamped: built.Add(2 * time.Hour)},
+		{name: "recorded 2m after it finished, outside the margin", recorded: built.Add(2*time.Hour + 2*time.Minute), stamped: built.Add(2 * time.Hour)},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			source := boundCluster("old")
@@ -948,6 +961,11 @@ func TestRestoreRefusesABarrierItsSourceInheritedFromARestore(t *testing.T) {
 			}
 			if refused && !strings.Contains(got.Status.Error, "before-purge") {
 				t.Fatalf("the refusal does not name the restore the source came from: %s", got.Status.Error)
+			}
+			// Claiming "before" of a barrier recorded after the cut-off is the
+			// misdirection this message exists to avoid.
+			if refused && c.withinMargin == strings.Contains(got.Status.Error, "before PgShardRestore") {
+				t.Errorf("withinMargin=%v but the refusal's claim about which side of the cut-off it fell on does not match: %s", c.withinMargin, got.Status.Error)
 			}
 			if refused {
 				// The two times come from DIFFERENT clocks -- the barrier's
