@@ -81,6 +81,8 @@ func TestMain(m *testing.M) {
 
 type fakeProber struct {
 	mu sync.Mutex
+	// openTxns is what OpenClientTransactions answers for every server.
+	openTxns int
 	// standbyProbes counts ProbeStandby calls: a failover's, and also a
 	// switchover's or an admission check's.
 	standbyProbes int
@@ -309,6 +311,12 @@ func (f *fakeProber) MaterializeShardSet(_ context.Context, _ string, name strin
 	}
 	f.shardSets = append(f.shardSets, ShardSetInfo{Name: name, Generation: generation, State: state, Ranges: ranges, PGMajor: major})
 	return nil
+}
+
+func (f *fakeProber) OpenClientTransactions(context.Context, string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.openTxns, nil
 }
 
 func (f *fakeProber) DropShardSet(_ context.Context, _ string, name string) error {

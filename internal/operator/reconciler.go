@@ -279,7 +279,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	catalogReady, dsn := r.reconcileCatalogSchema(ctx, &cluster, catalogObs, password)
 	var plan reshardPlan
 	if catalogReady.Status == metav1.ConditionTrue {
-		plan, err = r.reconcileReshard(ctx, &cluster, dsn)
+		plan, err = r.reconcileReshard(ctx, &cluster, dsn, password)
 		if err != nil {
 			log.Error(err, "reshard reconciliation failed; groups keep reconciling")
 			plan.cond = metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionUnknown, Reason: "Error", Message: err.Error(), ObservedGeneration: cluster.Generation}
@@ -399,6 +399,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if d := cluster.Spec.Resharding.RetireOldGroupsAfter; d != nil && d.Duration < requeue {
 			requeue = requeueRetiring
 		}
+	}
+	if plan.draining {
+		requeue = requeueRetiring
 	}
 	for _, o := range slices.Concat(observations, targets, retired) {
 		if o.failing {

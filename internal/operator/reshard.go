@@ -40,6 +40,9 @@ func ReshardName(cluster string, generation int64) string {
 
 // reshardPlan is what reconcileReshard decided for this pass.
 type reshardPlan struct {
+	// draining says the retired groups are being held for open
+	// transactions, which the next pass has to look at again soon.
+	draining   bool
 	cond       metav1.Condition
 	placements []pgshardv1alpha1.ClusterPlacementWorkflowStatus
 	pending    *ShardSetInfo
@@ -88,7 +91,7 @@ func cancellableOnRevert(phase string) bool {
 	return false
 }
 
-func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string) (reshardPlan, error) {
+func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn, password string) (reshardPlan, error) {
 	log := logf.FromContext(ctx)
 	plan := reshardPlan{cond: metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionFalse, Reason: "Idle", Message: "", ObservedGeneration: c.Generation}}
 	base := c.DeepCopy()
@@ -157,7 +160,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	want := c.Spec.Shards
 
 	if pending == nil && retired != nil {
-		done, err := r.reconcileRetirement(ctx, c, base, dsn, serving, retired, &plan)
+		done, err := r.reconcileRetirement(ctx, c, base, dsn, password, serving, retired, &plan)
 		if err != nil || !done {
 			return plan, err
 		}
@@ -413,7 +416,7 @@ func (r *ClusterReconciler) mirrorCutoverSpec(ctx context.Context, c *pgshardv1a
 // set is retired in the catalog and its groups stay up for reverse
 // replication until the workflow completes, then they are deleted. It
 // reports done=false when the pass is fully handled here.
-func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster, dsn string, serving, retired *ShardSetInfo, plan *reshardPlan) (bool, error) {
+func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster, dsn, password string, serving, retired *ShardSetInfo, plan *reshardPlan) (bool, error) {
 	log := logf.FromContext(ctx)
 	record := &pgshardv1alpha1.PgShardReshard{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: ReshardName(c.Name, serving.Generation)}, record); err != nil {
@@ -431,6 +434,18 @@ func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pg
 	}
 	phase := reshardPhase(wf)
 	if phase == pgshardv1alpha1.ReshardPhaseCompleted {
+		open, err := r.drainRetired(ctx, c, record, password)
+		if err != nil {
+			return false, err
+		}
+		if open > 0 {
+			plan.draining = true
+			plan.cond.Status = metav1.ConditionTrue
+			plan.cond.Reason = "Draining"
+			plan.cond.Message = fmt.Sprintf("reshard %s completed; %s retires once %d open transaction(s) on it finish, or at most %s after the drain began",
+				record.Name, retired.Name, open, retireDrainBound)
+			return false, nil
+		}
 		log.Info("reshard completed; deleting retired groups", "set", retired.Name)
 		if err := r.deleteTargetGroups(ctx, c, retired.Name); err != nil {
 			return false, err
@@ -471,6 +486,60 @@ func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pg
 	}
 	plan.workflow, plan.record = wf, record
 	return false, r.patchClusterStatus(ctx, c, base)
+}
+
+// retireDrainBound is the longest a completed reshard's old groups are kept
+// for the transactions still open on them (PGS-927). Deleting a primary
+// runs a fast shutdown at once, which ends every session on it -- the
+// pooler's own drain on SIGTERM cannot help, because postgres is stopping
+// beside it -- so without this a retirement with retireOldGroupsAfter: 0
+// killed every transaction pinned to the old set at the switch. A session
+// still open at the bound is ended as before; its router answers it
+// 08006, and the session reconnects on its next statement.
+const retireDrainBound = 30 * time.Second
+
+// annotationRetireDrainStarted records on the reshard record when the
+// drain began, so an operator restart does not start the bound again.
+const annotationRetireDrainStarted = "pgshard.io/retire-drain-started"
+
+// drainRetired reports how many transactions the retired groups' primaries
+// still have open, or zero once there are none or the drain has run for
+// retireDrainBound. New work has gone to the new set since the switch, so
+// the count only falls.
+func (r *ClusterReconciler) drainRetired(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, record *pgshardv1alpha1.PgShardReshard, password string) (int, error) {
+	log := logf.FromContext(ctx)
+	open := 0
+	for _, g := range RetiredGroups(c) {
+		n, err := r.Prober.OpenClientTransactions(ctx, DSN(g.ServiceRW(), c.Namespace, password))
+		if err != nil {
+			// A primary the operator cannot reach has no session that
+			// waiting would save, and holding the retirement for it would
+			// keep every other group of the set for nothing.
+			log.Info("retired primary unreachable; not waiting for it", "group", g.Name(), "err", err)
+			continue
+		}
+		open += n
+	}
+	if open == 0 {
+		return 0, nil
+	}
+	started, err := time.Parse(time.RFC3339, record.Annotations[annotationRetireDrainStarted])
+	if err != nil {
+		started = r.now()
+		patch := client.MergeFrom(record.DeepCopy())
+		if record.Annotations == nil {
+			record.Annotations = map[string]string{}
+		}
+		record.Annotations[annotationRetireDrainStarted] = started.UTC().Format(time.RFC3339)
+		if err := r.Patch(ctx, record, patch); err != nil {
+			return 0, err
+		}
+	}
+	if waited := r.now().Sub(started); waited >= retireDrainBound {
+		log.Info("retiring with transactions still open: the drain bound passed", "open", open, "waited", waited.Round(time.Second))
+		return 0, nil
+	}
+	return open, nil
 }
 
 func cutoverPause(wf WorkflowInfo) *metav1.Duration {
