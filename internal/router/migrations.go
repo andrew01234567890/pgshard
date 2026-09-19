@@ -395,6 +395,15 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 	err := e.releaseUntouchedTxn(ctx)
 	if err == nil {
 		err = e.queueMigration(ctx, m, w)
+		if err == nil {
+			// From here the DDL is applied, whatever becomes of the
+			// transaction around it. Recording that below the replay
+			// instead left txnRanDDL false on the one path where the DDL
+			// is in and the transaction still fails -- and a transaction
+			// recovered afterwards would run shard statements and commit
+			// them as if they were part of the DDL.
+			e.txnRanDDL = true
+		}
 	}
 	if err == nil {
 		if rerr := e.replayPrelude(ctx); rerr != nil {
@@ -413,7 +422,6 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 		e.failTxn()
 		return err
 	}
-	e.txnRanDDL = true
 	return w.CommandComplete(m.Kind)
 }
 

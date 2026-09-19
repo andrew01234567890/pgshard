@@ -1047,6 +1047,9 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if handled, err := e.endNoTxn(pl.Class, w); handled {
 		return e.afterBatch(ctx, err)
 	}
+	if err := e.recoverFailedTxnToSavepoint(ctx, pl.Class); err != nil {
+		return e.afterBatch(ctx, err)
+	}
 	if err := e.refuseInFailedTransaction(pl.Class); err != nil {
 		return e.afterBatch(ctx, err)
 	}
@@ -1385,6 +1388,50 @@ func (e *Executor) endNoTxn(class StmtClass, w pgwire.ResultWriter) (bool, error
 		return true, err
 	}
 	return true, w.CommandComplete(tag)
+}
+
+// recoverFailedTxnToSavepoint reopens a failed transaction for a ROLLBACK
+// TO SAVEPOINT, which PostgreSQL answers in the failed state -- it is how a
+// client recovers a transaction instead of losing it.
+//
+// The router can only honour it where the transaction holds nothing on any
+// shard, and then the prelude is the whole transaction: replaying it
+// rebuilds the savepoint with everything before it, and the ROLLBACK TO
+// runs on the backend afterwards and undoes what came after. That state is
+// exactly what a failed sequential DDL leaves, because releaseUntouchedTxn
+// gave the backend up before the migration was queued.
+//
+// A transaction a failover killed after it touched a shard keeps the 25P02:
+// its work is gone, and answering ROLLBACK TO there would tell the client
+// the statements before the savepoint survived when nothing did.
+func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtClass) error {
+	if e.tx != pgwire.TxFailed || e.conn != nil || class.Txn != plan.TxnRollbackTo {
+		return nil
+	}
+	if e.txnTouched || e.multiShardTxn() || len(e.txnPrelude) == 0 {
+		return nil
+	}
+	if e.savepointIndex(class.Savepoint) < 0 {
+		// 25P02, not PostgreSQL's 3B001 for an unknown savepoint, because
+		// the router's record is not good enough to tell the two apart: a
+		// batch that fails partway records NONE of the statements the
+		// client already watched succeed, so a savepoint set in it is
+		// missing here although it existed. Answering "does not exist"
+		// would name the wrong problem in exactly the case where the
+		// transaction is dead (PGS-959).
+		return nil
+	}
+	e.tx = pgwire.TxIdle
+	if err := e.acquire(ctx, nil); err != nil {
+		// acquire only fails a transaction it can see, and it has just
+		// been told there is none. Failed is what this session is if the
+		// backend cannot be had: leaving it Idle would tell the client its
+		// transaction ended cleanly.
+		e.dropStream()
+		e.failTxn()
+		return err
+	}
+	return nil
 }
 
 // refuseInFailedTransaction answers what PostgreSQL answers while a
