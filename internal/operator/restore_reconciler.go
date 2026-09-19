@@ -286,21 +286,8 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 					return ctrl.Result{}, gerr
 				}
 			}
-			// The two timestamps come from DIFFERENT CLOCKS and are
-			// compared with no tolerance: rec.CreatedAt is the source
-			// database's clock, written when the barrier row was recorded,
-			// and built is the operator's or the API server's, at second
-			// granularity. So a barrier taken within the skew of a restore
-			// completing can be refused although it is genuinely this
-			// cluster's. The message says so rather than asserting a cause
-			// the comparison cannot actually establish -- being told a
-			// barrier "belongs to another cluster" when it does not, while
-			// reaching for a recovery path, is the worst moment to be
-			// misdirected. Whether to add a margin, and which way to err,
-			// is PGS-933 and is the owner's call.
-			if rec.CreatedAt.Before(built) {
-				return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q was recorded at %s, before PgShardRestore %s finished building %s at %s: it belongs to the cluster %s was restored from, whose repository holds its restore point; take a new barrier on %s. If those two times are within a few seconds of each other this may be clock skew instead -- they come from different clocks, the barrier's from the source database and the cut-off from the operator -- and a barrier taken after the restore really did finish is the one to retake",
-					name, rec.CreatedAt.UTC().Format(time.RFC3339), from, source.Name, built.UTC().Format(time.RFC3339), source.Name, source.Name))
+			if rec.CreatedAt.Before(built.Add(inheritedBarrierMargin)) {
+				return ctrl.Result{}, r.fail(ctx, rs, inheritedBarrierRefusal(name, rec.CreatedAt, from, source.Name, built))
 			}
 		}
 		refusal, berr := backupAfterBarrier(ctx, r.Client, rs, name, rec)
@@ -780,6 +767,40 @@ func boolCondition(b bool) metav1.ConditionStatus {
 		return metav1.ConditionTrue
 	}
 	return metav1.ConditionFalse
+}
+
+// inheritedBarrierMargin moves the inherited-barrier cut-off FORWARD, so a
+// barrier recorded shortly after the restore that built its cluster finished
+// is refused as well. The two times come from different clocks -- the
+// barrier's from the source database, the cut-off from the operator or the
+// API server at second granularity -- and cannot be ordered closer than the
+// skew between them.
+//
+// Erring towards refusing is the owner's choice (PGS-933). Its cost is not
+// "retake it": a barrier refused here is refused for good, and a new one is a
+// different, later point in time -- that barrier's own moment cannot be
+// restored to. What keeps it narrow is backupAfterBarrier, which already
+// refuses a barrier with no backup ending before it, and on a freshly
+// restored cluster that backup normally takes longer than the margin. Erring
+// the other way lets an inherited barrier through, and that restore fails
+// later and further from its cause, after it has created the cluster and
+// watched a member crash-loop on a restore point its repository does not hold.
+const inheritedBarrierMargin = time.Minute
+
+// inheritedBarrierRefusal says which side of the cut-off the barrier fell on,
+// because the two are different claims. Before it, the barrier was taken
+// while the cluster was still replaying the one it was restored from. Within
+// the margin after it, all the code knows is that the clocks cannot tell --
+// and saying "before" there would be false.
+func inheritedBarrierRefusal(barrier string, recorded time.Time, restore, cluster string, built time.Time) string {
+	rec, cut := recorded.UTC().Format(time.RFC3339), built.UTC().Format(time.RFC3339)
+	clocks := "The two times come from different clocks -- the barrier's from the source database, the cut-off from the operator -- and cannot be ordered closer than the clock skew between them"
+	if recorded.Before(built) {
+		return fmt.Sprintf("barrier %q was recorded at %s, before PgShardRestore %s finished building %s at %s: it belongs to the cluster %s was restored from, whose repository holds its restore point; take a new barrier on %s. %s, so if they are within a few seconds this may be skew instead, and a barrier taken after the restore really did finish is the one to retake",
+			barrier, rec, restore, cluster, cut, cluster, cluster, clocks)
+	}
+	return fmt.Sprintf("barrier %q was recorded at %s, within %.0f seconds after PgShardRestore %s finished building %s at %s. %s, so a barrier this close may still belong to the cluster %s was restored from, and it is refused rather than risk a restore that fails later on a restore point this cluster's repository does not hold. Take a new barrier on %s: one recorded at least %.0f seconds after the restore is accepted",
+		barrier, rec, inheritedBarrierMargin.Seconds(), restore, cluster, cut, clocks, cluster, cluster, inheritedBarrierMargin.Seconds())
 }
 
 func (r *RestoreReconciler) fail(ctx context.Context, rs *pgshardv1alpha1.PgShardRestore, msg string) error {
