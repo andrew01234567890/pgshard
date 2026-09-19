@@ -784,8 +784,17 @@ func (e *Executor) moveTo(ctx context.Context, target Shard) error {
 // noteExecuted records what a completed statement did to the open
 // transaction: session-local statements join the prelude, anything else
 // pins the transaction to the current shard.
-func (e *Executor) noteExecuted(sql string, local bool) {
+//
+// DEALLOCATE does neither. PostgreSQL does not undo it on rollback, and
+// noteSessionEffect already drops the statement from sqlPrepared, which a
+// fresh backend is given before the prelude is replayed -- so replaying
+// the DEALLOCATE as well ran it against a backend that never had the
+// statement, and its 26000 failed the replay (PGS-959).
+func (e *Executor) noteExecuted(sql string, local bool, class StmtClass) {
 	if e.tx == pgwire.TxIdle {
+		return
+	}
+	if class.Session == plan.SessionDeallocate {
 		return
 	}
 	if local {
@@ -843,6 +852,7 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.txnPrelude, e.txnTouched = nil, false
 		e.txnOnBackend, e.txnPreFence = false, false
 		e.txnRanDDL = false
+		e.savepoints = nil
 		// finishTxn is what lowers uncancellable, and a panic skips it. Left
 		// up, every later cancel on this session would be swallowed: the
 		// client waits out the cancel grace and gets 08006 instead of 57014,
@@ -1149,7 +1159,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		}
 		err := e.pump(ctx, cw)
 		if err == nil {
-			e.noteExecuted(sql, pl.Kind == plan.SessionLocal && !pl.Class.RunsOnAShard)
+			e.noteExecuted(sql, pl.Kind == plan.SessionLocal && !pl.Class.RunsOnAShard, pl.Class)
 		}
 		if pl.Class.SetGUC && err == nil {
 			g := gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath}
@@ -1427,6 +1437,12 @@ func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtCl
 		return nil
 	}
 	e.tx = pgwire.TxIdle
+	// The backend that opened the transaction is gone, and with it the
+	// write-pause verdict of its BEGIN. The replayed BEGIN is a new one,
+	// and pump takes the verdict again from it only if this is cleared: a
+	// transaction re-opened under the pause cannot write, whatever the one
+	// before it could (PGS-959).
+	e.txnOnBackend, e.txnPreFence = false, false
 	if err := e.acquire(ctx, nil); err != nil {
 		// acquire only fails a transaction it can see, and it has just
 		// been told there is none. Failed is what this session is if the
@@ -2188,7 +2204,7 @@ func (e *Executor) flush(ctx context.Context, w pgwire.ResultWriter) error {
 	err := e.pump(ctx, w)
 	if err == nil {
 		for _, item := range executed {
-			e.noteExecuted(item.sql, item.local)
+			e.noteExecuted(item.sql, item.local, item.class)
 			e.noteSessionEffect(item.class, item.sql)
 		}
 	}
@@ -2396,7 +2412,7 @@ func (e *Executor) sync(ctx context.Context) error {
 		e.hiddenExec = nil
 		if err == nil {
 			for _, item := range executed {
-				e.noteExecuted(item.sql, item.local)
+				e.noteExecuted(item.sql, item.local, item.class)
 				e.noteSessionEffect(item.class, item.sql)
 			}
 		}
