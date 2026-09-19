@@ -449,7 +449,13 @@ func (e *Executor) refuseDDLInTransaction(m *plan.Migration) error {
 // shard in a transaction that has already applied DDL on its own: the two
 // could not commit or roll back together.
 func (e *Executor) refuseShardStatementAfterDDL(pl plan.Plan) error {
-	if !e.txnRanDDL || pl.Kind == plan.MigrationKind || pl.Kind == plan.SessionLocal || pl.Class.Txn != plan.TxnNone {
+	// RunsOnAShard: an SQL-level EXECUTE or a FETCH is SessionLocal because
+	// the router does not route it, but it RUNS on the pinned backend, which
+	// is exactly what this refuses. Exempting it let an EXECUTE of a
+	// statement prepared outside the transaction run after DDL where a plain
+	// SELECT in the same place is refused (PGS-883 item 6).
+	if !e.txnRanDDL || pl.Kind == plan.MigrationKind || pl.Class.Txn != plan.TxnNone ||
+		(pl.Kind == plan.SessionLocal && !pl.Class.RunsOnAShard) {
 		return nil
 	}
 	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "a statement that runs on a shard is not available after DDL in the same transaction: the DDL was applied on its own, so the two cannot commit together")

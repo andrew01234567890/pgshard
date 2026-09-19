@@ -81,6 +81,20 @@ type StmtClass struct {
 	// SessionName is the statement name of an SQL-level PREPARE or
 	// DEALLOCATE; empty for DEALLOCATE ALL.
 	SessionName string
+	// RunsOnAShard marks a SessionLocal statement that nevertheless
+	// executes on the session's pinned backend rather than being answered
+	// by the router or applied to session state alone: an SQL-level
+	// EXECUTE, and a FETCH from a cursor.
+	//
+	// SessionLocal conflates the two, and the guards that keep a
+	// transaction's DDL apart from its shard work -- refuseDDLInTransaction
+	// and refuseShardStatementAfterDDL -- both exempt SessionLocal. So an
+	// EXECUTE of a statement prepared OUTSIDE the transaction ran on a
+	// shard without either noticing (PGS-883 item 6). Measured: "BEGIN;
+	// EXECUTE ins; CREATE TABLE" ran both, and "BEGIN; CREATE TABLE;
+	// EXECUTE ins" ran the EXECUTE where a plain SELECT in the same place
+	// is refused.
+	RunsOnAShard bool
 }
 
 // SessionKind classifies statements that create, drop or reset session

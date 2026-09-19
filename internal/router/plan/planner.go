@@ -1097,6 +1097,14 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		*pgquerypb.Node_FetchStmt, *pgquerypb.Node_ExecuteStmt, *pgquerypb.Node_CheckPointStmt, *pgquerypb.Node_ConstraintsSetStmt:
 		w.plan.Kind = SessionLocal
 		w.plan.Shards = nil
+		// EXECUTE and FETCH are session-local in that the router does not
+		// route them -- they go to the pinned backend -- but they DO run
+		// there, unlike SET, SHOW, DISCARD or DEALLOCATE. The DDL guards
+		// need that distinction; see StmtClass.RunsOnAShard.
+		switch n.(type) {
+		case *pgquerypb.Node_ExecuteStmt, *pgquerypb.Node_FetchStmt:
+			w.plan.Class.RunsOnAShard = true
+		}
 		return nil
 	}
 	// A local database has one shard, so "the planner does not know how to
