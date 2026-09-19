@@ -78,6 +78,10 @@ type scaleLedger struct {
 	// reason per tenant so a timeout can say why nothing was acknowledged.
 	mu      sync.Mutex
 	lastErr []string
+	// batches records, per tenant, when each batch was acknowledged and
+	// how many attempts it took, so a row the oracle cannot find can be
+	// placed against the cutover's own timeline.
+	batches []map[int64]string
 }
 
 func (l *scaleLedger) note(i int, format string, args ...any) {
@@ -110,12 +114,17 @@ func (l *scaleLedger) why() string {
 
 func startScaleLedger(ctx context.Context, c *e2e.Cluster) *scaleLedger {
 	lctx, cancel := context.WithCancel(ctx)
-	l := &scaleLedger{c: c, acked: make([]atomic.Int64, len(ledgerTenants)), stop: cancel, lastErr: make([]string, len(ledgerTenants))}
+	l := &scaleLedger{c: c, acked: make([]atomic.Int64, len(ledgerTenants)), stop: cancel, lastErr: make([]string, len(ledgerTenants)),
+		batches: make([]map[int64]string, len(ledgerTenants))}
+	for i := range l.batches {
+		l.batches[i] = map[int64]string{}
+	}
 	for i, tenant := range ledgerTenants {
 		l.wg.Add(1)
 		go func() {
 			defer l.wg.Done()
 			next := int64(1)
+			attempts := 0
 			for lctx.Err() == nil {
 				hi := next + 9
 				// An explicit VALUES list rather than INSERT ... SELECT: the
@@ -134,11 +143,16 @@ func startScaleLedger(ctx context.Context, c *e2e.Cluster) *scaleLedger {
 				// directly goes under the pooler and the router, which is
 				// where the fence lives, and a source written around the
 				// fence never stands still for the switch to proceed.
+				attempts++
 				if _, err := routerSQL(lctx, c, sql); err != nil {
 					l.note(i, "insert failed: %v", err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
+				l.mu.Lock()
+				l.batches[i][next] = fmt.Sprintf("ids %d-%d acked %s after %d attempt(s)", next, hi, time.Now().UTC().Format("15:04:05.000"), attempts)
+				l.mu.Unlock()
+				attempts = 0
 				l.acked[i].Store(hi)
 				next = hi + 1
 				time.Sleep(time.Second)
@@ -203,7 +217,8 @@ func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 			t.Fatalf("verify tenant %d on %s: %v", tenant, group, err)
 		}
 		if want := fmt.Sprintf("%d/%d", acked[i], acked[i]); got != want {
-			t.Fatalf("tenant %d on %s: %s, want %s (rows lost or duplicated)", tenant, group, got, want)
+			t.Fatalf("tenant %d on %s: %s, want %s (rows lost or duplicated); %s; %s",
+				tenant, group, got, want, whereAreTheRows(ctx, l.c, groups, group, tenant, acked[i]), l.batchesAround(i, group, tenant, acked[i]))
 		}
 		total += acked[i]
 
@@ -547,6 +562,62 @@ func reshardUnderLoad(t *testing.T, startShards int, steps []reshardStep) {
 			t.Errorf("tenant %d made too little progress under load: %d rows", ledgerTenants[i], acked[i])
 		}
 	}
+}
+
+// whereAreTheRows says what a failed count means: which acknowledged ids the
+// owner lacks or holds twice, and which other group holds each missing one.
+// "630/630, want 640/640" alone cannot tell a lost write from a misplaced
+// one, and that is the whole question when it fires (PGS-963).
+func whereAreTheRows(ctx context.Context, c *e2e.Cluster, groups []string, owner string, tenant, acked int64) string {
+	missing, err := shardSQL(ctx, c, owner, fmt.Sprintf(
+		`SELECT coalesce(string_agg(g::text, ',' ORDER BY g), '') FROM generate_series(1, %d) g
+		 WHERE NOT EXISTS (SELECT 1 FROM ledger WHERE tenant_id = %d AND id = g)`, acked, tenant))
+	if err != nil {
+		return fmt.Sprintf("listing the missing ids failed: %v", err)
+	}
+	twice, err := shardSQL(ctx, c, owner, fmt.Sprintf(
+		`SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM
+		 (SELECT id FROM ledger WHERE tenant_id = %d AND id <= %d GROUP BY id HAVING count(*) > 1) d`, tenant, acked))
+	if err != nil {
+		return fmt.Sprintf("listing the duplicated ids failed: %v", err)
+	}
+	out := fmt.Sprintf("missing on %s: [%s]; duplicated there: [%s]", owner, missing, twice)
+	if missing == "" {
+		return out
+	}
+	for _, g := range groups {
+		if g == owner {
+			continue
+		}
+		held, err := shardSQL(ctx, c, g, fmt.Sprintf(
+			`SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM ledger WHERE tenant_id = %d AND id IN (%s)`, tenant, missing))
+		if err != nil {
+			out += fmt.Sprintf("; %s unreadable: %v", g, err)
+			continue
+		}
+		out += fmt.Sprintf("; on %s: [%s]", g, held)
+	}
+	return out
+}
+
+// batchesAround names when each batch holding a missing id was acknowledged.
+func (l *scaleLedger) batchesAround(i int, owner string, tenant, acked int64) string {
+	missing, err := shardSQL(context.Background(), l.c, owner, fmt.Sprintf(
+		`SELECT coalesce(string_agg(DISTINCT (((g - 1) / 10) * 10 + 1)::text, ','), '') FROM generate_series(1, %d) g
+		 WHERE NOT EXISTS (SELECT 1 FROM ledger WHERE tenant_id = %d AND id = g)`, acked, tenant))
+	if err != nil || missing == "" {
+		return "no batch timeline"
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, f := range strings.Split(missing, ",") {
+		first, _ := strconv.ParseInt(f, 10, 64)
+		if b, ok := l.batches[i][first]; ok {
+			out = append(out, b)
+		}
+	}
+	return "batches: " + strings.Join(out, "; ")
 }
 
 // finishlessSnapshot reads the acknowledged high-water marks without

@@ -551,6 +551,10 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 			return c.abortSwitch(ctx, wf, ops, fmt.Sprintf("step %s finished but the fence had been held %s, over the %s limit",
 				step, c.now().Sub(*wf.cutover.FencedAt).Round(time.Millisecond), c.cutoverTimeout()))
 		}
+		// Logged at INFO, one line a step: a cutover lasts under a second
+		// and the saved message keeps only the last step, so without these
+		// a failure in it has no timeline to be placed against (PGS-963).
+		c.logger().Info("switch step done", "workflow", wf.id, "step", step, "positions", wf.cutover.Positions)
 		next := nextStep(step)
 		wf.cutover.Step = next
 		wf.cutover.stampStep(c.now())
