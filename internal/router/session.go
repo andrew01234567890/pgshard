@@ -1141,7 +1141,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		}
 		err := e.pump(ctx, cw)
 		if err == nil {
-			e.noteExecuted(sql, pl.Kind == plan.SessionLocal)
+			e.noteExecuted(sql, pl.Kind == plan.SessionLocal && !pl.Class.RunsOnAShard)
 		}
 		if pl.Class.SetGUC && err == nil {
 			g := gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath}
@@ -1784,7 +1784,11 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 			e.failBatch()
 			return err
 		}
-		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class, tables: st.plan.Tables})
+		// local drives noteExecuted, which is what sets txnTouched. An
+		// EXECUTE or FETCH is SessionLocal but does touch the shard, so
+		// calling it local left refuseDDLInTransaction believing the
+		// transaction had run nothing there (PGS-883 item 6).
+		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal && !st.plan.Class.RunsOnAShard, class: st.class, tables: st.plan.Tables})
 	}
 	e.batch = append(e.batch, executeReq(portal, maxRows))
 	e.batchDDL = append(e.batchDDL, e.portalDDL[portal])
