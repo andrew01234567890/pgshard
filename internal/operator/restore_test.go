@@ -949,6 +949,36 @@ func TestRestoreRefusesABarrierItsSourceInheritedFromARestore(t *testing.T) {
 			if refused && !strings.Contains(got.Status.Error, "before-purge") {
 				t.Fatalf("the refusal does not name the restore the source came from: %s", got.Status.Error)
 			}
+			if refused {
+				// The two times come from DIFFERENT clocks -- the barrier's
+				// from the source database, the cut-off from the operator --
+				// and are compared with no tolerance, so this refusal can
+				// land on a barrier that is genuinely this cluster's. The
+				// message must show both times and admit skew rather than
+				// assert a cause the comparison cannot establish: an
+				// operator reaching for a recovery path is the worst person
+				// to misdirect (PGS-933).
+				for _, want := range []string{"clock skew", "different clocks"} {
+					if !strings.Contains(got.Status.Error, want) {
+						t.Errorf("the refusal does not mention %q, so a barrier refused by skew reads as one belonging to another cluster: %s", want, got.Status.Error)
+					}
+				}
+				// The cut-off in precedence order: the cluster's own stamp,
+				// else the PgShardRestore's CompletedAt, else the cluster's
+				// creation time.
+				cut := built
+				if !c.completed.IsZero() {
+					cut = c.completed
+				}
+				if !c.stamped.IsZero() {
+					cut = c.stamped
+				}
+				for _, want := range []string{c.recorded.UTC().Format(time.RFC3339), cut.UTC().Format(time.RFC3339)} {
+					if !strings.Contains(got.Status.Error, want) {
+						t.Errorf("the refusal does not show the time %s, so the reader cannot see how far apart the two clocks are: %s", want, got.Status.Error)
+					}
+				}
+			}
 		})
 	}
 }

@@ -286,9 +286,21 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 					return ctrl.Result{}, gerr
 				}
 			}
+			// The two timestamps come from DIFFERENT CLOCKS and are
+			// compared with no tolerance: rec.CreatedAt is the source
+			// database's clock, written when the barrier row was recorded,
+			// and built is the operator's or the API server's, at second
+			// granularity. So a barrier taken within the skew of a restore
+			// completing can be refused although it is genuinely this
+			// cluster's. The message says so rather than asserting a cause
+			// the comparison cannot actually establish -- being told a
+			// barrier "belongs to another cluster" when it does not, while
+			// reaching for a recovery path, is the worst moment to be
+			// misdirected. Whether to add a margin, and which way to err,
+			// is PGS-933 and is the owner's call.
 			if rec.CreatedAt.Before(built) {
-				return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q was recorded at %s, before PgShardRestore %s finished building %s: it belongs to the cluster %s was restored from, whose repository holds its restore point; take a new barrier on %s",
-					name, rec.CreatedAt.UTC().Format(time.RFC3339), from, source.Name, source.Name, source.Name))
+				return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q was recorded at %s, before PgShardRestore %s finished building %s at %s: it belongs to the cluster %s was restored from, whose repository holds its restore point; take a new barrier on %s. If those two times are within a few seconds of each other this may be clock skew instead -- they come from different clocks, the barrier's from the source database and the cut-off from the operator -- and a barrier taken after the restore really did finish is the one to retake",
+					name, rec.CreatedAt.UTC().Format(time.RFC3339), from, source.Name, built.UTC().Format(time.RFC3339), source.Name, source.Name))
 			}
 		}
 		refusal, berr := backupAfterBarrier(ctx, r.Client, rs, name, rec)
