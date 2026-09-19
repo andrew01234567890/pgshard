@@ -363,6 +363,20 @@ func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 		case pgquerypb.VariableSetKind_VAR_RESET_ALL:
 			c.SetGUC, c.GUCName = true, ""
 		case pgquerypb.VariableSetKind_VAR_SET_MULTI:
+			// A snapshot belongs to ONE backend. The id comes from
+			// pg_export_snapshot(), which pgshard routes to a single shard,
+			// so it is only meaningful there -- and the client cannot know
+			// which shard that was. Relayed as it used to be, it pinned a
+			// snapshot on the session's current shard and left every other
+			// shard the transaction reached on its own, which is the same
+			// missing guarantee that makes a multi-shard REPEATABLE READ
+			// refused. It also survives into the transaction prelude, and
+			// the router replays that on a fresh backend when it has to
+			// give one up -- where the exporting transaction is long gone.
+			if strings.EqualFold(s.GetName(), "TRANSACTION SNAPSHOT") {
+				return notYet("SET TRANSACTION SNAPSHOT is not available: a snapshot belongs to one shard's backend, and pgshard has no snapshot that spans shards",
+					"a transaction confined to one shard can use REPEATABLE READ for a stable view; there is no equivalent across shards")
+			}
 			if strings.EqualFold(s.GetName(), "SESSION CHARACTERISTICS") {
 				c.SetGUC, c.GUCName = true, "session characteristics"
 			}
