@@ -689,6 +689,11 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		return true, s.complete("RELEASE")
 	case strings.HasPrefix(q, "prepare ") && strings.Contains(q, " as "):
 		name, body, _ := strings.Cut(strings.TrimPrefix(q, "prepare "), " as ")
+		// PostgreSQL's answer to a name already prepared on the backend: a
+		// fake that overwrote it hid a replay that prepared a statement twice.
+		if _, dup := b.stmts[strings.TrimSpace(name)]; dup {
+			return true, s.errorf("42P05", "prepared statement \""+strings.TrimSpace(name)+"\" already exists")
+		}
 		b.stmts[strings.TrimSpace(name)] = strings.TrimSpace(body)
 		return true, s.complete("PREPARE")
 	case strings.HasPrefix(q, "execute "):
