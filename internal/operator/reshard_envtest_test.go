@@ -342,9 +342,28 @@ func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
 		t.Errorf("status.shards must list the new serving shards: %+v", c.Status.Shards)
 	}
 
+	// Transactions still open on the old primaries hold the retirement
+	// (PGS-927): deleting a primary fast-shuts it down, which ends them.
 	fp.mu.Lock()
 	fp.workflows["g2"] = WorkflowInfo{ID: "wf-2", State: "completed", Stage: "completed", CutoverPauseMS: 800}
+	fp.openTxns = 2
 	fp.mu.Unlock()
+	now := time.Now()
+	r.Now = func() time.Time { return now }
+	reconcile(t, r, c)
+	reconcile(t, r, c)
+	get(t, "rsw-shard-0", &pgshardv1alpha1.PgShardGroup{})
+	get(t, "rsw-reshard-g2", &rec)
+	if rec.Annotations[annotationRetireDrainStarted] == "" {
+		t.Fatal("the drain's start is not recorded, so an operator restart would begin the bound again")
+	}
+	get(t, "rsw", c)
+	if cond := meta.FindStatusCondition(c.Status.Conditions, pgshardv1alpha1.ConditionResharding); cond == nil || cond.Reason != "Draining" {
+		t.Fatalf("a drain in progress is not reported: %+v", cond)
+	}
+	// The bound is a bound: open transactions do not hold the old groups
+	// past it.
+	now = now.Add(retireDrainBound)
 	reconcile(t, r, c)
 	reconcile(t, r, c)
 	get(t, "rsw-reshard-g2", &rec)

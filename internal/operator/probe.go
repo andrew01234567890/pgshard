@@ -85,6 +85,9 @@ type Prober interface {
 	MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet, major int) error
 	// DropShardSet removes a shard set with its ranges and status rows.
 	DropShardSet(ctx context.Context, dsn, name string) error
+	// OpenClientTransactions counts the client sessions of one server that
+	// are inside a transaction.
+	OpenClientTransactions(ctx context.Context, dsn string) (int, error)
 	// SetShardSetMajor stamps the PostgreSQL major a set's groups run.
 	SetShardSetMajor(ctx context.Context, dsn, name string, major int) error
 	// SetWorkflowRollback asks a switched upgrade workflow to return
@@ -454,6 +457,20 @@ func (PgxProber) MaterializeShardSet(ctx context.Context, dsn, name string, gene
 // DropShardSet removes a shard set in one transaction.
 func (PgxProber) DropShardSet(ctx context.Context, dsn, name string) error {
 	return inTx(ctx, dsn, func(tx pgx.Tx) error { return catalog.DropShardSet(ctx, tx, name) })
+}
+
+// OpenClientTransactions counts the client backends of one server with a
+// transaction open, other than the one asking.
+func (PgxProber) OpenClientTransactions(ctx context.Context, dsn string) (int, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var n int
+	err = conn.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+		WHERE backend_type = 'client backend' AND xact_start IS NOT NULL AND pid <> pg_backend_pid()`).Scan(&n)
+	return n, err
 }
 
 // ReshardWorkflow returns the newest reshard or upgrade workflow targeting
@@ -1226,6 +1243,12 @@ func (b boundedProber) DropShardSet(ctx context.Context, dsn, name string) error
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.DropShardSet(ctx, dsn, name)
+}
+
+func (b boundedProber) OpenClientTransactions(ctx context.Context, dsn string) (int, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.OpenClientTransactions(ctx, dsn)
 }
 
 func (b boundedProber) SetShardSetMajor(ctx context.Context, dsn, name string, major int) error {

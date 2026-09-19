@@ -417,6 +417,17 @@ At `0s` it does not hold at all: the run completes and the operator deletes
 the old groups on the pass that sees the switch, so there is no window to
 switch back in.
 
+Before deleting them the operator drains them: deleting a primary shuts it
+down at once and ends every session on it, so while any client transaction
+is still open on an old primary the groups stay, for at most 30 seconds
+from the first pass that saw one (the `Resharding` condition reads
+`Draining`, and the start is recorded on the `PgShardReshard` as
+`pgshard.io/retire-drain-started`). New work has gone to the new set since
+the switch, so only transactions begun before it are waited for. A
+transaction still open at the bound is ended with its old primary; its
+client gets `08006` and its session reconnects to the new set on the next
+statement. This applies at `0s` too.
+
 The window is an **upper bound on the rollback, not a guarantee of it**. DDL
 goes to the serving set and logical replication does not carry it, so a
 schema change inside the window ends the rollback: the drift check refuses a
