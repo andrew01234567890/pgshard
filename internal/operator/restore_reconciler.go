@@ -262,33 +262,12 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// restored from -- a restore to the end of the archive keeps
 		// replaying that cluster's WAL after this one's object exists -- and
 		// its restore point is in that cluster's repository, not this one's.
-		if from := source.Labels[LabelRestoredFrom]; from != "" {
-			// The cluster's own stamp first: the PgShardRestore is a
-			// one-shot object operators delete, and without it the cut-off
-			// falls back to the cluster's creation time -- which is BEFORE
-			// recovery ended, so every barrier inherited in that window is
-			// accepted again. That is the window this check exists for.
-			built := source.CreationTimestamp.Time
-			if at, err := time.Parse(time.RFC3339, source.Annotations[AnnotationRestoreCompletedAt]); err == nil {
-				built = at
-			} else {
-				var buildingRestore pgshardv1alpha1.PgShardRestore
-				gerr := r.Get(ctx, types.NamespacedName{Namespace: source.Namespace, Name: from}, &buildingRestore)
-				switch {
-				case gerr == nil:
-					if buildingRestore.Spec.NewClusterName == source.Name && buildingRestore.Status.CompletedAt != nil {
-						built = buildingRestore.Status.CompletedAt.Time
-					}
-				case !apierrors.IsNotFound(gerr):
-					// Deleted is an answer; unreachable is not. Falling
-					// through on an API failure would loosen the cut-off
-					// for as long as the failure lasted.
-					return ctrl.Result{}, gerr
-				}
-			}
-			if rec.CreatedAt.Before(built.Add(inheritedBarrierMargin)) {
-				return ctrl.Result{}, r.fail(ctx, rs, inheritedBarrierRefusal(name, rec.CreatedAt, from, source.Name, built))
-			}
+		cut, err := InheritedBarrierCutoffOf(ctx, r.Client, &source)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if refusal := cut.Refusal(name, rec.CreatedAt); refusal != "" {
+			return ctrl.Result{}, r.fail(ctx, rs, refusal)
 		}
 		refusal, berr := backupAfterBarrier(ctx, r.Client, rs, name, rec)
 		if berr != nil {
@@ -767,6 +746,58 @@ func boolCondition(b bool) metav1.ConditionStatus {
 		return metav1.ConditionTrue
 	}
 	return metav1.ConditionFalse
+}
+
+// InheritedBarrierCutoff is where a restored cluster's inherited barriers
+// end: those recorded before Built, plus inheritedBarrierMargin, belong to
+// the cluster it was restored from. The restore reconciler refuses them and
+// the admin UI marks them, from this one value, so the two cannot disagree
+// about which barriers are restorable (PGS-961).
+type InheritedBarrierCutoff struct {
+	Restore, Cluster string
+	Built            time.Time
+}
+
+// InheritedBarrierCutoffOf returns the cut-off of cluster, or nil for a
+// cluster no restore built.
+func InheritedBarrierCutoffOf(ctx context.Context, c client.Reader, cluster *pgshardv1alpha1.PgShardCluster) (*InheritedBarrierCutoff, error) {
+	from := cluster.Labels[LabelRestoredFrom]
+	if from == "" {
+		return nil, nil
+	}
+	// The cluster's own stamp first: the PgShardRestore is a one-shot
+	// object operators delete, and without it the cut-off falls back to the
+	// cluster's creation time -- which is BEFORE recovery ended, so every
+	// barrier inherited in that window is accepted again. That is the
+	// window this check exists for.
+	built := cluster.CreationTimestamp.Time
+	if at, err := time.Parse(time.RFC3339, cluster.Annotations[AnnotationRestoreCompletedAt]); err == nil {
+		built = at
+	} else {
+		var buildingRestore pgshardv1alpha1.PgShardRestore
+		gerr := c.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: from}, &buildingRestore)
+		switch {
+		case gerr == nil:
+			if buildingRestore.Spec.NewClusterName == cluster.Name && buildingRestore.Status.CompletedAt != nil {
+				built = buildingRestore.Status.CompletedAt.Time
+			}
+		case !apierrors.IsNotFound(gerr):
+			// Deleted is an answer; unreachable is not. Falling through on
+			// an API failure would loosen the cut-off for as long as the
+			// failure lasted.
+			return nil, gerr
+		}
+	}
+	return &InheritedBarrierCutoff{Restore: from, Cluster: cluster.Name, Built: built}, nil
+}
+
+// Refusal is why a restore to barrier, recorded at recorded, is refused as
+// inherited, or "" when it is not.
+func (cut *InheritedBarrierCutoff) Refusal(barrier string, recorded time.Time) string {
+	if cut == nil || !recorded.Before(cut.Built.Add(inheritedBarrierMargin)) {
+		return ""
+	}
+	return inheritedBarrierRefusal(barrier, recorded, cut.Restore, cut.Cluster, cut.Built)
 }
 
 // inheritedBarrierMargin moves the inherited-barrier cut-off FORWARD, so a

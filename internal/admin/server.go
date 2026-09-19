@@ -361,7 +361,13 @@ func (s *Server) handleAPIRestorePoints(w http.ResponseWriter, r *http.Request) 
 			s.fail(w, err)
 			return
 		}
-		out = ConvertRestorePoints(points, catalogRebuilt(onlyCluster(clusters.Items, s.Cluster)))
+		scoped := onlyCluster(clusters.Items, s.Cluster)
+		cut, err := inheritedCutoff(r.Context(), s.Client, scoped)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		out = ConvertRestorePoints(points, catalogRebuilt(scoped), cut)
 	}
 	writeJSON(w, out)
 }
