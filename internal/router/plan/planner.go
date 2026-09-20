@@ -828,6 +828,10 @@ type walker struct {
 	// inLocalSchemas says the statement's objects all live in the
 	// database's local schemas, so it runs on the home shard.
 	inLocalSchemas bool
+	// intoSelect is set while derived() replans a SELECT ... INTO as the
+	// query behind the relation it creates, so that the second pass reads
+	// it as an ordinary SELECT instead of routing it back here.
+	intoSelect bool
 	// root is the statement being planned; raw wraps it and sql is its text.
 	root *pgquerypb.Node
 	raw  *pgquerypb.RawStmt
@@ -974,6 +978,16 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	switch n := node.GetNode().(type) {
 	case *pgquerypb.Node_SelectStmt:
 		w.stmt = "SELECT"
+		// SELECT ... INTO is CREATE TABLE AS in another spelling: it
+		// creates the relation the into clause names. Planned as a plain
+		// SELECT it was routed and answered without any of the checks
+		// that creating a relation carries -- the placement of the table
+		// it creates, the refusal to build one out of distributed rows,
+		// or the mark that stops DDL running during a reshard (PGS-969).
+		if into := n.SelectStmt.GetIntoClause(); into != nil && !w.intoSelect {
+			w.intoSelect = true
+			return w.derived(into.GetRel(), node, "SELECT INTO")
+		}
 		if name := w.nextvalName(n.SelectStmt); name != "" {
 			w.plan.Kind, w.plan.Shards, w.plan.NextVal = SessionLocal, nil, name
 			return nil
@@ -1065,6 +1079,18 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	case *pgquerypb.Node_VacuumStmt:
 		return w.vacuum(n.VacuumStmt)
 	case *pgquerypb.Node_CreateSchemaStmt:
+		// CREATE SCHEMA s CREATE TABLE ... / CREATE VIEW ... is refused
+		// rather than run: the statement is planned as one CREATE SCHEMA,
+		// so the objects inside it are created without ever meeting the
+		// checks their own statements would meet -- a table without the
+		// shard-key rules, a view without the distributed-table refusal,
+		// neither declared in pgshard.tables. On a local schema it is
+		// worse, because the whole statement is routed home and nothing
+		// looks inside at all (PGS-969).
+		if len(n.CreateSchemaStmt.GetSchemaElts()) > 0 {
+			return notYet("CREATE SCHEMA with objects declared inside it is not available yet: the objects would be created without the checks their own statements carry",
+				"CREATE SCHEMA on its own, then create each object in its own statement")
+		}
 		return w.migration(Migration{Kind: "CREATE SCHEMA", Scope: ScopeAll,
 			Object: ObjectRef{Kind: "schema", Name: n.CreateSchemaStmt.GetSchemaname(), Expect: objectPresent}})
 	case *pgquerypb.Node_CreateSeqStmt:
@@ -1263,6 +1289,14 @@ func (w *walker) derived(rv *pgquerypb.RangeVar, query *pgquerypb.Node, what str
 		return notYet(what+" over sharded or reference tables is not available yet",
 			"the object would exist on the home shard only; create it through the operator on every shard")
 	}
+	// It creates an object, so it is DDL, and it never reaches migration():
+	// it runs on the home shard directly, in the client's own transaction,
+	// whatever the database. HomeDDL marks exactly that, so the executor
+	// refuses it while something it would overlap is unfinished. Without
+	// the mark a relation created during a reshard lived on the source
+	// alone -- the copy carries rows, not new relations -- and cutover lost
+	// it (PGS-969).
+	w.plan.HomeDDL = true
 	return nil
 }
 
@@ -1374,9 +1408,10 @@ func (w *walker) outerFeatures(s *pgquerypb.SelectStmt) {
 	if len(s.GetLockingClause()) > 0 {
 		w.blocker("FOR UPDATE/SHARE")
 	}
-	if s.GetIntoClause() != nil {
-		w.blocker("SELECT INTO")
-	}
+	// No blocker for the into clause. Every SELECT ... INTO now reaches
+	// derived(), which refuses the multi-shard case with the reason that
+	// is true of it: the relation it creates lives on the home shard, so
+	// it cannot be built out of rows that are spread across shards.
 }
 
 func hasWindow(node *pgquerypb.Node) bool {

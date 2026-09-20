@@ -158,7 +158,11 @@ func TestMergeSpecRefusals(t *testing.T) {
 		{"select id from orders limit -1", "LIMIT must not be negative"},
 		{"select row_number() over (order by id) from orders", "multi-shard SELECT with window functions"},
 		{"select * from orders for share", "multi-shard SELECT with FOR UPDATE/SHARE"},
-		{"select * into tmp from orders", "multi-shard SELECT with SELECT INTO"},
+		// SELECT INTO creates a relation, so it is refused by the rule
+		// about the relation rather than by a scatter blocker: it would
+		// live on the home shard, and it cannot be built out of rows
+		// that are spread across shards.
+		{"select * into tmp from orders", "SELECT INTO over sharded or reference tables is not available yet"},
 		{"select * from orders where tenant_id in (select 1)", "multi-shard SELECT with subqueries"},
 		// Each reason a colocated plan is impossible says which one it is.
 		// They used to share the join message, so a statement with no join

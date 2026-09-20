@@ -435,7 +435,7 @@ expressions), `FETCH … WITH TIES`, `ORDER BY … USING`, `ORDER BY` on a
 type without a comparator (`jsonb`, arrays, …), `min()`/`max()` over a text
 column, `sum()` over a non-numeric type, `SELECT DISTINCT` ordered by an
 expression outside the select list, window functions, `FOR UPDATE/SHARE`,
-`SELECT INTO`, set operations, CTEs, subqueries, joins that are not
+set operations, CTEs, subqueries, joins that are not
 colocated (above) and function scans, and `EXPLAIN`/`DECLARE CURSOR` of a
 scatter. `ORDER BY 3` past the select list is `42P10`, a negative `LIMIT`
 `2201W`, as in PostgreSQL.
@@ -500,7 +500,7 @@ could act on.
 
 | Statement shape | Message |
 |---|---|
-| multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, SELECT INTO, set operations, CTEs, subqueries, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; only a plain SELECT can run on multiple shards |
+| multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, set operations, CTEs, subqueries, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; only a plain SELECT can run on multiple shards |
 | `UPDATE`/`DELETE` without a key predicate | scatter UPDATE/DELETE without a shard key predicate is not available yet |
 | tables that do not resolve to one shard | a message naming which one it is — see *Colocated joins*; only a join of sharded tables on a non-key column is "cross-shard join is not available yet" |
 | a single-shard statement that also includes an unsharded table, resolving off the home shard | a statement including an unsharded table must resolve to the home shard alone |
@@ -551,8 +551,17 @@ rolled back with the transaction); rewrite-class `ALTER TABLE` (`ALTER COLUMN
 volatile `DEFAULT`) until online schema change; dropping, renaming or retyping
 the shard key column; renaming or moving a sharded/reference table to another
 schema (the catalog declares it by name); one statement touching both sharded
-and unsharded tables; `CREATE TABLE AS` over sharded or reference tables.
+and unsharded tables; `CREATE TABLE AS` over sharded or reference tables;
+`CREATE SCHEMA` with objects declared inside it (they would be created
+without the checks their own statements carry).
 Sessions on the catalog database run DDL on the catalog directly.
+
+`CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` and `SELECT … INTO` create
+their relation on the home shard, in the client's own transaction, rather
+than through the migration model — so the query behind them must itself run
+on the home shard alone, and, like a local database's DDL, they are refused
+while a reshard, upgrade or table placement they would overlap is
+unfinished.
 
 ### Reference tables
 
