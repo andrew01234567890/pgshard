@@ -232,9 +232,18 @@ func (e *Executor) routerAnswers(batch []*pgshardv1.ExecuteRequest, parsed []str
 // that prepares and then binds sends no values at all unless the server
 // says how many it expects, so answering nothing here is not "this takes no
 // parameters" but "this cannot be prepared with any".
-func answerBatch(batch []*pgshardv1.ExecuteRequest, paramOIDs []uint32, answer func(describe, execute bool) error, w pgwire.ResultWriter) error {
+func (e *Executor) answerBatch(batch []*pgshardv1.ExecuteRequest, paramOIDs []uint32, answer func(describe, execute bool) error, w pgwire.ResultWriter) error {
 	for _, req := range batch {
 		switch r := req.Message.(type) {
+		case *pgshardv1.ExecuteRequest_Parse, *pgshardv1.ExecuteRequest_Bind, *pgshardv1.ExecuteRequest_Close:
+			// The completions a backend would have sent. A batch the
+			// router answers itself reaches no backend, and without these
+			// the client's first answer was the row description -- one
+			// message out of step for the rest of the connection, which
+			// is how a driver loses a pipeline (PGS-939 review).
+			if err := e.answerStagedCompletions(w, []*pgshardv1.ExecuteRequest{req}); err != nil {
+				return err
+			}
 		case *pgshardv1.ExecuteRequest_Describe:
 			if r.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
 				if err := w.ParameterDescription(paramOIDs); err != nil {
@@ -268,7 +277,7 @@ func (e *Executor) nextvalBatch(ctx context.Context, batch []*pgshardv1.ExecuteR
 	if err := e.refuseSelfAnsweredInFailedTxn(); err != nil {
 		return true, err
 	}
-	return true, answerBatch(batch, nil, func(describe, execute bool) error {
+	return true, e.answerBatch(batch, nil, func(describe, execute bool) error {
 		return e.answerNextval(ctx, st.plan.NextVal, describe, execute, binary, w)
 	}, w)
 }
@@ -285,7 +294,7 @@ func (e *Executor) explainBatch(batch []*pgshardv1.ExecuteRequest, parsed []stri
 		err.Hint = "send a Sync before and after it"
 		return true, err
 	}
-	return true, answerBatch(batch, declaredOver(st.plan.ExplainParams, st.oids), func(describe, execute bool) error {
+	return true, e.answerBatch(batch, declaredOver(st.plan.ExplainParams, st.oids), func(describe, execute bool) error {
 		return e.answerExplain(st.plan.Explain, describe, execute, w)
 	}, w)
 }
