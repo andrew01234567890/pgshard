@@ -509,6 +509,20 @@ func TestARerunAfterARollbackRetiresItsRealSource(t *testing.T) {
 
 	fp.mu.Lock()
 	fp.workflows["g3"] = WorkflowInfo{ID: "wf-3", State: "completed", Stage: "completed", SourceSet: catalog.DefaultShardSet}
+	// g2's own run is still going -- a rollback retires its target before
+	// it has released the pause and dropped replication -- so g2's groups
+	// are still in use and must survive, while default's go.
+	fp.workflows["g2"] = WorkflowInfo{ID: "wf-2", State: "running", Stage: "rolling_back"}
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	reconcile(t, r, c)
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "rrb-marker-g2"}, &corev1.ConfigMap{}); err != nil {
+		t.Errorf("g2's groups were deleted while its own run was still going: %v", err)
+	}
+
+	// Once that run ends, g2 goes too.
+	fp.mu.Lock()
+	fp.workflows["g2"] = WorkflowInfo{ID: "wf-2", State: "cancelled", Stage: "rolled_back"}
 	fp.mu.Unlock()
 	reconcile(t, r, c)
 	reconcile(t, r, c)

@@ -109,7 +109,11 @@ func TestSchemaFingerprintSeesTheBodyOfAFunctionAConstraintCalls(t *testing.T) {
 	mustExec(t, conn, `CREATE FUNCTION unused(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1'`)
 	mustExec(t, conn, `CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'`)
 	mustExec(t, conn, `CREATE DOMAIN bounded AS int CHECK (small(VALUE))`)
-	mustExec(t, conn, `CREATE TABLE guarded (id bigint PRIMARY KEY, x int CHECK (legal(x)), b bounded, k int)`)
+	// A SQL-standard body (PostgreSQL 14+): its code lives in prosqlbody,
+	// not prosrc, so a fingerprint that hashes prosrc alone cannot see it
+	// change.
+	mustExec(t, conn, `CREATE FUNCTION atomic(int) RETURNS bool LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT $1 > 0; END`)
+	mustExec(t, conn, `CREATE TABLE guarded (id bigint PRIMARY KEY, x int CHECK (legal(x)), b bounded, k int, a int CHECK (atomic(a)))`)
 	mustExec(t, conn, `CREATE UNIQUE INDEX guarded_bucket ON guarded (bucket(k))`)
 
 	for _, c := range []struct {
@@ -118,6 +122,7 @@ func TestSchemaFingerprintSeesTheBodyOfAFunctionAConstraintCalls(t *testing.T) {
 	}{
 		{"the body of a function a table CHECK calls", `CREATE OR REPLACE FUNCTION legal(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > -100'`, true},
 		{"the body of a function a domain CHECK calls", `CREATE OR REPLACE FUNCTION small(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 < 5000'`, true},
+		{"the SQL-standard body of a function a CHECK calls", `CREATE OR REPLACE FUNCTION atomic(int) RETURNS bool LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT $1 > -100; END`, true},
 		{"the body of a function a unique index is built on", `CREATE OR REPLACE FUNCTION bucket(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 / 100'`, true},
 		{"the body of a function nothing references", `CREATE OR REPLACE FUNCTION unused(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1'`, false},
 		{"a trigger added to a replicated table", `CREATE TRIGGER t BEFORE INSERT ON guarded FOR EACH ROW EXECUTE FUNCTION trg()`, false},

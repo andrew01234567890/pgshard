@@ -837,7 +837,8 @@ FROM (
      WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
     UNION ALL
     SELECT DISTINCT 'fn ' || n.nspname || ' ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') '
-        || md5(p.prosrc || ' ' || coalesce(p.probin, ''))
+        || md5(coalesce(p.prosrc, '') || ' ' || coalesce(p.probin, '')
+                || ' ' || coalesce(pg_get_function_sqlbody(p.oid), ''))
       FROM pg_depend d
       JOIN pg_proc p ON p.oid = d.refobjid
       JOIN pg_namespace n ON n.oid = p.pronamespace

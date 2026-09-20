@@ -83,6 +83,28 @@ func TestRollbackToSavepointRecoversAFailedTransactionOverTheExtendedProtocol(t 
 		}
 	})
 
+	// The same recovery with the ROLLBACK TO carried by a NAMED statement.
+	// The recovery replays the session's prepared statements onto the
+	// backend it acquires; the batch then parses its own named statement
+	// as it is forwarded, and PostgreSQL refuses a second Parse of a live
+	// name with 42P05 -- so a replay that did not exclude the batch's own
+	// names failed the very recovery the client sent.
+	t.Run("ANamedStatementIsNotParsedTwice", func(t *testing.T) {
+		h := newH(t)
+		s := newExtendedSession(t, h.dsn())
+		failAfterSavepoint(t, s)
+		code, _, st := s.send("named rollback to",
+			&pgproto3.Parse{Name: "rb", Query: "rollback to savepoint sp"},
+			&pgproto3.Bind{DestinationPortal: "rb", PreparedStatement: "rb"},
+			&pgproto3.Execute{Portal: "rb"}, &pgproto3.Sync{})
+		if code != "" {
+			t.Fatalf("a named ROLLBACK TO answered %s; the recovery must not parse the batch's own statement", code)
+		}
+		if st != 'T' {
+			t.Fatalf("ReadyForQuery reported %c after the recovery, want T", st)
+		}
+	})
+
 	t.Run("ARealDriverRecoversIt", func(t *testing.T) {
 		h := newH(t)
 		ctx := context.Background()

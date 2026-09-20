@@ -570,6 +570,20 @@ func (r *ClusterReconciler) deleteRetiredSets(ctx context.Context, c *pgshardv1a
 		if !slices.ContainsFunc(current, func(cur ShardSetInfo) bool { return cur.Name == s.Name && cur.State == catalog.ShardSetRetired }) {
 			continue
 		}
+		// A set is only garbage once the run that TARGETED it is over. A
+		// rollback retires its own target while it is still running -- it
+		// commits the serving flip before releasing the pause and
+		// dropping replication -- so deleting on the retired state alone
+		// took that run's groups away mid-rollback, and its remaining
+		// steps then ran against infrastructure that was gone.
+		wf, err := r.Prober.ReshardWorkflow(ctx, dsn, s.Name)
+		if err != nil {
+			return fmt.Errorf("workflow of retired shard set %s: %w", s.Name, err)
+		}
+		if wf.ID != "" && !terminalWorkflowState(wf.State) {
+			logf.FromContext(ctx).Info("a retired shard set is still held by its own run", "set", s.Name, "workflow", wf.ID, "state", wf.State, "stage", wf.Stage)
+			continue
+		}
 		logf.FromContext(ctx).Info("deleting a retired shard set no run can switch back to", "set", s.Name, "generation", s.Generation)
 		if err := r.deleteTargetGroups(ctx, c, s.Name); err != nil {
 			return err
@@ -579,6 +593,16 @@ func (r *ClusterReconciler) deleteRetiredSets(ctx context.Context, c *pgshardv1a
 		}
 	}
 	return nil
+}
+
+// terminalWorkflowState reports whether a workflow is over, so the set it
+// targeted can be torn down.
+func terminalWorkflowState(state string) bool {
+	switch state {
+	case "completed", "cancelled", "failed", "":
+		return true
+	}
+	return false
 }
 
 func cutoverPause(wf WorkflowInfo) *metav1.Duration {
