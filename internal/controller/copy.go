@@ -885,6 +885,29 @@ func (c *Copier) materializeSchemas(ctx context.Context, wf *copyWorkflow, srcSe
 	return nil
 }
 
+// dependentsOutside names the objects in ANOTHER schema that depend on
+// something inside this one, which a DROP SCHEMA CASCADE would take with
+// it.
+//
+// Objects that belong to no schema are deliberately not counted: the event
+// triggers calling the schema's functions are exactly what this cleanup
+// exists to remove, and they are global. What must not be removed is
+// something a table elsewhere relies on -- a CHECK calling a function here
+// is the case that was measured.
+func dependentsOutside(ctx context.Context, conn ShardConn, schema string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT DISTINCT pg_describe_object(d.classid, d.objid, 0)
+		FROM pg_depend d
+		WHERE d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass, 'pg_class'::regclass)
+		  AND d.deptype IN ('n', 'a')
+		  AND (SELECT i.schema FROM pg_identify_object(d.refclassid, d.refobjid, 0) i) = $1
+		  AND coalesce((SELECT i.schema FROM pg_identify_object(d.classid, d.objid, 0) i), '') NOT IN ('', $1)
+		ORDER BY 1`, schema)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
 // dropLocalSchemas removes a database's local schemas from a target that
 // will not be its home shard. The schema copy is taken from the home shard,
 // so it carries them to every target, with the event triggers that call
@@ -901,6 +924,24 @@ func (c *Copier) dropLocalSchemas(ctx context.Context, set string, t int32, db d
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	for _, schema := range db.localSchemas {
+		// CASCADE drops whatever depends on the schema's contents, and what
+		// depends on them need not be in the schema: a sharded table's
+		// CHECK calling a function here is dropped with it, so this target
+		// would then accept rows every other shard rejects -- silently,
+		// because the cleanup succeeded (PGS-970). The declaration guard
+		// only refuses a schema that CONTAINS a distributed table, which
+		// says nothing about what outside it points in.
+		//
+		// Refusing stops the copy with a reason. Dropping does not stop
+		// anything, and the divergence is only visible later, on rows.
+		outside, err := dependentsOutside(ctx, conn, schema)
+		if err != nil {
+			return err
+		}
+		if len(outside) > 0 {
+			return fmt.Errorf("local schema %q of database %q cannot be removed from %s shard %d: %s depend(s) on it, and dropping the schema would drop them on this shard alone; move them out of the local schema, or stop declaring it local",
+				schema, db.name, set, t, strings.Join(outside, ", "))
+		}
 		if _, err := conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+QuoteIdent(schema)+" CASCADE"); err != nil {
 			return err
 		}
