@@ -1023,3 +1023,40 @@ func TestAWedgedPassGoesStaleWhileLivenessKeepsBeating(t *testing.T) {
 		t.Fatalf("progress age is %s: a fresh liveness beat refreshed it, so a wedged pass still reads as progress", age)
 	}
 }
+
+// TestAPlacementWithNoStageSeesTheDDLQueuedAheadOfIt (PGS-939 review): the
+// queue read ddl_hold_ends as
+//
+//	w.status->>'stage' = 'retiring'
+//
+// which is NULL -- not false -- for a workflow whose status carries no
+// stage, which is exactly what a placement looks like when it is created.
+// The rule then evaluated "... AND NOT a_hold_ends" to NULL, and the
+// blocker query keeps only rows whose conflict is true, so a fresh
+// placement saw no DDL queued ahead of it and the DDL saw no placement.
+//
+// The window is the one that matters: the placer's first act is to describe
+// the table, and a DDL running beside it changes the shape it just read.
+func TestAPlacementWithNoStageSeesTheDDLQueuedAheadOfIt(t *testing.T) {
+	conn, _, _ := queueCatalog(t)
+	ids := insertOps(t, conn, []queueOp{
+		{name: "ddl", kind: OperationDDL, state: "queued", database: "app", arrival: 1},
+		{name: "placement", kind: OperationPlacement, state: "pending", database: "app", arrival: 2},
+	})
+	blockers := blockersOf(t, conn, OperationPlacement, ids["placement"])
+	if len(blockers) != 1 || blockers[0].ID != ids["ddl"] {
+		t.Fatalf("a placement with no stage yet is blocked by %+v, want the DDL queued before it", blockers)
+	}
+	// And the same in the other direction, since either side's NULL was
+	// enough to lose the conflict.
+	if b := blockersOf(t, conn, OperationDDL, ids["ddl"]); len(b) != 0 {
+		t.Fatalf("the DDL arrived first, so nothing holds it: %+v", b)
+	}
+	ids2 := insertOps(t, conn, []queueOp{
+		{name: "placement2", kind: OperationPlacement, state: "pending", database: "other", arrival: 3},
+		{name: "ddl2", kind: OperationDDL, state: "queued", database: "other", arrival: 4},
+	})
+	if b := blockersOf(t, conn, OperationDDL, ids2["ddl2"]); len(b) != 1 || b[0].ID != ids2["placement2"] {
+		t.Fatalf("a DDL behind a placement with no stage is blocked by %+v, want the placement", b)
+	}
+}
