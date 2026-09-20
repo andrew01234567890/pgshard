@@ -1593,7 +1593,7 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow, abandon bool) err
 	// write fence is still raised on the sources and the reverse replication
 	// still attached to them, and neither is anyone else's to remove. Without
 	// this the sources stay unwritable with no workflow left to lift them.
-	if fencedStage(wf.stage) {
+	if cutoverStarted(wf) {
 		ops, err := c.pgCutover(ctx, wf)
 		if err != nil {
 			return err
@@ -1630,6 +1630,20 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow, abandon bool) err
 
 // fencedStage reports whether a workflow's stage means a cutover has started,
 // so the fence may be raised and reverse replication may exist.
+// cutoverStarted reports whether the run got as far as raising its fence,
+// from what the CUTOVER recorded rather than from the stage.
+//
+// The stage cannot answer it here: the reconciler overwrites it with
+// "cancelling" when it marks the run (reshard.go), so fencedStage -- which
+// lists switching, switched, rolling_back and completing -- was always
+// false by the time cancel ran, and the undo below never ran at all. The
+// fence itself was still lifted by the catalog update further down, so no
+// shard was left unwritable; what was left was the reverse replication the
+// undo drops, pinning WAL on the sources (PGS-968).
+func cutoverStarted(wf *copyWorkflow) bool {
+	return wf.cutover.Step != "" || wf.cutover.FencedAt != nil || wf.cutover.SwitchedAt != nil
+}
+
 func fencedStage(stage string) bool {
 	switch stage {
 	case StageSwitching, StageSwitched, StageRollingBack, StageCompleting:
