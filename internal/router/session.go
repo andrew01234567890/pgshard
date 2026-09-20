@@ -98,6 +98,14 @@ type execItem struct {
 	local  bool
 	class  StmtClass
 	tables []snapshot.TableKey
+	// foreign marks an Execute of a portal this router did not bind -- a
+	// cursor DECLAREd in SQL, which lives on the backend. It carries no
+	// statement of ours, but it DOES produce a completion, and noteBatch
+	// walks the batch's Executes by counting completions: without a place
+	// held here, a cursor's completion shifted the count and made
+	// noteBatch record a later statement that had not run. Its empty class
+	// records nothing but the shard it ran on.
+	foreign bool
 }
 
 type gucEntry struct {
@@ -1083,7 +1091,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if handled, err := e.endNoTxn(pl.Class, w); handled {
 		return e.afterBatch(ctx, err)
 	}
-	if err := e.recoverFailedTxnToSavepoint(ctx, pl.Class); err != nil {
+	if err := e.recoverFailedTxnToSavepoint(ctx, pl.Class, nil); err != nil {
 		return e.afterBatch(ctx, err)
 	}
 	if err := e.refuseInFailedTransaction(pl.Class); err != nil {
@@ -1443,7 +1451,7 @@ func (e *Executor) endNoTxn(class StmtClass, w pgwire.ResultWriter) (bool, error
 // A transaction a failover killed after it touched a shard keeps the 25P02:
 // its work is gone, and answering ROLLBACK TO there would tell the client
 // the statements before the savepoint survived when nothing did.
-func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtClass) error {
+func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtClass, fresh map[string]bool) error {
 	if e.tx != pgwire.TxFailed || e.conn != nil || class.Txn != plan.TxnRollbackTo {
 		return nil
 	}
@@ -1467,7 +1475,12 @@ func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtCl
 	// transaction re-opened under the pause cannot write, whatever the one
 	// before it could (PGS-959).
 	e.txnOnBackend, e.txnPreFence = false, false
-	if err := e.acquire(ctx, nil); err != nil {
+	// fresh, not nil: the batch that carries the ROLLBACK TO parses its
+	// own named statements, and a replay that parsed them here as well
+	// would meet them again as the batch is forwarded -- PostgreSQL
+	// refuses a second Parse of a live name with 42P05, which would fail
+	// the recovery the client sent.
+	if err := e.acquire(ctx, fresh); err != nil {
 		// acquire only fails a transaction it can see, and it has just
 		// been told there is none. Failed is what this session is if the
 		// backend cannot be had: leaving it Idle would tell the client its
@@ -1512,7 +1525,7 @@ func (e *Executor) recoverFailedTxnToSavepoint(ctx context.Context, class StmtCl
 // the simple protocol, and a transaction it reopens runs the rest of the
 // batch normally. The only Describe admitted is one of that portal, which
 // the backend answers once the transaction is back.
-func (e *Executor) failedTxnBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, w pgwire.ResultWriter) (bool, error) {
+func (e *Executor) failedTxnBatch(ctx context.Context, batch []*pgshardv1.ExecuteRequest, fresh map[string]bool, w pgwire.ResultWriter) (bool, error) {
 	if e.tx != pgwire.TxFailed || e.conn != nil {
 		return false, nil
 	}
@@ -1529,7 +1542,7 @@ func (e *Executor) failedTxnBatch(ctx context.Context, batch []*pgshardv1.Execut
 				return false, nil
 			}
 			if class, ok := e.portalRollsBackToSavepoint(r.Execute.Portal); ok && !ends {
-				return e.recoverBatchToSavepoint(ctx, class)
+				return e.recoverBatchToSavepoint(ctx, class, fresh)
 			}
 			if !e.portalEndsTxn(r.Execute.Portal) {
 				return true, failedTxnRefusal()
@@ -1603,8 +1616,8 @@ func (e *Executor) portalRollsBackToSavepoint(portal string) (StmtClass, bool) {
 // recoverBatchToSavepoint answers failedTxnBatch for a batch whose first
 // Execute is a ROLLBACK TO: handled, with the refusal, unless the
 // transaction was reopened, and then the batch goes to the backend.
-func (e *Executor) recoverBatchToSavepoint(ctx context.Context, class StmtClass) (bool, error) {
-	if err := e.recoverFailedTxnToSavepoint(ctx, class); err != nil {
+func (e *Executor) recoverBatchToSavepoint(ctx context.Context, class StmtClass, fresh map[string]bool) (bool, error) {
+	if err := e.recoverFailedTxnToSavepoint(ctx, class, fresh); err != nil {
 		return true, err
 	}
 	if e.tx == pgwire.TxFailed {
@@ -1936,6 +1949,14 @@ func (e *Executor) replanStaleAt(ctx context.Context, statement string, snap *sn
 		return err
 	}
 	if snapshot.SamePlanning(st.snap, snap) {
+		// Pinned even when nothing is replanned. Without it this path left
+		// stmtSnap unset, so the statement was AIMED from the plan made
+		// against st.snap while userSet and generation() read the live
+		// snapshot: a reshard landing between this check and aimBound sent
+		// the write to the old plan's shard id under the new set's
+		// generation, which the fence cannot catch because the generation
+		// is the current one.
+		e.stmtSnap = snap
 		return nil
 	}
 	pl, err := e.planOpAt(ctx, snap, st.sql, "parse")
@@ -2049,7 +2070,13 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 	// measured on a real stack, a SET left unnamed and never executed was
 	// recorded as session state and applied to the next backend the session
 	// used (PGS-942). Not refused, because the portal does exist there.
-	if st, ok := e.stmts[stmt]; ok && bound {
+	st, known := e.stmts[stmt]
+	if !known || !bound {
+		// Still forwarded; the backend answers its own portal. The place
+		// is held so the completion it produces lines up.
+		e.batchExec = append(e.batchExec, execItem{foreign: true})
+	}
+	if ok := known && bound; ok {
 		if st.plan.Explain == nil {
 			if err := e.refuseStagedInFailedTransaction(st.plan.Class); err != nil {
 				e.failBatch()
@@ -2293,7 +2320,7 @@ func (e *Executor) sync(ctx context.Context) error {
 	if w == nil {
 		w = discardWriter{}
 	}
-	if handled, err := e.failedTxnBatch(ctx, batch, w); handled {
+	if handled, err := e.failedTxnBatch(ctx, batch, fresh, w); handled {
 		return e.afterBatch(ctx, err)
 	}
 	for _, item := range executed {
@@ -2457,6 +2484,10 @@ func (e *Executor) sync(ctx context.Context) error {
 // statements after a failure never ran: PostgreSQL skips to the Sync.
 func (e *Executor) noteBatch(executed []execItem) {
 	for _, item := range executed[:min(e.execDone, len(executed))] {
+		// A foreign item carries no statement and an empty class, so it
+		// records no session effect -- and noteExecuted marks the
+		// transaction as having touched this shard, which is true: the
+		// backend ran its own portal.
 		e.noteExecuted(item.sql, item.local, item.class)
 		e.noteSessionEffect(item.class, item.sql)
 	}
