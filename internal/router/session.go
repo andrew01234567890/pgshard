@@ -2022,6 +2022,20 @@ func (e *Executor) Describe(_ context.Context, kind pgwire.DescribeKind, name st
 	e.batchWriter = w
 	if kind == pgwire.DescribeStatement {
 		e.describes = append(e.describes, name)
+		// A Describe carries no keys and sets no target of its own, so a
+		// batch that only describes stays on whatever shard the session
+		// is on -- and since the replay stopped parsing statements of
+		// OTHER shards there, that backend answers 26000 for a statement
+		// the client prepared and never closed (PGS-967). Aim the batch
+		// at the statement's own shard, where the replay will parse it.
+		// Only when nothing else has aimed the batch: a Describe must not
+		// fight the aim of a Parse or Bind beside it.
+		if st, ok := e.stmts[name]; ok && e.batchTarget == nil && e.batchScatter == nil && !e.replayableHere(st.plan) {
+			if err := e.aimBatch(st.plan, name); err != nil {
+				e.failBatch()
+				return err
+			}
+		}
 		name = e.physical(name)
 	}
 	e.batch = append(e.batch, describeReq(kind, name))

@@ -1018,7 +1018,17 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 		case *pgshardv1.ExecuteRequest_Describe:
 			var sql string
 			if m.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
-				sql = b.stmts[m.Describe.Name]
+				// PostgreSQL's answer for a name this backend never
+				// parsed. A fake that described one anyway hid a router
+				// that had sent the Describe to the wrong backend.
+				var known bool
+				if sql, known = b.stmts[m.Describe.Name]; !known {
+					failed = true
+					if err := s.errorf("26000", "prepared statement \""+m.Describe.Name+"\" does not exist"); err != nil {
+						return err
+					}
+					continue
+				}
 				if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_ParameterDescription{ParameterDescription: &pgshardv1.ParameterDescription{ParamOids: paramOIDs(sql)}}}); err != nil {
 					return err
 				}
