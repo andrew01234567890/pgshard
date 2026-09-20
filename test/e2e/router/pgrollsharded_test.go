@@ -181,6 +181,24 @@ func TestPgrollAgainstAShardedDatabase(t *testing.T) {
 	if n != 3 {
 		t.Errorf("the version view answered %d rows, want 3 -- a view routed to one shard answers 2", n)
 	}
+	// And the schema and its view are on EVERY shard, not only the one the
+	// read happened to reach: a view that exists on one shard answers until
+	// a statement routes to another (PGS-873).
+	for id := range s.shardDSNs {
+		if !s.viewOn(t, id, "public_"+version, "orders") {
+			t.Errorf("shard %d has no orders view in the version schema public_%s", id, version)
+		}
+		// The check is only worth its line if it can fail.
+		if s.viewOn(t, id, "public_no_such_version", "orders") {
+			t.Fatalf("shard %d reports a view in a schema that does not exist, so the check above proves nothing", id)
+		}
+		// And while the migration is in flight the shard DOES hold
+		// _pgroll_ state, so the emptiness asserted after the refusal
+		// below is a real absence.
+		if left := s.pgrollArtefacts(t, id); len(left) == 0 {
+			t.Fatalf("shard %d reports no _pgroll_ state mid-migration, so the check after the refusal proves nothing", id)
+		}
+	}
 
 	if _, err := run("complete", "complete"); err != nil {
 		t.Fatalf("pgroll complete: %v", err)
@@ -219,6 +237,14 @@ func TestPgrollAgainstAShardedDatabase(t *testing.T) {
 	// a start, and nothing can undo a half-completed rename.
 	if _, err := run("rollback", "rollback"); err != nil {
 		t.Fatalf("a refused start could not be rolled back, which leaves pgroll wedged: %v", err)
+	}
+	// Nothing of the refused migration is left anywhere: a _pgroll_ column
+	// or table on any shard is state the next migration would trip over
+	// (PGS-873).
+	for id := range s.shardDSNs {
+		if left := s.pgrollArtefacts(t, id); len(left) > 0 {
+			t.Errorf("shard %d kept %v after the refused start was rolled back", id, left)
+		}
 	}
 
 	// And the tool still works afterwards, which is the part that matters:
@@ -476,4 +502,35 @@ func (s *shardedStack) shardBool(tb testing.TB, shard int, sql string, args ...a
 		tb.Fatalf("shard %d: %s: %v", shard, sql, err)
 	}
 	return ok
+}
+
+// viewOn reports whether one shard has a view by name in a schema.
+func (s *shardedStack) viewOn(tb testing.TB, shard int, schema, view string) bool {
+	tb.Helper()
+	return s.shardBool(tb, shard, `SELECT EXISTS (SELECT 1 FROM pg_views WHERE schemaname = $1 AND viewname = $2)`, schema, view)
+}
+
+// pgrollArtefacts lists the _pgroll_ columns and tables one shard holds, so
+// a refusal can be shown to have left nothing behind.
+func (s *shardedStack) pgrollArtefacts(tb testing.TB, shard int) []string {
+	tb.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, strings.Replace(s.shardDSNs[shard], "/postgres?", "/"+appDatabase+"?", 1))
+	if err != nil {
+		tb.Fatalf("shard %d: %v", shard, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT table_name || '.' || column_name FROM information_schema.columns
+			WHERE table_schema = 'public' AND column_name LIKE '\_pgroll\_%'
+		UNION ALL
+		SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE '\_pgroll\_%'
+		ORDER BY 1`)
+	if err != nil {
+		tb.Fatalf("shard %d: %v", shard, err)
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		tb.Fatalf("shard %d: %v", shard, err)
+	}
+	return out
 }
