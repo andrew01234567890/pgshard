@@ -123,7 +123,7 @@ jobs:
           docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
           docker build -f Dockerfile.router -t pgshard-router:e2e .
       - name: Build controller image
-        if: startsWith(inputs.suite, 'reshard') || inputs.suite == 'upgrade'
+        if: inputs.suite != 'smoke'
         run: docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
         if: inputs.suite == 'upgrade'
@@ -140,7 +140,7 @@ jobs:
         if: inputs.suite != 'smoke'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e pgshard-router:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Load controller image into kind
-        if: startsWith(inputs.suite, 'reshard') || inputs.suite == 'upgrade'
+        if: inputs.suite != 'smoke'
         run: hack/kind/load-images.sh pgshard-controller:e2e
       - name: Load the target-major image into kind
         if: inputs.suite == 'upgrade'
