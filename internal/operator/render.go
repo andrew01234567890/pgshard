@@ -507,7 +507,9 @@ func (Renderer) CatalogEndpointService(c *pgshardv1alpha1.PgShardCluster, active
 // CatalogGenerationService renders a Service that selects one catalog
 // generation's primary regardless of which generation is active. Only
 // generation 1 needs it - later generations already have an unambiguous
-// -rw Service of their own - and only while an upgrade is in flight.
+// -rw Service of their own. It is created before a catalog cutover and
+// outlives a rollback to generation 1, and the barrier guard reads through
+// it whenever it exists (CatalogGroupDSN), so it is not only an upgrade's.
 func (Renderer) CatalogGenerationService(c *pgshardv1alpha1.PgShardCluster, g Group) *corev1.Service {
 	sel := g.Labels()
 	sel[LabelRole] = RolePrimary

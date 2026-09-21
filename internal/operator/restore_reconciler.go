@@ -48,6 +48,11 @@ type RestoreReconciler struct {
 // the source's catalog upgrade has finished.
 const catalogUpgradeRestoreWait = 30 * time.Second
 
+// dedicatedCatalogGrace is how long after a restore is created a failure to
+// read its barrier through catalog generation 1's dedicated address is
+// retried rather than failing the restore.
+const dedicatedCatalogGrace = 5 * time.Minute
+
 // BarrierCertifier reports whether a barrier of that name was certified,
 // which groups it holds a restore point on and when it was recorded, and
 // lifts the fence a restored catalog came back holding.
@@ -241,7 +246,26 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// moves after the status that names the new generation, so for a
 		// window after a cutover the stable one answers as the catalog the
 		// restore is NOT going to recover (PGS-932).
-		rec, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogGroupDSN(&source), password, name)
+		dedicated, derr := r.hasService(ctx, source.Namespace, CatalogGenerationServiceRW(source.Name, 1))
+		if derr != nil {
+			return ctrl.Result{}, derr
+		}
+		rec, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogGroupDSN(&source, dedicated), password, name)
+		if cerr != nil && dedicated && r.now().Sub(rs.CreationTimestamp.Time) < dedicatedCatalogGrace {
+			// The dedicated address can be newer than the stable one --
+			// created at a cutover moments ago, its endpoints not yet
+			// propagated -- where the stable one was already reachable. A
+			// failed restore cannot be resumed, so a first failure through
+			// it is waited out rather than made final (PGS-973 review).
+			base := rs.DeepCopy()
+			meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: metav1.ConditionFalse, Reason: "WaitingForCatalogEndpoint",
+				Message:            fmt.Sprintf("cannot yet read barrier %q through %s: %v", name, CatalogGenerationServiceRW(source.Name, 1), cerr),
+				ObservedGeneration: rs.Generation})
+			if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: catalogUpgradeRestoreWait}, nil
+		}
 		if cerr != nil {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
 		}
@@ -899,4 +923,14 @@ func groupsWithoutBarrier(want []Group, recorded []string) []string {
 		}
 	}
 	return missing
+}
+
+// hasService reports whether a Service exists. Absent is an answer, not an
+// error: the caller chooses another address.
+func (r *RestoreReconciler) hasService(ctx context.Context, namespace, name string) (bool, error) {
+	err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &corev1.Service{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
 }
