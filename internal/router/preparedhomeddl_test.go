@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
 // TestPreparedHomeDDLMeetsTheGateWhenItRuns (PGS-975).
@@ -73,5 +74,118 @@ func TestPreparedHomeDDLMeetsTheGateWhenItRuns(t *testing.T) {
 	res := pg.ExecPrepared(ctx, "ctas", nil, nil, nil).Read()
 	if !refused(res.Err) {
 		t.Fatalf("Bind/Execute of a cached CREATE TABLE AS during a reshard: %v, want 55000 naming the reshard", res.Err)
+	}
+}
+
+// TestHomeDDLIsCheckedWhereAPortalRuns (PGS-975 review): checking where a
+// statement is planned or bound left paths that execute without either.
+// The check is made where a portal is executed, which every one of them
+// passes through.
+func TestHomeDDLIsCheckedWhereAPortalRuns(t *testing.T) {
+	q := &fakeQueue{homeQueued: true}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	w := discardWriter{}
+	keys := &pgwire.SCRAMKeys{ClientKey: make([]byte, 32), ServerKey: make([]byte, 32)}
+	var ids uint64
+	session := func() *Executor {
+		ids++
+		return newExecutor(h.r, pgwire.SessionInfo{ID: ids, Database: "app", User: "app", Auth: &pgwire.AuthResult{SCRAM: keys}}, Shard{Set: DefaultShardSet, ID: 0})
+	}
+	block := func(on bool) {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		q.home = nil
+		if on {
+			q.home = []catalog.Blocker{{Kind: catalog.OperationReshard, ID: "00000000-0000-0000-0000-00000000e975", Reason: catalog.BlockedByStarted}}
+		}
+	}
+	refused := func(err error) bool {
+		var pe *pgwire.Error
+		return errors.As(err, &pe) && pe.Code == "55000"
+	}
+	step := func(e *Executor, name, sql string) error {
+		t.Helper()
+		if err := e.Parse(ctx, name, sql, nil, w); err != nil {
+			return err
+		}
+		if err := e.Bind(ctx, name, name, nil, nil, nil, w); err != nil {
+			return err
+		}
+		return e.Execute(ctx, name, 0, w)
+	}
+
+	// A PREPARE and the EXECUTE of it in one batch: the PREPARE is not
+	// recorded until the batch's results are in, so the EXECUTE had
+	// nothing to look up.
+	block(true)
+	e := session()
+	if err := step(e, "a", "prepare p as select 1 as n into saved"); err != nil {
+		t.Fatalf("PREPARE during a reshard: %v", err)
+	}
+	if err := step(e, "b", "execute p"); !refused(err) {
+		t.Errorf("EXECUTE of a PREPARE earlier in the same batch: %v, want 55000", err)
+	}
+
+	// A protocol-prepared "EXECUTE p", cached from before the reshard: its
+	// own plan is not home DDL, what it runs is.
+	block(false)
+	e = session()
+	if err := e.SimpleQuery(ctx, "prepare p as select 1 as n into saved", w); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Parse(ctx, "wrapper", "execute p", nil, w); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.Sync(ctx)
+	block(true)
+	if err := e.Bind(ctx, "wrapper", "wrapper", nil, nil, nil, w); err != nil && !refused(err) {
+		t.Fatal(err)
+	}
+	if err := e.Execute(ctx, "wrapper", 0, w); !refused(err) {
+		t.Errorf("a cached protocol EXECUTE of a prepared SELECT ... INTO during a reshard: %v, want 55000", err)
+	}
+	_ = e.Sync(ctx)
+
+	// A portal bound inside a transaction before the reshard and executed
+	// after it, across a Sync: nothing plans or binds it again.
+	block(false)
+	e = session()
+	if err := e.SimpleQuery(ctx, "begin", w); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Parse(ctx, "ctas", "create table x as select 1 as n", nil, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Bind(ctx, "held", "ctas", nil, nil, nil, w); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.Sync(ctx)
+	block(true)
+	if err := e.Execute(ctx, "held", 0, w); !refused(err) {
+		t.Errorf("a portal bound before the reshard and executed during it: %v, want 55000", err)
+	}
+}
+
+// TestExplainAnalyzeExecuteNamesWhatItRuns (PGS-975 review): EXPLAIN ANALYZE
+// EXECUTE runs the prepared statement, so it has to name it as a bare
+// EXECUTE does; plain EXPLAIN runs nothing and names nothing.
+func TestExplainAnalyzeExecuteNamesWhatItRuns(t *testing.T) {
+	q := &fakeQueue{homeQueued: true}
+	h := newDDLHarness(t, q)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+	if _, err := conn.Exec(ctx, "prepare into_saved as select 1 as n into saved"); err != nil {
+		t.Fatal(err)
+	}
+	q.mu.Lock()
+	q.home = []catalog.Blocker{{Kind: catalog.OperationReshard, ID: "00000000-0000-0000-0000-00000000e975", Reason: catalog.BlockedByStarted}}
+	q.mu.Unlock()
+	var pe *pgconn.PgError
+	if _, err := conn.Exec(ctx, "explain analyze execute into_saved"); !errors.As(err, &pe) || pe.Code != "55000" {
+		t.Fatalf("EXPLAIN ANALYZE EXECUTE of a prepared SELECT ... INTO during a reshard: %v, want 55000", err)
+	}
+	if _, err := conn.Exec(ctx, "explain execute into_saved"); errors.As(err, &pe) && pe.Code == "55000" {
+		t.Fatalf("plain EXPLAIN EXECUTE was refused: %v; it runs nothing", err)
 	}
 }

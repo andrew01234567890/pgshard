@@ -1257,10 +1257,23 @@ func (e *Executor) savepointIndex(name string) int {
 }
 
 // executesHomeDDL reports that an SQL-level EXECUTE runs a statement whose
-// execution creates a relation on the home shard.
+// execution creates a relation on the home shard. A PREPARE or DEALLOCATE of
+// that name earlier in the batch in flight has not been recorded in
+// sqlPrepared yet -- that happens once the batch's results are in -- so it
+// is read from the batch first, latest first.
 func (e *Executor) executesHomeDDL(name string) bool {
 	if name == "" {
 		return false
+	}
+	for i := len(e.batchExec) - 1; i >= 0; i-- {
+		c := e.batchExec[i].class
+		switch {
+		case c.Session == plan.SessionPrepare && c.SessionName == name:
+			return c.PreparesHomeDDL
+		case c.Session == plan.SessionDeallocate && (c.SessionName == name || c.SessionName == ""),
+			c.Session == plan.SessionDiscardAll:
+			return false
+		}
 	}
 	for _, p := range e.sqlPrepared {
 		if p.name == name {
@@ -1268,6 +1281,12 @@ func (e *Executor) executesHomeDDL(name string) bool {
 		}
 	}
 	return false
+}
+
+// createsHomeRelation reports that executing pl creates a relation on the
+// home shard: pl is such a statement, or an EXECUTE of one.
+func (e *Executor) createsHomeRelation(pl plan.Plan) bool {
+	return pl.HomeDDL || e.executesHomeDDL(pl.Class.Executes)
 }
 
 func (e *Executor) forgetSQLPrepared(name string) {
@@ -1976,14 +1995,6 @@ func (e *Executor) replanStaleAt(ctx context.Context, statement string, snap *sn
 		// generation, which the fence cannot catch because the generation
 		// is the current one.
 		e.stmtSnap = snap
-		// Nothing replanned means nothing re-checked, and a reshard
-		// starting does not change what SamePlanning compares. A statement
-		// Parsed before it -- a driver's statement cache does exactly that
-		// -- would create its relation on the source during the copy, and
-		// cutover would lose it (PGS-975).
-		if st.plan.HomeDDL {
-			return e.checkHomeDDL(ctx)
-		}
 		return nil
 	}
 	pl, err := e.planOpAt(ctx, snap, st.sql, "parse")
@@ -2070,11 +2081,11 @@ func (e *Executor) Describe(_ context.Context, kind pgwire.DescribeKind, name st
 }
 
 // Execute implements pgwire.Executor.
-func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
-	return e.guard("Execute", func() error { return e.execute(portal, maxRows, w) })
+func (e *Executor) Execute(ctx context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
+	return e.guard("Execute", func() error { return e.execute(ctx, portal, maxRows, w) })
 }
 
-func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) error {
+func (e *Executor) execute(ctx context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
 	if e.batchFailed {
 		return nil
 	}
@@ -2146,6 +2157,19 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 		if err := e.refuseShardStatementAfterDDL(st.plan); err != nil {
 			e.failBatch()
 			return err
+		}
+		// Checked where the portal RUNS, not only where its statement was
+		// planned: a statement Parsed before a reshard started and
+		// executed during it -- a driver's statement cache, a portal kept
+		// across Syncs in a transaction, an EXECUTE of an SQL-level
+		// statement PREPAREd earlier or earlier in this very batch -- is
+		// otherwise never checked again, and creates its relation on the
+		// source mid-copy (PGS-975).
+		if !e.catalogSession() && e.createsHomeRelation(st.plan) {
+			if err := e.checkHomeDDL(ctx); err != nil {
+				e.failBatch()
+				return err
+			}
 		}
 		// local drives noteExecuted, which is what sets txnTouched. An
 		// EXECUTE or FETCH is SessionLocal but does touch the shard, so

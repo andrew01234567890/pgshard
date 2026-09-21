@@ -1020,6 +1020,10 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		// answerable. EXPLAIN ANALYZE does run it, and keeps the mark.
 		if !explainAnalyzes(n.ExplainStmt) {
 			w.plan.HomeDDL = false
+		} else if ex := n.ExplainStmt.GetQuery().GetExecuteStmt(); ex != nil {
+			// EXPLAIN ANALYZE EXECUTE runs the prepared statement, which
+			// the executor has to see by name as it does a bare EXECUTE.
+			w.plan.Class.Executes = ex.GetName()
 		}
 		return nil
 	case *pgquerypb.Node_DeclareCursorStmt:
