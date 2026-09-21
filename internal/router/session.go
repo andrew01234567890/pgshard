@@ -86,7 +86,12 @@ func (p prepared) paramOIDs() []uint32 {
 }
 
 // execItem is one statement a batch executed, for the transaction prelude.
-type sqlPreparedStmt struct{ name, sql string }
+type sqlPreparedStmt struct {
+	name, sql string
+	// homeDDL: executing it creates a relation on the home shard, so the
+	// EXECUTE meets checkHomeDDL (PGS-975).
+	homeDDL bool
+}
 
 type savepointMark struct {
 	name   string
@@ -238,6 +243,13 @@ type Executor struct {
 	// found the statement: a name parsed again before the Execute names
 	// another statement by then.
 	portalDDL map[string]*plan.Plan
+	// portalRun is what a portal's statement, as its Bind found it, runs
+	// -- for the same reason as portalDDL: a statement replaced after the
+	// Bind, the unnamed one above all, no longer says what the portal runs.
+	// Only the portal's own facts are kept. The SQL-level statement an
+	// EXECUTE names is looked up when the portal runs, which is when
+	// PostgreSQL looks it up too (PGS-975).
+	portalRun map[string]portalRun
 
 	batch       []*pgshardv1.ExecuteRequest
 	batchStmts  []string
@@ -342,7 +354,7 @@ func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
 		ident: &pgshardv1.UserIdentity{Username: info.User,
 			ScramClientKey: append([]byte(nil), keys.ClientKey...), ScramServerKey: append([]byte(nil), keys.ServerKey...)},
 		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
-		stmts: map[string]prepared{}, portals: map[string]string{}, portalDDL: map[string]*plan.Plan{},
+		stmts: map[string]prepared{}, portals: map[string]string{}, portalDDL: map[string]*plan.Plan{}, portalRun: map[string]portalRun{},
 	}
 	e.startupSearchPath = startupPath(info.Params)
 	return e
@@ -703,7 +715,7 @@ func (e *Executor) planOpAt(ctx context.Context, snap *snapshot.Snapshot, sql, o
 	}
 	if err == nil && !e.catalogSession() {
 		switch {
-		case pl.HomeDDL:
+		case pl.HomeDDL, e.executesHomeDDL(pl.Class.Executes):
 			err = e.checkHomeDDL(ctx)
 		case pl.Kind == plan.MigrationKind:
 			err = e.checkFanoutDDL(ctx)
@@ -1227,7 +1239,7 @@ func (e *Executor) noteSessionEffect(class StmtClass, sql string) {
 	switch class.Session {
 	case plan.SessionPrepare:
 		e.forgetSQLPrepared(class.SessionName)
-		e.sqlPrepared = append(e.sqlPrepared, sqlPreparedStmt{name: class.SessionName, sql: sql})
+		e.sqlPrepared = append(e.sqlPrepared, sqlPreparedStmt{name: class.SessionName, sql: sql, homeDDL: class.PreparesHomeDDL})
 	case plan.SessionDeallocate:
 		if class.SessionName == "" {
 			e.sqlPrepared = nil
@@ -1249,6 +1261,39 @@ func (e *Executor) savepointIndex(name string) int {
 		}
 	}
 	return -1
+}
+
+// executesHomeDDL reports that an SQL-level EXECUTE runs a statement whose
+// execution creates a relation on the home shard. A PREPARE or DEALLOCATE of
+// that name earlier in the batch in flight has not been recorded in
+// sqlPrepared yet -- that happens once the batch's results are in -- so it
+// is read from the batch first, latest first.
+func (e *Executor) executesHomeDDL(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := len(e.batchExec) - 1; i >= 0; i-- {
+		c := e.batchExec[i].class
+		switch {
+		case c.Session == plan.SessionPrepare && c.SessionName == name:
+			return c.PreparesHomeDDL
+		case c.Session == plan.SessionDeallocate && (c.SessionName == name || c.SessionName == ""),
+			c.Session == plan.SessionDiscardAll:
+			return false
+		}
+	}
+	for _, p := range e.sqlPrepared {
+		if p.name == name {
+			return p.homeDDL
+		}
+	}
+	return false
+}
+
+// portalRun is what a bound portal runs, as its Bind found its statement.
+type portalRun struct {
+	homeDDL  bool
+	executes string
 }
 
 func (e *Executor) forgetSQLPrepared(name string) {
@@ -1916,6 +1961,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 	}
 	e.portals[portal] = statement
 	e.portalDDL[portal] = migrationPlan(e.stmts, statement)
+	e.portalRun[portal] = portalRun{homeDDL: e.stmts[statement].plan.HomeDDL, executes: e.stmts[statement].plan.Class.Executes}
 	e.batch = append(e.batch, e.clientRequest(bindReq(portal, e.physical(statement), paramFormats, params, resultFormats)))
 	e.batchDDL = append(e.batchDDL, e.portalDDL[portal])
 	return nil
@@ -2043,11 +2089,11 @@ func (e *Executor) Describe(_ context.Context, kind pgwire.DescribeKind, name st
 }
 
 // Execute implements pgwire.Executor.
-func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
-	return e.guard("Execute", func() error { return e.execute(portal, maxRows, w) })
+func (e *Executor) Execute(ctx context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
+	return e.guard("Execute", func() error { return e.execute(ctx, portal, maxRows, w) })
 }
 
-func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) error {
+func (e *Executor) execute(ctx context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
 	if e.batchFailed {
 		return nil
 	}
@@ -2120,6 +2166,19 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 			e.failBatch()
 			return err
 		}
+		// Checked where the portal RUNS, not only where its statement was
+		// planned: a statement Parsed before a reshard started and
+		// executed during it -- a driver's statement cache, a portal kept
+		// across Syncs in a transaction, an EXECUTE of an SQL-level
+		// statement PREPAREd earlier or earlier in this very batch -- is
+		// otherwise never checked again, and creates its relation on the
+		// source mid-copy (PGS-975).
+		if run := e.portalRun[portal]; !e.catalogSession() && (run.homeDDL || e.executesHomeDDL(run.executes)) {
+			if err := e.checkHomeDDL(ctx); err != nil {
+				e.failBatch()
+				return err
+			}
+		}
 		// local drives noteExecuted, which is what sets txnTouched. An
 		// EXECUTE or FETCH is SessionLocal but does touch the shard, so
 		// calling it local left refuseDDLInTransaction believing the
@@ -2166,6 +2225,7 @@ func (e *Executor) Close(_ context.Context, kind pgwire.DescribeKind, name strin
 	} else {
 		delete(e.portals, name)
 		delete(e.portalDDL, name)
+		delete(e.portalRun, name)
 	}
 	e.batch = append(e.batch, e.clientRequest(closeReq(kind, name)))
 	return nil

@@ -318,6 +318,8 @@ func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 		}
 	case *pgquerypb.Node_PrepareStmt:
 		c.Session, c.SessionName = SessionPrepare, n.PrepareStmt.GetName()
+	case *pgquerypb.Node_ExecuteStmt:
+		c.Executes = n.ExecuteStmt.GetName()
 	case *pgquerypb.Node_DeallocateStmt:
 		c.Session, c.SessionName = SessionDeallocate, n.DeallocateStmt.GetName()
 	case *pgquerypb.Node_DiscardStmt:
@@ -1018,6 +1020,10 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		// answerable. EXPLAIN ANALYZE does run it, and keeps the mark.
 		if !explainAnalyzes(n.ExplainStmt) {
 			w.plan.HomeDDL = false
+		} else if ex := n.ExplainStmt.GetQuery().GetExecuteStmt(); ex != nil {
+			// EXPLAIN ANALYZE EXECUTE runs the prepared statement, which
+			// the executor has to see by name as it does a bare EXECUTE.
+			w.plan.Class.Executes = ex.GetName()
 		}
 		return nil
 	case *pgquerypb.Node_DeclareCursorStmt:
@@ -1029,6 +1035,9 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		if w.plan.Kind != Unsharded {
 			return notYet("SQL-level PREPARE touching sharded or reference tables is not available yet",
 				"use protocol-level prepared statements ($1 bind parameters)")
+		}
+		if w.plan.HomeDDL {
+			w.plan.HomeDDL, w.plan.Class.PreparesHomeDDL = false, true
 		}
 		return nil
 	case *pgquerypb.Node_CopyStmt:

@@ -95,6 +95,13 @@ type StmtClass struct {
 	// EXECUTE ins" ran the EXECUTE where a plain SELECT in the same place
 	// is refused.
 	RunsOnAShard bool
+	// Executes is the SQL-level prepared statement an EXECUTE runs.
+	Executes string
+	// PreparesHomeDDL marks an SQL-level PREPARE whose statement is home
+	// DDL -- SELECT ... INTO, which PREPARE accepts. The PREPARE creates
+	// nothing, so it is not refused while a reshard runs; the EXECUTE is
+	// what creates the relation, and it is refused then instead (PGS-975).
+	PreparesHomeDDL bool
 }
 
 // SessionKind classifies statements that create, drop or reset session
