@@ -241,7 +241,11 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		// moves after the status that names the new generation, so for a
 		// window after a cutover the stable one answers as the catalog the
 		// restore is NOT going to recover (PGS-932).
-		rec, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogGroupDSN(&source), password, name)
+		dedicated, derr := r.hasService(ctx, source.Namespace, CatalogGenerationServiceRW(source.Name, 1))
+		if derr != nil {
+			return ctrl.Result{}, derr
+		}
+		rec, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogGroupDSN(&source, dedicated), password, name)
 		if cerr != nil {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
 		}
@@ -899,4 +903,14 @@ func groupsWithoutBarrier(want []Group, recorded []string) []string {
 		}
 	}
 	return missing
+}
+
+// hasService reports whether a Service exists. Absent is an answer, not an
+// error: the caller chooses another address.
+func (r *RestoreReconciler) hasService(ctx context.Context, namespace, name string) (bool, error) {
+	err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &corev1.Service{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
 }

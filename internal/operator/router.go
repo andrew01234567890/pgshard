@@ -86,8 +86,22 @@ func CatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
 // answers as the old catalog while the status already names the new one.
 // Anything judging a barrier has to ask the group the restore will actually
 // recover, which is this one.
-func CatalogGroupDSN(c *pgshardv1alpha1.PgShardCluster) string {
-	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", Groups(c)[0].ServiceRW(), c.Namespace, postgresPort, superuserName)
+//
+// Generation 1 is the exception to "its own address": its group's -rw
+// Service IS the stable endpoint. A catalog upgrade gives it a dedicated
+// one (CatalogGenerationServiceRW) before the cutover, and a rollback to it
+// keeps that one; dedicatedGen1 says it exists, and it is used, because a
+// rollback moves the stable endpoint back and clears the upgrade status in
+// the same pass -- so the first reader after it can still reach generation
+// 2, terminating, through the stable name (PGS-973). A cluster whose
+// catalog was never upgraded has no dedicated Service and needs none: its
+// stable endpoint has only ever selected generation 1.
+func CatalogGroupDSN(c *pgshardv1alpha1.PgShardCluster, dedicatedGen1 bool) string {
+	host := Groups(c)[0].ServiceRW()
+	if gen := CatalogGeneration(c); gen == 1 && dedicatedGen1 {
+		host = CatalogGenerationServiceRW(c.Name, gen)
+	}
+	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", host, c.Namespace, postgresPort, superuserName)
 }
 
 // ControllerCatalogDSN is the same catalog, reached as the controller's own
