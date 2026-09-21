@@ -769,9 +769,12 @@ func reshardingDDLRefusal(queueable bool) *pgwire.Error {
 	return err
 }
 
-// checkHomeDDL refuses DDL a local database runs directly on its home shard
+// checkHomeDDL refuses DDL that runs directly on the database's home shard
 // while something it would overlap is unfinished: it cannot wait its turn in
-// the operation queue the way a migration does.
+// the operation queue the way a migration does. A local database's DDL takes
+// this path, as does a statement about a local schema and CREATE TABLE AS,
+// which creates its relation on the home shard in the client's own
+// transaction whatever the database is.
 func (e *Executor) checkHomeDDL(ctx context.Context) error {
 	var blockers []catalog.Blocker
 	queued := false
@@ -790,8 +793,8 @@ func (e *Executor) checkHomeDDL(ctx context.Context) error {
 	if len(blockers) == 0 {
 		return nil
 	}
-	err := pgwire.Errorf(codeObjectNotInPrerequisiteState, "schema changes on local database %s are not available while %s is unfinished", e.info.Database, describeBlockers(blockers))
-	err.Detail = "DDL on a local database runs on its home shard at once and cannot wait its turn behind a reshard, upgrade or table placement."
+	err := pgwire.Errorf(codeObjectNotInPrerequisiteState, "schema changes on the home shard of database %s are not available while %s is unfinished", e.info.Database, describeBlockers(blockers))
+	err.Detail = "This statement creates or changes objects on the home shard at once and cannot wait its turn behind a reshard, upgrade or table placement."
 	err.Hint = "retry once it completes; a shorter resharding.retireOldGroupsAfter shortens a reshard's wait"
 	return err
 }

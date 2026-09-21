@@ -137,8 +137,13 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
      `NOT NULL` or another constraint): create a new table and copy the
      rows.
    * `TRUNCATE`, `LOCK`, plain `VACUUM`/`ANALYZE`, `COPY` on
-     sharded/reference tables and `CREATE TABLE AS` over them (not
-     migrations; still refused).
+     sharded/reference tables and `CREATE TABLE AS`, `CREATE MATERIALIZED
+     VIEW` or `SELECT … INTO` over them (not migrations; still refused).
+   * `CREATE SCHEMA` with `CREATE TABLE`/`CREATE VIEW`/`CREATE INDEX`/
+     `GRANT` elements declared inside it: the statement is planned as one
+     `CREATE SCHEMA`, so the objects inside would be created without the
+     checks their own statements carry. Create the schema, then each
+     object, in its own statement.
    * Roles with `SUPERUSER`, `REPLICATION` or `BYPASSRLS` (they would apply
      on every shard's server), `ALTER ROLE … RENAME`, `ALTER ROLE … SET …
      FROM CURRENT`, `ALTER DEFAULT PRIVILEGES`, `REASSIGN OWNED` and `DROP
