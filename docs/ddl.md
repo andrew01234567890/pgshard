@@ -175,7 +175,16 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    placement conflicts with DDL in its database until it has swapped; and
    two migrations conflict in the same database, or when either is about
    roles or databases. The statement is not refused for any of that — it
-   waits, and the session is told what it waits for. A migration that does
+   waits, and the session is told what it waits for. What it was planned
+   under can change while it waits, though: a migration held behind a
+   placement is released exactly when that placement has swapped. So the
+   router records the placement of every table the statement named, and
+   the applier re-reads them before it starts; if one has moved, the
+   migration **fails** with `the placement this statement was planned
+   under has changed while it waited in the queue` and names the table,
+   rather than running an `ALTER TABLE` on the home shard alone for a table
+   that is now on every shard. Re-issue the statement to plan it against
+   the placement in force. A migration that does
    run after a reshard or upgrade has switched makes that run's rollback
    refuse, because the old groups no longer carry the schema the new ones
    have ([upgrade.md](upgrade.md)). Otherwise the applier

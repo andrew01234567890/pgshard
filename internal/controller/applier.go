@@ -82,6 +82,11 @@ func (s *PGMigrationStore) Queued(ctx context.Context) (bool, error) {
 	return queueOn(ctx, s.Pool)
 }
 
+// PlacementDrift implements placementReader.
+func (s *PGMigrationStore) PlacementDrift(ctx context.Context, database string, want []catalog.TablePlacement) (string, error) {
+	return catalog.PlacementDrift(ctx, s.Pool, database, want)
+}
+
 // DatabaseHomeShard implements homeShards.
 func (s *PGMigrationStore) DatabaseHomeShard(ctx context.Context, database string) (int32, error) {
 	var home int32
@@ -111,6 +116,13 @@ type queueAware interface {
 // homeShards reads a database's home shard as the catalog has it now.
 type homeShards interface {
 	DatabaseHomeShard(ctx context.Context, database string) (int32, error)
+}
+
+// placementReader answers what the placement of a queued migration's
+// relations is NOW, so the applier can tell that the one its plan was made
+// under has moved.
+type placementReader interface {
+	PlacementDrift(ctx context.Context, database string, want []catalog.TablePlacement) (string, error)
 }
 
 // heartbeater records that the applier is alive, for a router waiting on a
@@ -585,6 +597,29 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		m.State, m.Meta.ShardSet = catalog.MigrationQueued, ""
 	}
 	if m.State == catalog.MigrationQueued {
+		// The queue holds DDL behind a table placement in the same
+		// database until that placement has SWAPPED, so a migration
+		// released from the queue has been waiting for exactly the event
+		// that can invalidate its plan. Its scope, and the
+		// placement-dependent refusals the planner did not make, were all
+		// decided from placements read at plan time; applying it anyway
+		// runs an ALTER TABLE on the home shard alone for a table that is
+		// now on every shard. There is nothing to replan here -- the
+		// statement text is the client's and the refusals are the
+		// planner's -- so it fails, saying what moved (PGS-971).
+		if pr, ok := a.Store.(placementReader); ok && len(m.Meta.Placements) > 0 {
+			moved, err := pr.PlacementDrift(ctx, m.Database, m.Meta.Placements)
+			if err != nil {
+				return fmt.Errorf("applier: placement of %s: %w", m.Database, err)
+			}
+			if moved != "" {
+				m.State = catalog.MigrationFailed
+				m.Error = "the placement this statement was planned under has changed while it waited in the queue: " +
+					moved + "; re-issue the statement so it is planned against the placement in force"
+				logger.Error("migration planned under a placement that has moved", "moved", moved)
+				return a.Store.Save(ctx, m, a.term())
+			}
+		}
 		if hs, ok := a.Store.(homeShards); ok && m.Scope == "home" {
 			if queued, err := a.queued(ctx); err != nil {
 				return err

@@ -436,6 +436,13 @@ func TestMigrationDedupKey(t *testing.T) {
 	if MigrationDedupKey(pinned, base.Statement) != key {
 		t.Error("the set the applier pins at start changes the key")
 	}
+	// A router from before placements were recorded queues without them,
+	// and a retry through one from after must still attach (PGS-971).
+	placed := base
+	placed.Meta.Placements = []TablePlacement{{Schema: "public", Table: "t", Placement: "sharded", ShardKey: "c"}}
+	if MigrationDedupKey(placed, base.Statement) != key {
+		t.Error("the placements a router read change the key, so a retry through an upgraded router queues a second migration")
+	}
 	for what, change := range map[string]func(*DDLMigration){
 		"database":    func(m *DDLMigration) { m.Database = "other" },
 		"role":        func(m *DDLMigration) { m.Meta.RunAs = "admin" },

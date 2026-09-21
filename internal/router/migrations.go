@@ -501,6 +501,7 @@ func (e *Executor) queueMigration(ctx context.Context, m *plan.Migration, w pgwi
 			SearchPath:    e.recordedSearchPath(),
 			Object:        catalog.MigrationObject{Kind: m.Object.Kind, Schema: m.Object.Schema, Name: m.Object.Name, Table: m.Object.Table, Expect: m.Object.Expect},
 			Target:        m.Target,
+			Placements:    m.Placements,
 			RunAs:         e.info.User,
 			Role:          m.Role,
 			RoleOp:        m.RoleOp,
