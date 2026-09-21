@@ -86,7 +86,12 @@ func (p prepared) paramOIDs() []uint32 {
 }
 
 // execItem is one statement a batch executed, for the transaction prelude.
-type sqlPreparedStmt struct{ name, sql string }
+type sqlPreparedStmt struct {
+	name, sql string
+	// homeDDL: executing it creates a relation on the home shard, so the
+	// EXECUTE meets checkHomeDDL (PGS-975).
+	homeDDL bool
+}
 
 type savepointMark struct {
 	name   string
@@ -703,7 +708,7 @@ func (e *Executor) planOpAt(ctx context.Context, snap *snapshot.Snapshot, sql, o
 	}
 	if err == nil && !e.catalogSession() {
 		switch {
-		case pl.HomeDDL:
+		case pl.HomeDDL, e.executesHomeDDL(pl.Class.Executes):
 			err = e.checkHomeDDL(ctx)
 		case pl.Kind == plan.MigrationKind:
 			err = e.checkFanoutDDL(ctx)
@@ -1227,7 +1232,7 @@ func (e *Executor) noteSessionEffect(class StmtClass, sql string) {
 	switch class.Session {
 	case plan.SessionPrepare:
 		e.forgetSQLPrepared(class.SessionName)
-		e.sqlPrepared = append(e.sqlPrepared, sqlPreparedStmt{name: class.SessionName, sql: sql})
+		e.sqlPrepared = append(e.sqlPrepared, sqlPreparedStmt{name: class.SessionName, sql: sql, homeDDL: class.PreparesHomeDDL})
 	case plan.SessionDeallocate:
 		if class.SessionName == "" {
 			e.sqlPrepared = nil
@@ -1249,6 +1254,20 @@ func (e *Executor) savepointIndex(name string) int {
 		}
 	}
 	return -1
+}
+
+// executesHomeDDL reports that an SQL-level EXECUTE runs a statement whose
+// execution creates a relation on the home shard.
+func (e *Executor) executesHomeDDL(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, p := range e.sqlPrepared {
+		if p.name == name {
+			return p.homeDDL
+		}
+	}
+	return false
 }
 
 func (e *Executor) forgetSQLPrepared(name string) {
@@ -1957,6 +1976,14 @@ func (e *Executor) replanStaleAt(ctx context.Context, statement string, snap *sn
 		// generation, which the fence cannot catch because the generation
 		// is the current one.
 		e.stmtSnap = snap
+		// Nothing replanned means nothing re-checked, and a reshard
+		// starting does not change what SamePlanning compares. A statement
+		// Parsed before it -- a driver's statement cache does exactly that
+		// -- would create its relation on the source during the copy, and
+		// cutover would lose it (PGS-975).
+		if st.plan.HomeDDL {
+			return e.checkHomeDDL(ctx)
+		}
 		return nil
 	}
 	pl, err := e.planOpAt(ctx, snap, st.sql, "parse")
