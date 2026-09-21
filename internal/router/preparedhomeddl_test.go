@@ -184,6 +184,33 @@ func TestHomeDDLIsCheckedWhereAPortalRuns(t *testing.T) {
 	if err := e.Execute(ctx, "kept", 0, w); !refused(err) {
 		t.Errorf("a portal bound to a CREATE TABLE AS whose statement was parsed again: %v, want 55000", err)
 	}
+
+	// And the other way round: a portal bound to "EXECUTE p" runs whatever
+	// p is when it runs, which is when PostgreSQL looks p up. Re-prepared
+	// as a plain SELECT, it is not refused.
+	block(false)
+	e = session()
+	for _, sql := range []string{"begin", "prepare p as select 1 as n into saved"} {
+		if err := e.SimpleQuery(ctx, sql, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.Parse(ctx, "wrap", "execute p", nil, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Bind(ctx, "wrapped", "wrap", nil, nil, nil, w); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.Sync(ctx)
+	for _, sql := range []string{"deallocate p", "prepare p as select 1"} {
+		if err := e.SimpleQuery(ctx, sql, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	block(true)
+	if err := e.Execute(ctx, "wrapped", 0, w); refused(err) {
+		t.Errorf("a portal bound to EXECUTE p, with p re-prepared as a plain SELECT, was refused: %v", err)
+	}
 }
 
 // TestExplainAnalyzeExecuteNamesWhatItRuns (PGS-975 review): EXPLAIN ANALYZE

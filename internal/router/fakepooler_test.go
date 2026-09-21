@@ -421,12 +421,16 @@ type fakeStream struct {
 	// of a transaction. It only did so inside one, and the Execute after a
 	// failed one ran and completed, which PostgreSQL never does.
 	errored bool
-	f       *fakePooler
-	sid     string
-	stream  pgshardv1.Pooler_ExecuteServer
-	batch   []*pgshardv1.ExecuteRequest
-	copyIn  []byte
-	inCopy  bool
+	// skipToSync carries a batch's failure across a Flush: PostgreSQL
+	// discards every extended message after an error until the next Sync,
+	// and a Flush in between ends nothing.
+	skipToSync bool
+	f          *fakePooler
+	sid        string
+	stream     pgshardv1.Pooler_ExecuteServer
+	batch      []*pgshardv1.ExecuteRequest
+	copyIn     []byte
+	inCopy     bool
 	// packed answers rows the way a current pooler does once the router
 	// has asked, so the whole suite exercises that shape rather than only
 	// the one a pooler that predates the request field sends.
@@ -955,7 +959,9 @@ func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) 
 		}
 		return s.rfq()
 	case *pgshardv1.ExecuteRequest_Sync:
-		if err := s.runBatch(ctx); err != nil {
+		err := s.runBatch(ctx)
+		s.skipToSync = false
+		if err != nil {
 			return err
 		}
 		return s.rfq()
@@ -977,7 +983,8 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 	s.batch = nil
 	b := s.f.backend(s.sid)
 	portals := map[string]string{}
-	failed := false
+	failed := s.skipToSync
+	defer func() { s.skipToSync = failed }()
 	for _, req := range batch {
 		if failed {
 			break
