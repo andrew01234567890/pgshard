@@ -115,56 +115,74 @@ type MigrationMeta struct {
 // statement was planned. Placement is the word pgshard.table_status uses --
 // "sharded", "reference" or "unsharded" -- and for a relation with no
 // catalog row it is the database's default, which is what the planner used.
+// ShardKey is the effective shard key of a sharded one: a re-key leaves the
+// word "sharded" alone and still invalidates what was planned -- a unique
+// index that included the old key enforces nothing across shards once the
+// key is another column.
 type TablePlacement struct {
 	Schema    string `json:"schema"`
 	Table     string `json:"table"`
 	Placement string `json:"placement"`
+	ShardKey  string `json:"shard_key,omitempty"`
+}
+
+// placementDriftSQL selects, of the placements recorded in the jsonb array
+// placements, those that no longer hold in database -- both SQL
+// expressions, so the same rule serves PlacementDrift and the guarded start
+// of a queued migration.
+//
+// It resolves a placement exactly as snapshot.load does: the observed
+// status row where the inspection has recorded one, then a DESIRED
+// unsharded row (which the loader trusts without an observation because
+// there is nothing to observe), then the database default. A rule that
+// differed would report drift where the router saw none, and fail DDL that
+// was planned correctly. The shard key likewise comes only from an observed
+// row, as the loader takes it.
+func placementDriftSQL(database, placements string) string {
+	const effective = `coalesce(s.effective_placement,
+		CASE WHEN t.placement = 'unsharded' THEN t.placement END,
+		d.default_placement, 'unsharded')`
+	const effectiveKey = `CASE WHEN s.effective_placement IS NOT NULL THEN coalesce(s.effective_shard_key, '') ELSE '' END`
+	return `SELECT w.schema, w."table", w.placement, coalesce(w.shard_key, ''), ` + effective + `, ` + effectiveKey + `
+		FROM jsonb_to_recordset(coalesce(` + placements + `, '[]'::jsonb)) AS w(schema text, "table" text, placement text, shard_key text)
+		LEFT JOIN pgshard.table_status s
+		       ON s.database = ` + database + ` AND s.schema_name = w.schema AND s.table_name = w."table"
+		LEFT JOIN pgshard.tables t
+		       ON t.database = ` + database + ` AND t.schema_name = w.schema AND t.table_name = w."table"
+		LEFT JOIN pgshard.databases d ON d.name = ` + database + `
+		WHERE ` + effective + ` IS DISTINCT FROM w.placement
+		   OR ` + effectiveKey + ` IS DISTINCT FROM coalesce(w.shard_key, '')`
 }
 
 // PlacementDrift names the first relation of want whose effective
-// placement in database is no longer what want records, and says what it
-// was and is. It returns "" when every one still matches, which is also the
-// answer for a migration that recorded none.
-//
-// It reads what the ROUTER read: the table_status row where there is one,
-// and the database's default placement where there is not, so that
-// declaring a previously undeclared table counts as the change it is.
+// placement or shard key in database is no longer what want records, and
+// says what it was and is. It returns "" when every one still matches,
+// which is also the answer for a migration that recorded none.
 func PlacementDrift(ctx context.Context, q RowQuerier, database string, want []TablePlacement) (string, error) {
 	if len(want) == 0 {
 		return "", nil
 	}
-	schemas := make([]string, len(want))
-	tables := make([]string, len(want))
-	recorded := make([]string, len(want))
-	for i, w := range want {
-		schemas[i], tables[i], recorded[i] = w.Schema, w.Table, w.Placement
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		return "", err
 	}
-	// effective mirrors snapshot.load exactly: the observed placement
-	// where the inspection has recorded one, then a DESIRED unsharded row
-	// (which the loader trusts without an observation because there is
-	// nothing to observe), then the database default. A rule that differed
-	// would report drift where the router saw none.
-	const effective = `coalesce(s.effective_placement,
-		CASE WHEN t.placement = 'unsharded' THEN t.placement END,
-		d.default_placement, 'unsharded')`
-	var schema, table, was, now string
-	err := q.QueryRow(ctx, `
-		SELECT w.schema_name, w.table_name, w.recorded, `+effective+`
-		FROM unnest($2::text[], $3::text[], $4::text[]) AS w(schema_name, table_name, recorded)
-		LEFT JOIN pgshard.table_status s
-		       ON s.database = $1 AND s.schema_name = w.schema_name AND s.table_name = w.table_name
-		LEFT JOIN pgshard.tables t
-		       ON t.database = $1 AND t.schema_name = w.schema_name AND t.table_name = w.table_name
-		LEFT JOIN pgshard.databases d ON d.name = $1
-		WHERE `+effective+` IS DISTINCT FROM w.recorded
-		LIMIT 1`, database, schemas, tables, recorded).Scan(&schema, &table, &was, &now)
+	var schema, table, was, wasKey, now, nowKey string
+	err = q.QueryRow(ctx, placementDriftSQL("$1", "$2::jsonb")+` LIMIT 1`, database, string(encoded)).
+		Scan(&schema, &table, &was, &wasKey, &now, &nowKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s.%s was %s when the statement was planned and is %s now", schema, table, was, now), nil
+	return fmt.Sprintf("%s.%s was %s when the statement was planned and is %s now", schema, table, describePlacement(was, wasKey), describePlacement(now, nowKey)), nil
+}
+
+func describePlacement(placement, key string) string {
+	if key == "" {
+		return placement
+	}
+	return placement + " by " + key
 }
 
 // MigrationStep is one statement of a multistep migration.
@@ -562,6 +580,7 @@ func SaveQueuedMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigrat
 		WHERE id = $1 AND `+leaderTermPredicate+`
 		  AND NOT (state = 'queued' AND $2 = 'running' AND (
 		      EXISTS (SELECT 1 FROM pgshard.operation_blockers('ddl', pgshard.migrations.id))
+		      OR EXISTS (`+placementDriftSQL("pgshard.migrations.database", "pgshard.migrations.meta->'placements'")+`)
 		      OR $6 IS DISTINCT FROM coalesce((SELECT shard_set FROM pgshard.shard_sets WHERE state = 'serving' ORDER BY generation DESC LIMIT 1), 'default')
 		      OR (scope = 'home' AND $7::int IS DISTINCT FROM (SELECT d.home_shard FROM pgshard.databases d WHERE d.name = pgshard.migrations.database))))`,
 		m.HomeShard)

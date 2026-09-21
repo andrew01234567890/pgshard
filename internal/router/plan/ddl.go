@@ -868,7 +868,7 @@ func (w *walker) createView(v *pgquerypb.ViewStmt) error {
 	// The view's scope comes from the placements the INNER walker read, so
 	// they are the ones the applier has to re-check.
 	for _, pl := range inner.placements {
-		w.notePlacement(pl.Schema, pl.Table, pl.Placement)
+		w.notePlacement(pl)
 	}
 	scope := ScopeHome
 	for _, r := range inner.rels {

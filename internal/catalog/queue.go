@@ -106,7 +106,11 @@ func MigrationDedupKey(m DDLMigration, statement string) string {
 		return ""
 	}
 	meta := m.Meta
-	meta.ShardSet, meta.Target = "", ""
+	// Placements are left out too: a retry of the same statement is the
+	// same request whatever placement each router read, and a router from
+	// before they were recorded must still attach to one from after. The
+	// migration it attaches to is checked against its own placements.
+	meta.ShardSet, meta.Target, meta.Placements = "", "", nil
 	encoded, err := json.Marshal(meta)
 	if err != nil {
 		return ""

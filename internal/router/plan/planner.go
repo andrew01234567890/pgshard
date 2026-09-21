@@ -933,7 +933,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 			r.schema = schema
 			// The BASE table's placement, under the base table's name: a
 			// placement workflow moves the table, not the view over it.
-			w.notePlacement(v.Base.SchemaName, v.Base.TableName, base.Placement)
+			w.notePlacement(catalog.TablePlacement{Schema: v.Base.SchemaName, Table: v.Base.TableName, Placement: base.Placement, ShardKey: base.ShardKey})
 			if err := applyPlacement(r, base, v.Base.TableName); err != nil {
 				return nil, err
 			}
@@ -950,7 +950,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		}
 		w.plan.Tables = append(w.plan.Tables, key)
 		r.schema = schema
-		w.notePlacement(schema, name, pl.Placement)
+		w.notePlacement(catalog.TablePlacement{Schema: schema, Table: name, Placement: pl.Placement, ShardKey: pl.ShardKey})
 		if err := applyPlacement(r, pl, name); err != nil {
 			return nil, err
 		}
@@ -963,8 +963,16 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 	if snap != nil {
 		// No catalog row, so the database default is the placement the
 		// plan is made under -- and DECLARING the table is itself a
-		// placement change, which the applier must see.
-		w.notePlacement(r.schema, name, snap.Databases[w.sess.Database].DefaultPlacement)
+		// placement change, which the applier must see. Unqualified, the
+		// name is whichever schema of the path PostgreSQL finds it in,
+		// which the router cannot know; so it depends on every one of
+		// them, and a declaration in any is a change.
+		for _, schema := range schemas {
+			if schema == "pg_catalog" || schema == "information_schema" || schema == "pg_temp" {
+				continue
+			}
+			w.notePlacement(catalog.TablePlacement{Schema: schema, Table: name, Placement: snap.Databases[w.sess.Database].DefaultPlacement})
+		}
 		switch snap.Databases[w.sess.Database].DefaultPlacement {
 		case "reference":
 			// Undeclared, but a reference table all the same: it is
@@ -2741,16 +2749,16 @@ func hiddenDDLName(n *pgquerypb.Node) string {
 // notePlacement records the effective placement a relation had when the
 // statement was planned, once per relation. An empty placement is the
 // unsharded default, written out so the applier compares like with like.
-func (w *walker) notePlacement(schema, table, placement string) {
-	if placement == "" {
-		placement = "unsharded"
+func (w *walker) notePlacement(pl catalog.TablePlacement) {
+	if pl.Placement == "" {
+		pl.Placement = "unsharded"
 	}
 	for _, p := range w.placements {
-		if p.Schema == schema && p.Table == table {
+		if p.Schema == pl.Schema && p.Table == pl.Table {
 			return
 		}
 	}
-	w.placements = append(w.placements, catalog.TablePlacement{Schema: schema, Table: table, Placement: placement})
+	w.placements = append(w.placements, pl)
 }
 
 func applyPlacement(r *rel, pl snapshot.Placement, name string) error {
