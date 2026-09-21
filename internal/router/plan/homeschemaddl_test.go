@@ -112,6 +112,49 @@ func TestCreateTableAsIsMarkedAsHomeDDL(t *testing.T) {
 		}
 	}
 
+	// The grammar hangs the into clause off the LEFTMOST ARM of a set
+	// operation, so reading it off the top node alone missed these --
+	// they create a relation exactly as the plain form does.
+	for _, sql := range []string{
+		`SELECT 1 AS n INTO tool.u UNION ALL SELECT 2`,
+		`SELECT 1 AS n INTO tool.i INTERSECT SELECT 1`,
+		`SELECT 1 AS n INTO tool.e EXCEPT SELECT 2`,
+		`SELECT 1 AS n INTO tool.u3 UNION ALL SELECT 2 UNION ALL SELECT 3`,
+	} {
+		pl, err := p.Plan(context.Background(), session(s), sql)
+		if err != nil {
+			t.Errorf("refused: %.70s\n  %v", sql, err)
+			continue
+		}
+		if !pl.HomeDDL {
+			t.Errorf("%.70s planned %v without HomeDDL; the into clause is on its leftmost arm", sql, pl.Kind)
+		}
+	}
+
+	// EXPLAIN without ANALYZE runs nothing, so it creates no relation and
+	// must not be refused while a reshard is copying. EXPLAIN ANALYZE does
+	// run it.
+	for _, c := range []struct {
+		sql  string
+		mark bool
+	}{
+		{`EXPLAIN CREATE TABLE tool.x AS SELECT id FROM public.items`, false},
+		{`EXPLAIN SELECT id INTO tool.y FROM public.items`, false},
+		{`EXPLAIN (ANALYZE false) CREATE TABLE tool.z AS SELECT 1 AS n`, false},
+		{`EXPLAIN ANALYZE CREATE TABLE tool.a AS SELECT 1 AS n`, true},
+		{`EXPLAIN (ANALYZE) SELECT 1 AS n INTO tool.b`, true},
+		{`EXPLAIN (ANALYZE true, BUFFERS) CREATE TABLE tool.c AS SELECT 1 AS n`, true},
+	} {
+		pl, err := p.Plan(context.Background(), session(s), c.sql)
+		if err != nil {
+			t.Errorf("refused: %.70s\n  %v", c.sql, err)
+			continue
+		}
+		if pl.HomeDDL != c.mark {
+			t.Errorf("%.70s: HomeDDL %v, want %v", c.sql, pl.HomeDDL, c.mark)
+		}
+	}
+
 	// A plain SELECT is not DDL and stays unmarked, so the gate does not
 	// refuse reads while a reshard runs.
 	if pl, err := p.Plan(context.Background(), session(s), `SELECT id FROM public.items`); err != nil || pl.HomeDDL {

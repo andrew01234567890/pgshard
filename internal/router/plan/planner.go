@@ -984,7 +984,7 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		// that creating a relation carries -- the placement of the table
 		// it creates, the refusal to build one out of distributed rows,
 		// or the mark that stops DDL running during a reshard (PGS-969).
-		if into := n.SelectStmt.GetIntoClause(); into != nil && !w.intoSelect {
+		if into := intoOf(n.SelectStmt); into != nil && !w.intoSelect {
 			w.intoSelect = true
 			return w.derived(into.GetRel(), node, "SELECT INTO")
 		}
@@ -1006,7 +1006,20 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		w.stmt = "DELETE"
 		return w.delete(n.DeleteStmt)
 	case *pgquerypb.Node_ExplainStmt:
-		return w.statement(n.ExplainStmt.GetQuery())
+		if err := w.statement(n.ExplainStmt.GetQuery()); err != nil {
+			return err
+		}
+		// EXPLAIN without ANALYZE plans its argument and runs nothing, so
+		// it creates no relation -- PostgreSQL accepts EXPLAIN of CREATE
+		// TABLE AS and SELECT ... INTO precisely to show the plan without
+		// the table. Carrying the mark out of the inner statement would
+		// have the executor refuse an EXPLAIN during a reshard, which
+		// answers a question about routing that is still perfectly
+		// answerable. EXPLAIN ANALYZE does run it, and keeps the mark.
+		if !explainAnalyzes(n.ExplainStmt) {
+			w.plan.HomeDDL = false
+		}
+		return nil
 	case *pgquerypb.Node_DeclareCursorStmt:
 		return w.statement(n.DeclareCursorStmt.GetQuery())
 	case *pgquerypb.Node_PrepareStmt:
@@ -1412,6 +1425,39 @@ func (w *walker) outerFeatures(s *pgquerypb.SelectStmt) {
 	// derived(), which refuses the multi-shard case with the reason that
 	// is true of it: the relation it creates lives on the home shard, so
 	// it cannot be built out of rows that are spread across shards.
+}
+
+// intoOf is the into clause of a SELECT. The grammar attaches it to the
+// LEFTMOST ARM of a set operation, not to the statement -- PostgreSQL's own
+// transformSelectStmt walks down larg to find it (analyze.c) -- so reading
+// it off the top node alone missed SELECT 1 INTO t UNION ALL SELECT 2,
+// which creates a relation just the same.
+func intoOf(s *pgquerypb.SelectStmt) *pgquerypb.IntoClause {
+	for s != nil {
+		if into := s.GetIntoClause(); into != nil {
+			return into
+		}
+		s = s.GetLarg()
+	}
+	return nil
+}
+
+// explainAnalyzes reports EXPLAIN ANALYZE, which executes the statement it
+// explains. The option is read the way defGetBoolean reads it, and the last
+// spelling wins, as it does for the pgshard option.
+func explainAnalyzes(e *pgquerypb.ExplainStmt) bool {
+	on := false
+	for _, o := range e.GetOptions() {
+		d := o.GetDefElem()
+		if d == nil || !strings.EqualFold(d.GetDefname(), "analyze") {
+			continue
+		}
+		// An unreadable value is PostgreSQL's error to raise, and until it
+		// does the safe reading is that the statement RUNS.
+		v, err := optionIsOn(d)
+		on = err != nil || v
+	}
+	return on
 }
 
 func hasWindow(node *pgquerypb.Node) bool {
