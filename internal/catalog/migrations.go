@@ -93,12 +93,78 @@ type MigrationMeta struct {
 	// reshard or upgrade cutover must not read them against the set that
 	// is serving now.
 	ShardSet string `json:"shard_set,omitempty"`
+	// Placements is the placement every relation the statement resolved
+	// had when it was planned. A queued migration's scope, and the
+	// placement-dependent refusals the planner made, were all decided from
+	// these -- and the operation queue holds DDL behind a table placement
+	// in the same database until that placement has SWAPPED, so a
+	// migration released from the queue has been waiting for exactly the
+	// event that makes them untrue. The applier re-reads them before it
+	// starts and fails the migration rather than applying a plan made
+	// under a placement that has moved (PGS-971).
+	Placements []TablePlacement `json:"placements,omitempty"`
 	// Target is the object the statement names, qualified when the client
 	// qualified it. It is for reading only -- the queue withholds the
 	// statement, and without a name every ALTER TABLE in it reads as
 	// "ALTER TABLE" -- so it is not part of a migration's identity and the
 	// dedup key leaves it out.
 	Target string `json:"target,omitempty"`
+}
+
+// TablePlacement is the effective placement one relation had when a
+// statement was planned. Placement is the word pgshard.table_status uses --
+// "sharded", "reference" or "unsharded" -- and for a relation with no
+// catalog row it is the database's default, which is what the planner used.
+type TablePlacement struct {
+	Schema    string `json:"schema"`
+	Table     string `json:"table"`
+	Placement string `json:"placement"`
+}
+
+// PlacementDrift names the first relation of want whose effective
+// placement in database is no longer what want records, and says what it
+// was and is. It returns "" when every one still matches, which is also the
+// answer for a migration that recorded none.
+//
+// It reads what the ROUTER read: the table_status row where there is one,
+// and the database's default placement where there is not, so that
+// declaring a previously undeclared table counts as the change it is.
+func PlacementDrift(ctx context.Context, q RowQuerier, database string, want []TablePlacement) (string, error) {
+	if len(want) == 0 {
+		return "", nil
+	}
+	schemas := make([]string, len(want))
+	tables := make([]string, len(want))
+	recorded := make([]string, len(want))
+	for i, w := range want {
+		schemas[i], tables[i], recorded[i] = w.Schema, w.Table, w.Placement
+	}
+	// effective mirrors snapshot.load exactly: the observed placement
+	// where the inspection has recorded one, then a DESIRED unsharded row
+	// (which the loader trusts without an observation because there is
+	// nothing to observe), then the database default. A rule that differed
+	// would report drift where the router saw none.
+	const effective = `coalesce(s.effective_placement,
+		CASE WHEN t.placement = 'unsharded' THEN t.placement END,
+		d.default_placement, 'unsharded')`
+	var schema, table, was, now string
+	err := q.QueryRow(ctx, `
+		SELECT w.schema_name, w.table_name, w.recorded, `+effective+`
+		FROM unnest($2::text[], $3::text[], $4::text[]) AS w(schema_name, table_name, recorded)
+		LEFT JOIN pgshard.table_status s
+		       ON s.database = $1 AND s.schema_name = w.schema_name AND s.table_name = w.table_name
+		LEFT JOIN pgshard.tables t
+		       ON t.database = $1 AND t.schema_name = w.schema_name AND t.table_name = w.table_name
+		LEFT JOIN pgshard.databases d ON d.name = $1
+		WHERE `+effective+` IS DISTINCT FROM w.recorded
+		LIMIT 1`, database, schemas, tables, recorded).Scan(&schema, &table, &was, &now)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s.%s was %s when the statement was planned and is %s now", schema, table, was, now), nil
 }
 
 // MigrationStep is one statement of a multistep migration.

@@ -49,6 +49,13 @@ type Migration struct {
 	// Target is the object the statement names, for reading only: the
 	// operation queue shows it because it withholds the statement.
 	Target string
+	// Placements is the effective placement of every relation the
+	// statement resolved, as the planner read it. The scope above, and
+	// every placement-dependent refusal the planner did not make, follow
+	// from these; the applier re-reads them before it starts so a
+	// migration the queue held through a table placement is not applied
+	// to the shards the old placement named (PGS-971).
+	Placements []catalog.TablePlacement
 	// Role and Verifier are set for CREATE/ALTER/DROP ROLE so the applier
 	// mirrors the desired row in pgshard.roles.
 	Role     string
@@ -166,6 +173,7 @@ func (w *walker) migration(m Migration) error {
 	if m.Target == "" {
 		m.Target = targetName(w.root)
 	}
+	m.Placements = w.placements
 	w.plan.Kind, w.plan.Shards, w.plan.Migration = MigrationKind, nil, &m
 	return nil
 }
@@ -856,6 +864,11 @@ func (w *walker) createView(v *pgquerypb.ViewStmt) error {
 	inner := &walker{sess: w.sess, plan: &Plan{home: w.plan.home, set: w.plan.set, snap: w.plan.snap}, tree: w.tree, root: v.GetQuery()}
 	if err := inner.statement(v.GetQuery()); err != nil {
 		return err
+	}
+	// The view's scope comes from the placements the INNER walker read, so
+	// they are the ones the applier has to re-check.
+	for _, pl := range inner.placements {
+		w.notePlacement(pl.Schema, pl.Table, pl.Placement)
 	}
 	scope := ScopeHome
 	for _, r := range inner.rels {

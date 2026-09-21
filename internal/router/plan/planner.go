@@ -834,6 +834,11 @@ type walker struct {
 	// query behind the relation it creates, so that the second pass reads
 	// it as an ordinary SELECT instead of routing it back here.
 	intoSelect bool
+	// placements is the effective placement of every relation the
+	// statement resolved, in the order they were resolved. A migration
+	// carries them so the applier can tell that the placement its scope
+	// was decided from has moved while it waited in the queue (PGS-971).
+	placements []catalog.TablePlacement
 	// root is the statement being planned; raw wraps it and sql is its text.
 	root *pgquerypb.Node
 	raw  *pgquerypb.RawStmt
@@ -926,6 +931,9 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 			key = v.Base
 			w.plan.Tables = append(w.plan.Tables, key)
 			r.schema = schema
+			// The BASE table's placement, under the base table's name: a
+			// placement workflow moves the table, not the view over it.
+			w.notePlacement(v.Base.SchemaName, v.Base.TableName, base.Placement)
 			if err := applyPlacement(r, base, v.Base.TableName); err != nil {
 				return nil, err
 			}
@@ -942,6 +950,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		}
 		w.plan.Tables = append(w.plan.Tables, key)
 		r.schema = schema
+		w.notePlacement(schema, name, pl.Placement)
 		if err := applyPlacement(r, pl, name); err != nil {
 			return nil, err
 		}
@@ -952,6 +961,10 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		return r, nil
 	}
 	if snap != nil {
+		// No catalog row, so the database default is the placement the
+		// plan is made under -- and DECLARING the table is itself a
+		// placement change, which the applier must see.
+		w.notePlacement(r.schema, name, snap.Databases[w.sess.Database].DefaultPlacement)
 		switch snap.Databases[w.sess.Database].DefaultPlacement {
 		case "reference":
 			// Undeclared, but a reference table all the same: it is
@@ -2725,6 +2738,21 @@ func hiddenDDLName(n *pgquerypb.Node) string {
 // routes by. name is what the message calls the relation, which for a view
 // is its BASE table -- the client asked for the view, but the problem being
 // reported is the base table's.
+// notePlacement records the effective placement a relation had when the
+// statement was planned, once per relation. An empty placement is the
+// unsharded default, written out so the applier compares like with like.
+func (w *walker) notePlacement(schema, table, placement string) {
+	if placement == "" {
+		placement = "unsharded"
+	}
+	for _, p := range w.placements {
+		if p.Schema == schema && p.Table == table {
+			return
+		}
+	}
+	w.placements = append(w.placements, catalog.TablePlacement{Schema: schema, Table: table, Placement: placement})
+}
+
 func applyPlacement(r *rel, pl snapshot.Placement, name string) error {
 	switch pl.Placement {
 	case "sharded":
