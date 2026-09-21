@@ -129,7 +129,10 @@ type TablePlacement struct {
 // placementDriftSQL selects, of the placements recorded in the jsonb array
 // placements, those that no longer hold in database -- both SQL
 // expressions, so the same rule serves PlacementDrift and the guarded start
-// of a queued migration.
+// of a queued migration. A JSON null reads as no placements: Go decodes it
+// as an empty list and skips the check, and jsonb_to_recordset would raise
+// on it inside the start's guard, failing every applier pass rather than
+// one migration.
 //
 // It resolves a placement exactly as snapshot.load does: the observed
 // status row where the inspection has recorded one, then a DESIRED
@@ -144,7 +147,7 @@ func placementDriftSQL(database, placements string) string {
 		d.default_placement, 'unsharded')`
 	const effectiveKey = `CASE WHEN s.effective_placement IS NOT NULL THEN coalesce(s.effective_shard_key, '') ELSE '' END`
 	return `SELECT w.schema, w."table", w.placement, coalesce(w.shard_key, ''), ` + effective + `, ` + effectiveKey + `
-		FROM jsonb_to_recordset(coalesce(` + placements + `, '[]'::jsonb)) AS w(schema text, "table" text, placement text, shard_key text)
+		FROM jsonb_to_recordset(coalesce(nullif(` + placements + `, 'null'::jsonb), '[]'::jsonb)) AS w(schema text, "table" text, placement text, shard_key text)
 		LEFT JOIN pgshard.table_status s
 		       ON s.database = ` + database + ` AND s.schema_name = w.schema AND s.table_name = w."table"
 		LEFT JOIN pgshard.tables t

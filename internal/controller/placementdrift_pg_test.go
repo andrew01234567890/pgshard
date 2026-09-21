@@ -115,6 +115,23 @@ func TestPlacementDriftReadsWhatTheRouterRead(t *testing.T) {
 	if got, err := catalog.PlacementDrift(ctx, pool, "app", nil); err != nil || got != "" {
 		t.Errorf("no placements recorded: %q %v, want no drift", got, err)
 	}
+
+	// A row whose placements are an explicit JSON null starts like one with
+	// none; the guard raising on it would fail every pass of the applier.
+	id, err := catalog.EnqueueMigration(ctx, pool, catalog.DDLMigration{Database: "app", Statement: "CREATE INDEX i ON t (c)",
+		Kind: "CREATE INDEX", Strategy: "direct", Scope: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE pgshard.migrations SET meta = jsonb_set(meta, '{placements}', 'null'::jsonb) WHERE id = $1`, id)
+	m, err := catalog.LoadMigration(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.State, m.Meta.ShardSet = catalog.MigrationRunning, "default"
+	if err := (&PGMigrationStore{Pool: pool}).Save(ctx, m, 0); err != nil {
+		t.Fatalf("starting a migration whose placements are JSON null: %v", err)
+	}
 }
 
 // TestAReKeyIsAPlacementChange (PGS-971 review): a re-key leaves the word

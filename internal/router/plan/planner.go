@@ -966,7 +966,12 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		// placement change, which the applier must see. Unqualified, the
 		// name is whichever schema of the path PostgreSQL finds it in,
 		// which the router cannot know; so it depends on every one of
-		// them, and a declaration in any is a change.
+		// them, and a declaration in any is a change. That over-counts
+		// when a LATER schema's same-named table is declared while the
+		// statement resolves to an earlier one -- which fails a migration
+		// that would have been right. The other way round, missing the
+		// one it does resolve to, runs DDL on the wrong shards; a
+		// failure the client re-issues is the cheaper mistake.
 		for _, schema := range schemas {
 			if schema == "pg_catalog" || schema == "information_schema" || schema == "pg_temp" {
 				continue
