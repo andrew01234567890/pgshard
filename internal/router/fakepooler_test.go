@@ -416,12 +416,17 @@ func (f *fakePooler) Cancel(_ context.Context, req *pgshardv1.CancelRequest) (*p
 }
 
 type fakeStream struct {
-	f      *fakePooler
-	sid    string
-	stream pgshardv1.Pooler_ExecuteServer
-	batch  []*pgshardv1.ExecuteRequest
-	copyIn []byte
-	inCopy bool
+	// errored is set by every error this stream answers, so the extended
+	// batch loop can skip to Sync after one as PostgreSQL does -- in or out
+	// of a transaction. It only did so inside one, and the Execute after a
+	// failed one ran and completed, which PostgreSQL never does.
+	errored bool
+	f       *fakePooler
+	sid     string
+	stream  pgshardv1.Pooler_ExecuteServer
+	batch   []*pgshardv1.ExecuteRequest
+	copyIn  []byte
+	inCopy  bool
 	// packed answers rows the way a current pooler does once the router
 	// has asked, so the whole suite exercises that shape rather than only
 	// the one a pooler that predates the request field sends.
@@ -599,6 +604,7 @@ func (f *fakePooler) isReserved(sid string) bool {
 }
 
 func (s *fakeStream) errorf(code, msg string) error {
+	s.errored = true
 	b := s.f.backend(s.sid)
 	if b.tx == 'T' {
 		b.tx = 'E'
@@ -1077,6 +1083,7 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 				s.described, s.formats = false, nil
 				continue
 			}
+			s.errored = false
 			ready, err := s.query(ctx, sql)
 			s.described, s.formats = false, nil
 			if err != nil {
@@ -1085,7 +1092,7 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 			if !ready {
 				return errors.New("fake pooler: COPY through the extended protocol is not scripted")
 			}
-			if b.tx == 'E' {
+			if b.tx == 'E' || s.errored {
 				failed = true
 			}
 		case *pgshardv1.ExecuteRequest_Close:

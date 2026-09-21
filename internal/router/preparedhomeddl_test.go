@@ -165,6 +165,25 @@ func TestHomeDDLIsCheckedWhereAPortalRuns(t *testing.T) {
 	if err := e.Execute(ctx, "held", 0, w); !refused(err) {
 		t.Errorf("a portal bound before the reshard and executed during it: %v, want 55000", err)
 	}
+
+	// A portal bound from the unnamed statement, which is then parsed
+	// again: the portal still runs what it was bound to, so it is judged
+	// by that, not by whatever the name holds now.
+	block(false)
+	e = session()
+	if err := e.Parse(ctx, "", "create table y as select 1 as n", nil, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Bind(ctx, "kept", "", nil, nil, nil, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Parse(ctx, "", "select 1", nil, w); err != nil {
+		t.Fatal(err)
+	}
+	block(true)
+	if err := e.Execute(ctx, "kept", 0, w); !refused(err) {
+		t.Errorf("a portal bound to a CREATE TABLE AS whose statement was parsed again: %v, want 55000", err)
+	}
 }
 
 // TestExplainAnalyzeExecuteNamesWhatItRuns (PGS-975 review): EXPLAIN ANALYZE

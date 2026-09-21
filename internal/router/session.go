@@ -243,6 +243,11 @@ type Executor struct {
 	// found the statement: a name parsed again before the Execute names
 	// another statement by then.
 	portalDDL map[string]*plan.Plan
+	// portalHome says a portal's statement, as its Bind found it, creates
+	// a relation on the home shard -- for the same reason as portalDDL: a
+	// statement replaced after the Bind, the unnamed one above all, no
+	// longer says what the portal runs (PGS-975).
+	portalHome map[string]bool
 
 	batch       []*pgshardv1.ExecuteRequest
 	batchStmts  []string
@@ -347,7 +352,7 @@ func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
 		ident: &pgshardv1.UserIdentity{Username: info.User,
 			ScramClientKey: append([]byte(nil), keys.ClientKey...), ScramServerKey: append([]byte(nil), keys.ServerKey...)},
 		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
-		stmts: map[string]prepared{}, portals: map[string]string{}, portalDDL: map[string]*plan.Plan{},
+		stmts: map[string]prepared{}, portals: map[string]string{}, portalDDL: map[string]*plan.Plan{}, portalHome: map[string]bool{},
 	}
 	e.startupSearchPath = startupPath(info.Params)
 	return e
@@ -1954,6 +1959,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 	}
 	e.portals[portal] = statement
 	e.portalDDL[portal] = migrationPlan(e.stmts, statement)
+	e.portalHome[portal] = e.createsHomeRelation(e.stmts[statement].plan)
 	e.batch = append(e.batch, e.clientRequest(bindReq(portal, e.physical(statement), paramFormats, params, resultFormats)))
 	e.batchDDL = append(e.batchDDL, e.portalDDL[portal])
 	return nil
@@ -2165,7 +2171,7 @@ func (e *Executor) execute(ctx context.Context, portal string, maxRows int32, w 
 		// statement PREPAREd earlier or earlier in this very batch -- is
 		// otherwise never checked again, and creates its relation on the
 		// source mid-copy (PGS-975).
-		if !e.catalogSession() && e.createsHomeRelation(st.plan) {
+		if !e.catalogSession() && (e.portalHome[portal] || e.createsHomeRelation(st.plan)) {
 			if err := e.checkHomeDDL(ctx); err != nil {
 				e.failBatch()
 				return err
@@ -2217,6 +2223,7 @@ func (e *Executor) Close(_ context.Context, kind pgwire.DescribeKind, name strin
 	} else {
 		delete(e.portals, name)
 		delete(e.portalDDL, name)
+		delete(e.portalHome, name)
 	}
 	e.batch = append(e.batch, e.clientRequest(closeReq(kind, name)))
 	return nil
