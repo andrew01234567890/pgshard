@@ -118,8 +118,11 @@ type mergeBuilder struct {
 	onlySharded bool
 	// scalar answers whether a non-built-in name has been declared a scalar
 	// function for this session's database.
-	scalar  declared
-	spec    Merge
+	scalar declared
+	spec   Merge
+	// setOp says sel stands for a set operation: its target list is the
+	// leftmost arm's, and nothing can be added to it.
+	setOp   bool
 	changed bool
 	// clone is the mutable copy of the tree, made on first change.
 	clone  *pgquerypb.SelectStmt
@@ -262,6 +265,13 @@ func (b *mergeBuilder) run() error {
 		return err
 	}
 	b.spec.Limit, b.spec.Offset = limit, offset
+	b.pushLimit(limit, offset)
+	return nil
+}
+
+// pushLimit asks every shard for the first limit+offset rows, which is all
+// the router can need from any one of them, and applies the OFFSET itself.
+func (b *mergeBuilder) pushLimit(limit, offset int64) {
 	switch {
 	case limit >= 0:
 		m := b.mutable()
@@ -280,7 +290,6 @@ func (b *mergeBuilder) run() error {
 		m := b.mutable()
 		m.LimitOffset = nil
 	}
-	return nil
 }
 
 func intConst(v int64) *pgquerypb.Node {
@@ -536,6 +545,13 @@ func (b *mergeBuilder) orderBy(distinct bool) error {
 			}
 		}
 		if col < 0 {
+			if b.setOp {
+				// PostgreSQL's own refusal (parse_clause.c), which the
+				// shards would raise anyway.
+				err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "invalid UNION/INTERSECT/EXCEPT ORDER BY clause")
+				err.Detail = "Only result column names can be used, not expressions or functions."
+				return err
+			}
 			if distinct {
 				return notYet("multi-shard SELECT DISTINCT with ORDER BY expressions outside the select list is not available yet",
 					"add the ORDER BY expression to the select list")

@@ -825,6 +825,10 @@ type walker struct {
 	tree    proto.Message
 	// outer is the outermost SELECT, the one a multi-shard merge is built for.
 	outer *pgquerypb.SelectStmt
+	// setOp is the outermost set operation, when the statement is one, and
+	// unionAllOnly says every set operation in it is UNION ALL.
+	setOp        *pgquerypb.SelectStmt
+	unionAllOnly bool
 	// target is the relation an INSERT, UPDATE or DELETE writes.
 	target *rel
 	// inLocalSchemas says the statement's objects all live in the
@@ -1384,6 +1388,12 @@ func (w *walker) selectStmt(s *pgquerypb.SelectStmt) error {
 	}
 	if s.GetOp() != pgquerypb.SetOperation_SETOP_NONE && s.GetOp() != pgquerypb.SetOperation_SET_OPERATION_UNDEFINED {
 		w.blocker("set operations")
+		if !w.nested && w.setOp == nil {
+			w.setOp, w.unionAllOnly = s, true
+		}
+		if s.GetOp() != pgquerypb.SetOperation_SETOP_UNION || !s.GetAll() {
+			w.unionAllOnly = false
+		}
 		w.nested = true
 		if err := w.selectStmt(s.GetLarg()); err != nil {
 			return err
@@ -2466,6 +2476,9 @@ func (w *walker) scatter(write bool, rels int) error {
 	if write {
 		return notYet("scatter "+w.stmt+" without a shard key predicate is not available yet",
 			"add WHERE <shard key> = ... or IN (...); this will fan out once multi-shard writes land")
+	}
+	if w.setOp != nil && w.unionAllOnly {
+		return w.scatterUnionAll()
 	}
 	if _, ok := w.colocatedKey(); rels > 1 && !ok {
 		return w.crossShardJoinError()

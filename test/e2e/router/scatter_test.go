@@ -384,6 +384,15 @@ var joinCorpus = []corpusQuery{
 	{`select e.id, r.name from events e left join regions r on r.id = e.region order by e.id limit 40`, true},
 	// Three relations at once, two sharded and one reference.
 	{`select count(*) from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id join regions r on r.id = e.region`, true},
+	// PGS-774: UNION ALL of sharded tables. Every row of every arm lives on
+	// one shard, so the shards' answers concatenated are the whole answer;
+	// the statement's ORDER BY and LIMIT are merged at the router.
+	{`select id from events union all select id from event_lines`, false},
+	{`select tenant_id, id from events where qty > 0 union all select tenant_id, id from event_lines where units > 2`, false},
+	{`select id, qty from events union all select id, units from event_lines order by 2 desc nulls last, 1 limit 50 offset 5`, true},
+	{`select tenant_id, id from events union all select tenant_id, id from events order by tenant_id, id limit 30`, true},
+	{`select id from events where tenant_id = 3 union all select id from event_lines order by 1`, true},
+	{`select id from events union all select id from event_lines union all select id from events order by id desc limit 20`, true},
 }
 
 func TestRouterScatterDifferential(t *testing.T) {
@@ -516,7 +525,8 @@ func TestRouterScatterDifferential(t *testing.T) {
 			{`select r.name from regions r left join events e on r.id = e.region`, "an outer join that preserves the rows of a reference table"},
 			// Neither of these contains a join, and both used to be told
 			// they contained a cross-shard one.
-			{`select id from events union all select id from event_lines`, "multi-shard SELECT with set operations"},
+			{`select id from events union select id from event_lines`, "multi-shard SELECT with set operations"},
+			{`select count(*) from events union all select count(*) from event_lines`, "multi-shard UNION ALL with an aggregate in an arm"},
 			{`select id from events where id in (select id from event_lines)`, "multi-shard SELECT with subqueries"},
 		} {
 			_, err := conn.Exec(ctx, c.sql, pgx.QueryExecModeSimpleProtocol)
