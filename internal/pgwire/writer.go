@@ -3,6 +3,7 @@ package pgwire
 import (
 	"errors"
 	"io"
+	"net"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -171,6 +172,18 @@ func (c *copyInStream) Next() ([]byte, error) {
 				return nil, ErrCopyFail
 			}
 			c.done = true
+			c.s.setCopyIn(nil)
+			// A read that failed part-way -- a CopyData declaring a body
+			// larger than the frontend accepts, an unknown message type --
+			// leaves the stream in the middle of a message. Carrying on
+			// parsed the rest of that body as new messages: a query
+			// smuggled inside a CopyData ran. PostgreSQL ends the
+			// connection here too.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+				c.s.copyLost = copyLostTerminated
+			} else {
+				c.s.copyLost = copyLostProtocol
+			}
 			return nil, err
 		}
 		switch m := msg.(type) {

@@ -3234,10 +3234,13 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			clientErr, werr = e.copyIn(w, m.CopyInResponse)
 			// The client ended the COPY badly -- a stray message, a
 			// Terminate, a lost connection -- and the pooler has been sent
-			// CopyFail. The pump reads the shard's answer to it, so the
-			// stream is left at a ReadyForQuery for the next statement, and
-			// the client is told what it did rather than the shard's
-			// "COPY from stdin failed".
+			// CopyFail. For a simple-query COPY the pump reads the shard's
+			// answer to it, so nothing is left unread, and the error is
+			// the client's rather than the shard's "COPY from stdin
+			// failed". (A COPY sent through Parse/Bind/Execute/Sync has
+			// no ReadyForQuery after it at all, because PostgreSQL swallows
+			// that Sync in copy-in mode; that path is broken on its own
+			// and tracked separately.)
 			if clientErr != nil && firstErr == nil {
 				firstErr = clientErr
 			}

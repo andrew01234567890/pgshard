@@ -177,14 +177,15 @@ const (
 
 // copyDrain reads one shard's responses for the whole of a COPY.
 //
-// Nothing else reads the stream while the rows are sent. A shard that
-// answers during the load -- a NOTICE per row from a trigger is enough --
-// filled the stream's buffer and gRPC flow control behind it; the pooler
-// then stopped reading, the backend stopped reading CopyData, and the
-// router's next send blocked for good, out of reach of the client and of
-// a cancel. The drainer keeps the stream moving, holds the notices for the
-// client, notices an early refusal, and reads the load's own end: its
-// COPY count and ReadyForQuery.
+// Nothing else reads the stream while the rows are sent, and anything the
+// pooler relays during the load would otherwise fill it: its buffer, then
+// gRPC flow control, then the router's next send. The drainer keeps the
+// stream moving, holds the notices for the client, notices an early
+// refusal, and reads the load's own end: its COPY count and ReadyForQuery.
+//
+// Today's pooler relays nothing until CopyDone, so a backend raising a
+// NOTICE per row still stalls the load one hop further down, between the
+// pooler and the backend (PGS-983). This is the router's half of that fix.
 type copyDrain struct {
 	p       *txnPart
 	failed  atomic.Bool

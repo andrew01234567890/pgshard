@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -120,9 +121,10 @@ func expectProtocolLost(t *testing.T, fe *pgproto3.Frontend) {
 	}
 }
 
-// A shard that raises notices during a load -- a trigger raising one per
-// row -- used to fill the stream nobody read until the COPY ended, and the
-// load wedged out of reach of the client and of a cancel.
+// A pooler that relays a shard's notices during a load -- as the fake does
+// here, and the real one will once it reads the backend mid-COPY (PGS-983)
+// -- filled a stream nobody read until the COPY ended, and the load
+// wedged out of reach of the client and of a cancel.
 func TestACopyWhoseShardsRaiseNoticesDuringTheLoadCompletes(t *testing.T) {
 	h := newCopyHarness(t)
 	for _, p := range h.poolers {
@@ -264,5 +266,52 @@ func TestAShardedCopyRowWiderThanAGRPCMessageIsRelayed(t *testing.T) {
 	}
 	if tag.RowsAffected() != 1 {
 		t.Fatalf("tag %q", tag)
+	}
+}
+
+// A CopyData declaring a body larger than the router accepts leaves the
+// stream in the middle of that body. Carrying on parsed the rest of it as
+// new messages, so a query smuggled inside the COPY data ran.
+func TestAnOversizedCopyDataEndsTheSessionAndRunsNothingInsideIt(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	nc := conn.PgConn().Conn()
+	fe := pgproto3.NewFrontend(nc, nc)
+	if err := nc.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	fe.Send(&pgproto3.Query{String: "copy t from stdin"})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fe.Receive(); err != nil {
+		t.Fatal(err)
+	}
+	smuggled, err := (&pgproto3.Query{String: "select 1"}).Encode(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := []byte{'d', 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(header[1:], uint32(17<<20+4))
+	if _, err := nc.Write(append(header, smuggled...)); err != nil {
+		t.Fatal(err)
+	}
+	var fatal bool
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			break
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow, *pgproto3.RowDescription:
+			t.Fatal("a query inside the COPY data ran")
+		case *pgproto3.ReadyForQuery:
+			t.Fatal("the session carried on inside a COPY message")
+		case *pgproto3.ErrorResponse:
+			fatal = fatal || m.Severity == "FATAL"
+		}
+	}
+	if !fatal {
+		t.Fatal("the session ended without a FATAL")
 	}
 }
