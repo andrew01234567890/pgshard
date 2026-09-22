@@ -607,11 +607,17 @@ func TestShardedInTransactionCannotLeaveTouchedShard(t *testing.T) {
 	}
 	_, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a)
 	_ = expectRefusal(t, err, "two-phase commit is not available: the router has no decision log")
-	if _, err := conn.Exec(ctx, "commit"); err != nil {
+	// The refusal failed the transaction, as any error does in PostgreSQL,
+	// so its COMMIT rolls back the insert that ran before it.
+	tag, err := conn.Exec(ctx, "commit")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !h.ranOn(0, "commit") || !h.ranOn(0, "insert into items") {
-		t.Fatalf("home shard did not run the transaction: %v", h.poolers[0].ran())
+	if tag.String() != "ROLLBACK" {
+		t.Fatalf("COMMIT of the failed transaction answered %q, want ROLLBACK", tag)
+	}
+	if h.ranOn(0, "commit") || !h.ranOn(0, "rollback") {
+		t.Fatalf("home shard did not roll the transaction back: %v", h.poolers[0].ran())
 	}
 	if _, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", b); err != nil {
 		t.Fatalf("after commit the session moves again: %v", err)

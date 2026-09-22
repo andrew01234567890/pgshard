@@ -254,6 +254,9 @@ type Executor struct {
 	batch       []*pgshardv1.ExecuteRequest
 	batchStmts  []string
 	batchFailed bool
+	// erredSinceSync records an error answered since the last Sync or
+	// simple query began, which pgwire skips to Sync after.
+	erredSinceSync bool
 	// clientReqs marks the staged requests the client sent, and
 	// completions queues, in send order, the Parse, Bind and Close
 	// completions the backend owes and whether each is the client's.
@@ -886,7 +889,11 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.forgetCancelTargets()
 		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
 	}()
-	return e.nameFence(e.asWritePause(run()))
+	err = e.nameFence(e.asWritePause(run()))
+	if err != nil {
+		e.erredSinceSync = true
+	}
+	return err
 }
 
 // nameFence is the last word on a pooler's fence refusal.
@@ -950,8 +957,63 @@ func (e *Executor) asWritePause(err error) error {
 func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
 	e.enterStatement(ctx)
 	defer e.endStatement()
-	return e.guard("SimpleQuery", func() error { return e.simpleQuery(ctx, sql, w) })
+	e.erredSinceSync = false
+	err := e.guard("SimpleQuery", func() error { return e.simpleQuery(ctx, sql, w) })
+	e.failTxnTheBackendDidNotFail(ctx)
+	return err
 }
+
+// failTxnTheBackendDidNotFail puts the client's transaction into the failed
+// state after an error the router answered itself -- a refusal, a DDL
+// PostgreSQL would have run, anything that never reached a shard.
+//
+// PostgreSQL fails the transaction block on every error: statements after
+// it get 25P02 and a COMMIT rolls back. A shard's own error does that on
+// the shard, and the relayed ReadyForQuery says so. A router error left the
+// backend's transaction healthy, so "psql -1 -f" without ON_ERROR_STOP, or
+// any client that logs an error and commits anyway, committed the
+// statements around the one refused (PGS-976).
+//
+// The backend is failed rather than dropped, with a statement that raises
+// on every participant: a savepoint taken before the error then recovers
+// the transaction exactly as it does in PostgreSQL, which a dropped backend
+// cannot. With no backend yet there is nothing to fail but the session's
+// own state, which failTxn already answers for.
+func (e *Executor) failTxnTheBackendDidNotFail(ctx context.Context) {
+	erred := e.erredSinceSync
+	e.erredSinceSync = false
+	// A multi-shard transaction between shards has an idle current part
+	// and is still the client's; an implicit one is pgwire's to roll back,
+	// at once.
+	inTxn := e.tx == pgwire.TxInBlock || (e.tx == pgwire.TxIdle && e.multiShardTxn())
+	if !erred || !inTxn || e.implicitTx {
+		return
+	}
+	if e.conn == nil && !e.multiShardTxn() {
+		e.failTxn()
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	var parts []*txnPart
+	for _, p := range e.parts() {
+		if p.ps != nil {
+			parts = append(parts, p)
+		}
+	}
+	e.each(parts, func(p *txnPart) error { return e.runOn(ctx, p, abortTxnSQL, discardWriter{}) })
+	for _, p := range parts {
+		if p.tx != pgwire.TxFailed {
+			e.r.cfg.Logger.Warn("router: could not fail a transaction on its shard; dropping its backends",
+				"session", e.sid, "shard", p.shard, "err", p.err)
+			e.dropStream()
+			e.failTxn()
+			return
+		}
+	}
+	e.tx = pgwire.TxFailed
+}
+
+const abortTxnSQL = "DO $pgshard$BEGIN RAISE EXCEPTION 'pgshard: an earlier statement of this transaction failed at the router'; END$pgshard$"
 
 // endStatement forgets the snapshot the statement just ended was planned
 // against. pump does it on a relayed ReadyForQuery, but a statement the
@@ -1064,6 +1126,10 @@ func noActiveTransactionWarning() *pgproto3.NoticeResponse {
 // answers reaches the client.
 func (e *Executor) BeginImplicit(ctx context.Context) error {
 	e.enterStatement(ctx)
+	// Its error ends the batch there, with no Sync or simple query of the
+	// router's to consume the flag, which would then fail the client's
+	// next transaction.
+	defer func() { e.erredSinceSync = false }()
 	if err := e.guard("BeginImplicit", func() error {
 		return e.simpleQuery(ctx, "BEGIN", discardWriter{})
 	}); err != nil {
@@ -1076,6 +1142,7 @@ func (e *Executor) BeginImplicit(ctx context.Context) error {
 // EndImplicit implements pgwire.Executor.
 func (e *Executor) EndImplicit(ctx context.Context, commit bool) error {
 	e.enterStatement(ctx)
+	defer func() { e.erredSinceSync = false }()
 	sql := "ROLLBACK"
 	if commit {
 		sql = "COMMIT"
@@ -2095,6 +2162,7 @@ func (e *Executor) Describe(_ context.Context, kind pgwire.DescribeKind, name st
 		if st, ok := e.stmts[name]; ok && e.batchTarget == nil && e.batchScatter == nil && !e.replayableHere(st.plan) {
 			if err := e.aimBatch(st.plan, name); err != nil {
 				e.failBatch()
+				e.erredSinceSync = true
 				return err
 			}
 		}
@@ -2264,7 +2332,9 @@ func (e *Executor) failBatch() {
 func (e *Executor) Sync(ctx context.Context) error {
 	e.enterStatement(ctx)
 	defer e.endStatement()
-	return e.guard("Sync", func() error { return e.sync(ctx) })
+	err := e.guard("Sync", func() error { return e.sync(ctx) })
+	e.failTxnTheBackendDidNotFail(ctx)
+	return err
 }
 
 // Flush answers a client's Flush: the extended batch staged so far runs and

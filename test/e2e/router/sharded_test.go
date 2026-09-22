@@ -4,6 +4,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -209,11 +210,13 @@ func TestRouterShardedRouting(t *testing.T) {
 		if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "cannot take part in a multi-shard transaction") {
 			t.Fatalf("second shard inside a transaction: %v", err)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			t.Fatal(err)
+		// The refusal failed the transaction, as any error does in
+		// PostgreSQL, so the COMMIT rolls back the row before it.
+		if err := tx.Commit(ctx); !errors.Is(err, pgx.ErrTxCommitRollback) {
+			t.Fatalf("COMMIT after the refusal: %v, want it rolled back", err)
 		}
-		if n := s.rowsOn(t, 0, t0); n != 1 {
-			t.Fatalf("committed row missing on shard 0: %d", n)
+		if n := s.rowsOn(t, 0, t0); n != 0 {
+			t.Fatalf("the failed transaction left %d rows on shard 0", n)
 		}
 	})
 
