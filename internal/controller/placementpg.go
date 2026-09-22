@@ -1726,7 +1726,20 @@ func tableRowSecurity(ctx context.Context, conn ShardConn, schema, table string)
 // role it holds, and pgshard's DDL role is NOBYPASSRLS -- and losing rows
 // that way is silent. And a shadow is not the table clients see, so nothing
 // should be enforcing on it before it is.
+//
+// The expressions are rendered with search_path set to pg_catalog alone, so
+// every user relation, function and type in them is schema-qualified.
+// pg_get_expr leaves a name bare when the session's search_path finds it,
+// and the statement is replayed later, on other shards and in another
+// session: a search_path changed in between -- an ALTER DATABASE or ALTER
+// ROLE SET -- would bind the bare name to something else, or make the
+// recheck before the swap read the same policies as changed (PGS-886).
 func tablePolicies(ctx context.Context, conn ShardConn, schema, table, shadow string) ([]string, error) {
+	restore, err := qualifyingSearchPath(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
 	rows, err := conn.Query(ctx, `SELECT p.polname, p.polcmd::text, p.polpermissive,
 			(SELECT coalesce(string_agg(CASE WHEN u.oid = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END, ', '), '')
 			   FROM unnest(p.polroles) AS u(oid) LEFT JOIN pg_roles r ON r.oid = u.oid) AS roles,
@@ -1778,6 +1791,27 @@ func tablePolicies(ctx context.Context, conn ShardConn, schema, table, shadow st
 		out = append(out, stmt)
 	}
 	return out, nil
+}
+
+// qualifyingSearchPath sets conn's search_path to pg_catalog alone, so that
+// what the catalog renders is schema-qualified, and returns what puts the
+// session's own back.
+func qualifyingSearchPath(ctx context.Context, conn ShardConn) (func(), error) {
+	rows, err := conn.Query(ctx, `SELECT current_setting('search_path'), set_config('search_path', 'pg_catalog', false)`)
+	if err != nil {
+		return nil, err
+	}
+	type setting struct {
+		Was string
+		Now string
+	}
+	s, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[setting])
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		_, _ = conn.Exec(ctx, `SELECT set_config('search_path', $1, false)`, s.Was)
+	}, nil
 }
 
 // policyCommands maps pg_policy.polcmd to the command a CREATE POLICY names.
@@ -2803,6 +2837,49 @@ func restorePrivileges(ctx context.Context, conn ShardConn, wf *placementWorkflo
 	}
 	_, err := conn.Exec(ctx, "ALTER TABLE "+wf.shape.qualified(wf.spec.TableName)+" OWNER TO "+wf.st.Owner)
 	return err
+}
+
+// checkShadowPolicies refuses to swap a table that would enforce row-level
+// security with none of its policies (PGS-886).
+//
+// A workflow without PoliciesAtSwap put its policies on the shadow when it
+// built it, and the swap only turns row-level security on. But one prepared
+// by this version built its shadow bare, to add the policies at the swap --
+// and an older controller that saved it in between wrote its own state
+// back, without the flag or the captured statements. The swap would then
+// enable row-level security on a table with no policy at all: every role
+// without BYPASSRLS sees no rows and cannot insert, and nothing says why.
+func (p *Placer) checkShadowPolicies(ctx context.Context, wf *placementWorkflow) error {
+	if !wf.st.RowSecurity {
+		return nil
+	}
+	count := func(set string, id int32, table string) (int64, error) {
+		conn, err := p.Shards.DialDatabase(ctx, set, id, wf.spec.Database)
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_policy WHERE polrelid = pg_catalog.to_regclass($1)`, table)
+		if err != nil {
+			return 0, err
+		}
+		return pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
+	}
+	have, err := count(wf.st.SourceSet, wf.from.Sources()[0], wf.shape.qualified(wf.spec.TableName))
+	if err != nil || have == 0 {
+		return err
+	}
+	for _, t := range wf.rt.Holders() {
+		n, err := count(wf.st.SourceSet, t, wf.shape.qualified(wf.shadow()))
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fatal("the moved copy of %s on shard %d has none of the source's %d row-level security policies, and the swap would enforce row-level security without them; the move stops before the swap and the table stays where it is",
+				wf.spec.table(), t, have)
+		}
+	}
+	return nil
 }
 
 // restorePolicies recreates the source table's policies on the table clients

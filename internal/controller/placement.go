@@ -577,6 +577,8 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 					if err := p.checkPolicyDependencies(ctx, nil, wf); err != nil {
 						return false, err
 					}
+				} else if err := p.checkShadowPolicies(ctx, wf); err != nil {
+					return false, err
 				}
 			}
 			if err := p.swapAll(ctx, wf); err != nil {
