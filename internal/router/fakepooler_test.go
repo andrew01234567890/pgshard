@@ -28,6 +28,10 @@ type fakePooler struct {
 	gen, epoch uint64
 
 	mu sync.Mutex
+	// copied is the data of every COPY FROM STDIN this pooler completed.
+	copied []string
+	// copyShort makes this pooler report one row fewer than it received.
+	copyShort bool
 	// rows models the shard's table, not one backend's view of it: a
 	// session under transaction pooling gets a different backend for its
 	// next statement, and a table that only one backend could see made
@@ -862,7 +866,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		// waits for ever.
 		<-ctx.Done()
 		return true, ctx.Err()
-	case q == "copy t from stdin":
+	case q == "copy t from stdin", (strings.HasPrefix(q, "copy orders ") || strings.HasPrefix(q, "copy docs ")) && strings.HasSuffix(q, "from stdin"):
 		s.inCopy = true
 		return false, s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_CopyInResponse{CopyInResponse: &pgshardv1.CopyInResponse{}}})
 	case q == "select midrow_stale":
@@ -960,7 +964,15 @@ func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) 
 			n = 0
 		}
 		s.f.addRows(n)
+		s.f.mu.Lock()
+		s.f.copied = append(s.f.copied, string(s.copyIn))
+		s.f.mu.Unlock()
 		s.copyIn, s.inCopy = nil, false
+		s.f.mu.Lock()
+		if s.f.copyShort && n > 0 {
+			n--
+		}
+		s.f.mu.Unlock()
 		if err := s.complete(fmt.Sprintf("COPY %d", n)); err != nil {
 			return err
 		}

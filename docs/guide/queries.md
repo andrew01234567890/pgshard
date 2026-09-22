@@ -229,7 +229,20 @@ BYPASSRLS roles, `ALTER ROLE ... RENAME`, `ALTER DEFAULT PRIVILEGES`,
 ## COPY
 
 `COPY ... FROM STDIN` and `COPY ... TO STDOUT` work on unsharded tables.
-COPY on sharded and reference tables is not available yet.
+
+`COPY ... FROM STDIN` also loads a **sharded** table. Name the columns, and
+include the shard key among them: the router reads the key out of every row
+and sends the row to its shard. The load runs in one transaction across the
+shards and commits with two-phase commit, so a load that fails anywhere --
+a row whose key cannot be read, a constraint on one shard -- leaves nothing
+behind on any shard. Inside your own transaction the rows commit with it.
+
+Limits: the text format only (not `csv` or `binary`), no `ON_ERROR`,
+`REJECT_LIMIT`, `LOG_VERBOSITY` or `WHERE`, sent as a simple query (as
+`psql`'s `\copy` and `pgx`'s `CopyFrom` do), and a NULL shard key is an
+error. Every shard needs `max_prepared_transactions` above zero, as for any
+multi-shard write. `COPY TO` from a sharded table and COPY on a reference
+table are not available yet.
 
 ## Errors worth knowing
 

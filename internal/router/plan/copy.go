@@ -4,6 +4,8 @@ import (
 	"strings"
 
 	pgquerypb "github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 // Copy is what a COPY ... FROM STDIN into a sharded table needs at
@@ -20,6 +22,33 @@ type Copy struct {
 	// Columns is how many columns the statement names, which is how a row
 	// with too few is caught before it is sent anywhere.
 	Columns int
+	// keyOID is the type the key column's text is read as, and keyType the
+	// column's declared type, which normaliseKey needs for character(n).
+	keyOID  uint32
+	keyType string
+}
+
+// CopyShard is the shard a COPY row with this key text belongs to.
+//
+// The text is read the way PostgreSQL reads the column -- as the key's own
+// type, from the COPY text format -- and then hashed exactly as a bound
+// parameter of that type is, so a row lands where a later SELECT by the
+// same key looks for it.
+func (p Plan) CopyShard(key string) (int32, error) {
+	c := p.Copy
+	v, err := decodeParam(c.keyOID, 0, []byte(key))
+	if err != nil {
+		return 0, pgwire.Errorf("22P02", "COPY row has a shard key the router cannot read: %v", err)
+	}
+	id, err := placement.KeyspaceID(normaliseKey(v, c.keyType))
+	if err != nil {
+		return 0, pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%v", err)
+	}
+	sh, err := p.snap.Locate(p.set, id)
+	if err != nil {
+		return 0, pgwire.Errorf("57P03", "%v", err)
+	}
+	return sh, nil
 }
 
 // copyIn plans COPY <table> FROM STDIN.
@@ -47,7 +76,15 @@ func (w *walker) copyIn(c *pgquerypb.CopyStmt, r *rel) error {
 		return notYet("COPY into a sharded table must include the shard key \""+r.shardKey+"\" in its columns",
 			"the router reads the key out of every row to know which shard it belongs to")
 	}
-	w.plan.Copy = &Copy{KeyColumn: at, Columns: len(cols)}
+	// The key's type decides how its text is read and hashed. Until the
+	// controller has recorded it, a text key could be routed by the wrong
+	// rules, as a bound parameter's would be.
+	oid := inferredOID(r.shardKeyType)
+	if !r.shardKeyChecked || oid == 0 {
+		return notYet("COPY into sharded table \""+r.name+"\" cannot be routed until the type of its shard key \""+r.shardKey+"\" has been inspected",
+			"the controller records the key column's type shortly after the table becomes effective; retry then")
+	}
+	w.plan.Copy = &Copy{KeyColumn: at, Columns: len(cols), keyOID: oid, keyType: r.shardKeyType}
 	w.plan.Kind, w.plan.Shards = Scatter, w.sess.servingShards()
 	return nil
 }
@@ -74,6 +111,15 @@ func refuseCopyOptions(c *pgquerypb.CopyStmt) error {
 				return notYet("COPY FORMAT "+f+" into a sharded table is not available yet",
 					"the text format is what COPY FROM STDIN uses by default; load with it, or filter on one shard key value")
 			}
+		case "delimiter", "null", "default", "header", "encoding", "quote", "escape",
+			"force_quote", "force_not_null", "force_null":
+			// The router splits rows and reads the key with the text
+			// format's defaults -- a tab between columns, \N for NULL, no
+			// header, the connection's encoding -- so a COPY that changes
+			// any of them would be split, keyed or counted differently
+			// from the way the shard reads it.
+			return notYet("COPY "+strings.ToUpper(name)+" into a sharded table is not available yet",
+				"load with the text format's defaults: tab-separated, \\N for NULL, no header")
 		case "on_error", "reject_limit", "log_verbosity":
 			return notYet("COPY "+strings.ToUpper(name)+" into a sharded table is not available yet",
 				"a row rejected on one shard cannot unsend the rows already accepted on the others")

@@ -155,3 +155,67 @@ func TestAnUnterminatedRowIsLeftForTheCaller(t *testing.T) {
 		t.Fatalf("rest %q", s.Rest())
 	}
 }
+
+// PostgreSQL reads octal and hex escapes in a value, so the key it stores
+// for \101 or \x41 is "A", and the router has to hash "A" as well.
+func TestOctalAndHexEscapesAreResolvedAsPostgreSQLResolvesThem(t *testing.T) {
+	for raw, want := range map[string]string{
+		`\101`:   "A",
+		`\x41`:   "A",
+		`\x4`:    "\x04",
+		`\1011`:  "A1",
+		`\x41z`:  "Az",
+		`\xz`:    "xz",
+		`a\\b`:   `a\b`,
+		`\q`:     "q",
+		`\7`:     "\x07",
+		`\x7f\1`: "\x7f\x01",
+	} {
+		rows := collect(t, 0, 2, raw+"\tv\n")
+		if len(rows) != 1 || rows[0].Key != want {
+			t.Fatalf("%q: rows %+v, want key %q", raw, rows, want)
+		}
+	}
+}
+
+// A backslash escapes the byte after it, a raw tab or newline included, as
+// in PostgreSQL's reader: neither ends the column or the row.
+func TestABackslashEscapesARawTabAndARawNewline(t *testing.T) {
+	rows := collect(t, 0, 2, "a\\\tb\tv\n")
+	if len(rows) != 1 || rows[0].Key != "a\tb" {
+		t.Fatalf("escaped raw tab: %+v", rows)
+	}
+	rows = collect(t, 0, 2, "a\\\nb\tv\n", "c\td\n")
+	if len(rows) != 2 || rows[0].Key != "a\nb" || rows[1].Key != "c" {
+		t.Fatalf("escaped raw newline: %+v", rows)
+	}
+	// A chunk ending in the backslash does not end the row at the newline
+	// that starts the next chunk.
+	rows = collect(t, 0, 2, "a\\", "\nb\tv\n")
+	if len(rows) != 1 || rows[0].Key != "a\nb" {
+		t.Fatalf("escape split across chunks: %+v", rows)
+	}
+}
+
+func TestARowWithTooManyColumnsIsAnError(t *testing.T) {
+	s := New(0, 2)
+	s.Write([]byte("1\t2\t3\n"))
+	if _, _, err := s.Next(); !errors.Is(err, ErrLongRow) {
+		t.Fatalf("err = %v, want ErrLongRow", err)
+	}
+}
+
+func TestAKeyWithAZeroByteIsAnError(t *testing.T) {
+	s := New(0, 2)
+	s.Write([]byte(`a\000b` + "\tv\n"))
+	if _, _, err := s.Next(); !errors.Is(err, ErrNulInKey) {
+		t.Fatalf("err = %v, want ErrNulInKey", err)
+	}
+}
+
+func TestACRLFRowEndsWithoutItsCarriageReturn(t *testing.T) {
+	rows := collect(t, 1, 2, "v\tk\r\n")
+	if len(rows) != 1 || rows[0].Key != "k" {
+		t.Fatalf("%+v", rows)
+	}
+}

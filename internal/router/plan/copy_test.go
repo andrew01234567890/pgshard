@@ -4,11 +4,73 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 func copyPlan(t *testing.T, sql string) (Plan, error) {
 	t.Helper()
-	return New().Plan(context.Background(), session(fixture(t)), sql)
+	return New().Plan(context.Background(), session(typedFixture(t)), sql)
+}
+
+// typedFixture records the key types the controller would have inspected,
+// which COPY needs before it can read a key out of a row.
+func typedFixture(t *testing.T) *snapshot.Snapshot {
+	snap := fixture(t)
+	for k, p := range snap.Tables {
+		switch p.ShardKey {
+		case "tenant_id":
+			p.ShardKeyType = "bigint"
+		case "slug":
+			p.ShardKeyType = "text"
+		}
+		snap.Tables[k] = p
+	}
+	return snap
+}
+
+// A row goes where a SELECT by the same key looks for it.
+func TestACopyRowGoesWhereItsKeyIsRouted(t *testing.T) {
+	snap := typedFixture(t)
+	for _, c := range []struct{ copySQL, key, selectSQL string }{
+		{"copy orders (tenant_id, id) from stdin", "42", "select * from orders where tenant_id = 42"},
+		{"copy orders (tenant_id, id) from stdin", "-7", "select * from orders where tenant_id = -7"},
+		{"copy docs (slug, body) from stdin", "a\tb", "select * from docs where slug = 'a\tb'"},
+		{"copy docs (slug, body) from stdin", "hello", "select * from docs where slug = 'hello'"},
+	} {
+		cp, err := New().Plan(context.Background(), session(snap), c.copySQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := cp.CopyShard(c.key)
+		if err != nil {
+			t.Fatalf("%s %q: %v", c.copySQL, c.key, err)
+		}
+		sel, err := New().Plan(context.Background(), session(snap), c.selectSQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sel.Shards) != 1 || sel.Shards[0] != got {
+			t.Fatalf("%q copies to shard %d, %s reads shards %v", c.key, got, c.selectSQL, sel.Shards)
+		}
+	}
+}
+
+func TestACopyRowWithAKeyOfTheWrongTypeIsAnError(t *testing.T) {
+	p, err := copyPlan(t, "copy orders (tenant_id, id) from stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.CopyShard("abc"); err == nil || !strings.Contains(err.Error(), "22P02") {
+		t.Fatalf("err = %v, want 22P02", err)
+	}
+}
+
+func TestCopyWaitsForTheKeyTypeToBeInspected(t *testing.T) {
+	_, err := New().Plan(context.Background(), session(fixture(t)), "copy orders (tenant_id, id) from stdin")
+	if err == nil || !strings.Contains(err.Error(), "has been inspected") {
+		t.Fatalf("err = %v", err)
+	}
 }
 
 // COPY into a sharded table was refused outright, so the documented way to
@@ -95,5 +157,17 @@ func TestCopyOnOtherPlacementsIsUnchanged(t *testing.T) {
 	_, err := copyPlan(t, "copy regions from stdin")
 	if err == nil || !strings.Contains(err.Error(), "reference table") {
 		t.Errorf("reference: %v", err)
+	}
+}
+
+// The router splits and keys rows with the text format's defaults, so an
+// option that changes them is refused rather than read differently from
+// the shard.
+func TestCopyOptionsTheSplitterDoesNotHonourAreRefused(t *testing.T) {
+	for _, opt := range []string{"delimiter ','", "null ''", "header true", "default '\\D'", "encoding 'LATIN1'"} {
+		_, err := copyPlan(t, "copy orders (tenant_id, id) from stdin with ("+opt+")")
+		if err == nil || !strings.Contains(err.Error(), "into a sharded table is not available yet") {
+			t.Fatalf("%s: err = %v", opt, err)
+		}
 	}
 }
