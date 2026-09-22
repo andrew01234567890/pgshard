@@ -3064,13 +3064,23 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			if prev != pgwire.TxIdle && e.tx == pgwire.TxIdle {
 				e.txnEnded = true
 			}
-			// A pooler older than this router does not forward
+			// After an error the backend skipped everything up to the
+			// Sync, so what it still owes it will never send -- and
+			// neither does the router: it relays completions, it does not
+			// invent them (PGS-974). Answering them told the client that
+			// statements after the failure had been parsed and bound,
+			// which PostgreSQL never says.
+			//
+			// Only a batch that succeeded is owed anything at its end: a
+			// pooler older than this router does not forward
 			// CloseComplete, so a client that closed a statement would
 			// wait for an answer that never comes. Answering the
 			// stragglers at the end of the batch is later than PostgreSQL
 			// would, and it is the difference between a mixed-version
 			// rollout being slightly out of order and being hung.
-			if werr := e.answerOwedCompletions(w); werr != nil {
+			if firstErr != nil {
+				e.completions = nil
+			} else if werr := e.answerOwedCompletions(w); werr != nil {
 				return werr
 			}
 			return firstErr
