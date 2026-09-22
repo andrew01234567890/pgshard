@@ -143,9 +143,12 @@ the rest with `0A000`. See *Routing* below.
   `COMMIT` or `ROLLBACK` ends it with PostgreSQL's `25P01` warning that no
   transaction was in progress, and the statements after it run in a new
   one; a savepoint or `AND CHAIN` is the `25P01` error PostgreSQL raises.
-  One difference: a `BEGIN` naming transaction modes (an isolation level,
-  `READ ONLY`) is accepted only as the batch's first statement, and refused
-  with `0A000` after others. DDL is refused there for the same
+  A `BEGIN` naming transaction modes after other statements applies them
+  as `SET TRANSACTION` does, as PostgreSQL does: `READ ONLY` takes effect,
+  and an isolation level or `DEFERRABLE` gets PostgreSQL's own `25001`
+  "must be called before any query". Once the batch has reached several shards such a
+  `BEGIN` is refused with `0A000`: `SET TRANSACTION` would reach only the
+  current shard. DDL is refused there for the same
   reason it is refused inside `BEGIN`: it fans out to every shard and
   cannot be rolled back with the transaction, so a migration file whose
   statements include DDL still has to send them one query at a time.
