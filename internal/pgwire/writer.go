@@ -1,7 +1,9 @@
 package pgwire
 
 import (
+	"errors"
 	"io"
+	"net"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -145,8 +147,13 @@ type copyInStream struct {
 }
 
 // Next returns the next CopyData payload, io.EOF after CopyDone or
-// ErrCopyFail after CopyFail. Other messages during COPY are ignored, as
-// PostgreSQL does (Flush and Sync are dropped in copy-in mode).
+// ErrCopyFail after CopyFail. Flush and Sync are ignored in copy-in mode,
+// as PostgreSQL ignores them; any other message ends the COPY with an
+// error, as it does in PostgreSQL (copyfromparse.c, CopyGetData).
+//
+// Terminate is one of those. It used to read as CopyDone, so a client
+// that went away in the middle of a load had the rows it had sent so far
+// -- a half-sent last row included -- committed as if it had finished.
 func (c *copyInStream) Next() ([]byte, error) {
 	if c.done {
 		return nil, io.EOF
@@ -165,6 +172,18 @@ func (c *copyInStream) Next() ([]byte, error) {
 				return nil, ErrCopyFail
 			}
 			c.done = true
+			c.s.setCopyIn(nil)
+			// A read that failed part-way -- a CopyData declaring a body
+			// larger than the frontend accepts, an unknown message type --
+			// leaves the stream in the middle of a message. Carrying on
+			// parsed the rest of that body as new messages: a query
+			// smuggled inside a CopyData ran. PostgreSQL ends the
+			// connection here too.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+				c.s.copyLost = copyLostTerminated
+			} else {
+				c.s.copyLost = copyLostProtocol
+			}
 			return nil, err
 		}
 		switch m := msg.(type) {
@@ -178,9 +197,30 @@ func (c *copyInStream) Next() ([]byte, error) {
 			c.done = true
 			c.s.setCopyIn(nil)
 			return nil, ErrCopyFail
+		case *pgproto3.Flush, *pgproto3.Sync:
 		case *pgproto3.Terminate:
 			c.done = true
-			return nil, io.EOF
+			c.s.setCopyIn(nil)
+			c.s.copyLost = copyLostTerminated
+			return nil, ErrCopyTerminated
+		default:
+			c.done = true
+			c.s.setCopyIn(nil)
+			c.s.copyLost = copyLostProtocol
+			return nil, Errorf(CodeProtocolViolation, "unexpected message type 0x%02X during COPY from stdin", messageType(m))
 		}
 	}
+}
+
+// ErrCopyTerminated is a client that sent Terminate in the middle of a COPY
+// FROM STDIN: the load did not finish and must not be committed.
+var ErrCopyTerminated = errors.New("pgwire: client terminated the connection during COPY from stdin")
+
+// messageType is the protocol type byte of a frontend message.
+func messageType(m pgproto3.FrontendMessage) byte {
+	b, err := m.Encode(nil)
+	if err != nil || len(b) == 0 {
+		return 0
+	}
+	return b[0]
 }
