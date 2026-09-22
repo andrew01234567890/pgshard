@@ -237,13 +237,11 @@ func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[
 		case errors.Is(err, pgwire.ErrCopyFail):
 			return 0, pgwire.Errorf("57014", "COPY from stdin failed: COPY terminated by client")
 		case errors.Is(err, io.EOF):
-			// A last row without its newline is still a row, as it is to
-			// PostgreSQL.
-			if rest := split.Rest(); len(rest) > 0 {
-				split.Write([]byte("\n"))
-				if rerr := route(); rerr != nil {
-					return 0, rerr
-				}
+			// A last row without its line ending is still a row, as it is
+			// to PostgreSQL.
+			split.End()
+			if rerr := route(); rerr != nil {
+				return 0, rerr
 			}
 			for sh := range pending {
 				if ferr := flush(sh); ferr != nil {
