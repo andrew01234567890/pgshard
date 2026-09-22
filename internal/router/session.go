@@ -1772,11 +1772,20 @@ func failedTxnRefusal() error {
 
 // refuseInFailedTransaction answers what PostgreSQL answers while a
 // transaction is in the failed state: nothing runs until it is ended.
+//
+// Also where the failed backend is still there, which would answer the
+// same 25P02 -- but only for a statement sent to it. One routed to another
+// shard moved the session there and ran, in a transaction PostgreSQL would
+// have refused it in (PGS-978).
 func (e *Executor) refuseInFailedTransaction(class StmtClass) error {
-	if e.tx != pgwire.TxFailed || e.conn != nil {
+	if e.tx != pgwire.TxFailed {
 		return nil
 	}
 	if class.Txn == plan.TxnCommit || class.Txn == plan.TxnRollback {
+		return nil
+	}
+	// The backend recovers its own transaction to a savepoint.
+	if e.conn != nil && class.Txn == plan.TxnRollbackTo {
 		return nil
 	}
 	return pgwire.Errorf("25P02", "current transaction is aborted, commands ignored until end of transaction block")
@@ -1796,9 +1805,8 @@ func (e *Executor) refuseStagedInFailedTransaction(class StmtClass) error {
 // refuseSelfAnsweredInFailedTxn refuses nextval() over a global sequence in
 // a transaction PostgreSQL has already failed.
 //
-// refuseInFailedTransaction above only covers a session whose backend is
-// gone, because a session that still has one is refused by the backend when
-// the statement gets there. nextval() never gets there: the value comes
+// nextval() never reaches a backend that would refuse it, including on
+// either protocol: the value comes
 // from the router's own block of the global sequence. It would be handed
 // out inside a transaction that cannot commit and never returned -- a gap
 // in the sequence, which is allowed, opened at precisely the point where
