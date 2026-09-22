@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -232,5 +233,16 @@ func TestABeginWithModesAfterOtherStatementsSetsThemOnTheTransaction(t *testing.
 	}
 	if st := conn.PgConn().TxStatus(); st != 'T' {
 		t.Fatalf("status %c, want the adopted transaction open", st)
+	}
+}
+
+// Across several shards the modes would reach the current one only.
+func TestABeginWithModesAfterABatchReachedSeveralShardsIsRefused(t *testing.T) {
+	h := newShardedHarness(t)
+	conn := h.connect(t, h.dsn())
+	a, b := h.twoTenants(t)
+	_, err := conn.Exec(context.Background(), fmt.Sprintf("select * from orders where tenant_id = %d; select * from orders where tenant_id = %d; begin read only", a, b), pgx.QueryExecModeSimpleProtocol)
+	if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "reached several shards") {
+		t.Fatalf("err = %v", err)
 	}
 }

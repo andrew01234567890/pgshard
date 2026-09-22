@@ -1085,6 +1085,15 @@ func (e *Executor) txnControlInBatch(ctx context.Context, class StmtClass, w pgw
 		// the shard decides what may still change: READ ONLY may, an
 		// isolation level or DEFERRABLE after a query may not, and the
 		// shard answers PostgreSQL's own 25001 for those.
+		// SET TRANSACTION reaches the current shard only, and a part
+		// parked earlier would stay read-write under a READ ONLY the
+		// client was told it had.
+		if e.multiShardTxn() && class.TxnModesSQL != "" {
+			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
+				"BEGIN with transaction modes is not available after statements of a batch that reached several shards")
+			err.Hint = "put the BEGIN first in the batch, or send it as its own query"
+			return true, err
+		}
 		e.implicitTx = false
 		if class.TxnModesSQL != "" {
 			if err := e.simpleQuery(ctx, class.TxnModesSQL, discardWriter{}); err != nil {
