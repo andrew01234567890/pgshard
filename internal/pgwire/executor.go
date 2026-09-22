@@ -106,7 +106,9 @@ type Executor interface {
 	// anywhere undoes all of them. It is called only when the session is
 	// not already in a transaction of its own.
 	BeginImplicit(ctx context.Context) error
-	// EndImplicit commits or rolls back what BeginImplicit opened.
+	// EndImplicit commits or rolls back what BeginImplicit opened. It does
+	// nothing when a BEGIN in the batch took that transaction over: it is
+	// the client's then, as in PostgreSQL.
 	EndImplicit(ctx context.Context, commit bool) error
 	TransactionStatus() TxStatus
 	// Release frees any resources when the session ends.

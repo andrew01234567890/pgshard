@@ -1047,21 +1047,27 @@ func (s *session) runStatement(ctx context.Context, sql string, w ResultWriter) 
 // scripts that send batches: a migration that fails halfway through a
 // semicolon-separated file must not leave half of itself applied.
 //
+// A statement of the batch can end that transaction -- a COMMIT does -- and
+// the statements after it run in a new one, as they do in PostgreSQL
+// (exec_simple_query opens an implicit block before every statement of a
+// batch). A BEGIN takes it over instead, and then ending it is the
+// client's: the executor's EndImplicit does nothing once that happened.
+//
 // A batch sent inside a transaction the client opened is already atomic,
 // and its own COMMIT or ROLLBACK is the client's to send.
 func (s *session) simpleQueryBatch(ctx context.Context, stmts []string, w *resultWriter) error {
-	implicit := s.exec.TransactionStatus() == TxIdle
-	if implicit {
-		err := s.runQuery(ctx, s.exec.BeginImplicit)
-		if err != nil {
-			if w.ioErr != nil {
-				return w.ioErr
-			}
-			s.reportError(err)
-			return s.readyForQuery()
-		}
-	}
+	implicit := false
 	for i, stmt := range stmts {
+		if s.exec.TransactionStatus() == TxIdle {
+			if err := s.runQuery(ctx, s.exec.BeginImplicit); err != nil {
+				if w.ioErr != nil {
+					return w.ioErr
+				}
+				s.reportError(err)
+				return s.readyForQuery()
+			}
+			implicit = true
+		}
 		// The last statement's completion is held back until the commit
 		// has succeeded. PostgreSQL ends the implicit transaction before
 		// it reports that statement (postgres.c, exec_simple_query) for
@@ -1085,10 +1091,12 @@ func (s *session) simpleQueryBatch(ctx context.Context, stmts []string, w *resul
 			s.reportError(err)
 			return s.readyForQuery()
 		}
-		// Still in it, unless a statement ended it: an executor that lets
-		// a batch commit its own transaction leaves nothing to close, and
-		// committing again would be a COMMIT against no transaction.
-		if held != nil && s.exec.TransactionStatus() != TxIdle {
+		// A statement that ended the transaction leaves nothing to close,
+		// and committing again would be a COMMIT against no transaction.
+		if s.exec.TransactionStatus() == TxIdle {
+			implicit = false
+		}
+		if held != nil && implicit {
 			if err := s.endImplicit(ctx, true); err != nil {
 				if w.ioErr != nil {
 					return w.ioErr

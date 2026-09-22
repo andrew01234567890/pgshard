@@ -137,10 +137,15 @@ the rest with `0A000`. See *Routing* below.
   `ReadyForQuery` at the end. A batch the client did not already wrap in a
   transaction runs in one the router opens: an error stops the batch there
   and undoes all of it, so a migration script cannot leave half of itself
-  applied. That transaction is the router's, and a transaction control
-  statement inside such a batch is refused with `0A000` -- PostgreSQL lets
-  a `BEGIN` there adopt the implicit transaction and a `COMMIT` end it, and
-  that handover is not implemented. DDL is refused there for the same
+  applied. Transaction control inside the batch behaves as in PostgreSQL:
+  a `BEGIN` adopts that transaction, so `BEGIN; ...; COMMIT` is one
+  transaction and a batch ending without its `COMMIT` leaves it open; a
+  `COMMIT` or `ROLLBACK` ends it with PostgreSQL's `25P01` warning that no
+  transaction was in progress, and the statements after it run in a new
+  one; a savepoint or `AND CHAIN` is the `25P01` error PostgreSQL raises.
+  One difference: a `BEGIN` naming transaction modes (an isolation level,
+  `READ ONLY`) is accepted only as the batch's first statement, and refused
+  with `0A000` after others. DDL is refused there for the same
   reason it is refused inside `BEGIN`: it fans out to every shard and
   cannot be rolled back with the transaction, so a migration file whose
   statements include DDL still has to send them one query at a time.

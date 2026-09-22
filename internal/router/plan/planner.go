@@ -300,7 +300,7 @@ func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 		c.Chain = t.GetChain()
 		switch t.GetKind() {
 		case pgquerypb.TransactionStmtKind_TRANS_STMT_BEGIN, pgquerypb.TransactionStmtKind_TRANS_STMT_START:
-			c.Txn = TxnBegin
+			c.Txn, c.TxnModes = TxnBegin, len(t.GetOptions()) > 0
 		case pgquerypb.TransactionStmtKind_TRANS_STMT_COMMIT:
 			c.Txn = TxnCommit
 		case pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK:
