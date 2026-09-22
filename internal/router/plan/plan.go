@@ -74,6 +74,9 @@ type StmtClass struct {
 	Txn TxnKind
 	// Chain marks COMMIT/ROLLBACK AND CHAIN.
 	Chain bool
+	// TxnModes marks a BEGIN or START TRANSACTION that names transaction
+	// modes: an isolation level, READ ONLY or DEFERRABLE.
+	TxnModes bool
 	// Savepoint names the savepoint of a SAVEPOINT, RELEASE or ROLLBACK TO.
 	Savepoint string
 	// Session is the session-state statement this is, if any.

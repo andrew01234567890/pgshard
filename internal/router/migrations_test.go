@@ -1022,7 +1022,10 @@ func TestAnAtomicDatabaseStillRefusesDDLInATransaction(t *testing.T) {
 	h.snap.Databases["app"] = app
 	conn := h.connect(t, h.dsn())
 	_, err := conn.PgConn().Exec(context.Background(), "BEGIN; DROP VIEW IF EXISTS v; CREATE VIEW v AS SELECT id FROM orders; COMMIT").ReadAll()
-	_ = expectRefusal(t, err, "a transaction control statement is not available inside a multi-statement simple query")
+	_ = expectRefusal(t, err, "DROP VIEW inside a transaction block is not available")
+	if _, err := conn.PgConn().Exec(context.Background(), "ROLLBACK").ReadAll(); err != nil {
+		t.Fatal(err)
+	}
 	_, err = conn.PgConn().Exec(context.Background(), "ALTER TABLE orders ADD COLUMN a int; ALTER TABLE orders ADD COLUMN b int").ReadAll()
 	_ = expectRefusal(t, err, "ALTER TABLE is not available inside a multi-statement simple query")
 	if len(q.queued) != 0 {

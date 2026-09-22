@@ -99,6 +99,32 @@ func TestABatchInsideTheClientsOwnTransactionOpensNothing(t *testing.T) {
 	}
 }
 
+// PostgreSQL opens an implicit block before every statement of a batch, so
+// the statements after a COMMIT run in a transaction of their own rather
+// than each committing alone.
+func TestStatementsAfterACommitInABatchShareANewTransaction(t *testing.T) {
+	ts := startServer(t, Config{})
+	var seen []string
+	ts.newExec = func(SessionInfo) (Executor, error) {
+		return &recordingExecutor{Executor: NewFakeExecutor(), seen: &seen}, nil
+	}
+	c := dialRaw(t, ts.addr)
+	c.startup(ProtocolVersion30)
+	c.send(&pgproto3.Query{String: "select 1; commit; select 1; select 1"})
+	for {
+		m := c.recv()
+		if er, ok := m.(*pgproto3.ErrorResponse); ok {
+			t.Fatalf("batch failed: %s", er.Message)
+		}
+		if _, ok := m.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if got := strings.Join(seen, "|"); got != "BEGIN|select 1|commit|BEGIN|select 1|select 1|COMMIT" {
+		t.Fatalf("executed %q, want a second implicit transaction after the COMMIT", got)
+	}
+}
+
 // recordingExecutor notes the SQL each statement runs as, including the
 // implicit transaction's own, which no client ever sees.
 type recordingExecutor struct {

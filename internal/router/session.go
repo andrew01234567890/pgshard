@@ -620,16 +620,6 @@ func (e *Executor) homeAt(snap *snapshot.Snapshot) Shard {
 	return e.home
 }
 
-// localOnly reports whether the session's database keeps every object on
-// its home shard, so there is one PostgreSQL to be consistent with.
-func (e *Executor) localOnly() bool {
-	if e.catalogSession() {
-		return false
-	}
-	snap := e.r.cfg.Snapshot()
-	return snap != nil && snap.Databases[e.info.Database].LocalOnly
-}
-
 // catalogSession reports whether the session fronts the catalog database,
 // whose plans never depend on the shard map.
 func (e *Executor) catalogSession() bool { return e.home.Set == CatalogShardSet }
@@ -972,18 +962,6 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 // than the one it was checked against (PGS-962).
 func (e *Executor) endStatement() { e.stmtSnap = nil }
 
-// refuseTxnControlInBatch refuses a transaction control statement inside a
-// batch this executor opened a transaction for.
-//
-// PostgreSQL does not refuse it: a BEGIN there adopts the implicit
-// transaction and a COMMIT ends it, and the statements after either run in
-// a new one. Nothing here implements that handover, and running the
-// statement anyway would be worse than refusing it -- a COMMIT would commit
-// a transaction the client did not open and cannot see, leaving the rest of
-// its own batch to apply on its own.
-//
-// implicitTx is set after BeginImplicit's own BEGIN and cleared before
-// EndImplicit's COMMIT, so neither refuses itself.
 // refuseQueryDuringABufferedBatch refuses a simple Query sent while an
 // extended batch is still buffered, because the router would otherwise run
 // them in the wrong order.
@@ -1013,35 +991,70 @@ func (e *Executor) refuseQueryDuringABufferedBatch() error {
 	return err
 }
 
-func (e *Executor) refuseTxnControlInBatch(class StmtClass) error {
-	if !e.implicitTx || class.Txn == plan.TxnNone {
-		return nil
+// txnControlInBatch answers a transaction control statement inside a batch
+// this executor opened a transaction for, the way PostgreSQL does
+// (xact.c, BeginTransactionBlock and EndTransactionBlock in
+// TBLOCK_IMPLICIT_INPROGRESS): a BEGIN adopts the transaction, so the
+// statements before it commit or roll back with the client's own; a COMMIT
+// or ROLLBACK ends it with a WARNING that no transaction was in progress,
+// and pgwire opens a new one for the statements after it; a savepoint is
+// an error, because there is no transaction block to hold one.
+//
+// implicitTx is set after BeginImplicit's own BEGIN and cleared before
+// EndImplicit's COMMIT, so neither reaches this.
+func (e *Executor) txnControlInBatch(ctx context.Context, class StmtClass, w pgwire.ResultWriter) (handled bool, err error) {
+	if !e.implicitTx {
+		return false, nil
 	}
-	// A local database is one PostgreSQL and the batch is pinned to it, so
-	// the client's own BEGIN adopts the transaction this executor opened
-	// and its COMMIT ends it -- which is what the harm above was about: a
-	// COMMIT committing a transaction the client did not open. Here it did.
-	//
-	// One difference from PostgreSQL remains and is not worth machinery:
-	// statements AFTER a COMMIT in the same batch each commit on their own
-	// rather than sharing a second implicit transaction.
-	if e.localOnly() {
-		return nil
+	switch class.Txn {
+	case plan.TxnBegin:
+		if !class.TxnModes {
+			e.implicitTx = false
+			return true, w.CommandComplete("BEGIN")
+		}
+		// Modes apply to a transaction that has not run anything yet, and
+		// then ending the implicit one and running the client's BEGIN in
+		// its place is the same transaction. Once a statement has run,
+		// PostgreSQL itself refuses an isolation level, and the prelude
+		// holding the router's own BEGIN may already be on a backend.
+		if len(e.txnPrelude) <= 1 && !e.txnTouched && !e.txnRanDDL && !e.multiShardTxn() {
+			return false, e.EndImplicit(ctx, false)
+		}
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
+			"BEGIN with transaction modes is not available after other statements of a multi-statement simple query")
+		err.Hint = "put the BEGIN first in the batch, or send it as its own query"
+		return true, err
+	case plan.TxnCommit, plan.TxnRollback:
+		verb := "COMMIT"
+		if class.Txn == plan.TxnRollback {
+			verb = "ROLLBACK"
+		}
+		if class.Chain {
+			return true, pgwire.Errorf(codeNoActiveSQLTransaction, "%s AND CHAIN can only be used in transaction blocks", verb)
+		}
+		if err := w.Notice(noActiveTransactionWarning()); err != nil {
+			return true, err
+		}
+		if err := e.EndImplicit(ctx, class.Txn == plan.TxnCommit); err != nil {
+			return true, err
+		}
+		return true, w.CommandComplete(verb)
+	case plan.TxnSavepoint:
+		return true, pgwire.Errorf(codeNoActiveSQLTransaction, "SAVEPOINT can only be used in transaction blocks")
+	case plan.TxnRelease:
+		return true, pgwire.Errorf(codeNoActiveSQLTransaction, "RELEASE SAVEPOINT can only be used in transaction blocks")
+	case plan.TxnRollbackTo:
+		return true, pgwire.Errorf(codeNoActiveSQLTransaction, "ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
 	}
-	// Nor where the transaction holds nothing on a shard and DDL runs
-	// statement by statement: then there is no work of the client's that a
-	// COMMIT here could commit without it. pgroll sends its version views as
-	// "BEGIN; DROP VIEW ...; CREATE VIEW ...; COMMIT".
-	if e.ddlRunsSequentially() && !e.txnTouched && !e.multiShardTxn() {
-		return nil
-	}
-	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
-		"a transaction control statement is not available inside a multi-statement simple query")
-	// Not "put it inside BEGIN and COMMIT": the batch that trips this
-	// usually is "begin; ...; commit", and the answer is that the BEGIN
-	// has to arrive as its own query, before the batch.
-	err.Hint = "send BEGIN as its own query before the batch, and COMMIT as its own query after it"
-	return err
+	return false, nil
+}
+
+// PostgreSQL's own words and SQLSTATE (xact.c: ERRCODE_NO_ACTIVE_SQL_TRANSACTION).
+const codeNoActiveSQLTransaction = "25P01"
+
+func noActiveTransactionWarning() *pgproto3.NoticeResponse {
+	return &pgproto3.NoticeResponse{Severity: "WARNING", SeverityUnlocalized: "WARNING",
+		Code: codeNoActiveSQLTransaction, Message: "there is no transaction in progress"}
 }
 
 // BeginImplicit implements pgwire.Executor: it opens the transaction a
@@ -1067,6 +1080,11 @@ func (e *Executor) EndImplicit(ctx context.Context, commit bool) error {
 	if commit {
 		sql = "COMMIT"
 	}
+	// A BEGIN in the batch adopted the transaction: it is the client's
+	// now, and so is ending it.
+	if !e.implicitTx {
+		return nil
+	}
 	e.implicitTx = false
 	return e.guard("EndImplicit", func() error {
 		return e.simpleQuery(ctx, sql, discardWriter{})
@@ -1081,7 +1099,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if err != nil {
 		return err
 	}
-	if err := e.refuseTxnControlInBatch(pl.Class); err != nil {
+	if handled, err := e.txnControlInBatch(ctx, pl.Class, w); handled || err != nil {
 		return err
 	}
 	if pl.Explain != nil {
@@ -1474,9 +1492,7 @@ func (e *Executor) endNoTxn(class StmtClass, w pgwire.ResultWriter) (bool, error
 	default:
 		return false, nil
 	}
-	// PostgreSQL's own words and SQLSTATE (xact.c: ERRCODE_NO_ACTIVE_SQL_TRANSACTION).
-	if err := w.Notice(&pgproto3.NoticeResponse{Severity: "WARNING", SeverityUnlocalized: "WARNING", Code: "25P01",
-		Message: "there is no transaction in progress"}); err != nil {
+	if err := w.Notice(noActiveTransactionWarning()); err != nil {
 		return true, err
 	}
 	return true, w.CommandComplete(tag)
