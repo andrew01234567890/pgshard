@@ -162,10 +162,11 @@ func (b *mergeBuilder) mutable() *pgquerypb.SelectStmt {
 		b.changed = true
 		if b.clone == nil {
 			// A DECLARE or a CREATE VIEW has no SELECT at its top, so
-			// there is no shard statement to rewrite; this one absorbs
-			// the rewrite and buildMerge refuses (PGS-979). Returning nil
+			// there is no shard statement to rewrite; a copy of the SELECT
+			// the merge was built for absorbs the rewrite, which indexes
+			// its select list, and buildMerge refuses (PGS-979). Returning nil
 			// here was a nil dereference that reset the session.
-			b.clone, b.unrewritable = &pgquerypb.SelectStmt{}, true
+			b.clone, b.unrewritable = proto.Clone(b.sel).(*pgquerypb.SelectStmt), true
 		}
 	}
 	return b.clone
