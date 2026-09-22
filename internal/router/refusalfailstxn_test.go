@@ -113,3 +113,24 @@ func TestARefusalOutsideATransactionLeavesTheSessionIdle(t *testing.T) {
 	}
 	wantStatus(t, pc, 'I', "the refusal")
 }
+
+// A batch whose implicit COMMIT fails ends without a Sync or another simple
+// query, and the next transaction the client opens must not inherit that
+// error.
+func TestAFailedImplicitCommitDoesNotFailTheNextTransaction(t *testing.T) {
+	h := newHarness(t)
+	pc := h.connect(t, h.dsn("app", "secret", "app")).PgConn()
+	ctx := context.Background()
+	h.fp.script("commit", script{err: "deferred constraint violated", code: "23505", once: true})
+	if _, err := pc.Exec(ctx, "select 1; select 1").ReadAll(); sqlstate(err) != "23505" {
+		t.Fatalf("batch: %v, want the commit's error", err)
+	}
+	wantStatus(t, pc, 'I', "the failed batch")
+	if rr := pc.ExecParams(ctx, "begin", nil, nil, nil, nil).Read(); rr.Err != nil {
+		t.Fatal(rr.Err)
+	}
+	wantStatus(t, pc, 'T', "the next BEGIN")
+	if rr := pc.ExecParams(ctx, "select 1", nil, nil, nil, nil).Read(); rr.Err != nil {
+		t.Fatalf("a statement of the new transaction: %v", rr.Err)
+	}
+}

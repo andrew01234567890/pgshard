@@ -210,6 +210,19 @@ func (s *fakeStream) scripted(key string, sc script, described bool) error {
 		if code == "" {
 			code = "42P01"
 		}
+		if key == "commit" {
+			// A COMMIT that fails still ends the transaction, and a spent
+			// script must leave the real COMMIT to answer the next one.
+			if sc.once {
+				s.f.mu.Lock()
+				delete(s.f.scripts, key)
+				s.f.mu.Unlock()
+			}
+			err := s.errorf(code, sc.err)
+			b := s.f.backend(s.sid)
+			b.tx, b.xidAssigned = 'I', false
+			return err
+		}
 		return s.errorf(code, sc.err)
 	}
 	if !described {

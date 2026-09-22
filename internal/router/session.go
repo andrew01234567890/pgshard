@@ -982,8 +982,11 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 func (e *Executor) failTxnTheBackendDidNotFail(ctx context.Context) {
 	erred := e.erredSinceSync
 	e.erredSinceSync = false
-	// An implicit transaction is pgwire's to roll back, at once.
-	if !erred || e.tx != pgwire.TxInBlock || e.implicitTx {
+	// A multi-shard transaction between shards has an idle current part
+	// and is still the client's; an implicit one is pgwire's to roll back,
+	// at once.
+	inTxn := e.tx == pgwire.TxInBlock || (e.tx == pgwire.TxIdle && e.multiShardTxn())
+	if !erred || !inTxn || e.implicitTx {
 		return
 	}
 	if e.conn == nil && !e.multiShardTxn() {
@@ -991,7 +994,12 @@ func (e *Executor) failTxnTheBackendDidNotFail(ctx context.Context) {
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
-	parts := e.parts()
+	var parts []*txnPart
+	for _, p := range e.parts() {
+		if p.ps != nil {
+			parts = append(parts, p)
+		}
+	}
 	e.each(parts, func(p *txnPart) error { return e.runOn(ctx, p, abortTxnSQL, discardWriter{}) })
 	for _, p := range parts {
 		if p.tx != pgwire.TxFailed {
@@ -1118,6 +1126,10 @@ func noActiveTransactionWarning() *pgproto3.NoticeResponse {
 // answers reaches the client.
 func (e *Executor) BeginImplicit(ctx context.Context) error {
 	e.enterStatement(ctx)
+	// Its error ends the batch there, with no Sync or simple query of the
+	// router's to consume the flag, which would then fail the client's
+	// next transaction.
+	defer func() { e.erredSinceSync = false }()
 	if err := e.guard("BeginImplicit", func() error {
 		return e.simpleQuery(ctx, "BEGIN", discardWriter{})
 	}); err != nil {
@@ -1130,6 +1142,7 @@ func (e *Executor) BeginImplicit(ctx context.Context) error {
 // EndImplicit implements pgwire.Executor.
 func (e *Executor) EndImplicit(ctx context.Context, commit bool) error {
 	e.enterStatement(ctx)
+	defer func() { e.erredSinceSync = false }()
 	sql := "ROLLBACK"
 	if commit {
 		sql = "COMMIT"
