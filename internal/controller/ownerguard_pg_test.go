@@ -29,9 +29,9 @@ func TestARowIsRefusedOnAShardItsKeyDoesNotHashTo(t *testing.T) {
 	if _, err := (&ShardKeyCheck{Pool: f.pool, Shards: f.placer.Shards, Logger: logger}).Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (&OwnedRanges{Pool: f.pool, Shards: f.placer.Shards, Logger: logger}).Pass(ctx); err != nil {
-		t.Fatal(err)
-	}
+	// No owned-range pass first: the guard writes each shard's range before
+	// installing the check, or the check would refuse every write until
+	// that pass came round on its own timer.
 	guard := &OwnerGuard{Pool: f.pool, Shards: f.placer.Shards, Logger: logger}
 	if n, err := guard.Pass(ctx); err != nil || n != 1 {
 		t.Fatalf("guard pass: %d %v, want the one table guarded", n, err)
@@ -98,10 +98,16 @@ func TestARowIsRefusedOnAShardItsKeyDoesNotHashTo(t *testing.T) {
 	}
 	_ = tx.Rollback(ctx)
 
-	// A shard that does not know its range refuses rather than guessing.
+	// A shard that does not know its range refuses rather than guessing --
+	// with no row, and with no table at all, which is what a schema copy
+	// leaves on a target.
 	mustExec(t, shard0, `DELETE FROM `+OwnerSchema+`.`+OwnerTable)
 	if _, err := shard0.Exec(ctx, `INSERT INTO orders VALUES ($1, 4, 'unknown')`, home); !refused(err, "55000") {
 		t.Fatalf("a write with no owned range recorded: %v, want 55000", err)
+	}
+	mustExec(t, shard0, `DROP TABLE `+OwnerSchema+`.`+OwnerTable)
+	if _, err := shard0.Exec(ctx, `INSERT INTO orders VALUES ($1, 5, 'no table')`, home); !refused(err, "55000") {
+		t.Fatalf("a write where the owned range table does not exist: %v, want 55000", err)
 	}
 
 	// No longer sharded: the check goes.

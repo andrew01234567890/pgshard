@@ -58,8 +58,16 @@ BEGIN
 	IF TG_OP = 'UPDATE' AND OLD.%[3]s IS NOT DISTINCT FROM NEW.%[3]s THEN
 		RETURN NULL;
 	END IF;
-	SELECT lo, hi INTO owned FROM %[4]s.%[5]s;
-	IF NOT FOUND THEN
+	-- Checked before it is read: the table is created on a shard with the
+	-- range in it, and the schema copy never carries it, so a shard that
+	-- has not been told its range has no table at all -- which would
+	-- otherwise surface as the unhelpful 42P01.
+	IF pg_catalog.to_regclass('%[4]s.%[5]s') IS NULL THEN
+		owned := NULL;
+	ELSE
+		SELECT lo, hi INTO owned FROM %[4]s.%[5]s;
+	END IF;
+	IF owned IS NULL THEN
 		RAISE EXCEPTION 'this shard does not know which keyspace range it owns yet, so a row of %%.%% cannot be checked', TG_TABLE_SCHEMA, TG_TABLE_NAME
 			USING ERRCODE = '55000', HINT = 'retry shortly; pgshard records each shard''s range in %[4]s';
 	END IF;
@@ -183,8 +191,17 @@ func (g *OwnerGuard) apply(ctx context.Context, set string, ranges []catalog.Sha
 			return false, err
 		}
 	}
+	owned := catalog.RangeSet(ranges)
 	all := true
-	for _, rg := range ranges {
+	for i, rg := range ranges {
+		// The shard's range first: a check installed before the shard knows
+		// what it owns refuses every write to the table until the owned
+		// range pass reaches it, and that pass runs on its own timer.
+		if t.Sharded {
+			if _, err := writeOwnedRange(ctx, g.Shards, set, rg.ShardID, t.Database, owned[i].Start, owned[i].End); err != nil {
+				return false, fmt.Errorf("shard %s/%d %s: owned range: %w", set, rg.ShardID, t.Database, err)
+			}
+		}
 		ok, err := g.applyOn(ctx, set, rg.ShardID, t, fn)
 		if err != nil {
 			return false, fmt.Errorf("shard %s/%d %s.%s.%s: %w", set, rg.ShardID, t.Database, t.SchemaName, t.TableName, err)
