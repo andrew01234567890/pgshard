@@ -220,6 +220,29 @@ func TestRouterShardedRouting(t *testing.T) {
 		}
 	})
 
+	// PGS-981: a SET TRANSACTION READ ONLY reaches the shard parked
+	// earlier in the transaction, so a write there is refused as
+	// PostgreSQL refuses it.
+	t.Run("read_only_reaches_a_parked_shard", func(t *testing.T) {
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		for _, k := range []int64{t0, t1} {
+			if _, err := tx.Exec(ctx, "select count(*) from orders where tenant_id = $1", k); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := tx.Exec(ctx, "set transaction read only"); err != nil {
+			t.Fatal(err)
+		}
+		_, err = tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 300)", t0)
+		if sqlstate(err) != "25006" {
+			t.Fatalf("a write on the parked shard: %v, want 25006", err)
+		}
+	})
+
 	t.Run("refusals", func(t *testing.T) {
 		for _, c := range []struct{ sql, msg string }{
 			{"select * from orders for update", "multi-shard SELECT with FOR UPDATE/SHARE is not available yet"},
