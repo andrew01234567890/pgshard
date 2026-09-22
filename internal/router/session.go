@@ -1795,11 +1795,27 @@ func (e *Executor) refuseInFailedTransaction(class StmtClass) error {
 // Parse, Bind or Execute, and also admits ROLLBACK TO, as PostgreSQL does
 // at all three: whether the router can recover the transaction to that
 // savepoint takes a backend, so failedTxnBatch decides it at Sync.
+//
+// A statement staged after a ROLLBACK TO in the same batch is admitted too
+// where the backend is there: the recovery runs first at Sync, and the
+// backend refuses what follows if it did not recover.
 func (e *Executor) refuseStagedInFailedTransaction(class StmtClass) error {
 	if class.Txn == plan.TxnRollbackTo {
 		return nil
 	}
+	if e.conn != nil && e.batchRecovers() {
+		return nil
+	}
 	return e.refuseInFailedTransaction(class)
+}
+
+func (e *Executor) batchRecovers() bool {
+	for _, item := range e.batchExec {
+		if item.class.Txn == plan.TxnRollbackTo {
+			return true
+		}
+	}
+	return false
 }
 
 // refuseSelfAnsweredInFailedTxn refuses nextval() over a global sequence in
