@@ -124,6 +124,9 @@ type mergeBuilder struct {
 	// clone is the mutable copy of the tree, made on first change.
 	clone  *pgquerypb.SelectStmt
 	cloneT *pgquerypb.ParseResult
+	// unrewritable marks a rewrite the statement had no SELECT at its top
+	// to carry.
+	unrewritable bool
 }
 
 // buildMerge computes the Merge for sel; err is the refusal when the shape
@@ -138,6 +141,9 @@ func buildMerge(tree proto.Message, sel *pgquerypb.SelectStmt, shardKey string, 
 		scalar: scalar, spec: Merge{Limit: -1, Offset: -1}}
 	if err := b.run(); err != nil {
 		return nil, err
+	}
+	if b.unrewritable {
+		return nil, notYet("only a plain SELECT can run on multiple shards", "filter on one shard key value")
 	}
 	if b.changed {
 		out, err := pgparser.Deparse(b.cloneT)
@@ -154,6 +160,14 @@ func (b *mergeBuilder) mutable() *pgquerypb.SelectStmt {
 		b.cloneT = proto.Clone(b.tree).(*pgquerypb.ParseResult)
 		b.clone = b.cloneT.GetStmts()[0].GetStmt().GetSelectStmt()
 		b.changed = true
+		if b.clone == nil {
+			// A DECLARE or a CREATE VIEW has no SELECT at its top, so
+			// there is no shard statement to rewrite; a copy of the SELECT
+			// the merge was built for absorbs the rewrite, which indexes
+			// its select list, and buildMerge refuses (PGS-979). Returning nil
+			// here was a nil dereference that reset the session.
+			b.clone, b.unrewritable = proto.Clone(b.sel).(*pgquerypb.SelectStmt), true
+		}
 	}
 	return b.clone
 }
