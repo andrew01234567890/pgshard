@@ -296,7 +296,9 @@ func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 			}
 		}
 	case *pgquerypb.Node_CopyStmt:
-		c.CopyFromStdin = n.CopyStmt.GetIsFrom() && n.CopyStmt.GetFilename() == "" && !n.CopyStmt.GetIsProgram()
+		// FROM a file and FROM PROGRAM both name something in filename;
+		// only STDIN leaves it empty.
+		c.CopyFromStdin = n.CopyStmt.GetIsFrom() && n.CopyStmt.GetFilename() == ""
 	case *pgquerypb.Node_TransactionStmt:
 		t := n.TransactionStmt
 		c.Chain = t.GetChain()
