@@ -19,6 +19,7 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgoutput"
 	"github.com/andrew01234567890/pgshard/internal/pgrepl"
+	"github.com/andrew01234567890/pgshard/internal/schemacopy"
 )
 
 // ErrorDomain marks structured error details produced by the pooler.
@@ -662,6 +663,9 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 	case *pgoutput.Origin:
 		ev.Event = &pgshardv1.ChangeEvent_Origin_{Origin: &pgshardv1.ChangeEvent_Origin{Name: v.Name, CommitLsn: v.CommitLSN}}
 	case *pgoutput.Relation:
+		if v.Namespace == schemacopy.OwnerSchema {
+			return nil, false, nil
+		}
 		ev.Xid = v.Xid
 		rel := &pgshardv1.ChangeEvent_Relation{RelationId: v.ID, Schema: v.Namespace, Table: v.Name, ReplicaIdentity: string(v.ReplicaIdentity)}
 		for _, c := range v.Columns {
@@ -671,6 +675,9 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 	case *pgoutput.Type:
 		return nil, false, nil
 	case *pgoutput.Insert:
+		if ownRelation(dec, v.RelationID) {
+			return nil, false, nil
+		}
 		ev.Xid = v.Xid
 		row, err := rowEvent(dec, v.RelationID, pgshardv1.ChangeEvent_Row_KIND_INSERT, nil, false, &v.New)
 		if err != nil {
@@ -678,6 +685,9 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 		}
 		ev.Event = &pgshardv1.ChangeEvent_Row_{Row: row}
 	case *pgoutput.Update:
+		if ownRelation(dec, v.RelationID) {
+			return nil, false, nil
+		}
 		ev.Xid = v.Xid
 		old, isKey := v.Old, false
 		if v.Key != nil {
@@ -689,6 +699,9 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 		}
 		ev.Event = &pgshardv1.ChangeEvent_Row_{Row: row}
 	case *pgoutput.Delete:
+		if ownRelation(dec, v.RelationID) {
+			return nil, false, nil
+		}
 		ev.Xid = v.Xid
 		old, isKey := v.Old, false
 		if v.Key != nil {
@@ -743,6 +756,17 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 		return nil, false, fmt.Errorf("unhandled pgoutput message %T", m)
 	}
 	return ev, false, nil
+}
+
+// ownRelation reports a relation pgshard keeps for itself in a user
+// database, whose changes are not the consumer's (PGS-878). A change stream
+// decodes a FOR ALL TABLES publication, which cannot leave a table out on
+// PostgreSQL 18, so each shard's owned range would reach every consumer as
+// rows of a table it never created -- and a consumer reading every row as
+// its own breaks on them.
+func ownRelation(dec *pgoutput.Decoder, relID uint32) bool {
+	rel, ok := dec.Relation(relID)
+	return ok && rel.Namespace == schemacopy.OwnerSchema
 }
 
 func rowEvent(dec *pgoutput.Decoder, relID uint32, kind pgshardv1.ChangeEvent_Row_Kind, old *pgoutput.Tuple, oldIsKey bool, newT *pgoutput.Tuple) (*pgshardv1.ChangeEvent_Row, error) {

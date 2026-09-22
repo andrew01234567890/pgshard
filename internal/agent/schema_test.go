@@ -38,7 +38,7 @@ func TestMaterializeSchemaRunsDumpIntoPsql(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("ARGS -X -q -v ON_ERROR_STOP=1 --dbname=host=/tmp port=%d user=postgres dbname=app\nDUMP --schema-only --no-publications --no-subscriptions --dbname=host=src dbname=app\n", in.cfg.Port)
+	want := fmt.Sprintf("ARGS -X -q -v ON_ERROR_STOP=1 --dbname=host=/tmp port=%d user=postgres dbname=app\nDUMP --schema-only --no-publications --no-subscriptions --exclude-schema=pgshard_owner --dbname=host=src dbname=app\n", in.cfg.Port)
 	if string(got) != want {
 		t.Fatalf("psql saw:\n%s\nwant:\n%s", got, want)
 	}

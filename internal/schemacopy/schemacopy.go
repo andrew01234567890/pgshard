@@ -10,11 +10,20 @@ import (
 	"strings"
 )
 
+// OwnerSchema is the schema in which each shard records the keyspace range
+// it owns. It is per shard, so it is never copied: a reshard target that
+// inherited it would believe it owned its source's range.
+const OwnerSchema = "pgshard_owner"
+
 // DumpArgs are the pg_dump arguments of a schema copy: schema only, without
 // the replication objects of the source so a reshard's own publications are
-// never dumped into a target.
+// never dumped into a target, and without the source's owned range.
+//
+// The per-table checks that read the range are dumped: they are plpgsql,
+// whose body is not resolved when it is created, so they restore before the
+// target has a range and read the target's own once it does.
 func DumpArgs(source string) []string {
-	return []string{"--schema-only", "--no-publications", "--no-subscriptions", "--dbname=" + source}
+	return []string{"--schema-only", "--no-publications", "--no-subscriptions", "--exclude-schema=" + OwnerSchema, "--dbname=" + source}
 }
 
 // RestoreArgs are the psql arguments applying a dump: stop at the first
