@@ -1074,18 +1074,24 @@ func (e *Executor) txnControlInBatch(ctx context.Context, class StmtClass, w pgw
 			e.implicitTx = false
 			return true, w.CommandComplete("BEGIN")
 		}
-		// Modes apply to a transaction that has not run anything yet, and
-		// then ending the implicit one and running the client's BEGIN in
-		// its place is the same transaction. Once a statement has run,
-		// PostgreSQL itself refuses an isolation level, and the prelude
-		// holding the router's own BEGIN may already be on a backend.
+		// A transaction that has run nothing yet is the same one whether
+		// the router's BEGIN opened it or the client's did, so it is
+		// swapped for the client's own, modes and all.
 		if len(e.txnPrelude) <= 1 && !e.txnTouched && !e.txnRanDDL && !e.multiShardTxn() {
 			return false, e.EndImplicit(ctx, false)
 		}
-		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
-			"BEGIN with transaction modes is not available after other statements of a multi-statement simple query")
-		err.Hint = "put the BEGIN first in the batch, or send it as its own query"
-		return true, err
+		// PostgreSQL adopts the transaction and then applies the modes
+		// as SET TRANSACTION would (xact.c, standard_ProcessUtility), so
+		// the shard decides what may still change: READ ONLY may, an
+		// isolation level or DEFERRABLE after a query may not, and the
+		// shard answers PostgreSQL's own 25001 for those.
+		e.implicitTx = false
+		if class.TxnModesSQL != "" {
+			if err := e.simpleQuery(ctx, class.TxnModesSQL, discardWriter{}); err != nil {
+				return true, err
+			}
+		}
+		return true, w.CommandComplete("BEGIN")
 	case plan.TxnCommit, plan.TxnRollback:
 		verb := "COMMIT"
 		if class.Txn == plan.TxnRollback {

@@ -77,6 +77,9 @@ type StmtClass struct {
 	// TxnModes marks a BEGIN or START TRANSACTION that names transaction
 	// modes: an isolation level, READ ONLY or DEFERRABLE.
 	TxnModes bool
+	// TxnModesSQL is that BEGIN's modes as a SET TRANSACTION, or "" when it
+	// names none the router passes on.
+	TxnModesSQL string
 	// Savepoint names the savepoint of a SAVEPOINT, RELEASE or ROLLBACK TO.
 	Savepoint string
 	// Session is the session-state statement this is, if any.

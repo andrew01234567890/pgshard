@@ -168,11 +168,10 @@ func TestTransactionControlInsideABatchThatPostgreSQLRefusesIsRefused(t *testing
 	conn, _ := batchConn(t, h)
 	ctx := context.Background()
 	for sql, code := range map[string]string{
-		"select 1; savepoint s":                        "25P01",
-		"select 1; release savepoint s":                "25P01",
-		"select 1; rollback to savepoint s":            "25P01",
-		"select 1; commit and chain":                   "25P01",
-		"select 1; begin isolation level serializable": "0A000",
+		"select 1; savepoint s":             "25P01",
+		"select 1; release savepoint s":     "25P01",
+		"select 1; rollback to savepoint s": "25P01",
+		"select 1; commit and chain":        "25P01",
 	} {
 		_, err := conn.Exec(ctx, sql, pgx.QueryExecModeSimpleProtocol)
 		if sqlstate(err) != code {
@@ -214,5 +213,24 @@ func TestDDLInsideABatchIsRefusedInTermsOfTheBatch(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "BEGIN/COMMIT") {
 		t.Fatalf("err = %v, blames a transaction block the client never opened", err)
+	}
+}
+
+// After other statements PostgreSQL adopts the transaction and applies the
+// modes as SET TRANSACTION would, so the shard decides what may still
+// change: READ ONLY may, an isolation level after a query may not (25001).
+func TestABeginWithModesAfterOtherStatementsSetsThemOnTheTransaction(t *testing.T) {
+	h := newHarness(t)
+	conn, _ := batchConn(t, h)
+	ctx := context.Background()
+	h.shardRan()
+	if _, err := conn.Exec(ctx, "select 1; begin read only; select 1", pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.shardRan(); got != "begin|select 1|set transaction read only|select 1" {
+		t.Fatalf("shard ran %q, want the modes set on the adopted transaction", got)
+	}
+	if st := conn.PgConn().TxStatus(); st != 'T' {
+		t.Fatalf("status %c, want the adopted transaction open", st)
 	}
 }
