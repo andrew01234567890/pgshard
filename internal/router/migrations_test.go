@@ -913,8 +913,11 @@ func TestASequentialDatabaseRunsATransactionsDDLStatementByStatement(t *testing.
 	}
 	_, err = tx.Exec(ctx, "select * from items")
 	_ = expectRefusal(t, err, "a statement that runs on a shard is not available after DDL in the same transaction")
+	// The refusal failed the transaction, so the next statement is told so.
 	_, err = tx.Exec(ctx, "select * from items where id = $1", 1)
-	_ = expectRefusal(t, err, "a statement that runs on a shard is not available after DDL in the same transaction")
+	if sqlstate(err) != "25P02" {
+		t.Fatalf("a statement after the refusal: %v, want 25P02", err)
+	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
