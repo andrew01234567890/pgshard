@@ -244,7 +244,7 @@ func decodeParam(oid uint32, format int16, raw []byte) (any, error) {
 	s := string(raw)
 	switch oid {
 	case oidInt8, oidInt4, oidInt2:
-		i, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		i, err := pgStrToInt64(s)
 		if err != nil {
 			return nil, fmt.Errorf("integer parameter %q: %w", s, err)
 		}
@@ -260,10 +260,107 @@ func decodeParam(oid uint32, format int16, raw []byte) (any, error) {
 	case oidBpchar:
 		return s, nil
 	case 0, oidUnknown:
-		if _, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+		if _, err := pgStrToInt64(s); err == nil {
 			return nil, ErrAmbiguousKey
 		}
 		return s, nil
 	}
 	return nil, fmt.Errorf("parameter of type oid %d is not a supported shard key", oid)
+}
+
+// pgStrToInt64 reads an integer the way PostgreSQL's int8in does
+// (numutils.c, pg_strtoint64_safe): surrounding whitespace, a sign, the
+// 0x, 0o and 0b prefixes of PostgreSQL 16 and later, and underscores
+// between digits. A key the shard reads as 16 has to be hashed as 16, and
+// strconv read "0x10" as no integer at all.
+func pgStrToInt64(s string) (int64, error) {
+	invalid := fmt.Errorf("invalid input syntax for type bigint: %q", s)
+	i := 0
+	for i < len(s) && isCSpace(s[i]) {
+		i++
+	}
+	neg := false
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		neg = s[i] == '-'
+		i++
+	}
+	base := uint64(10)
+	if i+1 < len(s) && s[i] == '0' {
+		switch s[i+1] {
+		case 'x', 'X':
+			base = 16
+		case 'o', 'O':
+			base = 8
+		case 'b', 'B':
+			base = 2
+		}
+		if base != 10 {
+			i += 2
+		}
+	}
+	digit := func(c byte) (uint64, bool) {
+		var d uint64
+		switch {
+		case c >= '0' && c <= '9':
+			d = uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = uint64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = uint64(c-'A') + 10
+		default:
+			return 0, false
+		}
+		return d, d < base
+	}
+	// The magnitude of the most negative int64, which only a negative
+	// number may reach.
+	const limit = uint64(1) << 63
+	first := i
+	var v uint64
+	for i < len(s) {
+		if d, ok := digit(s[i]); ok {
+			if v > (limit-d)/base {
+				return 0, fmt.Errorf("value %q is out of range for type bigint", s)
+			}
+			v = v*base + d
+			i++
+			continue
+		}
+		if s[i] != '_' {
+			break
+		}
+		// An underscore sits between digits: never first in a decimal
+		// number, and always followed by another digit.
+		if base == 10 && i == first {
+			return 0, invalid
+		}
+		i++
+		if i >= len(s) {
+			return 0, invalid
+		}
+		if _, ok := digit(s[i]); !ok {
+			return 0, invalid
+		}
+	}
+	if i == first {
+		return 0, invalid
+	}
+	for i < len(s) && isCSpace(s[i]) {
+		i++
+	}
+	if i != len(s) {
+		return 0, invalid
+	}
+	if neg {
+		return -int64(v), nil //nolint:gosec // v <= 2^63, and -2^63 is representable
+	}
+	if v == limit {
+		return 0, fmt.Errorf("value %q is out of range for type bigint", s)
+	}
+	return int64(v), nil //nolint:gosec // v < 2^63 here
+}
+
+// isCSpace is C's isspace in the C locale, which is what int8in skips.
+func isCSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
 }
