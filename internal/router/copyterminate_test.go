@@ -167,3 +167,68 @@ func TestACopyWhoseShardsRaiseNoticesDuringTheLoadCompletes(t *testing.T) {
 		t.Fatal("the shards' notices never reached the client")
 	}
 }
+
+// The unsharded relay too. After the client breaks the COPY with a stray
+// message, the pooler's answer to the router's CopyFail has to be read,
+// or the next statement reads it instead of its own.
+func TestAnUnshardedCopyBrokenByAStrayMessageLeavesTheSessionInStep(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	nc := conn.PgConn().Conn()
+	fe := pgproto3.NewFrontend(nc, nc)
+	if err := nc.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	fe.Send(&pgproto3.Query{String: "copy t from stdin"})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fe.Receive(); err != nil {
+		t.Fatal(err)
+	}
+	fe.Send(&pgproto3.CopyData{Data: []byte("1\n")})
+	fe.Send(&pgproto3.Query{String: "select 1"})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var code string
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok && code == "" {
+			code = e.Code
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if code != "08P01" {
+		t.Fatalf("error %q, want 08P01", code)
+	}
+	// The next statement gets its own answer, not the stale one.
+	fe.Send(&pgproto3.Query{String: "select 1"})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var sawRow bool
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			sawRow = true
+		case *pgproto3.ErrorResponse:
+			t.Fatalf("the next statement got an error: %s %s", m.Code, m.Message)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if !sawRow {
+		t.Fatal("the next statement returned no row")
+	}
+}

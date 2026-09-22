@@ -3230,7 +3230,17 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 		case *pgshardv1.ExecuteResponse_NoData:
 			werr = w.NoData()
 		case *pgshardv1.ExecuteResponse_CopyInResponse:
-			werr = e.copyIn(w, m.CopyInResponse)
+			var clientErr error
+			clientErr, werr = e.copyIn(w, m.CopyInResponse)
+			// The client ended the COPY badly -- a stray message, a
+			// Terminate, a lost connection -- and the pooler has been sent
+			// CopyFail. The pump reads the shard's answer to it, so the
+			// stream is left at a ReadyForQuery for the next statement, and
+			// the client is told what it did rather than the shard's
+			// "COPY from stdin failed".
+			if clientErr != nil && firstErr == nil {
+				firstErr = clientErr
+			}
 		case *pgshardv1.ExecuteResponse_CopyOutResponse:
 			werr = w.CopyOut(byte(m.CopyOutResponse.Format), toUint16s(m.CopyOutResponse.ColumnFormats))
 		case *pgshardv1.ExecuteResponse_CopyData:
@@ -3437,25 +3447,24 @@ func (e *Executor) inferParams(oids []uint32) {
 
 // copyIn relays a COPY FROM STDIN: client chunks go to the pooler until the
 // client ends the transfer.
-func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse) error {
+func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse) (clientErr, sendErr error) {
 	in, err := w.CopyIn(byte(resp.Format), toUint16s(resp.ColumnFormats))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for {
 		data, err := in.Next()
 		switch {
 		case err == nil:
 			if err := e.send(copyDataReq(data)); err != nil {
-				return err
+				return nil, err
 			}
 		case errors.Is(err, pgwire.ErrCopyFail):
-			return e.send(copyFailReq("COPY terminated by client"))
+			return nil, e.send(copyFailReq("COPY terminated by client"))
 		case errors.Is(err, io.EOF):
-			return e.send(copyDoneReq())
+			return nil, e.send(copyDoneReq())
 		default:
-			_ = e.send(copyFailReq("client connection lost"))
-			return err
+			return err, e.send(copyFailReq("COPY ended by the client: " + err.Error()))
 		}
 	}
 }
