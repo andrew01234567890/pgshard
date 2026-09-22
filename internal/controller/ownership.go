@@ -113,7 +113,14 @@ func (o *OwnedRanges) Pass(ctx context.Context) (int, error) {
 // write makes one database's row say [lo, hi] for shard id of set, and
 // reports whether it changed anything.
 func (o *OwnedRanges) write(ctx context.Context, set string, id int32, database string, lo, hi int64) (int, error) {
-	conn, err := o.Shards.DialDatabase(ctx, set, id, database)
+	return writeOwnedRange(ctx, o.Shards, set, id, database, lo, hi)
+}
+
+// writeOwnedRange is the one place a shard's owned range is written: by the
+// pass, and by a cutover that will not let a target serve before it knows
+// what it owns.
+func writeOwnedRange(ctx context.Context, shards ShardDBDialer, set string, id int32, database string, lo, hi int64) (int, error) {
+	conn, err := shards.DialDatabase(ctx, set, id, database)
 	if err != nil {
 		return 0, err
 	}
