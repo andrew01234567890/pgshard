@@ -268,3 +268,10 @@ func TestMixedLineEndingsAreRefusedAsPostgreSQLRefusesThem(t *testing.T) {
 		t.Fatalf("escaped CR: %+v %v", rows, err)
 	}
 }
+
+// In a \r\n stream a bare \r at the very end is not a line ending either.
+func TestABareCarriageReturnAtTheEndOfACRLFStreamIsRefused(t *testing.T) {
+	if _, err := collectEnded(t, 0, 2, "a\t1\r\nb\t2\r"); !errors.Is(err, ErrMixedLineEndings) {
+		t.Fatalf("err = %v", err)
+	}
+}

@@ -141,8 +141,12 @@ func (s *Splitter) rowEnd() (int, error) {
 				if !s.ended {
 					return -1, nil
 				}
-				if s.eol == eolUnknown {
+				switch s.eol {
+				case eolUnknown:
 					s.eol = eolCR
+				case eolCRNL:
+					// No \n is coming: a bare \r in a \r\n stream.
+					return 0, ErrMixedLineEndings
 				}
 				return i + 1, nil
 			}

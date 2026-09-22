@@ -195,14 +195,11 @@ func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[
 			if !ok {
 				return nil
 			}
-			if ended {
-				continue
-			}
 			if row.Key == "" && !row.KeyIsNull && strings.TrimRight(string(row.Bytes), "\r\n") == `\.` {
 				// PostgreSQL stops reading at the end-of-data marker and
-				// ignores whatever follows it.
+				// ignores whatever follows it, parsed or not.
 				ended = true
-				continue
+				return nil
 			}
 			if row.KeyIsNull {
 				return pgwire.Errorf("23502", "COPY row has a NULL shard key, which places it on no shard")
@@ -227,6 +224,9 @@ func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[
 		data, err := in.Next()
 		switch {
 		case err == nil:
+			if ended {
+				continue
+			}
 			split.Write(data)
 			if rerr := route(); rerr != nil {
 				return 0, rerr
@@ -239,9 +239,11 @@ func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[
 		case errors.Is(err, io.EOF):
 			// A last row without its line ending is still a row, as it is
 			// to PostgreSQL.
-			split.End()
-			if rerr := route(); rerr != nil {
-				return 0, rerr
+			if !ended {
+				split.End()
+				if rerr := route(); rerr != nil {
+					return 0, rerr
+				}
 			}
 			for sh := range pending {
 				if ferr := flush(sh); ferr != nil {
