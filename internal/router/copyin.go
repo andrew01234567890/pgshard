@@ -135,9 +135,14 @@ func (e *Executor) startCopyOn(ctx context.Context, p *txnPart, sql string) erro
 	if err := e.sendOn(p, simpleQuery(sql)); err != nil {
 		return err
 	}
+	// A cancel while a shard is still starting its COPY reaches that
+	// shard, as one during any other statement does in runReqsOn.
+	e.noteCancelTarget(p.ps.client)
+	n := e.statement.Load()
+	onCancel := func() { e.cancelStatement(context.Background(), n) }
 	var firstErr error
 	for {
-		resp, err := p.ps.recv(ctx, nil)
+		resp, err := p.ps.recv(ctx, onCancel)
 		if err != nil {
 			return poolerTransportError(fmt.Sprintf("shard %s/%d", p.shard.Set, p.shard.ID), err)
 		}

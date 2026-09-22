@@ -2166,7 +2166,7 @@ func constOrParam(node *pgquerypb.Node) (item keyItem, ok bool, err error) {
 		return keyItem{}, false, nil
 	}
 	if s, isString := item.value.(string); isString && item.hint == HintNone {
-		if _, err := parseInt(strings.TrimSpace(s)); err == nil {
+		if _, err := pgStrToInt64(s); err == nil {
 			return keyItem{}, false, notYet("shard key literal '"+s+"' is untyped and looks numeric",
 				"cast it: '"+s+"'::int8 or '"+s+"'::text")
 		}
@@ -2191,7 +2191,7 @@ func literal(node *pgquerypb.Node) (keyItem, bool) {
 		case *pgquerypb.A_Const_Ival:
 			return keyItem{value: int64(v.Ival.GetIval()), hint: HintInt}, true
 		case *pgquerypb.A_Const_Fval:
-			if i, err := parseInt(v.Fval.GetFval()); err == nil {
+			if i, err := pgStrToInt64(v.Fval.GetFval()); err == nil {
 				return keyItem{value: i, hint: HintInt}, true
 			}
 		case *pgquerypb.A_Const_Sval:
@@ -2281,7 +2281,7 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 			item.value, item.hint = x, hint
 			return item, true
 		}
-		if i, err := parseInt(strings.TrimSpace(x)); err == nil {
+		if i, err := pgStrToInt64(x); err == nil {
 			return keyItem{value: i, hint: HintInt}, true
 		}
 	}
