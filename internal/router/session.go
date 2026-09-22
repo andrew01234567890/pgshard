@@ -2498,6 +2498,9 @@ func (e *Executor) flush(ctx context.Context, w pgwire.ResultWriter) error {
 	e.execDone = 0
 	err := e.pump(ctx, w)
 	e.noteBatch(executed)
+	if err == nil {
+		err = e.fanOutTxnScopedSets(ctx, executed)
+	}
 	return e.afterBatch(ctx, err)
 }
 
@@ -2702,8 +2705,31 @@ func (e *Executor) sync(ctx context.Context) error {
 		err := e.pump(ctx, cw)
 		e.hiddenExec = nil
 		e.noteBatch(executed)
+		if err == nil {
+			err = e.fanOutTxnScopedSets(ctx, executed)
+		}
 		return err
 	})
+}
+
+// fanOutTxnScopedSets is setOnParkedParts for the SET LOCAL and SET
+// TRANSACTION statements of an extended batch, in the order they ran: the
+// simple protocol was the only path that did it, and a driver that sends
+// SET TRANSACTION READ ONLY with Parse and Bind left the parked shards as
+// writable as before (PGS-981).
+func (e *Executor) fanOutTxnScopedSets(ctx context.Context, executed []execItem) error {
+	if !e.multiShardTxn() {
+		return nil
+	}
+	for _, item := range executed[:min(e.execDone, len(executed))] {
+		if !item.class.TxnScopedSet {
+			continue
+		}
+		if err := e.setOnParkedParts(ctx, item.sql); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // noteBatch records the statements of a pumped batch that ran: all of them
