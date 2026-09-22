@@ -141,10 +141,13 @@ record under `status.copy` is informational except for the schema flags.
    every target the controller creates the database on the target and asks
    the agent of the target primary (`Agent.MaterializeSchema`, address =
    `shard_status.primary_endpoint` host + `--agent-port`) to run
-   `pg_dump --schema-only --no-publications --no-subscriptions` against the
-   database's home shard piped into `psql -v ON_ERROR_STOP=1`. Tables,
-   indexes, constraints, sequences, types, views and grants come across;
-   roles already exist on every group. On every target but the one that
+   `pg_dump --schema-only --no-publications --no-subscriptions
+   --exclude-schema=pgshard_owner` against the database's home shard piped
+   into `psql -v ON_ERROR_STOP=1`. Tables, indexes, constraints, sequences,
+   types, views and grants come across; roles already exist on every group.
+   `pgshard_owner` holds the keyspace range each shard owns and is per shard,
+   so it is neither dumped nor published: the controller writes every
+   target's own range there as soon as the target set has ranges. On every target but the one that
    receives the home shard's unsharded tables, the database's
    `local_schemas` are then dropped with `CASCADE`, taking the event
    triggers that call their functions (see `docs/catalog.md`).

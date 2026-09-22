@@ -7,7 +7,7 @@ import (
 )
 
 func TestArgs(t *testing.T) {
-	if got := strings.Join(DumpArgs("host=src dbname=app"), " "); got != "--schema-only --no-publications --no-subscriptions --dbname=host=src dbname=app" {
+	if got := strings.Join(DumpArgs("host=src dbname=app"), " "); got != "--schema-only --no-publications --no-subscriptions --exclude-schema=pgshard_owner --dbname=host=src dbname=app" {
 		t.Fatal(got)
 	}
 	if got := strings.Join(RestoreArgs("host=/tmp dbname=app"), " "); got != "-X -q -v ON_ERROR_STOP=1 --dbname=host=/tmp dbname=app" {

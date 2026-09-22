@@ -1186,10 +1186,14 @@ func describeTable(ctx context.Context, conn ShardConn, schema, name, key string
 }
 
 // listTables lists every ordinary table outside the system schemas.
+// listTables lists the user tables of a shard database: everything a
+// reshard copies, publishes, digests or locks. The owned range is left out
+// here, once, rather than at each of those: it is per shard, and a target
+// given its source's would refuse every row it is meant to hold (PGS-878).
 func listTables(ctx context.Context, conn ShardConn) ([]sourceTable, error) {
 	sql := `SELECT n.nspname, c.relname, c.relkind = 'p', ` + strings.ReplaceAll(replicaIdentitySQL, "$KEY", "''") + `
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.relkind IN ('r', 'p') AND c.relispartition = false AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard') AND n.nspname NOT LIKE 'pg\_%'
+		WHERE c.relkind IN ('r', 'p') AND c.relispartition = false AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', '` + OwnerSchema + `') AND n.nspname NOT LIKE 'pg\_%'
 		ORDER BY 1, 2`
 	rows, err := conn.Query(ctx, sql)
 	if err != nil {
