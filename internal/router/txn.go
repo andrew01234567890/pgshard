@@ -870,7 +870,9 @@ func (e *Executor) txnControl(ctx context.Context, class StmtClass, w pgwire.Res
 		if class.Chain {
 			return true, pgwire.Errorf(pgwire.CodeFeatureNotSupported, "COMMIT/ROLLBACK AND CHAIN is not available in a multi-shard transaction")
 		}
-		return true, e.endTxn(ctx, class.Txn == plan.TxnCommit, w)
+		// A COMMIT of a failed transaction rolls it back, and says so with
+		// its tag, as PostgreSQL does.
+		return true, e.endTxn(ctx, class.Txn == plan.TxnCommit && e.tx != pgwire.TxFailed, w)
 	case plan.TxnSavepoint, plan.TxnRelease, plan.TxnRollbackTo:
 		return true, pgwire.Errorf(pgwire.CodeFeatureNotSupported, "savepoints are not available once a transaction spans several shards")
 	}
