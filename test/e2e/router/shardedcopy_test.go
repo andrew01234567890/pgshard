@@ -117,6 +117,37 @@ func TestRouterShardedCopyMatchesOneNode(t *testing.T) {
 		t.Fatalf("a failed load left %d rows behind", after-before)
 	}
 
+	// A trigger that raises a NOTICE per row keeps every shard writing
+	// while the rows arrive; nothing read those until the load ended, and
+	// the COPY wedged once the notices filled the stream.
+	for _, dsn := range s.shardDSNs {
+		if _, err := s.appConn(t, dsn).Exec(ctx, `create function pgshard_test_notice() returns trigger language plpgsql as $$
+begin raise notice 'loaded % %', new.id, repeat('n', 8192); return new; end $$;
+create trigger pgshard_test_notice before insert on event_lines for each row execute function pgshard_test_notice()`); err != nil {
+			t.Fatalf("install notice trigger: %v", err)
+		}
+	}
+	var noisy strings.Builder
+	for i := 0; i < 4000; i++ {
+		fmt.Fprintf(&noisy, "%d\t%d\t7\tn\t1\n", int64(i%53-11), 200000+i)
+	}
+	noisyDone := make(chan error, 1)
+	go func() {
+		_, err := conn.PgConn().CopyFrom(ctx, strings.NewReader(noisy.String()), copySQL)
+		noisyDone <- err
+	}()
+	select {
+	case err := <-noisyDone:
+		if err != nil {
+			t.Fatalf("COPY into shards raising a notice per row: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("COPY into shards raising a notice per row wedged")
+	}
+	if _, err := oracle.PgConn().CopyFrom(ctx, strings.NewReader(noisy.String()), copySQL); err != nil {
+		t.Fatalf("oracle noisy load: %v", err)
+	}
+
 	// A stream whose rows end in a bare carriage return, which PostgreSQL
 	// accepts, loads the same through the router as into one node.
 	var cr strings.Builder

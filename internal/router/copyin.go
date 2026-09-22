@@ -7,6 +7,9 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync/atomic"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -82,15 +85,47 @@ func (e *Executor) copyShardedIn(ctx context.Context, pl plan.Plan, sql string, 
 	if err := firstError(targets); err != nil {
 		return e.copyFailed(ctx, implicit, targets, err)
 	}
-	rows, err := e.relayCopyRows(pl, w, parts)
-	if err != nil {
-		return e.copyFailed(ctx, implicit, targets, err)
+	drains := make([]*copyDrain, 0, len(targets))
+	for _, p := range targets {
+		drains = append(drains, e.drainCopy(ctx, p))
 	}
-	e.each(targets, func(p *txnPart) error {
-		return e.runReqsOn(ctx, p, []*pgshardv1.ExecuteRequest{copyDoneReq()}, discardWriter{})
-	})
+	failed := func() bool {
+		for _, d := range drains {
+			if d.failed.Load() {
+				return true
+			}
+		}
+		return false
+	}
+	rows, err := e.relayCopyRows(pl, w, parts, failed)
+	if err == nil && failed() {
+		err = errShardEndedCopy
+	}
+	end := copyDoneReq()
+	if err != nil {
+		end = copyFailReq("COPY aborted by the router")
+	}
+	for _, d := range drains {
+		if !d.failed.Load() {
+			if serr := e.sendOn(d.p, end); serr != nil && err == nil {
+				err = serr
+			}
+		}
+	}
+	for _, d := range drains {
+		<-d.done
+	}
 	e.syncCurrent(targets)
-	if err := firstError(targets); err != nil {
+	if nerr := relayCopyNotices(w, drains); nerr != nil {
+		return nerr
+	}
+	// A shard's own error says why the load failed; the router's
+	// errShardEndedCopy only says that one did. When the router ended the
+	// load itself, the shards' answer is only the CopyFail it sent them.
+	if ferr := firstError(targets); ferr != nil && (err == nil || errors.Is(err, errShardEndedCopy)) {
+		err = ferr
+	}
+	if err != nil {
 		return e.referenceFailed(ctx, implicit, err)
 	}
 	var total int64
@@ -127,6 +162,94 @@ func (e *Executor) copyShardedIn(ctx context.Context, pl plan.Plan, sql string, 
 	}
 	e.lastTag = fmt.Sprintf("COPY %d", total)
 	return w.CommandComplete(e.lastTag)
+}
+
+// errShardEndedCopy stops a load whose shard has already refused it.
+var errShardEndedCopy = pgwire.Errorf(pgwire.CodeInternalError, "router: a shard ended the COPY before its end")
+
+// copyMaxNotices and copyMaxNoticeBytes bound the notices one shard's
+// load holds for the client while it runs. A trigger that raises one per
+// row would otherwise grow the router's memory with the load.
+const (
+	copyMaxNotices     = 1000
+	copyMaxNoticeBytes = 1 << 20
+)
+
+// copyDrain reads one shard's responses for the whole of a COPY.
+//
+// Nothing else reads the stream while the rows are sent. A shard that
+// answers during the load -- a NOTICE per row from a trigger is enough --
+// filled the stream's buffer and gRPC flow control behind it; the pooler
+// then stopped reading, the backend stopped reading CopyData, and the
+// router's next send blocked for good, out of reach of the client and of
+// a cancel. The drainer keeps the stream moving, holds the notices for the
+// client, notices an early refusal, and reads the load's own end: its
+// COPY count and ReadyForQuery.
+type copyDrain struct {
+	p       *txnPart
+	failed  atomic.Bool
+	notices []*pgproto3.NoticeResponse
+	bytes   int
+	dropped int
+	done    chan struct{}
+}
+
+func (e *Executor) drainCopy(ctx context.Context, p *txnPart) *copyDrain {
+	d := &copyDrain{p: p, done: make(chan struct{})}
+	n := e.statement.Load()
+	onCancel := func() { e.cancelStatement(context.Background(), n) }
+	go func() {
+		defer close(d.done)
+		for {
+			resp, err := p.ps.recv(ctx, onCancel)
+			if err != nil {
+				p.err = poolerTransportError(fmt.Sprintf("shard %s/%d", p.shard.Set, p.shard.ID), err)
+				d.failed.Store(true)
+				return
+			}
+			switch m := resp.Message.(type) {
+			case *pgshardv1.ExecuteResponse_Notice:
+				n := toNotice(m.Notice.GetNotice())
+				size := len(n.Message) + len(n.Detail) + len(n.Hint)
+				if len(d.notices) < copyMaxNotices && d.bytes+size <= copyMaxNoticeBytes {
+					d.notices = append(d.notices, n)
+					d.bytes += size
+				} else {
+					d.dropped++
+				}
+			case *pgshardv1.ExecuteResponse_CommandComplete:
+				p.tag = m.CommandComplete.Tag
+			case *pgshardv1.ExecuteResponse_Error:
+				if p.err == nil {
+					p.err = toPgwireError(m.Error.GetError())
+				}
+				d.failed.Store(true)
+			case *pgshardv1.ExecuteResponse_ReadyForQuery:
+				p.tx = txStatus(m.ReadyForQuery.TxnStatus)
+				return
+			}
+		}
+	}()
+	return d
+}
+
+// relayCopyNotices hands the client the notices the shards raised during
+// the load, once the load is over.
+func relayCopyNotices(w pgwire.ResultWriter, drains []*copyDrain) error {
+	dropped := 0
+	for _, d := range drains {
+		for _, n := range d.notices {
+			if err := w.Notice(n); err != nil {
+				return err
+			}
+		}
+		dropped += d.dropped
+	}
+	if dropped == 0 {
+		return nil
+	}
+	return w.Notice(&pgproto3.NoticeResponse{Severity: "NOTICE", SeverityUnlocalized: "NOTICE", Code: "00000",
+		Message: fmt.Sprintf("%d more notices raised by the shards during the COPY were not kept", dropped)})
 }
 
 // startCopyOn sends the COPY to one shard and reads until the shard is
@@ -168,7 +291,7 @@ func (e *Executor) startCopyOn(ctx context.Context, p *txnPart, sql string) erro
 
 // relayCopyRows reads the client's rows and sends each to its shard. It
 // returns how many rows it sent.
-func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[int32]*txnPart) (int64, error) {
+func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[int32]*txnPart, failed func() bool) (int64, error) {
 	formats := make([]uint16, pl.Copy.Columns)
 	in, err := w.CopyIn(0, formats)
 	if err != nil {
@@ -226,6 +349,10 @@ func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[
 		case err == nil:
 			if ended {
 				continue
+			}
+			// A shard that refused the load will refuse the rest of it.
+			if failed() {
+				return 0, errShardEndedCopy
 			}
 			split.Write(data)
 			if rerr := route(); rerr != nil {

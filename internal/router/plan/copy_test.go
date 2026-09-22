@@ -171,3 +171,23 @@ func TestCopyOptionsTheSplitterDoesNotHonourAreRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestACopyWithAWhereClauseIsRefused(t *testing.T) {
+	_, err := copyPlan(t, "copy orders (tenant_id, id) from stdin where id > 5")
+	if err == nil || !strings.Contains(err.Error(), "COPY ... WHERE") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// Unquoted names are folded by the parser; a quoted upper-case column is a
+// different column from the shard key.
+func TestACopyKeyColumnIsMatchedExactly(t *testing.T) {
+	_, err := copyPlan(t, `copy orders (id, "TENANT_ID") from stdin`)
+	if err == nil || !strings.Contains(err.Error(), "must include the shard key") {
+		t.Fatalf("err = %v", err)
+	}
+	p, err := copyPlan(t, `copy orders (id, TENANT_ID) from stdin`)
+	if err != nil || p.Copy.KeyColumn != 1 {
+		t.Fatalf("unquoted upper case: %v %+v", err, p.Copy)
+	}
+}
