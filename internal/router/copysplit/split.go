@@ -28,7 +28,27 @@ type Splitter struct {
 	buf    []byte
 	keyCol int
 	cols   int
+	// eol is the line ending the stream uses, decided by its first row as
+	// PostgreSQL decides it, and ended says no more data will come.
+	eol   eol
+	ended bool
 }
+
+// eol is a COPY stream's line ending: PostgreSQL takes it from the first
+// line (copyfromparse.c, CopyReadLineText) and refuses a stream that mixes
+// them.
+type eol int
+
+const (
+	eolUnknown eol = iota
+	eolNL
+	eolCR
+	eolCRNL
+)
+
+// ErrMixedLineEndings is a raw newline or carriage return that does not
+// match the stream's line ending, which PostgreSQL refuses as literal data.
+var ErrMixedLineEndings = errors.New("copy row has a literal carriage return or newline that does not match the stream's line ending; write it as \\r or \\n")
 
 // New returns a Splitter that reads column keyCol (zero-based) of each row,
 // out of cols columns.
@@ -38,6 +58,10 @@ func New(keyCol, cols int) *Splitter {
 
 // Write adds a chunk of the stream.
 func (s *Splitter) Write(p []byte) { s.buf = append(s.buf, p...) }
+
+// End says the stream is over, so a carriage return at the very end ends a
+// row and whatever follows the last line ending is the last row.
+func (s *Splitter) End() { s.ended = true }
 
 // Row is one complete row of the stream: its bytes, including the trailing
 // newline, and the text of its shard-key column.
@@ -52,9 +76,16 @@ type Row struct {
 // Next returns the next complete row, or ok=false when the buffer holds
 // only part of one.
 func (s *Splitter) Next() (Row, bool, error) {
-	end := rowEnd(s.buf)
+	end, err := s.rowEnd()
+	if err != nil {
+		return Row{}, false, err
+	}
 	if end < 0 {
-		return Row{}, false, nil
+		if !s.ended || len(s.buf) == 0 {
+			return Row{}, false, nil
+		}
+		// The last row need not end in a line ending, to PostgreSQL either.
+		end = len(s.buf)
 	}
 	row := s.buf[:end]
 	s.buf = s.buf[end:]
@@ -73,24 +104,66 @@ func (s *Splitter) Next() (Row, bool, error) {
 // newline, or nothing.
 func (s *Splitter) Rest() []byte { return s.buf }
 
-// rowEnd is the index just past the newline that ends the first row, or -1
-// when the buffer does not hold a whole one.
+// rowEnd is the index just past the line ending that ends the first row,
+// or -1 when the buffer does not hold a whole one.
 //
 // A backslash escapes the byte after it, a newline included: PostgreSQL's
 // reader (copyfromparse.c, CopyReadLineText) steps over the byte that
 // follows a backslash before it looks for the end of the line, so a
 // backslash-newline is part of a value and not the end of a row. A buffer
 // ending in a backslash does not hold a whole row yet.
-func rowEnd(b []byte) int {
+//
+// The line ending is the first row's -- \n, \r or \r\n -- and a raw one
+// of another kind later is refused, as PostgreSQL refuses it.
+func (s *Splitter) rowEnd() (int, error) {
+	b := s.buf
 	for i := 0; i < len(b); i++ {
 		switch b[i] {
 		case '\\':
 			i++
 		case '\n':
-			return i + 1
+			if s.eol == eolUnknown {
+				s.eol = eolNL
+			}
+			if s.eol != eolNL {
+				return 0, ErrMixedLineEndings
+			}
+			return i + 1, nil
+		case '\r':
+			switch s.eol {
+			case eolNL:
+				return 0, ErrMixedLineEndings
+			case eolCR:
+				return i + 1, nil
+			}
+			if i+1 >= len(b) {
+				// Whether a \n follows is in the next chunk.
+				if !s.ended {
+					return -1, nil
+				}
+				switch s.eol {
+				case eolUnknown:
+					s.eol = eolCR
+				case eolCRNL:
+					// No \n is coming: a bare \r in a \r\n stream.
+					return 0, ErrMixedLineEndings
+				}
+				return i + 1, nil
+			}
+			if b[i+1] == '\n' {
+				if s.eol == eolUnknown {
+					s.eol = eolCRNL
+				}
+				return i + 2, nil
+			}
+			if s.eol == eolCRNL {
+				return 0, ErrMixedLineEndings
+			}
+			s.eol = eolCR
+			return i + 1, nil
 		}
 	}
-	return -1
+	return -1, nil
 }
 
 // ErrLongRow is a row with more columns than the COPY names.

@@ -219,3 +219,60 @@ func TestACRLFRowEndsWithoutItsCarriageReturn(t *testing.T) {
 		t.Fatalf("%+v", rows)
 	}
 }
+
+// collectEnded splits a whole two-column stream keyed on its first column.
+func collectEnded(t *testing.T, data string) ([]Row, error) {
+	t.Helper()
+	s := New(0, 2)
+	s.Write([]byte(data))
+	s.End()
+	var out []Row
+	for {
+		r, ok, err := s.Next()
+		if err != nil || !ok {
+			return out, err
+		}
+		out = append(out, r)
+	}
+}
+
+// PostgreSQL takes a stream's line ending from its first row, and \r on
+// its own is one of them.
+func TestACarriageReturnOnlyStreamSplitsIntoRows(t *testing.T) {
+	rows, err := collectEnded(t, "a\t1\rb\t2\rc\t3")
+	if err != nil || len(rows) != 3 || rows[0].Key != "a" || rows[1].Key != "b" || rows[2].Key != "c" {
+		t.Fatalf("rows %+v err %v", rows, err)
+	}
+	if string(rows[0].Bytes) != "a\t1\r" {
+		t.Fatalf("row bytes %q, want the CR kept for the shard", rows[0].Bytes)
+	}
+}
+
+// Whether \r is a line ending or the start of \r\n is only known once the
+// next byte arrives.
+func TestACarriageReturnAtAChunkEndWaitsForTheNextByte(t *testing.T) {
+	rows := collect(t, 0, 2, "a\t1\r", "\nb\t2\r\n")
+	if len(rows) != 2 || string(rows[0].Bytes) != "a\t1\r\n" || rows[1].Key != "b" {
+		t.Fatalf("%+v", rows)
+	}
+}
+
+func TestMixedLineEndingsAreRefusedAsPostgreSQLRefusesThem(t *testing.T) {
+	for _, data := range []string{"a\t1\nb\t2\r\n", "a\t1\r\nb\t2\n", "a\t1\rb\t2\n"} {
+		if _, err := collectEnded(t, data); !errors.Is(err, ErrMixedLineEndings) {
+			t.Fatalf("%q: err = %v", data, err)
+		}
+	}
+	// Escaped, a carriage return is data in any stream.
+	rows, err := collectEnded(t, "a\\\rb\t1\n")
+	if err != nil || len(rows) != 1 || rows[0].Key != "a\rb" {
+		t.Fatalf("escaped CR: %+v %v", rows, err)
+	}
+}
+
+// In a \r\n stream a bare \r at the very end is not a line ending either.
+func TestABareCarriageReturnAtTheEndOfACRLFStreamIsRefused(t *testing.T) {
+	if _, err := collectEnded(t, "a\t1\r\nb\t2\r"); !errors.Is(err, ErrMixedLineEndings) {
+		t.Fatalf("err = %v", err)
+	}
+}

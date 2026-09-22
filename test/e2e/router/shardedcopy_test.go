@@ -116,4 +116,22 @@ func TestRouterShardedCopyMatchesOneNode(t *testing.T) {
 	if after != before {
 		t.Fatalf("a failed load left %d rows behind", after-before)
 	}
+
+	// A stream whose rows end in a bare carriage return, which PostgreSQL
+	// accepts, loads the same through the router as into one node.
+	var cr strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&cr, "%d\t%d\t9\tcr-%d\t%d\r", int64(i%31-7), 100000+i, i, i)
+	}
+	if _, err := oracle.PgConn().CopyFrom(ctx, strings.NewReader(cr.String()), copySQL); err != nil {
+		t.Fatalf("oracle CR load: %v", err)
+	}
+	if _, err := conn.PgConn().CopyFrom(ctx, strings.NewReader(cr.String()), copySQL); err != nil {
+		t.Fatalf("router CR load: %v", err)
+	}
+	want = resultOf(t, oracle, all, pgx.QueryExecModeSimpleProtocol)
+	got = resultOf(t, conn, all, pgx.QueryExecModeSimpleProtocol)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("after the CR load router and oracle differ (%d vs %d rows)\nrouter: %s\noracle: %s", len(got), len(want), firstDiff(got, want), firstDiff(want, got))
+	}
 }

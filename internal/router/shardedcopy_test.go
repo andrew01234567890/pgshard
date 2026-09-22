@@ -231,6 +231,20 @@ func TestACopyRowLongerThanTheRouterHoldsFailsTheLoad(t *testing.T) {
 	}
 }
 
+// PostgreSQL stops at the end-of-data marker and ignores what follows it,
+// even text that is not a row at all.
+func TestACopyIgnoresWhatFollowsTheEndOfDataMarker(t *testing.T) {
+	h := newCopyHarness(t)
+	conn := h.connect(t, h.dsn())
+	tag, err := conn.PgConn().CopyFrom(context.Background(), strings.NewReader("1\t1\n\\.\nnot a row\n2\t2\r\n"), "copy orders (tenant_id, id) from stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("tag %q, want the one row before the marker", tag)
+	}
+}
+
 func contains(list []string, s string) bool {
 	for _, x := range list {
 		if x == s {
