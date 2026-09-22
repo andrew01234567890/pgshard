@@ -155,6 +155,18 @@ func (o *pgCutover) GateOpen(ctx context.Context) (bool, string, error) {
 	if len(stalled) > 0 {
 		return false, "subscriptions without an apply worker: " + strings.Join(stalled, ", "), nil
 	}
+	// Every target carries its tables' ownership checks, which came with
+	// its schema copy, and each refuses a write until the shard knows the
+	// range it owns. OwnedRanges writes it on a timer; a cutover does not
+	// wait for the timer, so it writes each target's own range here, before
+	// anything can make a target writable (PGS-878).
+	for i, t := range o.wf.ids {
+		for _, db := range o.dbs {
+			if _, err := writeOwnedRange(ctx, o.c.Shards, o.wf.set, t, db.name, o.wf.ranges[i].Start, o.wf.ranges[i].End); err != nil {
+				return false, fmt.Sprintf("recording the range target %s/%d owns in %s: %v", o.wf.set, t, db.name, err), nil
+			}
+		}
+	}
 	return true, "", nil
 }
 

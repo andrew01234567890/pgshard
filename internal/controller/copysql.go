@@ -75,6 +75,13 @@ func databaseTag(database string) string {
 // over its raw bytes. Other types are refused because their PostgreSQL hash
 // depends on the internal representation.
 func KeyHashExpr(col, typ string) (string, error) {
+	return keyHashOf(QuoteIdent(col), col, typ)
+}
+
+// keyHashOf is KeyHashExpr over an already-rendered expression -- a
+// trigger's NEW."col" as well as a bare column. col names the column in
+// the error.
+func keyHashOf(expr, col, typ string) (string, error) {
 	seed := fmt.Sprintf("%d::int8", int64(placement.PartitionSeed))
 	base := strings.ToLower(typ)
 	if i := strings.IndexByte(base, '('); i >= 0 {
@@ -82,11 +89,11 @@ func KeyHashExpr(col, typ string) (string, error) {
 	}
 	switch strings.TrimSpace(base) {
 	case "bigint", "integer", "smallint", "int8", "int4", "int2":
-		return fmt.Sprintf("hashint8extended(%s::int8, %s)", QuoteIdent(col), seed), nil
+		return fmt.Sprintf("hashint8extended(%s::int8, %s)", expr, seed), nil
 	case "text", "character varying", "varchar", "name":
-		return fmt.Sprintf("hashtextextended(%s::text, %s)", QuoteIdent(col), seed), nil
+		return fmt.Sprintf("hashtextextended(%s::text, %s)", expr, seed), nil
 	case "uuid":
-		return fmt.Sprintf("uuid_hash_extended(%s, %s)", QuoteIdent(col), seed), nil
+		return fmt.Sprintf("uuid_hash_extended(%s, %s)", expr, seed), nil
 	case "character", "bpchar", "char":
 		// The ::text cast strips the blank padding, so this hashes the
 		// value with its trailing spaces removed -- which is the value
@@ -97,7 +104,7 @@ func KeyHashExpr(col, typ string) (string, error) {
 		// This was refused until the router could normalise by column
 		// type. It can: the shard key's type reaches the snapshot and the
 		// planner trims by it.
-		return fmt.Sprintf("hashtextextended(%s::text, %s)", QuoteIdent(col), seed), nil
+		return fmt.Sprintf("hashtextextended(%s::text, %s)", expr, seed), nil
 	}
 	return "", fmt.Errorf("shard key %s of type %s cannot be hashed by a row filter", col, typ)
 }

@@ -43,8 +43,18 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    reads a sharded table answers from the home shard alone. A trigger body
    that writes another table writes it on the shard the triggering row is
    on, so a reference table written that way diverges between shards. A
-   `BEFORE` trigger that changes the shard key leaves the row on the shard
-   the router chose from the statement's key.
+   `BEFORE` trigger that changes the shard key would leave the row on the
+   shard the router chose from the statement's key, where no lookup by the
+   new key would reach it, so pgshard refuses it: every sharded table
+   carries `pgshard_owns_row`, an `AFTER INSERT OR UPDATE` trigger that runs
+   after every `BEFORE` trigger and fails the write with `23514` when the
+   row's key hashes outside the range that shard owns. The same check
+   refuses a misplaced row written on a shard directly. An `UPDATE` that
+   leaves the key alone is not rehashed. The check reads each shard's range
+   from `pgshard_owner.owned_range`, which pgshard writes per shard and never
+   copies; a shard that does not know its range yet refuses with `55000`
+   rather than guessing. A reshard's copy is applied as a replica, where
+   ordinary triggers do not fire, so a target fills before it owns its range.
 
    A plain `CREATE FUNCTION` (without `OR REPLACE`) records the function's
    signature so a migration resumed after a crash recognises the function

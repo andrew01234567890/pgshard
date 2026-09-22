@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/andrew01234567890/pgshard/internal/placement"
 	"github.com/andrew01234567890/pgshard/internal/router"
 )
 
@@ -85,6 +86,36 @@ func startDDLStack(tb testing.TB) *ddlStack {
 
 func (s *ddlStack) shardDSN(id int) string {
 	return strings.Replace(s.shardDSNs[id], "/postgres?", "/"+appDatabase+"?", 1)
+}
+
+// ddlShardOf is the shard of this stack's three that owns tenant, as the
+// router places it. A row written on a shard directly has to be one that
+// shard owns: every sharded table refuses the rest (PGS-878).
+func ddlShardOf(tb testing.TB, tenant int64) int {
+	tb.Helper()
+	ks, err := placement.KeyspaceID(tenant)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	switch {
+	case ks < -3000000000000000000:
+		return 0
+	case ks < 3000000000000000000:
+		return 1
+	}
+	return 2
+}
+
+// ddlTenantOn is the first tenant the given shard owns.
+func ddlTenantOn(tb testing.TB, id int) int64 {
+	tb.Helper()
+	for tenant := int64(1); tenant < 1000; tenant++ {
+		if ddlShardOf(tb, tenant) == id {
+			return tenant
+		}
+	}
+	tb.Fatalf("no tenant below 1000 is placed on shard %d", id)
+	return 0
 }
 
 func (s *ddlStack) shardConn(tb testing.TB, id int) *pgx.Conn {
@@ -595,15 +626,19 @@ func testOnlineSteps(t *testing.T, s *ddlStack, conn *pgx.Conn, top *testing.T) 
 			t.Fatalf("%s: %v\ncontroller log:\n%s", sql, err, s.controllerLog.String())
 		}
 	}
+	// Seeded on the shards directly, each with the tenants it owns: a shard
+	// refuses a row of a sharded table whose key belongs to another.
+	owned := map[int][]int64{}
+	for tenant := int64(1); tenant <= 21; tenant++ {
+		owned[ddlShardOf(t, tenant)] = append(owned[ddlShardOf(t, tenant)], tenant)
+	}
 	for id := 0; id < 3; id++ {
 		sc := s.shardConn(t, id)
-		for _, sql := range []string{
-			"insert into regions values (1, 'eu'), (2, 'us')",
-			"insert into orders (tenant_id, id, note, region) select t, i, 'seed', 1 + i % 2 from generate_series(1, 7) t, generate_series(1, 300) i on conflict do nothing",
-		} {
-			if _, err := sc.Exec(ctx, sql); err != nil {
-				t.Fatalf("shard %d: %s: %v", id, sql, err)
-			}
+		if _, err := sc.Exec(ctx, "insert into regions values (1, 'eu'), (2, 'us')"); err != nil {
+			t.Fatalf("shard %d: regions: %v", id, err)
+		}
+		if _, err := sc.Exec(ctx, "insert into orders (tenant_id, id, note, region) select t, i, 'seed', 1 + i % 2 from unnest($1::int8[]) t, generate_series(1, 300) i on conflict do nothing", owned[id]); err != nil {
+			t.Fatalf("shard %d: orders: %v", id, err)
 		}
 	}
 
@@ -633,7 +668,7 @@ func testOnlineSteps(t *testing.T, s *ddlStack, conn *pgx.Conn, top *testing.T) 
 	})
 
 	t.Run("set_not_null_fails_on_a_violating_row_and_leaves_no_constraint", func(t *testing.T) {
-		if _, err := s.shardConn(t, 1).Exec(ctx, "insert into orders (tenant_id, id, note) values (2, 999999, null)"); err != nil {
+		if _, err := s.shardConn(t, 1).Exec(ctx, "insert into orders (tenant_id, id, note) values ($1, 999999, null)", ddlTenantOn(t, 1)); err != nil {
 			t.Fatal(err)
 		}
 		_, err := conn.Exec(ctx, "alter table orders alter column region set not null")
