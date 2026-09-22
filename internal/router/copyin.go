@@ -117,7 +117,7 @@ func (e *Executor) copyShardedIn(ctx context.Context, pl plan.Plan, sql string, 
 	}
 	e.syncCurrent(targets)
 	if nerr := relayCopyNotices(w, drains); nerr != nil {
-		return nerr
+		return e.referenceFailed(ctx, implicit, nerr)
 	}
 	// A shard's own error says why the load failed; the router's
 	// errShardEndedCopy only says that one did. When the router ended the

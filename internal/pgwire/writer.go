@@ -188,10 +188,12 @@ func (c *copyInStream) Next() ([]byte, error) {
 		case *pgproto3.Terminate:
 			c.done = true
 			c.s.setCopyIn(nil)
+			c.s.copyLost = copyLostTerminated
 			return nil, ErrCopyTerminated
 		default:
 			c.done = true
 			c.s.setCopyIn(nil)
+			c.s.copyLost = copyLostProtocol
 			return nil, Errorf(CodeProtocolViolation, "unexpected message type 0x%02X during COPY from stdin", messageType(m))
 		}
 	}

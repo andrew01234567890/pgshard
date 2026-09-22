@@ -86,29 +86,37 @@ func TestAQueryDuringACopyIsAProtocolViolation(t *testing.T) {
 	if err := fe.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	var code string
-	for {
-		msg, err := fe.Receive()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if e, ok := msg.(*pgproto3.ErrorResponse); ok && code == "" {
-			code = e.Code
-		}
-		if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
-			if rfq.TxStatus != 'I' {
-				t.Fatalf("status %c after the failed COPY", rfq.TxStatus)
-			}
-			break
-		}
-	}
-	if code != "08P01" {
-		t.Fatalf("error code %q, want 08P01", code)
-	}
+	expectProtocolLost(t, fe)
 	for i := range h.poolers {
 		if h.ranOn(i, "commit") {
 			t.Fatalf("shard %d committed: %v", i, h.poolers[i].ran())
 		}
+	}
+}
+
+// expectProtocolLost reads what PostgreSQL sends after a client broke a
+// COPY: one FATAL 08P01, "protocol synchronization was lost", and then the
+// connection closes -- no ReadyForQuery, and no answer for the message that
+// broke it.
+func expectProtocolLost(t *testing.T, fe *pgproto3.Frontend) {
+	t.Helper()
+	var fatal *pgproto3.ErrorResponse
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			break
+		}
+		switch m := msg.(type) {
+		case *pgproto3.ErrorResponse:
+			if m.Severity == "FATAL" {
+				fatal = m
+			}
+		case *pgproto3.ReadyForQuery:
+			t.Fatal("the session carried on after the COPY lost protocol synchronization")
+		}
+	}
+	if fatal == nil || fatal.Code != "08P01" || !strings.Contains(fatal.Message, "protocol synchronization was lost") {
+		t.Fatalf("closing error %+v, want FATAL 08P01 protocol synchronization was lost", fatal)
 	}
 }
 
@@ -168,9 +176,8 @@ func TestACopyWhoseShardsRaiseNoticesDuringTheLoadCompletes(t *testing.T) {
 	}
 }
 
-// The unsharded relay too. After the client breaks the COPY with a stray
-// message, the pooler's answer to the router's CopyFail has to be read,
-// or the next statement reads it instead of its own.
+// The unsharded relay too: the client that broke the COPY is disconnected,
+// and the pooler's answer to the router's CopyFail is read on the way out.
 func TestAnUnshardedCopyBrokenByAStrayMessageLeavesTheSessionInStep(t *testing.T) {
 	h := newHarness(t)
 	conn := h.connect(t, h.dsn("app", "secret", "app"))
@@ -191,44 +198,12 @@ func TestAnUnshardedCopyBrokenByAStrayMessageLeavesTheSessionInStep(t *testing.T
 	if err := fe.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	var code string
-	for {
-		msg, err := fe.Receive()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if e, ok := msg.(*pgproto3.ErrorResponse); ok && code == "" {
-			code = e.Code
-		}
-		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
-			break
-		}
-	}
-	if code != "08P01" {
-		t.Fatalf("error %q, want 08P01", code)
-	}
-	// The next statement gets its own answer, not the stale one.
-	fe.Send(&pgproto3.Query{String: "select 1"})
-	if err := fe.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	var sawRow bool
-	for {
-		msg, err := fe.Receive()
-		if err != nil {
-			t.Fatal(err)
-		}
-		switch m := msg.(type) {
-		case *pgproto3.DataRow:
-			sawRow = true
-		case *pgproto3.ErrorResponse:
-			t.Fatalf("the next statement got an error: %s %s", m.Code, m.Message)
-		}
-		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
-			break
-		}
-	}
-	if !sawRow {
-		t.Fatal("the next statement returned no row")
+	expectProtocolLost(t, fe)
+	// The router cleaned the COPY up on the pooler before closing: a new
+	// session on the same router is answered in step.
+	next := h.connect(t, h.dsn("app", "secret", "app"))
+	var one int
+	if err := next.QueryRow(context.Background(), "select 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("a fresh session: %d %v", one, err)
 	}
 }
