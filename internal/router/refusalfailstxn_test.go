@@ -134,3 +134,18 @@ func TestAFailedImplicitCommitDoesNotFailTheNextTransaction(t *testing.T) {
 		t.Fatalf("a statement of the new transaction: %v", rr.Err)
 	}
 }
+
+// A batch whose BEGIN adopted its transaction leaves it the client's, so a
+// refusal after that fails it rather than rolling it back.
+func TestARefusalAfterAnAdoptingBeginInABatchFailsTheTransaction(t *testing.T) {
+	pc := atomicDDLConn(t)
+	ctx := context.Background()
+	if _, err := pc.Exec(ctx, "begin; select 1; create table zz (a int)").ReadAll(); sqlstate(err) != "0A000" {
+		t.Fatalf("batch: %v, want the DDL refusal", err)
+	}
+	wantStatus(t, pc, 'E', "the batch")
+	res := mustExec(t, pc, "commit")
+	if tag := res[0].CommandTag.String(); tag != "ROLLBACK" {
+		t.Fatalf("COMMIT answered %q, want ROLLBACK", tag)
+	}
+}
