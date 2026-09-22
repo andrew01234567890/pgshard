@@ -533,6 +533,10 @@ func (b *mergeBuilder) orderBy(distinct bool) error {
 		}
 		col := -1
 		if star {
+			if b.setOp {
+				return notYet("multi-shard UNION ALL ordered with * in the select list is not available yet",
+					"name the columns in the select list")
+			}
 			if match.GetAConst() != nil {
 				return notYet("multi-shard ORDER BY by position with * in the select list is not available yet",
 					"order by the column name")

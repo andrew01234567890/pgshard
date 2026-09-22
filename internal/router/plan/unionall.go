@@ -37,7 +37,10 @@ func (w *walker) scatterUnionAll() error {
 	if len(top.GetLockingClause()) > 0 {
 		return notYet("multi-shard UNION ALL with FOR UPDATE/SHARE is not available yet", "")
 	}
-	arms := unionArms(top, nil)
+	arms, err := unionArms(top, true, nil)
+	if err != nil {
+		return err
+	}
 	scalar := w.scalarFunctions()
 	for _, arm := range arms {
 		if err := plainArm(arm, scalar); err != nil {
@@ -74,13 +77,24 @@ func (w *walker) scatterUnionAll() error {
 }
 
 // unionArms lists the SELECTs a tree of set operations combines, leftmost
-// first.
-func unionArms(s *pgquerypb.SelectStmt, out []*pgquerypb.SelectStmt) []*pgquerypb.SelectStmt {
+// first, and refuses an inner set operation that carries its own ORDER BY,
+// LIMIT, locking or WITH: "(a union all b order by 1 limit 3) union all c"
+// would be limited by every shard on its own and concatenated, returning up
+// to three rows per shard where one server returns three.
+func unionArms(s *pgquerypb.SelectStmt, top bool, out []*pgquerypb.SelectStmt) ([]*pgquerypb.SelectStmt, error) {
 	if s.GetOp() == pgquerypb.SetOperation_SETOP_NONE || s.GetOp() == pgquerypb.SetOperation_SET_OPERATION_UNDEFINED {
-		return append(out, s)
+		return append(out, s), nil
 	}
-	out = unionArms(s.GetLarg(), out)
-	return unionArms(s.GetRarg(), out)
+	if !top && (len(s.GetSortClause()) > 0 || s.GetLimitCount() != nil || s.GetLimitOffset() != nil ||
+		len(s.GetLockingClause()) > 0 || s.GetWithClause() != nil) {
+		return nil, notYet("multi-shard UNION ALL with ORDER BY, LIMIT or WITH on a parenthesised set operation inside it is not available yet",
+			"move the ORDER BY and LIMIT to the outermost level")
+	}
+	out, err := unionArms(s.GetLarg(), false, out)
+	if err != nil {
+		return nil, err
+	}
+	return unionArms(s.GetRarg(), false, out)
 }
 
 // plainArm refuses an arm whose rows a shard cannot produce on its own.

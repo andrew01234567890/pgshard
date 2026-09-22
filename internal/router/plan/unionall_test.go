@@ -62,19 +62,23 @@ func TestAUnionAllOrderByAnExpressionIsPostgreSQLsRefusal(t *testing.T) {
 // What a shard cannot answer for its own rows alone stays refused.
 func TestSetOperationsThatCombineRowsStayRefused(t *testing.T) {
 	for sql, want := range map[string]string{
-		"select id from orders union select id from order_lines":                                         "set operations",
-		"select id from orders intersect select id from order_lines":                                     "set operations",
-		"select id from orders except all select id from order_lines":                                    "set operations",
-		"select count(*) from orders union all select count(*) from order_lines":                         "an aggregate in an arm",
-		"select distinct id from orders union all select id from order_lines":                            "DISTINCT in an arm",
-		"select id from orders union all (select id from order_lines limit 1)":                           "ORDER BY or LIMIT in an arm",
-		"select tenant_id from orders union all select tenant_id from orders group by 1":                 "GROUP BY in an arm",
-		"select id from orders union all select id from orders o join order_lines l using (tenant_id)":   "",
-		"select id from orders union all select id from items":                                           "",
-		"select id from orders union all select row_number() over () from orders":                        "window functions",
-		"select id from orders union all select id from orders where id in (select id from order_lines)": "subquer",
-		"with x as (select 1) select id from orders union all select id from orders":                     "common table expressions",
-		"select id from orders union all select id from orders for update":                               "FOR UPDATE",
+		"select id from orders union select id from order_lines":                                                           "set operations",
+		"select id from orders intersect select id from order_lines":                                                       "set operations",
+		"select id from orders except all select id from order_lines":                                                      "set operations",
+		"select count(*) from orders union all select count(*) from order_lines":                                           "an aggregate in an arm",
+		"select distinct id from orders union all select id from order_lines":                                              "DISTINCT in an arm",
+		"select id from orders union all (select id from order_lines limit 1)":                                             "ORDER BY or LIMIT in an arm",
+		"select tenant_id from orders union all select tenant_id from orders group by 1":                                   "GROUP BY in an arm",
+		"select id from orders union all select id from orders o join order_lines l using (tenant_id)":                     "",
+		"select id from orders union all select id from items":                                                             "",
+		"select id from orders union all select row_number() over () from orders":                                          "window functions",
+		"select id from orders union all select id from orders where id in (select id from order_lines)":                   "subquer",
+		"with x as (select 1) select id from orders union all select id from orders":                                       "common table expressions",
+		"(select id from orders union all select id from orders order by id limit 3) union all select id from order_lines": "parenthesised set operation",
+		"select id from orders union all (select id from orders union all select id from order_lines order by id limit 3)": "parenthesised set operation",
+		"select id from orders union all (select id from orders union all select id from order_lines offset 1)":            "parenthesised set operation",
+		"select * from orders union all select * from order_lines order by id":                                             "with * in the select list",
+		"select id from orders union all select id from orders for update":                                                 "FOR UPDATE",
 	} {
 		p, err := planOf(t, sql)
 		if err == nil {
