@@ -3456,7 +3456,7 @@ func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse)
 		data, err := in.Next()
 		switch {
 		case err == nil:
-			if err := e.send(copyDataReq(data)); err != nil {
+			if err := sendCopyData(data, e.send); err != nil {
 				return nil, err
 			}
 		case errors.Is(err, pgwire.ErrCopyFail):

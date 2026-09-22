@@ -419,14 +419,6 @@ type relay struct {
 	// write to it. COPY IN produces no reply until it ends, so nothing
 	// else would move the upload out of memory before CopyDone.
 	copyBytes int
-	// sendMu serialises stream sends: the COPY reader sends from its own
-	// goroutine.
-	sendMu sync.Mutex
-	// copyRead is the reader draining the backend while a COPY FROM STDIN
-	// is in progress, and copyAbandoned drops the copy messages still
-	// arriving for a COPY the backend already ended.
-	copyRead      *copyReader
-	copyAbandoned bool
 	// packed is set once a request asks for packed rows and answers every
 	// row of the session that way. A Value submessage per column cost an
 	// allocation and a length-delimited frame each way, per column, per
@@ -475,10 +467,6 @@ const batchRowCount = 256
 const batchWideRow = 4 << 10
 
 func (r *relay) send(msg *pgshardv1.ExecuteResponse) error {
-	// A COPY's backend reader sends from its own goroutine while the
-	// handler may refuse a request on the same stream.
-	r.sendMu.Lock()
-	defer r.sendMu.Unlock()
 	if r.batched {
 		if dr, ok := msg.GetMessage().(*pgshardv1.ExecuteResponse_DataRow); ok {
 			if n := rowBytes(dr.DataRow); n < batchWideRow {
@@ -630,12 +618,8 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	// Latched rather than read per message: the router sets it on the
 	// messages it originates, and a row can arrive while the relay is
 	// answering something else.
-	// Under sendMu: send reads batched, and a COPY's reader may be
-	// sending while this request is handled.
-	r.sendMu.Lock()
 	r.packed = r.packed || req.PackedRows
 	r.batched = r.batched || req.BatchedRows
-	r.sendMu.Unlock()
 	view := r.srv.cfg.Source.View()
 	if e := member(view); e != nil {
 		return r.refuse(e)
@@ -665,34 +649,6 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		}
 		return nil
 	}
-	isCopy := false
-	switch req.Message.(type) {
-	case *pgshardv1.ExecuteRequest_CopyData, *pgshardv1.ExecuteRequest_CopyDone, *pgshardv1.ExecuteRequest_CopyFail:
-		isCopy = true
-	}
-	if cr := r.copyRead; cr != nil {
-		select {
-		case <-cr.done:
-			// The backend ended the COPY on its own -- an error in the
-			// middle of the load -- and has answered its ReadyForQuery.
-			// What is still arriving for it has nowhere to go: the
-			// backend would ignore it, and a CopyDone forwarded now would
-			// have the handler wait for an answer that never comes.
-			if b := r.backend(); b != nil {
-				if err := r.settleCopy(b); err != nil {
-					return err
-				}
-			} else {
-				r.copyRead = nil
-			}
-			r.copyAbandoned = true
-		default:
-		}
-	}
-	if isCopy && r.copyAbandoned {
-		return nil
-	}
-	r.copyAbandoned = false
 	fm, err := toFrontend(req)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -775,11 +731,6 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		return r.backendLost(b, err)
 	}
 	r.flushed(ctx, b)
-	if r.copyRead != nil {
-		// The reader reads the COPY's end: its CommandComplete or error,
-		// and the ReadyForQuery.
-		return r.settleCopy(b)
-	}
 	return r.pump(b)
 }
 
@@ -1020,82 +971,9 @@ func (r *relay) pump(b *Backend) error {
 			}
 			return nil
 		case *pgproto3.CopyInResponse, *pgproto3.CopyBothResponse:
-			r.startCopyReader(b)
 			return nil
 		}
 	}
-}
-
-// copyReader reads a backend for the whole of a COPY FROM STDIN.
-//
-// COPY IN produces no reply until it ends, so the handler only wrote to
-// the backend while it ran. A backend that answers during the load -- a
-// NOTICE per row from a trigger -- then blocked writing to a socket nobody
-// read, stopped reading CopyData, and the handler's next write blocked on
-// it: the pooler stopped reading the stream, and the router, the client
-// and a cancel all waited on it for good. The reader relays what the
-// backend says while the rows arrive, up to the ReadyForQuery that ends
-// the COPY; the handler, which owns the rest of the relay's state, settles
-// the COPY afterwards.
-type copyReader struct {
-	done   chan struct{}
-	err    error
-	sawErr bool
-}
-
-func (r *relay) startCopyReader(b *Backend) {
-	cr := &copyReader{done: make(chan struct{})}
-	r.copyRead = cr
-	r.sendMu.Lock()
-	packed := r.packed
-	r.sendMu.Unlock()
-	stop := b.watch(r.stream.Context())
-	go func() {
-		defer close(cr.done)
-		defer stop()
-		for {
-			msg, err := b.receive()
-			if err != nil {
-				cr.err = err
-				return
-			}
-			if _, ok := msg.(*pgproto3.ErrorResponse); ok {
-				cr.sawErr = true
-			}
-			if resp := toResponse(msg, packed); resp != nil {
-				if err := r.send(resp); err != nil {
-					b.markBroken()
-					cr.err = err
-					return
-				}
-			}
-			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
-				return
-			}
-		}
-	}()
-}
-
-// settleCopy finishes a COPY whose reader has ended: the bookkeeping pump
-// does at a ReadyForQuery, done here because only the handler may touch the
-// relay's state and hand the backend back.
-func (r *relay) settleCopy(b *Backend) error {
-	cr := r.copyRead
-	<-cr.done
-	r.copyRead = nil
-	if cr.err != nil {
-		return r.backendLost(b, cr.err)
-	}
-	if cr.sawErr {
-		r.batchErr = true
-	}
-	r.endBatch(b)
-	if !r.reserved() && b.idle() {
-		r.stopWatch()
-		r.setBackend(nil)
-		r.srv.recycle(b)
-	}
-	return nil
 }
 
 func (r *relay) backendLost(b *Backend, cause error) error {

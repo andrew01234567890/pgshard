@@ -207,3 +207,62 @@ func TestAnUnshardedCopyBrokenByAStrayMessageLeavesTheSessionInStep(t *testing.T
 		t.Fatalf("a fresh session: %d %v", one, err)
 	}
 }
+
+// gRPC refuses a message over 4 MiB, and a client may send a COPY chunk of
+// up to 16 MiB. Relayed whole, the send failed and the session lost its
+// stream in the middle of the load.
+func TestAnUnshardedCopyChunkLargerThanAGRPCMessageIsRelayed(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	nc := conn.PgConn().Conn()
+	fe := pgproto3.NewFrontend(nc, nc)
+	if err := nc.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	fe.Send(&pgproto3.Query{String: "copy t from stdin"})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fe.Receive(); err != nil {
+		t.Fatal(err)
+	}
+	line := strings.Repeat("x", 1023) + "\n"
+	fe.Send(&pgproto3.CopyData{Data: []byte(strings.Repeat(line, 5<<10))})
+	fe.Send(&pgproto3.CopyDone{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var tag string
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.CommandComplete:
+			tag = string(m.CommandTag)
+		case *pgproto3.ErrorResponse:
+			t.Fatalf("COPY: %s %s", m.Code, m.Message)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if tag != "COPY 5120" {
+		t.Fatalf("tag %q, want COPY 5120", tag)
+	}
+}
+
+// One row wider than a gRPC message goes to its shard in pieces.
+func TestAShardedCopyRowWiderThanAGRPCMessageIsRelayed(t *testing.T) {
+	h := newCopyHarness(t)
+	conn := h.connect(t, h.dsn())
+	row := "7\t" + strings.Repeat("x", 5<<20) + "\n"
+	tag, err := conn.PgConn().CopyFrom(context.Background(), strings.NewReader(row), "copy orders (tenant_id, id) from stdin")
+	if err != nil {
+		t.Fatalf("COPY: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("tag %q", tag)
+	}
+}

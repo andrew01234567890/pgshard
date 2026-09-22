@@ -304,7 +304,8 @@ func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[
 		if len(pending[sh]) == 0 {
 			return nil
 		}
-		err := e.sendOn(parts[sh], copyDataReq(pending[sh]))
+		p := parts[sh]
+		err := sendCopyData(pending[sh], func(req *pgshardv1.ExecuteRequest) error { return e.sendOn(p, req) })
 		pending[sh] = pending[sh][:0]
 		return err
 	}
