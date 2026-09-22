@@ -74,6 +74,9 @@ type StmtClass struct {
 	Txn TxnKind
 	// Chain marks COMMIT/ROLLBACK AND CHAIN.
 	Chain bool
+	// TxnScopedSet marks a SET LOCAL or SET TRANSACTION: a setting that
+	// lasts for the transaction and belongs on every shard in it.
+	TxnScopedSet bool
 	// TxnModes marks a BEGIN or START TRANSACTION that names transaction
 	// modes: an isolation level, READ ONLY or DEFERRABLE.
 	TxnModes bool

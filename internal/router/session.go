@@ -1285,7 +1285,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if err := e.moveTo(ctx, target); err != nil {
 		return err
 	}
-	return e.withFailover(ctx, w, func(cw pgwire.ResultWriter) error {
+	err = e.withFailover(ctx, w, func(cw pgwire.ResultWriter) error {
 		if err := e.acquire(ctx, nil); err != nil {
 			return err
 		}
@@ -1320,6 +1320,31 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		}
 		return err
 	})
+	if err == nil && pl.Class.TxnScopedSet && e.multiShardTxn() {
+		err = e.setOnParkedParts(ctx, sql)
+	}
+	return err
+}
+
+// setOnParkedParts runs a SET LOCAL or SET TRANSACTION on every other shard
+// of the transaction as well.
+//
+// The statement ran on the current shard and joined the prelude, which a
+// shard that joins later replays. A shard already parked in the transaction
+// does not replay the prelude when it is revived, so it kept the setting it
+// had: a SET TRANSACTION READ ONLY left it writable, and a write there
+// committed in a transaction the client had been told was read-only
+// (PGS-981). A shard that refuses the setting -- an isolation level after a
+// query -- fails the transaction, as the refusal would in PostgreSQL.
+func (e *Executor) setOnParkedParts(ctx context.Context, sql string) error {
+	var parked []*txnPart
+	for _, p := range e.parts() {
+		if p.shard != e.shard && p.ps != nil {
+			parked = append(parked, p)
+		}
+	}
+	e.each(parked, func(p *txnPart) error { return e.runOn(ctx, p, sql, discardWriter{}) })
+	return firstError(parked)
 }
 
 // noteSessionEffect records what a completed statement did to the session

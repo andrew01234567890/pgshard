@@ -331,6 +331,8 @@ func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 		}
 	case *pgquerypb.Node_VariableSetStmt:
 		s := n.VariableSetStmt
+		c.TxnScopedSet = s.GetIsLocal() ||
+			s.GetKind() == pgquerypb.VariableSetKind_VAR_SET_MULTI && strings.EqualFold(s.GetName(), "TRANSACTION")
 		if s.GetIsLocal() {
 			if setsProtectedValue(s.GetKind()) {
 				if err := refuseProtectedGUC(s.GetName()); err != nil {
