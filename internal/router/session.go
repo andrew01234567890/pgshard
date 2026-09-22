@@ -125,13 +125,8 @@ type gucEntry struct {
 // Executor is the router's pgwire.Executor: one client session relayed to
 // the pooler of the shard its current statement plans onto.
 type Executor struct {
-	// copyTail is what an unsharded COPY's drainer read from the pooler,
-	// for the pump to take before it reads the stream again, and
-	// copyTailErr the stream failure that ended the drainer, if any.
-	copyTail    []*pgshardv1.ExecuteResponse
-	copyTailErr error
-	r           *Router
-	info        pgwire.SessionInfo
+	r    *Router
+	info pgwire.SessionInfo
 	// sid names the session to its poolers. A Release of it that failed
 	// may have left a pooler holding a backend under it, prepared
 	// statements and session state included, which the next statement
@@ -3169,19 +3164,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 	n := e.beginStatement(ctx)
 	onCancel := func() { e.cancelStatement(context.Background(), n) }
 	for {
-		var resp *pgshardv1.ExecuteResponse
-		var err error
-		switch {
-		case len(e.copyTail) > 0:
-			// What the pooler answered while a COPY's rows were still
-			// arriving, read by copyIn's drainer: the pump takes it from
-			// there, in order, as if it had read it now.
-			resp, e.copyTail = e.copyTail[0], e.copyTail[1:]
-		case e.copyTailErr != nil:
-			err, e.copyTailErr = e.copyTailErr, nil
-		default:
-			resp, err = e.conn.recv(ctx, onCancel)
-		}
+		resp, err := e.conn.recv(ctx, onCancel)
 		if err != nil {
 			return e.poolerLost(err)
 		}
@@ -3248,7 +3231,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			werr = w.NoData()
 		case *pgshardv1.ExecuteResponse_CopyInResponse:
 			var clientErr error
-			clientErr, werr = e.copyIn(ctx, onCancel, w, m.CopyInResponse)
+			clientErr, werr = e.copyIn(w, m.CopyInResponse)
 			// The client ended the COPY badly -- a stray message, a
 			// Terminate, a lost connection -- and the pooler has been sent
 			// CopyFail. The pump reads the shard's answer to it, so the
@@ -3464,111 +3447,26 @@ func (e *Executor) inferParams(oids []uint32) {
 
 // copyIn relays a COPY FROM STDIN: client chunks go to the pooler until the
 // client ends the transfer.
-func (e *Executor) copyIn(ctx context.Context, onCancel func(), w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse) (clientErr, sendErr error) {
+func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse) (clientErr, sendErr error) {
 	in, err := w.CopyIn(byte(resp.Format), toUint16s(resp.ColumnFormats))
 	if err != nil {
 		return nil, err
 	}
-	// The pooler relays what the backend says while the rows arrive -- a
-	// NOTICE per row from a trigger -- and nothing here read it until the
-	// load ended: the stream's buffer filled, the pooler stopped reading,
-	// and the next send blocked for good (PGS-983). A drainer reads the
-	// stream for the whole load and hands the pump what it read.
-	d := e.drainUnshardedCopy(ctx, onCancel)
-	defer func() {
-		<-d.done
-		e.copyTail, e.copyTailErr = d.tail(), d.err
-	}()
 	for {
 		data, err := in.Next()
 		switch {
 		case err == nil:
-			if d.ended.Load() {
-				// The backend already ended the COPY with an error; the
-				// pooler drops what still arrives for it.
-				continue
-			}
 			if err := e.send(copyDataReq(data)); err != nil {
-				e.conn.abort()
 				return nil, err
 			}
 		case errors.Is(err, pgwire.ErrCopyFail):
-			return nil, e.endUnshardedCopy(d, copyFailReq("COPY terminated by client"))
+			return nil, e.send(copyFailReq("COPY terminated by client"))
 		case errors.Is(err, io.EOF):
-			return nil, e.endUnshardedCopy(d, copyDoneReq())
+			return nil, e.send(copyDoneReq())
 		default:
-			return err, e.endUnshardedCopy(d, copyFailReq("COPY ended by the client: "+err.Error()))
+			return err, e.send(copyFailReq("COPY ended by the client: " + err.Error()))
 		}
 	}
-}
-
-// endUnshardedCopy sends the COPY's end, unless the backend already ended
-// it: then there is nothing to end, and nothing would answer.
-func (e *Executor) endUnshardedCopy(d *unshardedCopyDrain, end *pgshardv1.ExecuteRequest) error {
-	if d.ended.Load() {
-		return nil
-	}
-	if err := e.send(end); err != nil {
-		e.conn.abort()
-		return err
-	}
-	return nil
-}
-
-// unshardedCopyDrain holds what the pooler answered during an unsharded
-// COPY, up to its ReadyForQuery, keeping at most copyMaxNotices notices
-// (and copyMaxNoticeBytes of them) and counting the rest.
-type unshardedCopyDrain struct {
-	done    chan struct{}
-	ended   atomic.Bool
-	msgs    []*pgshardv1.ExecuteResponse
-	kept    int
-	bytes   int
-	dropped int
-	err     error
-}
-
-func (e *Executor) drainUnshardedCopy(ctx context.Context, onCancel func()) *unshardedCopyDrain {
-	d := &unshardedCopyDrain{done: make(chan struct{})}
-	ps := e.conn
-	go func() {
-		defer close(d.done)
-		for {
-			resp, err := ps.recv(ctx, onCancel)
-			if err != nil {
-				d.err = err
-				d.ended.Store(true)
-				return
-			}
-			if n := resp.GetNotice(); n != nil {
-				size := len(n.GetNotice().GetMessage()) + len(n.GetNotice().GetDetail()) + len(n.GetNotice().GetHint())
-				if d.kept >= copyMaxNotices || d.bytes+size > copyMaxNoticeBytes {
-					d.dropped++
-					continue
-				}
-				d.kept++
-				d.bytes += size
-			}
-			d.msgs = append(d.msgs, resp)
-			if resp.GetReadyForQuery() != nil {
-				d.ended.Store(true)
-				return
-			}
-		}
-	}()
-	return d
-}
-
-// tail is what the pump reads next, in the order the pooler sent it. A
-// stream that failed under the drainer is left for the pump to find.
-func (d *unshardedCopyDrain) tail() []*pgshardv1.ExecuteResponse {
-	msgs := d.msgs
-	if d.dropped > 0 {
-		note := &pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Notice{Notice: &pgshardv1.NoticeResponse{
-			Notice: &pgshardv1.Error{Sqlstate: "00000", Message: fmt.Sprintf("%d more notices raised during the COPY were not kept", d.dropped)}}}}
-		msgs = append([]*pgshardv1.ExecuteResponse{note}, msgs...)
-	}
-	return msgs
 }
 
 // beginStatement arms the backend cancel for a statement, once, and returns

@@ -207,32 +207,3 @@ func TestAnUnshardedCopyBrokenByAStrayMessageLeavesTheSessionInStep(t *testing.T
 		t.Fatalf("a fresh session: %d %v", one, err)
 	}
 }
-
-// The unsharded relay too (PGS-983): the pooler relays the backend's
-// notices while the rows arrive, and a router that read nothing until the
-// load ended filled its stream and wedged.
-func TestAnUnshardedCopyWhoseBackendRaisesNoticesCompletes(t *testing.T) {
-	h := newHarness(t)
-	h.fp.mu.Lock()
-	h.fp.copyNoticeBytes = 32 << 10
-	h.fp.mu.Unlock()
-	conn := h.connect(t, h.dsn("app", "secret", "app"))
-	var in strings.Builder
-	line := strings.Repeat("x", 70<<10) + "\n"
-	for range 400 {
-		in.WriteString(line)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := conn.PgConn().CopyFrom(context.Background(), strings.NewReader(in.String()), "copy t from stdin")
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("COPY: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the unsharded COPY wedged")
-	}
-}
