@@ -285,3 +285,111 @@ func TestAMoveFailsWhenItsPoliciesChangeBeforeTheSwap(t *testing.T) {
 		t.Fatalf("the source table has %d policies, want both", n)
 	}
 }
+
+// TestAMoveKeepsWhatItsPoliciesNameAcrossASearchPathChange (PGS-886): a
+// move captures its policies at prepare and replays them at the swap, on
+// other shards, in another session. Captured with bare names, a policy
+// reading public.open_regions came out as "open_regions" -- and a
+// search_path changed in between put a same-named table first, so the
+// recheck before the swap read the unchanged policy as changed and failed
+// the move. Captured schema-qualified, the move completes and the policy
+// still reads public.open_regions.
+func TestAMoveKeepsWhatItsPoliciesNameAcrossASearchPathChange(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	for id := range int32(2) {
+		c := f.app(id)
+		mustExec(t, c, `CREATE TABLE open_regions (region text PRIMARY KEY)`)
+		mustExec(t, c, `INSERT INTO open_regions VALUES ('r1'), ('r2')`)
+		mustExec(t, c, `CREATE ROLE notes_reader`)
+	}
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE notes (id bigint PRIMARY KEY, body text NOT NULL, region text NOT NULL)`)
+	mustExec(t, src, `INSERT INTO notes SELECT g, 'b' || g, 'r' || (g % 5) FROM generate_series(1, 50) g`)
+	mustExec(t, src, `CREATE POLICY notes_open ON notes FOR SELECT TO notes_reader USING (EXISTS (SELECT 1 FROM open_regions o WHERE o.region = notes.region))`)
+	mustExec(t, src, `ALTER TABLE notes ENABLE ROW LEVEL SECURITY`)
+
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'notes', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'notes'`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"drop_old_after_seconds": 0}'`)
+	f.driveUntil("notes", 2*time.Minute, StagePlacementCopying, StagePlacementCatchUp, StagePlacementBuffering)
+
+	// Between prepare and swap: every new session of the database now finds
+	// another open_regions first, one that lists a single region.
+	for id := range int32(2) {
+		c := f.app(id)
+		mustExec(t, c, `CREATE SCHEMA decoy`)
+		mustExec(t, c, `CREATE TABLE decoy.open_regions (region text PRIMARY KEY)`)
+		mustExec(t, c, `INSERT INTO decoy.open_regions VALUES ('r1')`)
+		mustExec(t, c, `ALTER DATABASE app SET search_path = decoy, public`)
+	}
+	f.driveUntil("notes", 2*time.Minute, StageCompleted)
+
+	for id := range int32(2) {
+		c := f.app(id)
+		mustExec(t, c, `SET search_path = public`)
+		mustExec(t, c, `GRANT USAGE ON SCHEMA decoy TO notes_reader`)
+		mustExec(t, c, `GRANT SELECT ON notes, open_regions, decoy.open_regions TO notes_reader`)
+		mustExec(t, c, `SET ROLE notes_reader`)
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM notes`); n != 20 {
+			t.Errorf("shard %d: a reader sees %d rows, want the 20 in public.open_regions' two regions", id, n)
+		}
+		mustExec(t, c, `RESET ROLE`)
+	}
+}
+
+// TestAMoveDoesNotSwapInATableWithRowSecurityAndNoPolicies (PGS-886): this
+// version builds a bare shadow and adds the policies at the swap. An older
+// controller that saved the workflow in between wrote back its own state,
+// without policies_at_swap and the captured statements; the swap then took
+// the old path, which assumes the shadow already has its policies, and
+// enabled row-level security on a table with none -- every ordinary role
+// seeing no rows, with no error. The move now stops before the swap.
+func TestAMoveDoesNotSwapInATableWithRowSecurityAndNoPolicies(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE notes (id bigint PRIMARY KEY, region text NOT NULL)`)
+	mustExec(t, src, `INSERT INTO notes SELECT g, 'r' || (g % 5) FROM generate_series(1, 50) g`)
+	mustExec(t, src, `CREATE POLICY notes_region ON notes FOR ALL TO PUBLIC USING (region = 'r1')`)
+	mustExec(t, src, `ALTER TABLE notes ENABLE ROW LEVEL SECURITY`)
+
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'notes', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'notes'`)
+	f.reconcile()
+	f.driveUntil("notes", 2*time.Minute, StagePlacementCopying, StagePlacementCatchUp, StagePlacementBuffering)
+
+	// What an older controller's save leaves behind.
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET status = jsonb_set(status, '{placement}', (status->'placement') - 'policies_at_swap' - 'policies')
+		WHERE spec->>'table_name' = 'notes'`)
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.workflows WHERE spec->>'table_name' = 'notes' AND status->'placement' ? 'policies_at_swap'`); n != 0 {
+		t.Fatal("the simulated older save did not remove policies_at_swap")
+	}
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		if _, err := f.placer.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_, state, stage, msg := f.workflow("notes")
+		if state == StateFailed {
+			if !strings.Contains(msg, "row-level security policies") {
+				t.Fatalf("the move failed for another reason: %q", msg)
+			}
+			break
+		}
+		if stage == StagePlacementRetiring || state == StateCompleted {
+			t.Fatalf("the move swapped: %s %s", state, stage)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the move neither swapped nor stopped: %s %s %q", state, stage, msg)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if n := queryOne[int64](t, src, `SELECT count(*) FROM pg_policy WHERE polrelid = 'public.notes'::regclass`); n != 1 {
+		t.Fatalf("the table clients see has %d policies after the refused move, want its 1", n)
+	}
+}
