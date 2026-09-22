@@ -1,6 +1,12 @@
 package plan
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"testing"
+)
 
 // Every case was answered by PostgreSQL 18's int8 input function
 // (pg_input_is_valid / ::int8) before it was written here; "" means the
@@ -44,5 +50,61 @@ func TestAHexKeyRoutesWhereItsValueDoes(t *testing.T) {
 	}
 	if a != b {
 		t.Fatalf("0x10 decoded as %v, 16 as %v", a, b)
+	}
+}
+
+// A literal key is read as the shard reads it too. The unknown literal
+// '0x10' compared with an int8 key is 16 to PostgreSQL; hashing it as the
+// string "0x10" sent the statement to a shard that does not hold the row.
+func TestAnIntegerLiteralKeyRoutesWhereItsValueDoes(t *testing.T) {
+	shardsOf := func(sql string) []int32 {
+		t.Helper()
+		p, err := New().Plan(context.Background(), session(fixture(t)), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		return p.Shards
+	}
+	for sql, same := range map[string]string{
+		"select * from orders where tenant_id = '0x10'::int8":  "select * from orders where tenant_id = 16",
+		"select * from orders where tenant_id = '1_6'::bigint": "select * from orders where tenant_id = 16",
+		"select * from orders where tenant_id = 0x10":          "select * from orders where tenant_id = 16",
+		"select * from orders where tenant_id = 0x100000000":   "select * from orders where tenant_id = 4294967296",
+	} {
+		got, want := shardsOf(sql), shardsOf(same)
+		if len(got) != 1 || !slices.Equal(got, want) {
+			t.Fatalf("%s routes to %v, %s to %v", sql, got, same, want)
+		}
+	}
+	for _, sql := range []string{
+		"select * from orders where tenant_id = '0x10'",
+		"select * from orders where tenant_id = '1_6'",
+	} {
+		_, err := New().Plan(context.Background(), session(fixture(t)), sql)
+		if err == nil || !strings.Contains(err.Error(), "untyped and looks numeric") {
+			t.Fatalf("%s: err = %v, want the numeric-literal refusal", sql, err)
+		}
+	}
+}
+
+func TestAnIntegerCastOfAParameterReadsPostgreSQLsSpellings(t *testing.T) {
+	v, err := DecodeShardKey(oidText, HintInt, 0, []byte("0x10"))
+	if err != nil || v != int64(16) {
+		t.Fatalf("got %v %v, want 16", v, err)
+	}
+}
+
+// An UNTYPED parameter spelled as any integer PostgreSQL reads -- 0x10 as
+// much as 16 -- could be either kind of key, and is refused as ambiguous;
+// declared as text it is a text key whatever it looks like.
+func TestAnUntypedParameterSpelledAsAnIntegerIsAmbiguous(t *testing.T) {
+	for _, raw := range []string{"16", "0x10", "1_000", "0b1"} {
+		if _, err := DecodeShardKey(0, HintNone, 0, []byte(raw)); !errors.Is(err, ErrAmbiguousKey) {
+			t.Fatalf("%q: err = %v, want ErrAmbiguousKey", raw, err)
+		}
+	}
+	v, err := DecodeShardKey(oidText, HintNone, 0, []byte("0xabc"))
+	if err != nil || v != "0xabc" {
+		t.Fatalf("a text parameter 0xabc: %v %v", v, err)
 	}
 }

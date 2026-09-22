@@ -482,7 +482,7 @@ func (b *mergeBuilder) limitValue(node *pgquerypb.Node, what string) (int64, err
 	case *pgquerypb.A_Const_Ival:
 		v = int64(x.Ival.GetIval())
 	case *pgquerypb.A_Const_Fval:
-		i, err := parseInt(x.Fval.GetFval())
+		i, err := pgStrToInt64(x.Fval.GetFval())
 		if err != nil {
 			return 0, notYet("multi-shard "+what+" must be an integer constant", "")
 		}

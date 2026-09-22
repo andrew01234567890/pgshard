@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
@@ -143,7 +142,7 @@ func applyCast(v any, hint TypeHint) (any, error) {
 		case int64:
 			return x, nil
 		case string:
-			i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+			i, err := pgStrToInt64(x)
 			if err != nil {
 				return nil, fmt.Errorf("parameter %q cast to an integer: %w", x, err)
 			}
