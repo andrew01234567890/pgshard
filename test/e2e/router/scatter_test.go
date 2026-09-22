@@ -44,11 +44,18 @@ create table regions (id int4 primary key, name text not null)`
 
 func startScatterStack(tb testing.TB) *scatterStack {
 	tb.Helper()
-	s := &scatterStack{stack: startStack(tb)}
+	return startScatterStackWith(tb, nil)
+}
+
+// startScatterStackWith starts the scatter stack with shardOpts on every
+// shard's PostgreSQL.
+func startScatterStackWith(tb testing.TB, shardOpts []string) *scatterStack {
+	tb.Helper()
+	s := &scatterStack{stack: startStackWith(tb, shardOpts)}
 	s.shardDSNs = []string{s.shardDSN}
 	poolerBin, _ := buildBinaries(tb)
 	for id := int32(1); id <= 2; id++ {
-		addr, dsn := startPostgres(tb, fmt.Sprintf("shard%d", id))
+		addr, dsn := startPostgres(tb, fmt.Sprintf("shard%d", id), shardOpts...)
 		s.shardDSNs = append(s.shardDSNs, dsn)
 		// Also on the embedded stack, whose map is what the controller is
 		// started with. Without it the controller knows shard 0 only, and

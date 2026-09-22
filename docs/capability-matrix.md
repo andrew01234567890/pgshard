@@ -42,10 +42,10 @@ tests are authoritative.
 | Scatter reads: streaming merge, ORDER BY, LIMIT/OFFSET pushdown, count/sum/min/max, key-covering GROUP BY/DISTINCT | Implemented | `internal/router/scatter`, differential-tested vs an oracle PostgreSQL |
 | Colocated joins: sharded tables joined on their shard key, and joins to a reference table | Implemented | `internal/router/plan`, differential-tested vs an oracle PostgreSQL |
 | Cross-shard joins (not on the shard key, or an unsharded table), subqueries, CTEs, window functions, `avg()` in scatter | Planned | refused with `0A000` and a hint |
-| Scatter UPDATE/DELETE, `INSERT ... SELECT`, multi-row INSERT spanning shards, COPY on sharded tables | Planned | refused with `0A000` |
+| Scatter UPDATE/DELETE, `INSERT ... SELECT`, multi-row INSERT spanning shards, COPY TO from sharded tables | Planned | refused with `0A000` |
 | Reference tables: fan-out writes in one 2PC, volatile-function refusal | Implemented | `internal/router` ([router.md](router.md#reference-tables)) |
 | Global sequences from the catalog (block allocation, INSERT rewrite, `nextval`) | Implemented | migration `0005`, [router.md](router.md#sequences) |
-| Session state replay over transaction pooling; cancel; COPY (unsharded); drain on SIGTERM; peer cancel forwarding | Implemented | `internal/router`, `cancelpeer` |
+| Session state replay over transaction pooling; cancel; COPY (unsharded, and FROM STDIN into sharded tables with two-phase commit); drain on SIGTERM; peer cancel forwarding | Implemented | `internal/router`, `cancelpeer` |
 | Failover buffering (`--buffer-window`), `40001` in-transaction, write fence (`57P03`) | Implemented | [router.md](router.md#operations) |
 | Cross-shard consistent snapshots (scatter under REPEATABLE READ / SERIALIZABLE) | Planned | refused |
 | PostgreSQL 19 grammar for the planner (mixed-major clusters mid-upgrade) | Planned | planner binds the PostgreSQL 18 grammar (`internal/pgparser`) |

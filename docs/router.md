@@ -227,7 +227,16 @@ the rest with `0A000`. See *Routing* below.
   until PostgreSQL answers. A backend cut short that way is discarded, not
   pooled -- its protocol state is unknown.
 - **COPY.** `COPY ... FROM STDIN` relays client chunks to the pooler until
-  `CopyDone`/`CopyFail`; `COPY ... TO STDOUT` streams back.
+  `CopyDone`/`CopyFail`; `COPY ... TO STDOUT` streams back. Into a
+  **sharded** table (columns named, shard key among them, text format,
+  simple query only) the router starts the COPY on every shard inside one
+  transaction, splits the stream into rows, hashes each row's key exactly as
+  a bound parameter of the key's type is hashed, and sends the row to its
+  shard in batches of up to 64 KiB. At the end it sums the shards'
+  `COPY n`, refuses the load if that is not the number of rows it sent, and
+  commits with two-phase commit when it opened the transaction itself; any
+  failure ends every shard's COPY with `CopyFail` and rolls the whole load
+  back.
 - **`ParameterStatus`.** A GUC_REPORT setting a backend reports as changed
   is forwarded to the client, including the report PostgreSQL sends when a
   `SET LOCAL` is undone by `ROLLBACK` or a savepoint. Only changes: the
@@ -527,7 +536,7 @@ could act on.
 | multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet |
 | `UPDATE … SET key`, `ON CONFLICT DO UPDATE SET key` | shard key is immutable |
 | reference-table write that reads a sharded or unsharded table, calls a volatile function, picks rows without an order, or names a **system column** (`ctid`, `xmin`, `xmax`, `cmin`, `cmax`, `tableoid`) | a write to reference table … cannot read sharded or unsharded tables; … cannot call now(); … cannot use LIMIT or OFFSET; … cannot name the system column ctid (see *Reference tables*) |
-| `TRUNCATE`, `VACUUM`, `LOCK`, `COPY` on sharded or reference tables | TRUNCATE/LOCK TABLE/VACUUM and ANALYZE on sharded and reference tables is not available yet; COPY on sharded and reference tables is not available yet |
+| `TRUNCATE`, `VACUUM`, `LOCK` on sharded or reference tables; `COPY` on reference tables and `COPY TO` from sharded ones | TRUNCATE/LOCK TABLE/VACUUM and ANALYZE on sharded and reference tables is not available yet; COPY on a reference table is not available yet; COPY TO from a sharded table is not available yet |
 | `CREATE TABLE`, `CREATE UNIQUE INDEX`, `ALTER TABLE ADD PRIMARY KEY/UNIQUE` on a declared sharded table without the key column, or with a PRIMARY KEY/UNIQUE that omits it | sharded table must define its shard key column; primary key or unique constraint (…) must include the shard key |
 | `SET`, `SET LOCAL`, `set_config` or `ALTER ROLE … SET` of `standard_conforming_strings` | changing standard_conforming_strings is not permitted through pgshard — the router parses and hashes shard keys with it on, so a session reading literals differently would place rows on a shard the router would not look on |
 | DDL forms the migration model refuses (transaction block, rewrite class, shard key changes, mixed sharded/unsharded objects, `CREATE TABLE AS` over sharded tables) | see *DDL* |

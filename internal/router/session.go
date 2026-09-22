@@ -1228,6 +1228,9 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if pl.Rewritten != "" {
 		sql = pl.Rewritten
 	}
+	if pl.Copy != nil {
+		return e.afterBatch(ctx, e.copyShardedIn(ctx, pl, sql, w))
+	}
 	if isReferenceWrite(pl) {
 		return e.afterBatch(ctx, e.referenceWrite(ctx, pl, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, w))
 	}
@@ -1924,6 +1927,12 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 	}
 	if err != nil {
 		e.failBatch()
+		return err
+	}
+	if pl.Copy != nil {
+		e.failBatch()
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "COPY into a sharded table is available only as a simple query")
+		err.Hint = "send the COPY with the simple query protocol, as psql does"
 		return err
 	}
 	if !pl.Deferred && pl.Kind != plan.SessionLocal && pl.Kind != plan.MigrationKind {
