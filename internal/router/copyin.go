@@ -19,6 +19,12 @@ import (
 // row would multiply the messages by the row count.
 const copyFlushBytes = 64 << 10
 
+// copyMaxLine bounds the one row the router holds while it waits for the
+// row's end. PostgreSQL's own limit is a gigabyte; the router holds the row
+// in memory on behalf of one client, so a stream that never ends a line
+// must not grow it without bound.
+var copyMaxLine = 64 << 20
+
 // copyShardedIn runs COPY ... FROM STDIN into a sharded table.
 //
 // Every shard starts the same COPY inside one transaction of the router's,
@@ -104,9 +110,19 @@ func (e *Executor) copyShardedIn(ctx context.Context, pl plan.Plan, sql string, 
 	}
 	if implicit {
 		// Committed before the tag is sent: a client told COPY n must not
-		// then learn that the commit failed.
-		if err := e.endTxn(ctx, true, discardWriter{}); err != nil {
-			return err
+		// then learn that the commit failed. A shard set of one shard never
+		// became a multi-shard transaction, and endTxn is only for those.
+		if e.multiShardTxn() {
+			if err := e.endTxn(ctx, true, discardWriter{}); err != nil {
+				return err
+			}
+		} else {
+			if err := e.send(simpleQuery("COMMIT")); err != nil {
+				return e.referenceFailed(ctx, implicit, err)
+			}
+			if err := e.pump(ctx, discardWriter{}); err != nil {
+				return e.referenceFailed(ctx, implicit, err)
+			}
 		}
 	}
 	e.lastTag = fmt.Sprintf("COPY %d", total)
@@ -209,6 +225,9 @@ func (e *Executor) relayCopyRows(pl plan.Plan, w pgwire.ResultWriter, parts map[
 			split.Write(data)
 			if rerr := route(); rerr != nil {
 				return 0, rerr
+			}
+			if len(split.Rest()) > copyMaxLine {
+				return 0, pgwire.Errorf("54000", "COPY row is longer than the %d MiB the router holds for one row", copyMaxLine>>20)
 			}
 		case errors.Is(err, pgwire.ErrCopyFail):
 			return 0, pgwire.Errorf("57014", "COPY from stdin failed: COPY terminated by client")

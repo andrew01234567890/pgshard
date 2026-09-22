@@ -6,6 +6,7 @@ package copysplit
 import (
 	"bytes"
 	"errors"
+	"strings"
 )
 
 // ErrShortRow is a row with fewer columns than the COPY names.
@@ -75,32 +76,85 @@ func (s *Splitter) Rest() []byte { return s.buf }
 // rowEnd is the index just past the newline that ends the first row, or -1
 // when the buffer does not hold a whole one.
 //
-// No backslash tracking: a raw newline inside a value cannot occur in this
-// format, because COPY writes one as the two characters \n. PostgreSQL's
-// own reader ends the row at the raw byte too, so tracking escapes here
-// would differ from it on malformed input and agree with it on nothing.
+// A backslash escapes the byte after it, a newline included: PostgreSQL's
+// reader (copyfromparse.c, CopyReadLineText) steps over the byte that
+// follows a backslash before it looks for the end of the line, so a
+// backslash-newline is part of a value and not the end of a row. A buffer
+// ending in a backslash does not hold a whole row yet.
 func rowEnd(b []byte) int {
-	if i := bytes.IndexByte(b, '\n'); i >= 0 {
-		return i + 1
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '\\':
+			i++
+		case '\n':
+			return i + 1
+		}
 	}
 	return -1
 }
 
+// ErrLongRow is a row with more columns than the COPY names.
+var ErrLongRow = errors.New("copy row has more columns than the statement names")
+
+// ErrNulInKey is a key whose escapes produce a zero byte, which PostgreSQL
+// refuses in text.
+var ErrNulInKey = errors.New("copy row's shard key contains a zero byte")
+
 // column returns the text of column n, and whether it was the NULL marker.
+//
+// Columns end at a tab that no backslash escapes, as in PostgreSQL's
+// CopyReadAttributesText, and the row has to have exactly cols of them:
+// PostgreSQL refuses a row with more or fewer, and so does the router,
+// before sending it anywhere.
 func column(row []byte, n, cols int) (string, bool, error) {
-	fields := bytes.Split(bytes.TrimRight(row, "\r\n"), []byte{'\t'})
-	if n >= len(fields) || len(fields) < cols {
+	line := bytes.TrimSuffix(row, []byte{'\n'})
+	if l := len(line); l > 0 && line[l-1] == '\r' && !escaped(line, l-1) {
+		line = line[:l-1]
+	}
+	var fields [][]byte
+	start := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			i++
+		case '\t':
+			fields = append(fields, line[start:i])
+			start = i + 1
+		}
+	}
+	fields = append(fields, line[start:])
+	switch {
+	case len(fields) < cols:
 		return "", false, ErrShortRow
+	case len(fields) > cols:
+		return "", false, ErrLongRow
 	}
 	raw := fields[n]
 	if bytes.Equal(raw, []byte(`\N`)) {
 		return "", true, nil
 	}
-	return unescape(raw), false, nil
+	key := unescape(raw)
+	if strings.IndexByte(key, 0) >= 0 {
+		return "", false, ErrNulInKey
+	}
+	return key, false, nil
+}
+
+// escaped reports that the byte at i is preceded by an odd run of
+// backslashes, which makes it part of an escape.
+func escaped(b []byte, i int) bool {
+	n := 0
+	for j := i - 1; j >= 0 && b[j] == '\\'; j-- {
+		n++
+	}
+	return n%2 == 1
 }
 
 // unescape resolves the backslash escapes COPY text format defines, so the
-// value the router hashes is the value the shard will store.
+// value the router hashes is the value the shard will store: the named
+// ones, octal \NNN and hex \xHH as PostgreSQL reads them (one to three
+// octal digits, one or two hex digits), and any other escaped byte as
+// itself.
 func unescape(b []byte) string {
 	if bytes.IndexByte(b, '\\') < 0 {
 		return string(b)
@@ -112,22 +166,51 @@ func unescape(b []byte) string {
 			continue
 		}
 		i++
-		switch b[i] {
-		case 'b':
+		switch c := b[i]; {
+		case c >= '0' && c <= '7':
+			v := int(c - '0')
+			for k := 0; k < 2 && i+1 < len(b) && b[i+1] >= '0' && b[i+1] <= '7'; k++ {
+				i++
+				v = v<<3 + int(b[i]-'0')
+			}
+			out = append(out, byte(v&0377))
+		case c == 'x' && i+1 < len(b) && isHex(b[i+1]):
+			i++
+			v := hexVal(b[i])
+			if i+1 < len(b) && isHex(b[i+1]) {
+				i++
+				v = v<<4 + hexVal(b[i])
+			}
+			out = append(out, byte(v))
+		case c == 'b':
 			out = append(out, '\b')
-		case 'f':
+		case c == 'f':
 			out = append(out, '\f')
-		case 'n':
+		case c == 'n':
 			out = append(out, '\n')
-		case 'r':
+		case c == 'r':
 			out = append(out, '\r')
-		case 't':
+		case c == 't':
 			out = append(out, '\t')
-		case 'v':
+		case c == 'v':
 			out = append(out, '\v')
 		default:
-			out = append(out, b[i])
+			out = append(out, c)
 		}
 	}
 	return string(out)
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func hexVal(c byte) int {
+	switch {
+	case c >= 'a':
+		return int(c-'a') + 10
+	case c >= 'A':
+		return int(c-'A') + 10
+	}
+	return int(c - '0')
 }

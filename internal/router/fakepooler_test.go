@@ -866,7 +866,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		// waits for ever.
 		<-ctx.Done()
 		return true, ctx.Err()
-	case q == "copy t from stdin", strings.HasPrefix(q, "copy orders ") && strings.HasSuffix(q, "from stdin"):
+	case q == "copy t from stdin", (strings.HasPrefix(q, "copy orders ") || strings.HasPrefix(q, "copy docs ")) && strings.HasSuffix(q, "from stdin"):
 		s.inCopy = true
 		return false, s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_CopyInResponse{CopyInResponse: &pgshardv1.CopyInResponse{}}})
 	case q == "select midrow_stale":

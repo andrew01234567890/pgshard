@@ -111,6 +111,15 @@ func refuseCopyOptions(c *pgquerypb.CopyStmt) error {
 				return notYet("COPY FORMAT "+f+" into a sharded table is not available yet",
 					"the text format is what COPY FROM STDIN uses by default; load with it, or filter on one shard key value")
 			}
+		case "delimiter", "null", "default", "header", "encoding", "quote", "escape",
+			"force_quote", "force_not_null", "force_null":
+			// The router splits rows and reads the key with the text
+			// format's defaults -- a tab between columns, \N for NULL, no
+			// header, the connection's encoding -- so a COPY that changes
+			// any of them would be split, keyed or counted differently
+			// from the way the shard reads it.
+			return notYet("COPY "+strings.ToUpper(name)+" into a sharded table is not available yet",
+				"load with the text format's defaults: tab-separated, \\N for NULL, no header")
 		case "on_error", "reject_limit", "log_verbosity":
 			return notYet("COPY "+strings.ToUpper(name)+" into a sharded table is not available yet",
 				"a row rejected on one shard cannot unsend the rows already accepted on the others")

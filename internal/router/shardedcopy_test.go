@@ -12,14 +12,22 @@ import (
 
 func newCopyHarness(t *testing.T) *shardedHarness {
 	t.Helper()
+	return newCopyHarnessShards(t, 4)
+}
+
+func newCopyHarnessShards(t *testing.T, shards int) *shardedHarness {
+	t.Helper()
 	log := &fakeDecisionLog{rows: map[string]string{}, fail: map[string]error{}}
-	h := newShardedHarnessWith(t, Config{Decisions: log})
+	h := newShardedHarnessShards(t, Config{Decisions: log}, shards)
 	log.h = h
 	next := *h.snap
 	next.Tables = map[snapshot.TableKey]snapshot.Placement{}
 	for k, p := range h.snap.Tables {
-		if p.ShardKey == "tenant_id" {
+		switch p.ShardKey {
+		case "tenant_id":
 			p.ShardKeyType = "bigint"
+		case "slug":
+			p.ShardKeyType = "text"
 		}
 		next.Tables[k] = p
 	}
@@ -173,6 +181,53 @@ func TestACopyIntoAShardedTableOverTheExtendedProtocolIsRefused(t *testing.T) {
 	rr := conn.PgConn().ExecParams(context.Background(), "copy orders (tenant_id, id) from stdin", nil, nil, nil, nil).Read()
 	if rr.Err == nil || !strings.Contains(rr.Err.Error(), "only as a simple query") {
 		t.Fatalf("err = %v", rr.Err)
+	}
+}
+
+// One shard never becomes a multi-shard transaction, and the load commits
+// on it plainly instead of failing after its rows were stored.
+func TestACopyIntoAOneShardSetCommits(t *testing.T) {
+	h := newCopyHarnessShards(t, 1)
+	conn := h.connect(t, h.dsn())
+	tag, err := conn.PgConn().CopyFrom(context.Background(), strings.NewReader("1\t1\n2\t2\n"), "copy orders (tenant_id, id) from stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.RowsAffected() != 2 {
+		t.Fatalf("tag %q", tag)
+	}
+	if st := conn.PgConn().TxStatus(); st != 'I' {
+		t.Fatalf("status %c, want the load committed and the session idle", st)
+	}
+	if !h.ranOn(0, "commit") {
+		t.Fatal("the load was not committed")
+	}
+}
+
+// A text key is hashed as the shard will store it: after its escapes are
+// resolved as PostgreSQL resolves them.
+func TestACopyTextKeyIsHashedAfterItsEscapes(t *testing.T) {
+	h := newCopyHarness(t)
+	conn := h.connect(t, h.dsn())
+	if _, err := conn.PgConn().CopyFrom(context.Background(), strings.NewReader(`a\x41\101`+"\tbody\n"), "copy docs (slug, body) from stdin"); err != nil {
+		t.Fatal(err)
+	}
+	sh := h.shardOf(t, "aAA")
+	if got := h.copiedRows(t)[sh]; len(got) != 1 {
+		t.Fatalf("shard %d holds %v, want the row keyed aAA; all %v", sh, got, h.copiedRows(t))
+	}
+}
+
+// A row that never ends is not held without limit.
+func TestACopyRowLongerThanTheRouterHoldsFailsTheLoad(t *testing.T) {
+	prev := copyMaxLine
+	copyMaxLine = 1 << 10
+	t.Cleanup(func() { copyMaxLine = prev })
+	h := newCopyHarness(t)
+	conn := h.connect(t, h.dsn())
+	_, err := conn.PgConn().CopyFrom(context.Background(), strings.NewReader("1\t"+strings.Repeat("x", 4<<10)), "copy orders (tenant_id, id) from stdin")
+	if err == nil || !strings.Contains(err.Error(), "longer than") {
+		t.Fatalf("err = %v", err)
 	}
 }
 

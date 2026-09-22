@@ -159,3 +159,15 @@ func TestCopyOnOtherPlacementsIsUnchanged(t *testing.T) {
 		t.Errorf("reference: %v", err)
 	}
 }
+
+// The router splits and keys rows with the text format's defaults, so an
+// option that changes them is refused rather than read differently from
+// the shard.
+func TestCopyOptionsTheSplitterDoesNotHonourAreRefused(t *testing.T) {
+	for _, opt := range []string{"delimiter ','", "null ''", "header true", "default '\\D'", "encoding 'LATIN1'"} {
+		_, err := copyPlan(t, "copy orders (tenant_id, id) from stdin with ("+opt+")")
+		if err == nil || !strings.Contains(err.Error(), "into a sharded table is not available yet") {
+			t.Fatalf("%s: err = %v", opt, err)
+		}
+	}
+}

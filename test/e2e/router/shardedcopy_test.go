@@ -39,6 +39,12 @@ func TestRouterShardedCopyMatchesOneNode(t *testing.T) {
 			sku = ""
 		case 4:
 			sku = `new\nline`
+		case 5:
+			// A backslash before a RAW newline keeps it in the value: the
+			// row does not end there.
+			sku = "raw\\\nnewline"
+		case 6:
+			sku = `oct\101hex\x42`
 		}
 		units := fmt.Sprint(i % 13)
 		if i%11 == 0 {
