@@ -401,7 +401,7 @@ because most of them are not a join:
 
 | What the statement did | Message |
 |---|---|
-| a set operation (`UNION`, `EXCEPT`, `INTERSECT`) | multi-shard SELECT with set operations is not available yet |
+| a set operation other than `UNION ALL` (`UNION`, `EXCEPT`, `INTERSECT`) | multi-shard SELECT with set operations is not available yet |
 | a subquery over another sharded table | multi-shard SELECT with subqueries is not available yet |
 | included an unsharded table | a multi-shard statement cannot include unsharded table "…", which is on the home shard alone |
 | preserved a reference table's rows in an outer join | an outer join that preserves the rows of a reference table is not available yet |
@@ -409,14 +409,27 @@ because most of them are not a join:
 | joined sharded tables on anything but their shard key | cross-shard join is not available yet |
 
 Only the last is a cross-shard join, and only it gets that message: `select
-* from orders union all select * from orders` contains no join, and being
+* from orders union select * from orders` contains no join, and being
 told it had one sent the reader looking for something that was not there.
 A single sharded table has nothing to compare against, needs no type
 verdict, and scatters as usual.
 
-Refused with `0A000` (message names the reason): `avg()` and every other
-aggregate PostgreSQL ships ("multi-shard avg() is not available yet" —
-compute `sum(x)` and `count(x)`), `JSON_ARRAYAGG`/`JSON_OBJECTAGG`,
+**`UNION ALL`** of sharded tables scatters: every shard runs the whole
+statement over its own rows and the router concatenates the answers, or
+merges them under the statement's `ORDER BY` and `LIMIT`/`OFFSET` (the
+`LIMIT` is pushed to every shard as limit+offset). That is the whole answer
+because `UNION ALL` keeps every row and each row of each arm lives on one
+shard. Each arm has to be a plain `SELECT` over one sharded table -- no
+aggregate, `DISTINCT`, `GROUP BY`, window function, subquery, CTE or `LIMIT`
+of its own, since each of those combines rows a shard sees only part of --
+and the `ORDER BY` names result columns, as PostgreSQL requires of a set
+operation. `UNION`, `INTERSECT` and `EXCEPT` compare rows across arms, which
+a shard can do only for its own, so they stay refused.
+
+Refused with `0A000` (message names the reason): the aggregates PostgreSQL
+ships beyond `count`, `sum`, `min`, `max` and `avg` (`avg()` is combined from
+a per-shard sum and count, over integer, numeric and double precision
+columns; `real` is refused), `JSON_ARRAYAGG`/`JSON_OBJECTAGG`,
 an aggregate in `ORDER BY` without a shard-key `GROUP BY` (an aggregate
 anywhere in a `SELECT` makes the whole statement return one row, so
 concatenating the shards returns one row per shard),
@@ -440,7 +453,7 @@ expressions), `FETCH … WITH TIES`, `ORDER BY … USING`, `ORDER BY` on a
 type without a comparator (`jsonb`, arrays, …), `min()`/`max()` over a text
 column, `sum()` over a non-numeric type, `SELECT DISTINCT` ordered by an
 expression outside the select list, window functions, `FOR UPDATE/SHARE`,
-set operations, CTEs, subqueries, joins that are not
+set operations other than `UNION ALL`, CTEs, subqueries, joins that are not
 colocated (above) and function scans, and `EXPLAIN`/`DECLARE CURSOR` of a
 scatter. `ORDER BY 3` past the select list is `42P10`, a negative `LIMIT`
 `2201W`, as in PostgreSQL.
@@ -505,7 +518,7 @@ could act on.
 
 | Statement shape | Message |
 |---|---|
-| multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, set operations, CTEs, subqueries, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; only a plain SELECT can run on multiple shards |
+| multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, set operations other than `UNION ALL`, CTEs, subqueries, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; only a plain SELECT can run on multiple shards |
 | `UPDATE`/`DELETE` without a key predicate | scatter UPDATE/DELETE without a shard key predicate is not available yet |
 | tables that do not resolve to one shard | a message naming which one it is — see *Colocated joins*; only a join of sharded tables on a non-key column is "cross-shard join is not available yet" |
 | a single-shard statement that also includes an unsharded table, resolving off the home shard | a statement including an unsharded table must resolve to the home shard alone |

@@ -169,7 +169,7 @@ func TestMergeSpecRefusals(t *testing.T) {
 		// in it -- the set operation below is the plainest -- was told it
 		// had a cross-shard one, and the reader looked for a join that was
 		// not there.
-		{"select * from orders union all select * from orders", "multi-shard SELECT with set operations is not available yet"},
+		{"select * from orders union select * from orders", "multi-shard SELECT with set operations is not available yet"},
 		{"select * from orders o join items i on o.item = i.id", `unsharded table "items", which is on the home shard alone`},
 		{"select * from orders where tenant_id in (select tenant_id from items)", `unsharded table "items", which is on the home shard alone`},
 		{"select * from regions r left join orders o on o.region = r.id", "an outer join that preserves the rows of a reference table"},
