@@ -100,6 +100,9 @@ type session struct {
 	// queued is what has been handed to the backend buffer since the last
 	// flush, in bytes on the wire.
 	queued int
+	// copyLost is set when the client broke a COPY FROM STDIN, and ends
+	// the session once the statement has been cleaned up.
+	copyLost copyLost
 	// copyIn is the active COPY FROM STDIN stream, if any. It is written by
 	// the session goroutine and read by a cancel arriving on another, so it
 	// is guarded like the rest of that group.
@@ -570,6 +573,14 @@ func (s *session) run() {
 		}
 		cont, err := s.dispatch(ctx, msg)
 		s.endMessage()
+		switch s.copyLost {
+		case copyLostProtocol:
+			s.copyLost = copyLostNone
+			s.terminate(Errorf(CodeProtocolViolation, "terminating connection because protocol synchronization was lost"))
+			return
+		case copyLostTerminated:
+			return
+		}
 		if err != nil {
 			log.Debug("session ended", "err", err)
 			return
@@ -869,10 +880,33 @@ func (a authExchange) Request(msg pgproto3.BackendMessage, authType uint32) (pgp
 }
 
 func (s *session) readyForQuery() error {
+	if s.copyLost != copyLostNone {
+		return nil
+	}
 	return s.send(&pgproto3.ReadyForQuery{TxStatus: byte(s.exec.TransactionStatus())})
 }
 
+// copyLost records how a COPY FROM STDIN ended when the client broke it.
+//
+// PostgreSQL does not answer such a COPY: the message that broke it was
+// consumed mid-protocol, so it escalates the error to FATAL "terminating
+// connection because protocol synchronization was lost" and disconnects
+// (postgres.c), and a Terminate simply ends the connection. Answering
+// ErrorResponse and ReadyForQuery and carrying on left the consumed
+// message -- a pipelined Query, say -- unanswered, with its client
+// waiting for it for good.
+type copyLost int
+
+const (
+	copyLostNone copyLost = iota
+	copyLostProtocol
+	copyLostTerminated
+)
+
 func (s *session) reportError(err error) {
+	if s.copyLost != copyLostNone {
+		return
+	}
 	if errors.Is(err, context.Canceled) {
 		err = Errorf(CodeQueryCanceled, "canceling statement due to user request")
 	}

@@ -67,8 +67,10 @@ func (w *walker) copyIn(c *pgquerypb.CopyStmt, r *rel) error {
 			"list the columns, including the shard key \""+r.shardKey+"\": COPY "+r.name+" (…) FROM STDIN")
 	}
 	at := -1
+	// The parser has already folded unquoted names, so the comparison is
+	// exact: a quoted "TENANT_ID" is another column, not the key.
 	for i, name := range cols {
-		if strings.EqualFold(name, r.shardKey) {
+		if name == r.shardKey {
 			at = i
 		}
 	}
@@ -126,6 +128,10 @@ func refuseCopyOptions(c *pgquerypb.CopyStmt) error {
 		case "where":
 			return notYet("COPY ... WHERE into a sharded table is not available yet", "filter the data before loading it")
 		}
+	}
+	// WHERE is the statement's own clause, not one of its options.
+	if c.GetWhereClause() != nil {
+		return notYet("COPY ... WHERE into a sharded table is not available yet", "filter the data before loading it")
 	}
 	if c.GetIsProgram() {
 		return notYet("COPY FROM PROGRAM into a sharded table is not available yet", "pipe the program's output into COPY FROM STDIN")
