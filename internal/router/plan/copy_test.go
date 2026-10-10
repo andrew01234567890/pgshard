@@ -171,3 +171,25 @@ func TestCopyOptionsTheSplitterDoesNotHonourAreRefused(t *testing.T) {
 		}
 	}
 }
+
+// Only a COPY whose data follows on the connection is COPY FROM STDIN; a
+// file or program is read by the server, and COPY TO sends data the other
+// way.
+func TestOnlyCopyFromStdinIsMarkedAsOne(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"copy items from stdin":           true,
+		"copy items (id) from stdin":      true,
+		"copy items to stdout":            false,
+		"copy items from '/tmp/x'":        false,
+		"copy items from 'stdin'":         false,
+		"copy items from program 'cat x'": false,
+	} {
+		p, err := New().Plan(context.Background(), session(fixture(t)), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if p.Class.CopyFromStdin != want {
+			t.Fatalf("%s: CopyFromStdin = %v, want %v", sql, p.Class.CopyFromStdin, want)
+		}
+	}
+}

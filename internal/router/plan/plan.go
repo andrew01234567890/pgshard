@@ -74,6 +74,9 @@ type StmtClass struct {
 	Txn TxnKind
 	// Chain marks COMMIT/ROLLBACK AND CHAIN.
 	Chain bool
+	// CopyFromStdin marks COPY ... FROM STDIN, whose data the client
+	// streams on the connection after the statement.
+	CopyFromStdin bool
 	// TxnScopedSet marks a SET LOCAL or SET TRANSACTION: a setting that
 	// lasts for the transaction and belongs on every shard in it.
 	TxnScopedSet bool
