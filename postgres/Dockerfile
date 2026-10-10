@@ -4,7 +4,7 @@ ARG PG_VERSION
 ARG PG_SHA256
 ARG PGBACKREST_VERSION=2.59.1
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS pg-build
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS pg-build
 ARG PG_MAJOR
 ARG PG_VERSION
 ARG PG_SHA256
@@ -31,7 +31,7 @@ RUN ./configure --prefix=/usr/local/pgsql --with-openssl --with-icu --with-lz4 -
       --with-llvm=no --enable-debug=no \
     && make -j"$(nproc)" world-bin && make install-world-bin
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS pgbackrest-build
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS pgbackrest-build
 ARG PGBACKREST_VERSION
 ARG PGBACKREST_SHA256
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o /out/pgshard-agent ./cmd/pgshard-agent \
     && CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o /out/pgshard-pooler ./cmd/pgshard-pooler
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 ARG PG_MAJOR
 ARG PG_VERSION
 ARG PGBACKREST_VERSION
