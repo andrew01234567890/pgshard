@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=1 go build -trimpath -o /out/pgshard-router ./cmd/pgshard-router && \
     CGO_ENABLED=0 go build -trimpath -o /out/pgshard-pooler ./cmd/pgshard-pooler
 
-FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin pgshard
 COPY --from=build /out/pgshard-router /out/pgshard-pooler /usr/local/bin/
