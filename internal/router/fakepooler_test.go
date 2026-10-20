@@ -32,6 +32,9 @@ type fakePooler struct {
 	copied []string
 	// copyShort makes this pooler report one row fewer than it received.
 	copyShort bool
+	// copyNoticeBytes makes this pooler answer every CopyData with a
+	// NOTICE of that size.
+	copyNoticeBytes int
 	// rows models the shard's table, not one backend's view of it: a
 	// session under transaction pooling gets a different backend for its
 	// next statement, and a table that only one backend could see made
@@ -957,6 +960,15 @@ func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) 
 		return s.rfq()
 	case *pgshardv1.ExecuteRequest_CopyData:
 		s.copyIn = append(s.copyIn, m.CopyData.Data...)
+		s.f.mu.Lock()
+		notice := s.f.copyNoticeBytes
+		s.f.mu.Unlock()
+		if notice > 0 {
+			// A backend that raises a NOTICE per chunk, as a per-row
+			// trigger does, and keeps writing whether or not anyone reads.
+			return s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Notice{Notice: &pgshardv1.NoticeResponse{
+				Notice: &pgshardv1.Error{Sqlstate: "00000", Message: strings.Repeat("n", notice)}}}})
+		}
 		return nil
 	case *pgshardv1.ExecuteRequest_CopyDone:
 		n := strings.Count(strings.TrimSpace(string(s.copyIn)), "\n") + 1
