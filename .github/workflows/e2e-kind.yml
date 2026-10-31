@@ -194,7 +194,7 @@ jobs:
       - name: Build PostgreSQL image
         id: build_postgres
         if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           source: .
           targets: postgres-${{ matrix.pg }}
@@ -226,7 +226,7 @@ jobs:
       - name: Build the target-major PostgreSQL image
         id: build_postgres_target
         if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true'
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           source: .
           targets: postgres-19
