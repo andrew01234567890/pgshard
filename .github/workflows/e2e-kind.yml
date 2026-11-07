@@ -116,14 +116,14 @@ jobs:
       # they took down three failing cells between them, each costing a
       # required context and roughly forty minutes of somebody's rerun.
       # The SHA stays pinned; only the attempt is repeated.
-      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         if: needs.changes.outputs.code == 'true'
         id: install_kind
         continue-on-error: true
         with:
           version: v0.32.0
           install_only: true
-      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         id: install_kind_retry
         if: steps.install_kind.outcome == 'failure' && needs.changes.outputs.code == 'true'
         continue-on-error: true
