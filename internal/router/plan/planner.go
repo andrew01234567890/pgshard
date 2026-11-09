@@ -295,6 +295,10 @@ func classify(node *pgquerypb.Node, c *StmtClass, local bool) error {
 				return notDurable("CREATE UNLOGGED SEQUENCE")
 			}
 		}
+	case *pgquerypb.Node_CopyStmt:
+		// FROM a file and FROM PROGRAM both name something in filename;
+		// only STDIN leaves it empty.
+		c.CopyFromStdin = n.CopyStmt.GetIsFrom() && n.CopyStmt.GetFilename() == ""
 	case *pgquerypb.Node_TransactionStmt:
 		t := n.TransactionStmt
 		c.Chain = t.GetChain()

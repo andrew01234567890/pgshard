@@ -1969,6 +1969,17 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 		e.failBatch()
 		return err
 	}
+	// Over the extended protocol a COPY FROM STDIN cannot end: PostgreSQL
+	// swallows the batch's Sync once it is in copy-in mode, so no
+	// ReadyForQuery follows the load, and the router and the pooler both
+	// waited for one for good (PGS-985). Refused by name instead, as the
+	// sharded COPY already was.
+	if pl.Class.CopyFromStdin && pl.Copy == nil {
+		e.failBatch()
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "COPY FROM STDIN is available only as a simple query")
+		err.Hint = "send the COPY with the simple query protocol, as psql and pgx's CopyFrom do"
+		return err
+	}
 	if pl.Copy != nil {
 		e.failBatch()
 		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "COPY into a sharded table is available only as a simple query")
