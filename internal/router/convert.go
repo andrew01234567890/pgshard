@@ -66,6 +66,26 @@ func flushReq() *pgshardv1.ExecuteRequest {
 	return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Flush{Flush: &pgshardv1.Flush{}}}
 }
 
+// copyChunkBytes bounds one CopyData message to the pooler. A client may
+// send a COPY chunk of up to 16 MiB and a row can be wider than that, while
+// gRPC refuses a message over 4 MiB: sent whole, the send failed and the
+// session lost its stream. COPY data is a byte stream, so the pieces need
+// not end on a row.
+const copyChunkBytes = 1 << 20
+
+// sendCopyData sends data to the pooler in CopyData messages of at most
+// copyChunkBytes.
+func sendCopyData(data []byte, send func(*pgshardv1.ExecuteRequest) error) error {
+	for len(data) > 0 {
+		n := min(len(data), copyChunkBytes)
+		if err := send(copyDataReq(data[:n])); err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
 func copyDataReq(data []byte) *pgshardv1.ExecuteRequest {
 	return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_CopyData{CopyData: &pgshardv1.CopyData{Data: data}}}
 }
